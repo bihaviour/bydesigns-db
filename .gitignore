@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Bun / Node (future bindings)
+node_modules/
+.bun/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Tooling artifacts
+.playwright-mcp/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example

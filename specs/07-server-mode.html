@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server Mode &amp; Wire Protocol · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="assets/spec.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">07 · SRV</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Server Mode &amp; Wire Protocol</h1>
+<p class="lede">Server mode is the <em>same</em> engine library wrapped in a wire-protocol listener — the <code>engine-server</code> binary — that speaks a defined subset of the Postgres wire protocol so PostgREST and <code>Bun.sql</code> connect for free; the listener is the only thing that differs from the embedded path, and everything below it is byte-for-byte the embedded engine.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This spec expands the server side of source §1 (the Slot A interface layer and the protocols between layers) and source §2.A (the <code>engine-server</code> build output), plus the pooler mentions in §1, §5, and §6. It defines what <code>engine-server</code> is, the network protocols it terminates, how a connection maps onto an engine instance and a database/branch, and the operational surface — pooling, TLS, auth, metrics, drain, backpressure — that only exists in server mode.</p>
+<p>The single most important framing, carried verbatim from the source: <em>server mode is just "the same library, wrapped in a wire-protocol listener."</em> The SQL parser, planner, executor, MVCC manager, local cache, and <code>Storage</code> trait are <strong>identical</strong> to the embedded build (<a href="02-engine-core.html">02 — Engine Core</a>). Server mode adds exactly one new thing on the inbound edge: a protocol listener that turns wire messages into the same engine calls that <code>bun:ffi</code> makes directly in-process.</p>
+<div class="callout note">
+<p class="callout-title">Note — one engine, two front doors</p>
+<p>Embedded (<a href="08-bun-integration.html">08 — Bun Integration</a>, Path 1) and server (Path 2) are the same <code>libengine</code> with a different front door. Embedded: <code>App ↔ Engine</code> via direct C-ABI function calls, no protocol. Server: <code>App ↔ Engine</code> via the Postgres wire protocol or HTTP. The <code>Engine ↔ Storage</code> RPC and <code>Storage ↔ Durability</code> S3 API are unchanged and remain internal in both modes.</p>
+</div>
+</section>
+
+<section>
+<h2>Responsibilities &amp; non-goals</h2>
+<h3>Responsibilities</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> link the unmodified engine library and expose it over a network listener, with no fork of engine behaviour between embedded and server builds.</li>
+<li><span class="req-tag must">MUST</span> implement a defined subset of the Postgres wire protocol (pgwire) sufficient for <code>Bun.sql</code> and PostgREST to connect and run parameterized queries.</li>
+<li><span class="req-tag must">MUST</span> route each connection to exactly one engine/database/branch and enforce single-writer-per-DB via the fencing token (source §4; <a href="06-lifecycle-controller.html">06</a>).</li>
+<li><span class="req-tag should">SHOULD</span> offer an alternative HTTP/WS request/response API for environments where a raw TCP pgwire listener is awkward (e.g. the edge).</li>
+<li><span class="req-tag should">SHOULD</span> sit behind a transaction-mode pooler (PgBouncer / pgcat) for serverless connection bursts (source §5, §6).</li>
+<li><span class="req-tag should">SHOULD</span> expose TLS, authentication, observability/metrics, graceful drain, and backpressure as first-class server concerns.</li>
+</ul>
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> reimplement SQL parsing, planning, MVCC, or WAL generation — those are the engine core (<a href="02-engine-core.html">02</a>); the listener only marshals messages to and from it.</li>
+<li><span class="req-tag must-not">MUST NOT</span> add multi-writer concurrency for a single database; the single-writer-per-DB ceiling is deliberate (source §4) and is enforced, not worked around, here.</li>
+<li><span class="req-tag must-not">MUST NOT</span> bundle a connection pooler into <code>engine-server</code>; the pooler is a separate, composable process in front (PgBouncer / pgcat).</li>
+<li><span class="req-tag must-not">MUST NOT</span> implement the auto-REST layer itself — that is PostgREST composed in front (<a href="12-capabilities.html">12 — Capabilities</a>); the server only has to be wire-compatible.</li>
+<li>Aiming for <em>full</em> Postgres wire/SQL fidelity is out of scope; the target is the subset real clients in this stack actually use.</li>
+</ul>
+</section>
+
+<section>
+<h2>Overview &amp; architecture</h2>
+<p>The listener is a thin shell. Inbound bytes are framed into protocol messages, authenticated once at startup, mapped to an engine handle, and translated into the same calls the embedded path uses. Results flow back out as protocol messages. Nothing about durability, MVCC, or storage changes.</p>
+<div class="diagram">
+<pre>
+   serverless clients (bursty, short-lived)
+   Bun.sql · PostgREST · psql · any pg driver
+                 │  many short connections
+                 ▼
+   ┌───────────────────────────────┐
+   │  POOLER (server mode only)    │   PgBouncer / pgcat
+   │  TRANSACTION mode             │   N client conns → few server conns
+   └───────────────┬───────────────┘
+                   │  few long-lived backend conns
+                   ▼
+   ┌───────────────────────────────┐
+   │  engine-server (listener)     │   pgwire  |  HTTP/WS
+   │  ─ framing / auth / TLS       │
+   │  ─ connection → db routing    │
+   │  ─ message ⇄ engine calls     │
+   └───────────────┬───────────────┘
+                   │  direct function calls (NO protocol)
+                   ▼
+   ┌───────────────────────────────┐
+   │  ENGINE LIBRARY (02)          │   identical to embedded build
+   │  parser·planner·exec·MVCC     │
+   │  local cache (05)             │
+   │  &gt;&gt;&gt; Storage trait &lt;&lt;&lt;        │
+   └───────────────┬───────────────┘
+                   │  Append(WAL) / GetPage@LSN  (internal RPC)
+                   ▼
+        Storage backend (03/04) → S3 / R2 / MinIO
+</pre>
+<p class="diagram-caption">Server mode = pooler (optional, in front) → listener (the only new code) → the embedded engine, unchanged. The dashed seam between listener and engine is in-process function calls, not a protocol.</p>
+</div>
+<p>Critically, the boundary <em>below</em> the listener is the embedded boundary: the listener calls <code>engine_open</code> / <code>engine_query</code> (or richer extended-query entry points) over the same C ABI that <code>bun:ffi</code> binds in Path 1. This is why "the listener is the only difference" is literally true and is the property the rest of this page is built to preserve.</p>
+</section>
+
+<section>
+<h2>Postgres wire protocol — supported subset</h2>
+<p>The engine speaks the Postgres frontend/backend protocol (protocol version 3.0) over TCP. Speaking it is what lets <code>Bun.sql</code> connect with zero extra deps and lets PostgREST point at the engine directly (source §5, §11; <a href="12-capabilities.html">12</a>, <a href="08-bun-integration.html">08</a>). The target is a <em>subset</em> — the message flows real clients in this stack use — not bug-for-bug Postgres fidelity.</p>
+
+<h3>Startup &amp; authentication</h3>
+<p>The connection opens with an unauthenticated <code>StartupMessage</code> (no leading type byte) carrying parameters including <code>user</code> and <code>database</code>. The server then drives an auth handshake and, on success, emits server parameters and signals readiness.</p>
+<dl class="fields">
+<dt>SSLRequest</dt>
+<dd>Optional pre-startup probe. Server replies a single byte <code>S</code> (proceed with TLS) or <code>N</code> (cleartext). See TLS &amp; auth below.</dd>
+<dt>StartupMessage</dt>
+<dd>Carries <code>user</code>, <code>database</code> (interpreted as a database/branch selector, see routing), and other parameters. The <code>database</code> field is the primary routing key.</dd>
+<dt>Authentication*</dt>
+<dd>Server requests an auth method; SCRAM-SHA-256 is the target (<code>AuthenticationSASL</code>), with optional cleartext/MD5 only behind TLS for legacy drivers.</dd>
+<dt>ParameterStatus / BackendKeyData</dt>
+<dd>Server announces <code>server_version</code>, <code>client_encoding</code>, <code>DateStyle</code>, etc., and a cancel key.</dd>
+<dt>ReadyForQuery</dt>
+<dd>Terminates startup; carries transaction status (<code>I</code> idle / <code>T</code> in-txn / <code>E</code> failed-txn). Emitted after every command cycle thereafter.</dd>
+</dl>
+<div class="callout warning">
+<p class="callout-title">server_version must satisfy client probes</p>
+<p><code>Bun.sql</code>, PostgREST, and most drivers probe <code>server_version</code> and a handful of catalog queries on connect. The server MUST report a <code>server_version</code> the clients accept and MUST answer the small set of introspection queries those clients issue during handshake (see Open questions). Failing this is the most common reason a "wire-compatible" engine fails to connect in practice.</p>
+</div>
+
+<h3>Simple query protocol</h3>
+<p>One <code>Query</code> message carries a SQL string (possibly multiple statements); the server replies with a row description, data rows, a command tag, and <code>ReadyForQuery</code>. This is the path <code>Bun.sql</code> uses for un-parameterized tagged-template fragments and the lowest-effort path to a working demo.</p>
+<pre data-lang="text"><code>C: Query                "SELECT id, name FROM t WHERE active"
+S: RowDescription       [ {id: int4}, {name: text} ]
+S: DataRow              [ 1, "ada" ]
+S: DataRow              [ 2, "bel" ]
+S: CommandComplete      "SELECT 2"
+S: ReadyForQuery        'I'    (idle, not in a transaction)</code></pre>
+
+<h3>Extended query protocol</h3>
+<p>The parameterized path: <code>Parse</code> → <code>Bind</code> → <code>Describe</code> → <code>Execute</code> → <code>Sync</code>. This is what real drivers (including <code>Bun.sql</code>'s parameterized queries) prefer because it separates the SQL text from values and supports prepared statements and binary result formats. It MUST be implemented for the engine to be more than a demo.</p>
+<pre data-lang="text"><code>C: Parse        stmt="s1"  sql="SELECT id FROM t WHERE name = $1"  paramtypes=[text]
+C: Bind         portal=""  stmt="s1"  params=["ada"]  resultfmt=[binary]
+C: Describe     portal=""
+C: Execute      portal=""  max_rows=0
+C: Sync
+S: ParseComplete
+S: BindComplete
+S: RowDescription   [ {id: int4} ]
+S: DataRow          [ 0x00000001 ]      (binary int4)
+S: CommandComplete  "SELECT 1"
+S: ReadyForQuery    'T'    (still in a transaction)</code></pre>
+<dl class="fields">
+<dt>Parse</dt>
+<dd>Compile SQL text into a named or unnamed prepared statement; optionally declare parameter OID types. Maps to engine parse/plan, cached by statement name for the connection lifetime.</dd>
+<dt>Bind</dt>
+<dd>Bind parameter values (text or binary format) to a prepared statement, producing a portal; specify per-column result formats (text/binary).</dd>
+<dt>Describe</dt>
+<dd>Request the <code>RowDescription</code> (for a portal) or <code>ParameterDescription</code>+<code>RowDescription</code> (for a statement) without executing.</dd>
+<dt>Execute</dt>
+<dd>Run a portal, optionally bounded by a row limit; emits <code>DataRow</code>* then <code>CommandComplete</code> (or <code>PortalSuspended</code> if the limit is hit).</dd>
+<dt>Sync</dt>
+<dd>Close the implicit transaction block, flush pending errors, and emit <code>ReadyForQuery</code>. On error mid-batch, the server discards messages until the next <code>Sync</code>.</dd>
+<dt>Close</dt>
+<dd>Free a named statement or portal (<code>CloseComplete</code>).</dd>
+</dl>
+
+<h3>Error &amp; notice responses</h3>
+<p>Errors and notices are field-tagged messages the engine must produce so drivers can classify failures. Each carries a severity, a SQLSTATE code, and a human message at minimum.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Message</th><th>When</th><th>Key fields</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ErrorResponse</code></td><td>Statement fails (syntax, constraint, fenced writer, etc.)</td><td><code>S</code> severity, <code>C</code> SQLSTATE, <code>M</code> message, optional <code>D</code>/<code>H</code>/<code>P</code></td></tr>
+<tr><td><code>NoticeResponse</code></td><td>Non-fatal warning</td><td>Same shape; does not abort the command</td></tr>
+<tr><td><code>ReadyForQuery</code></td><td>After error + <code>Sync</code></td><td>Reports <code>E</code> when the transaction is in a failed state</td></tr>
+</tbody>
+</table>
+</div>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> implement protocol 3.0 startup, SCRAM auth, the simple query path, and the full extended query path (<code>Parse</code>/<code>Bind</code>/<code>Describe</code>/<code>Execute</code>/<code>Sync</code>/<code>Close</code>).</li>
+<li><span class="req-tag must">MUST</span> emit <code>ErrorResponse</code> with a valid SQLSTATE for every failure mode, including a defined code for a fenced/lost-writer write attempt.</li>
+<li><span class="req-tag must">MUST</span> report a <code>server_version</code> and answer the connect-time introspection queries that <code>Bun.sql</code> and PostgREST issue.</li>
+<li><span class="req-tag should">SHOULD</span> support binary parameter and result formats, not only text, for driver compatibility and throughput.</li>
+<li><span class="req-tag should">SHOULD</span> honor <code>CancelRequest</code> (out-of-band cancel via the <code>BackendKeyData</code> secret) to abort a long-running query.</li>
+<li><span class="req-tag may">MAY</span> support <code>COPY</code> sub-protocol later; it is not required for the initial client set.</li>
+</ul>
+<div class="callout tip">
+<p class="callout-title">Start from an existing protocol library</p>
+<p>Do not hand-roll framing. Start from <strong>pgwire</strong> (Rust) for the native engine build, or <strong>jackc/pgproto3</strong> (Go) if a Go shim is preferred (source §6). These give the message codecs; this spec's job is to map the decoded messages onto engine calls and back.</p>
+</div>
+</section>
+
+<section>
+<h2>Wire-compatibility payoff</h2>
+<p>Speaking pgwire is not a feature for its own sake — it is what makes two ecosystem pieces attach with zero bespoke code:</p>
+<dl class="fields">
+<dt>Bun.sql (client, free)</dt>
+<dd>Bun ships a built-in Postgres client. Expose pgwire and a Bun app connects with <code>new SQL("postgres://…")</code> — no extra dependency, no custom driver (source §5, Path 2; <a href="08-bun-integration.html">08</a>).</dd>
+<dt>PostgREST (REST layer, free)</dt>
+<dd>PostgREST introspects a schema and auto-generates a REST API. Because the engine speaks pg wire in server mode, PostgREST points at it directly — you may not build a REST layer at all and inherit the existing one (source §11; <a href="12-capabilities.html">12</a>).</dd>
+</dl>
+<p>The corollary for this spec: the wire subset is driven by what these two clients (plus <code>psql</code> and generic drivers) actually emit. The Open questions section pins the exact catalog/introspection queries that must be answered.</p>
+</section>
+
+<section>
+<h2>Alternative HTTP/WS API</h2>
+<p>For environments where a raw TCP pgwire listener is awkward — notably the edge, where the runtime may not expose arbitrary TCP and connections are HTTP-shaped — <code>engine-server</code> SHOULD offer a minimal HTTP/WS request/response API over the <em>same</em> engine. This is an interface alternative only; it does not change the engine or storage.</p>
+<h3>Request shape</h3>
+<pre data-lang="json"><code>POST /v1/query
+Authorization: Bearer &lt;token&gt;
+{
+  "database": "mydb",          // routing key; may name a branch: "mydb@feature-x"
+  "sql": "SELECT id FROM t WHERE name = $1",
+  "params": ["ada"],           // positional, $1-based
+  "txn": null                  // or a txn handle from a prior BEGIN
+}</code></pre>
+<h3>Response shape</h3>
+<pre data-lang="json"><code>200 OK
+{
+  "columns": [ { "name": "id", "type": "int4" } ],
+  "rows":    [ [ 1 ] ],
+  "command": "SELECT",
+  "row_count": 1,
+  "commit_lsn": 873           // present for write commits; the durable commit point
+}
+
+409 Conflict                  // fenced / not the current writer
+{ "error": { "code": "55P03", "message": "not the writer for mydb" } }</code></pre>
+<dl class="fields">
+<dt>WS streaming</dt>
+<dd>A WebSocket variant MAY carry the same JSON frames for multi-statement sessions and result streaming, keeping one socket warm for a session instead of one HTTP request per statement.</dd>
+<dt>Transactions</dt>
+<dd>A <code>BEGIN</code> returns an opaque <code>txn</code> handle; subsequent requests pass it; <code>COMMIT</code>/<code>ROLLBACK</code> close it. Without a handle, each request is its own implicit transaction.</dd>
+</dl>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> expose an HTTP/WS API as an alternative front door for edge/HTTP-only runtimes; it MUST map onto the identical engine calls as pgwire.</li>
+<li><span class="req-tag must">MUST</span> return the same SQLSTATE codes (in the JSON error object) that pgwire would return, so client error handling is uniform across both front doors.</li>
+<li><span class="req-tag must">MUST</span> return <code>commit_lsn</code> on write commits and MUST NOT return it before the WAL is durable (the §8 durability rule applies regardless of front door).</li>
+<li><span class="req-tag may">MAY</span> omit the HTTP/WS API on native targets where pgwire is sufficient; it is required only where raw TCP is impractical.</li>
+</ul>
+</section>
+
+<section>
+<h2>Connection → engine/database routing</h2>
+<p>A connection must resolve to exactly one engine instance bound to one database (and optionally one branch). The routing key is the pgwire <code>database</code> startup field (or the <code>database</code> field in the HTTP/WS body). A branch is selected by an agreed suffix syntax — <code>db@branch</code> — resolving to a branch pointer (<a href="06-lifecycle-controller.html">06</a>).</p>
+<pre data-lang="text"><code>connection startup:
+  user="svc"  database="mydb@feature-x"
+        │
+        ▼
+  parse routing key → (db_id="mydb", branch="feature-x")
+        │
+        ▼
+  controller: is an engine for (db_id, branch) resident?
+     ─ yes → attach connection to it
+     ─ no  → cold-start engine, open Storage at branch base_lsn,
+             warm cache, then attach   (scale-to-zero wakeup, 06)
+        │
+        ▼
+  WRITE intent → must hold the writer lease (fencing token).
+                 one writer per DB; readers attach freely to a snapshot LSN.</code></pre>
+<h3>Single writer per DB, enforced by fencing</h3>
+<p>Source §4 fixes the model: <strong>one writer at a time per database.</strong> Server mode enforces it through the commit log's CAS fencing token (<a href="04-object-storage-backend.html">04</a>, <a href="06-lifecycle-controller.html">06</a>). The listener does not invent its own lock; it relies on the storage-layer fence:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> bind a write-issuing connection to the engine instance that holds the current writer lease for that DB/branch; a second concurrent writer MUST be rejected, not silently queued at a new engine.</li>
+<li><span class="req-tag must">MUST</span> surface a fencing event (a writer that lost the lease) to the client as an <code>ErrorResponse</code> with a defined SQLSTATE (e.g. <code>55P03</code> lock-not-available class) — never an acked write from a fenced writer.</li>
+<li><span class="req-tag should">SHOULD</span> allow many concurrent read connections per DB, each attached to a snapshot LSN; reads do not contend (source §10 — different-row/readers parallelize).</li>
+<li><span class="req-tag should">SHOULD</span> route many independent databases/branches to many engine instances — this is the sharding lever that recovers write lanes (W2, source §8/§9), so routing must make per-DB fan-out cheap.</li>
+<li><span class="req-tag may">MAY</span> proxy a misrouted connection to the node currently holding a DB's writer lease, or return a redirect, rather than starting a competing engine.</li>
+</ul>
+<div class="callout warning">
+<p class="callout-title">Routing must not manufacture a second writer</p>
+<p>The dangerous failure is two <code>engine-server</code> nodes each cold-starting a writer for the same DB. The CAS fence makes this <em>safe</em> (the loser is fenced at its first append), but it is wasteful. Routing SHOULD converge writes for a DB onto one node; correctness is guaranteed by the fence either way.</p>
+</div>
+</section>
+
+<section>
+<h2>Pooler (server mode only)</h2>
+<p>A connection pooler — <strong>PgBouncer</strong> or <strong>pgcat</strong> — SHOULD sit in front of <code>engine-server</code> in <strong>transaction mode</strong> to absorb serverless connection bursts (source §1, §5, §6). This exists only in server mode; the embedded path has no sockets and no pool.</p>
+<h3>Why transaction mode specifically</h3>
+<p>Serverless clients open many short-lived connections (one per request/invocation). Each backend connection holds engine resources (a session, cached prepared statements, a snapshot). Transaction mode multiplexes <em>N</em> client connections onto a small pool of backend connections, returning a backend to the pool at each transaction boundary rather than holding it for the client's whole lifetime.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Pool mode</th><th>Backend held for</th><th>Fit here</th></tr>
+</thead>
+<tbody>
+<tr><td>session</td><td>the entire client connection</td><td>Defeats the purpose — bursty serverless clients would exhaust backends.</td></tr>
+<tr><td><strong>transaction</strong></td><td>one transaction</td><td><span class="pill green">target</span> Maximizes reuse under burst; backend returns to pool at <code>COMMIT</code>/<code>ROLLBACK</code>.</td></tr>
+<tr><td>statement</td><td>one statement</td><td>Breaks multi-statement transactions; too aggressive for OLTP.</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">Transaction-mode constraints clients must respect</p>
+<p>In transaction mode a backend is not pinned to a client across transactions, so session-scoped state (session-level <code>SET</code>, server-side prepared statements not re-prepared per txn, advisory session locks, <code>LISTEN</code>/<code>NOTIFY</code>) does not survive between transactions. Clients and PostgREST MUST avoid relying on cross-transaction session state when pooled in transaction mode. This is standard PgBouncer guidance and applies unchanged here.</p>
+</div>
+<h3>Config sketch</h3>
+<pre data-lang="text"><code># pgbouncer.ini (sketch)
+[databases]
+mydb = host=127.0.0.1 port=5432 dbname=mydb
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type   = scram-sha-256
+auth_file   = /etc/pgbouncer/userlist.txt
+
+pool_mode             = transaction      # the required mode
+default_pool_size     = 20               # backend conns per (db,user)
+min_pool_size         = 0                # allow scale-to-zero: no idle backends
+reserve_pool_size     = 5
+max_client_conn       = 5000             # absorb the burst on the client edge
+server_idle_timeout   = 30               # drop idle backends → engine can idle-stop
+server_tls_sslmode    = require
+client_tls_sslmode    = require</code></pre>
+<p>pgcat is the alternative when sharding/load-balancing across many backend nodes is wanted; it offers the same transaction pooling plus query routing. Either way the pooler is composed, not built (source §6 — "Pooler … No (build from scratch); PgBouncer, pgcat").</p>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> deploy a transaction-mode pooler in front of <code>engine-server</code> for any serverless or bursty client population.</li>
+<li><span class="req-tag should">SHOULD</span> set <code>min_pool_size = 0</code> / a short <code>server_idle_timeout</code> so idle backends drain and the engine can scale to zero (<a href="06-lifecycle-controller.html">06</a>).</li>
+<li><span class="req-tag must-not">MUST NOT</span> embed pooling logic in <code>engine-server</code>; keep it a separate composable process.</li>
+<li><span class="req-tag should">SHOULD</span> document the transaction-mode session-state caveats for tool authors and for PostgREST configuration.</li>
+</ul>
+</section>
+
+<section>
+<h2>TLS &amp; authentication</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> support TLS on the pgwire listener via the <code>SSLRequest</code> negotiation (reply <code>S</code>, then complete the TLS handshake before <code>StartupMessage</code>).</li>
+<li><span class="req-tag must">MUST</span> support SCRAM-SHA-256 authentication; cleartext/MD5 MAY be offered only over TLS for legacy drivers.</li>
+<li><span class="req-tag should">SHOULD</span> support bearer-token (or mTLS) auth on the HTTP/WS API, mapping to the same principal model as pgwire.</li>
+<li><span class="req-tag should">SHOULD</span> require TLS between the pooler and <code>engine-server</code> and between client and pooler (<code>client_tls_sslmode</code> / <code>server_tls_sslmode</code> = <code>require</code>).</li>
+<li><span class="req-tag may">MAY</span> delegate user/role storage to the composed auth layer where better-auth or an external IdP owns identity (<a href="12-capabilities.html">12</a>); the server only needs to verify a credential and resolve a principal.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Auth is per-connection, authorization is per-statement</p>
+<p>The listener authenticates once at startup and resolves a principal; row/table authorization (RLS-style) is the engine's and/or the composed layer's job, not the wire layer's. The wire layer's contract is: prove identity, then forward statements tagged with that principal.</p>
+</div>
+</section>
+
+<section>
+<h2>Observability &amp; metrics</h2>
+<p>Server mode is the only mode with connections, so it owns connection-level observability. Metrics SHOULD be exported in a Prometheus-style scrape endpoint and SHOULD reuse the latency percentiles the benchmark plan demands (p50/p99/p999 — never mean-only; source §8).</p>
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">p99</div><div class="metric-label">commit latency (target tracked)</div></div>
+<div class="metric"><div class="metric-value">conns</div><div class="metric-label">active / idle / fenced</div></div>
+<div class="metric"><div class="metric-value">qps</div><div class="metric-label">by db / branch / op type</div></div>
+<div class="metric"><div class="metric-value">cold</div><div class="metric-label">cold-start wakeups &amp; warm time</div></div>
+</div>
+<dl class="fields">
+<dt>Connection metrics</dt>
+<dd>Active / idle connections, per-DB writer-lease holder, fencing events, auth failures, TLS handshake failures.</dd>
+<dt>Latency histograms</dt>
+<dd>Per-statement and per-commit p50/p99/p999 via HDR-style histograms (source §8 harness), labelled by simple vs extended query and read vs write.</dd>
+<dt>Engine/lifecycle</dt>
+<dd>Cold-start count and warm time (feeds idle-timeout / keep-warm tuning, source §10 / Exp 5), cache hit ratio passed through from <a href="05-local-cache.html">05</a>.</dd>
+<dt>Tracing</dt>
+<dd>SHOULD propagate a trace/request id from the client through the listener into engine calls so a slow request can be attributed to wire, engine, cache, or storage.</dd>
+</dl>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> expose a metrics endpoint with connection, latency-percentile, and lifecycle counters.</li>
+<li><span class="req-tag should">SHOULD</span> emit per-statement structured logs with SQLSTATE on failure for debuggability.</li>
+<li><span class="req-tag must-not">MUST NOT</span> log statement parameter values at default verbosity (they may carry user data); gate behind an explicit debug flag.</li>
+</ul>
+</section>
+
+<section>
+<h2>Graceful shutdown, drain &amp; backpressure</h2>
+<h3>Drain on shutdown</h3>
+<p>Because writes ack only after the WAL is durable, shutdown must not strand an in-flight commit. The server drains rather than dropping connections.</p>
+<pre data-lang="text"><code>SIGTERM received:
+  1. stop accepting new connections (close listener socket).
+  2. mark in-flight writes: let each open transaction reach
+     COMMIT/ROLLBACK or hit drain_timeout.
+  3. for committed-but-unacked writes: ensure the WAL CAS has
+     returned and the ack is delivered before closing the conn.
+  4. flush/handoff the writer lease (so a successor can claim it
+     without waiting for fence expiry).        (06)
+  5. close idle conns, then close remaining conns at drain_timeout.
+  6. exit. The engine itself may then idle-stop (scale-to-zero).</code></pre>
+<h3>Backpressure</h3>
+<p>The single-writer-per-DB ceiling means the write path is a single lane; under burst, the server must push back rather than unbounded-buffer (buffering would risk acking from memory, which the durability rule forbids).</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> drain in-flight transactions on <code>SIGTERM</code> up to <code>drain_timeout</code> before exiting, and MUST deliver the ack for any write whose WAL became durable during drain.</li>
+<li><span class="req-tag must">MUST</span> hand off or release the writer lease on graceful shutdown so a successor engine can take over without a stale-fence stall.</li>
+<li><span class="req-tag must">MUST</span> apply backpressure (bounded queue, <code>53300 too_many_connections</code> / a busy error) instead of buffering writes in memory and acking early — the §8 durability rule overrides throughput.</li>
+<li><span class="req-tag should">SHOULD</span> bound the per-connection in-flight message window and the global concurrent-write queue depth per DB.</li>
+<li><span class="req-tag should">SHOULD</span> coordinate drain with the pooler (pause new server connections) so clients see graceful reconnects, not reset sockets.</li>
+</ul>
+<div class="callout danger">
+<p class="callout-title">Never ack from memory under load</p>
+<p>Backpressure is the safe answer to a write firehose; in-memory buffering with early ack is not. A commit is durable only when its WAL CAS succeeds (source §8, Experiment 4 gate). Shedding load with a clear busy error is correct; pretending a buffered write is committed is disqualifying.</p>
+</div>
+</section>
+
+<section>
+<h2>Listener interface (engine-server entry points)</h2>
+<p>The listener calls the same C ABI the embedded path binds, plus a small surface for the extended-query lifecycle. These are the engine-side entry points the listener marshals to; they are <em>not</em> new engine behaviour.</p>
+<pre data-lang="rust"><code>// Same handle type bun:ffi opens in embedded mode.
+fn engine_open(storage_url: &amp;str, db: &amp;str, branch: Option&lt;&amp;str&gt;) -&gt; EngineHandle;
+fn engine_close(h: EngineHandle);
+
+// Simple query path.
+fn engine_query(h: EngineHandle, sql: &amp;str) -&gt; QueryResult;
+
+// Extended query path (Parse/Bind/Describe/Execute).
+fn engine_parse(h: EngineHandle, name: &amp;str, sql: &amp;str,
+                param_types: &amp;[Oid]) -&gt; Result&lt;(), EngineError&gt;;
+fn engine_bind(h: EngineHandle, portal: &amp;str, stmt: &amp;str,
+               params: &amp;[Value], result_formats: &amp;[Format]) -&gt; Result&lt;(), EngineError&gt;;
+fn engine_describe(h: EngineHandle, target: DescribeTarget) -&gt; Description;
+fn engine_execute(h: EngineHandle, portal: &amp;str, max_rows: u32) -&gt; ExecOutcome;
+
+// Transaction control surfaced to the wire layer.
+fn engine_begin(h: EngineHandle) -&gt; TxnStatus;
+fn engine_commit(h: EngineHandle) -&gt; Result&lt;Lsn, EngineError&gt;;   // Lsn = durable commit point
+fn engine_rollback(h: EngineHandle) -&gt; TxnStatus;
+
+// Out-of-band cancel (maps to pgwire CancelRequest).
+fn engine_cancel(h: EngineHandle, secret: u32) -&gt; Result&lt;(), EngineError&gt;;</code></pre>
+<p><code>engine_commit</code> returning the durable <code>Lsn</code> is the bridge between the wire layer and the §8 durability rule: the listener emits <code>CommandComplete</code> / <code>commit_lsn</code> only after this returns, never before.</p>
+</section>
+
+<section>
+<h2>Configuration</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Knob</th><th>Default (proposed)</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>listen_addr</code> / <code>listen_port</code></td><td><code>0.0.0.0:5432</code></td><td>pgwire TCP listener bind.</td></tr>
+<tr><td><code>http_listen</code></td><td><code>disabled</code></td><td>Enable the alternative HTTP/WS API (edge targets).</td></tr>
+<tr><td><code>tls_mode</code></td><td><code>require</code></td><td>TLS requirement on the pgwire listener (<code>disable</code>/<code>allow</code>/<code>require</code>).</td></tr>
+<tr><td><code>auth_method</code></td><td><code>scram-sha-256</code></td><td>Primary auth; cleartext/MD5 only over TLS for legacy drivers.</td></tr>
+<tr><td><code>server_version</code></td><td>a pg-compatible string</td><td>Reported in <code>ParameterStatus</code>; MUST satisfy client probes.</td></tr>
+<tr><td><code>max_connections</code></td><td>500</td><td>Per-node connection ceiling before backpressure (<code>53300</code>).</td></tr>
+<tr><td><code>statement_timeout</code></td><td>30 s</td><td>Abort a runaway statement; emits <code>ErrorResponse</code>.</td></tr>
+<tr><td><code>idle_in_txn_timeout</code></td><td>10 s</td><td>Reclaim a connection holding a transaction open idle (esp. behind a pooler).</td></tr>
+<tr><td><code>drain_timeout</code></td><td>30 s</td><td>Max time to finish in-flight transactions on <code>SIGTERM</code> before forced close.</td></tr>
+<tr><td><code>write_queue_depth</code></td><td>256 / DB</td><td>Bounded in-flight write queue per DB before backpressure; never unbounded.</td></tr>
+<tr><td><code>cancel_enabled</code></td><td><code>true</code></td><td>Honor pgwire <code>CancelRequest</code> via <code>BackendKeyData</code> secret.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The pooler has its own config (sketched above) and is provisioned separately; <code>engine-server</code> does not read it.</p>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Failure</th><th>Mechanism</th><th>Handling</th></tr>
+</thead>
+<tbody>
+<tr><td>Write from a fenced writer</td><td>Connection's engine lost the writer lease (another node claimed it).</td><td>Engine's CAS append fails (412 at storage, <a href="04-object-storage-backend.html">04</a>); listener emits <code>ErrorResponse</code> SQLSTATE <code>55P03</code>; the write is NOT acked. Client should reconnect (pooler/router converges to the lease holder).</td></tr>
+<tr><td>Two nodes cold-start same DB writer</td><td>Routing did not converge writes to one node.</td><td>Safe by construction: the CAS fence allows only one to commit; the other is fenced at first append. Wasteful, not incorrect; routing SHOULD converge.</td></tr>
+<tr><td>Client probe query unsupported</td><td>Driver issues a catalog/introspection query the subset doesn't answer.</td><td>Connect fails or driver misbehaves. Mitigation: enumerate and answer the probe set for <code>Bun.sql</code>/PostgREST/<code>psql</code> (Open questions); return a sensible <code>ErrorResponse</code> for genuinely unsupported SQL.</td></tr>
+<tr><td>Session state lost across txns</td><td>Transaction-mode pooler returned backend to pool mid-session.</td><td>Expected pooler behaviour; clients MUST NOT rely on cross-txn session state. Document; PostgREST configured accordingly.</td></tr>
+<tr><td>SIGKILL (no drain)</td><td>Hard kill skips graceful drain.</td><td>No acked-write loss: any commit acked was already WAL-durable; any un-acked in-flight commit is replayed or absent on restart (§8 Exp 4). Clients retry; idempotent on commit LSN.</td></tr>
+<tr><td>Backpressure / overload</td><td>Write firehose exceeds the single lane.</td><td>Bounded queue then <code>53300</code>/busy error — shed load, never early-ack from memory. The contended-same-row outlier belongs on coupled Postgres (source §9 / <a href="10-hot-row-contention.html">10</a>).</td></tr>
+<tr><td>TLS / auth failure</td><td>Bad credential or handshake.</td><td><code>ErrorResponse</code> + connection close; counted in metrics; no engine resources allocated.</td></tr>
+<tr><td>Cold start on first connection</td><td>Engine for the routed DB/branch is idle (scale-to-zero).</td><td>Listener waits on controller cold-start (process attach + cache warm, source §10); first request pays the warm cost. Tunable via idle-timeout / keep-warm.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Dependencies &amp; existing pieces to start from</h2>
+<dl class="fields">
+<dt>Wire protocol codec</dt>
+<dd><strong>pgwire</strong> (Rust) for the native engine build, or <strong>jackc/pgproto3</strong> (Go) for a Go shim (source §6). Provides message framing; this spec maps messages to engine calls.</dd>
+<dt>Pooler</dt>
+<dd><strong>PgBouncer</strong> (transaction mode) or <strong>pgcat</strong> (transaction mode + sharding/routing) — composed in front, not built (source §6).</dd>
+<dt>Engine library</dt>
+<dd>The unmodified <code>libengine</code> / <code>engine.h</code> from <a href="02-engine-core.html">02 — Engine Core</a>; the listener is built around it as the <code>engine-server</code> output.</dd>
+<dt>Clients (validation)</dt>
+<dd><code>Bun.sql</code> and PostgREST as the conformance targets (source §5, §11); <code>psql</code> and <code>pgbench</code> for protocol/perf testing (the <a href="09-benchmark-plan.html">09</a> harness runs in server mode).</dd>
+<dt>Controller</dt>
+<dd><a href="06-lifecycle-controller.html">06 — Lifecycle &amp; Controller</a> for cold-start/idle-stop and the writer-lease fencing token the routing depends on.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> connect <code>Bun.sql</code> (<code>new SQL("postgres://…")</code>) with zero custom driver code and run both simple and parameterized queries end to end.</li>
+<li><span class="req-tag must">MUST</span> let PostgREST point at the engine, introspect a schema, and serve an auto-generated REST endpoint with no bespoke REST code.</li>
+<li><span class="req-tag must">MUST</span> implement the full extended query path (<code>Parse</code>/<code>Bind</code>/<code>Describe</code>/<code>Execute</code>/<code>Sync</code>/<code>Close</code>) verified against a stock pg driver and <code>psql</code>.</li>
+<li><span class="req-tag must">MUST</span> reject a second concurrent writer for one DB with a fencing <code>ErrorResponse</code>, never an acked write, demonstrated with two nodes racing the same DB.</li>
+<li><span class="req-tag must">MUST</span> pass a drain test: <code>SIGTERM</code> during an in-flight commit delivers the ack iff the WAL became durable, and never strands an acked write (ties to §8 Exp 4).</li>
+<li><span class="req-tag should">SHOULD</span> run <code>pgbench -c N</code> through the pooler in transaction mode and report p50/p99/p999 (feeds <a href="09-benchmark-plan.html">09</a> Exp 1/2).</li>
+<li><span class="req-tag should">SHOULD</span> demonstrate the listener adds no engine-behaviour divergence: identical query results between embedded (<code>bun:ffi</code>) and server (pgwire) for a fixed test corpus.</li>
+<li><span class="req-tag should">SHOULD</span> serve the alternative HTTP/WS API returning identical results and SQLSTATE codes to pgwire for the same queries.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul>
+<li><strong>Exact introspection probe set.</strong> Enumerate the precise catalog/<code>pg_catalog</code> queries <code>Bun.sql</code>, PostgREST, and <code>psql</code> issue on connect, and decide which are answered for real vs. stubbed. This is the make-or-break detail for "wire-compatible."</li>
+<li><strong>server_version value.</strong> Which version string keeps all target clients happy without claiming features the subset lacks? Pin and test per client version.</li>
+<li><strong>Writer-lease handoff under the pooler.</strong> In transaction mode the backend is shared; how does a write transaction acquire/verify the writer lease per transaction without per-statement fence round-trips?</li>
+<li><strong>Cancel semantics.</strong> How does <code>CancelRequest</code> map onto an engine running a single-writer commit — can a commit mid-CAS be safely cancelled, or only pre-CAS statements?</li>
+<li><strong>Routing convergence.</strong> Proxy-to-lease-holder vs. redirect vs. let-the-fence-sort-it-out — which keeps writes on one node cheaply without a central directory becoming a bottleneck?</li>
+<li><strong>HTTP/WS transaction handles.</strong> Lifetime, idempotency, and timeout of an opaque <code>txn</code> handle across stateless HTTP requests, especially at the edge.</li>
+<li><strong>WASM listener form.</strong> On Workers there is no raw TCP and the engine is WASM (source §10); the HTTP/WS API is likely the only viable front door there — confirm pgwire is simply absent on that target (<a href="11-deployment-targets.html">11</a>).</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="02-engine-core.html"><span class="xref-id">CORE</span><span class="xref-title">Engine Core</span><span class="xref-desc">The library the listener wraps; same C ABI the embedded path binds.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">Path 2 — Bun.sql as a free pgwire client; the embedded counterpart to this front door.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAPS</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">PostgREST composed in front via wire-compat; interfaces wrap server mode.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTRL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Cold-start/idle-stop and the writer-lease fencing token routing depends on.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">CAS fencing that makes a fenced-writer error and durable commit_lsn possible.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (pgwire) vs WASM/edge (HTTP/WS); where the pooler lives.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">pgbench through the pooler; server-mode latency percentiles and the crash gate.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="assets/spec.js"></script>
+</body>
+</html>

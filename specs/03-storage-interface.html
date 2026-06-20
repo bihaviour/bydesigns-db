@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pluggable Storage Interface · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="assets/spec.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">03 · STOR</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Pluggable Storage Interface</h1>
+<p class="lede">A single narrow Rust trait that the engine calls instead of touching disk — the one seam that makes <em>embeddable</em> and <em>storage-disaggregated</em> stop contradicting each other, because the choice between a local file and object storage becomes a backend swap rather than a server boundary.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This page specifies <code>trait Storage</code>: the contract every durability backend implements and the only interface the engine core (<a href="02-engine-core.html">02</a>) ever uses to read pages or commit writes. It is the seam from Slot B → Slot C of the layer map. Everything above it (parser, planner, executor, MVCC, cache) is backend-agnostic; everything below it (a local file, an LSM-on-S3 page store, an S3-CAS commit log) is reachable only through these methods.</p>
+<p>The source design note calls this <strong>"the single most important artifact"</strong> and <strong>"the key artifact"</strong> to build from scratch (source §2.B, §6). The decoupling argument rests entirely on this trait being narrow, stable, and rigorously contracted: keep the engine a library, but make its storage backend pluggable and point it at the network instead of a local file. The seam is a storage interface <em>inside</em> the library, not a server boundary. Server mode (<a href="07-server-mode.html">07</a>) is then just the same library wrapped in a wire-protocol listener — the storage trait is identical in both forms.</p>
+
+<div class="callout note">
+<p class="callout-title">Why this seam resolves the tension</p>
+<p>Embeddable implies engine-as-library with function-call latency (SQLite). Separate storage implies durable state over the network with stateless compute (Neon/Aurora). Both hold simultaneously when the storage backend is a trait object: <code>LocalFileStorage</code> gives pure in-process embeddability; <code>ObjectStorage</code> gives disaggregation; the engine above does not know or care which is wired in.</p>
+</div>
+
+<h3>In scope</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> The exact method signatures, associated types, and per-method contracts of <code>trait Storage</code>.</li>
+<li><span class="req-tag must">MUST</span> Durability and ordering semantics for the write path (no ack-before-durable).</li>
+<li><span class="req-tag must">MUST</span> Snapshot-read semantics for the read path (version visible at-or-before a requested LSN).</li>
+<li><span class="req-tag must">MUST</span> Single-writer fencing primitives and the URL-scheme backend dispatch.</li>
+<li><span class="req-tag must">MUST</span> A backend-agnostic conformance test suite every implementation passes.</li>
+</ul>
+
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> Specify ObjectStorage internals (LSM layering, compaction, S3-CAS log mechanics) — those live in <a href="04-object-storage-backend.html">04</a>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> Specify the in-process page cache / LFC — that is <a href="05-local-cache.html">05</a>. The trait is the cache's <em>miss path</em>, not the cache itself.</li>
+<li><span class="req-tag must-not">MUST NOT</span> Define SQL, MVCC visibility rules, or WAL record encoding beyond the opaque <code>WalRecord</code> handed across the seam (<a href="02-engine-core.html">02</a>).</li>
+<li><span class="req-tag must-not">MUST NOT</span> Add SQL execution, query planning, or transaction-manager logic into a backend. Backends are dumb durable stores.</li>
+</ul>
+</section>
+
+<section>
+<h2>Responsibilities &amp; the contract surface</h2>
+<p>A <code>Storage</code> implementation owns exactly five durability concerns and nothing above them:</p>
+<dl class="fields">
+<dt>Durable ordered log</dt><dd>Accept WAL records, assign them a monotonic LSN, and make them durable before returning a commit LSN.</dd>
+<dt>Versioned page materialization</dt><dd>Return the version of any page as it was visible at-or-before a requested LSN (MVCC read floor).</dd>
+<dt>Durable commit point</dt><dd>Expose the latest LSN known to be durable, so the engine can advance its visibility horizon and recover after a crash.</dd>
+<dt>Single-writer fencing</dt><dd>Issue, renew, and revoke one writer token via compare-and-swap, so a stale writer cannot corrupt shared state.</dd>
+<dt>Snapshot / branch pointers</dt><dd>Create a copy-on-write branch as a new LSN pointer over shared immutable history, and resolve a branch to its base LSN.</dd>
+</dl>
+<p>The engine is responsible for everything else: it decides <em>what</em> to log, <em>when</em> to commit, and <em>which</em> LSN a transaction reads at. The backend never interprets WAL payloads, never makes visibility decisions, and never holds SQL state.</p>
+</section>
+
+<section>
+<h2>The source trait, then the realistic v1</h2>
+<p>The design note (source §2.B) gives the minimal seam — three methods. It is correct as a north star but under-specified for a buildable engine. We reproduce it verbatim, then extend to a v1 trait, justifying every addition. Nothing in v1 contradicts the source; each addition makes an implicit requirement explicit.</p>
+
+<h3>Source trait (verbatim, source §2.B)</h3>
+<pre data-lang="rust"><code>trait Storage {
+    fn get_page(&amp;self, page_id: PageId, lsn: Lsn) -&gt; Page;   // read path
+    fn append_wal(&amp;self, records: &amp;[WalRecord]) -&gt; Lsn;       // write path, returns commit LSN
+    fn flush(&amp;self) -&gt; Result&lt;()&gt;;
+}</code></pre>
+
+<h3>What the source trait omits (and why v1 must add it)</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Addition</th><th>Why it is forced by the rest of the spec</th></tr></thead>
+<tbody>
+<tr><td><code>get_pages</code> (batch read)</td><td>On <code>ObjectStorage</code> each cache miss is a network round-trip (hundreds of ms). A planner that touches N pages and issues N serial single-page reads pays N round-trips. Batch read lets the backend coalesce, parallelize, and amortize — the only way executor reads on a cold cache are affordable (source §2.C, §2.D).</td></tr>
+<tr><td><code>durable_lsn()</code> / <code>get_commit_lsn()</code></td><td>The source forbids acking before durable (source §8 durability rule). To recover after a crash and to advance MVCC visibility, the engine must read the latest durable commit point — otherwise it cannot know which acked commits survived (source Experiment 4).</td></tr>
+<tr><td>Fencing: <code>acquire</code> / <code>renew</code> / <code>release</code> token (CAS)</td><td>The architecture is single-writer-per-DB, fenced via the commit log's CAS token (source §2.C, §2.E, §4). A returning zombie writer after a controller restart must be rejected; that requires an explicit fence token on the write path.</td></tr>
+<tr><td>Branch pointer ops: <code>create_branch(base_lsn)</code> / <code>resolve_branch</code></td><td>Branch = a new LSN pointer over shared immutable layers, copy-on-write → instant clones (source §2.E, §3). The controller (<a href="06-lifecycle-controller.html">06</a>) needs trait-level branch creation; the read path needs to resolve a branch to a base LSN.</td></tr>
+<tr><td>GC / PITR hooks</td><td>Compaction + GC past the PITR window is a backend duty (source §2.C). The engine must declare the retention floor (oldest LSN any live reader or branch needs) so the backend can safely reclaim older versions without breaking snapshot reads.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>v1 trait (the buildable contract)</h3>
+<pre data-lang="rust"><code>/// The one seam. The engine calls this; it never touches disk directly.
+/// All methods are `async` because a backend may be network-bound (S3/R2).
+/// `LocalFileStorage` resolves them synchronously under the hood.
+#[async_trait]
+pub trait Storage: Send + Sync + 'static {
+    // ---- Read path -------------------------------------------------------
+    /// Page version visible at-or-before `lsn`. MVCC snapshot read floor.
+    async fn get_page(&amp;self, page_id: PageId, lsn: Lsn) -&gt; Result&lt;Page, StorageError&gt;;
+
+    /// Batch read: same semantics as `get_page` per id, but the backend MAY
+    /// coalesce / parallelize. Result order corresponds to `ids` order.
+    async fn get_pages(
+        &amp;self,
+        ids: &amp;[PageId],
+        lsn: Lsn,
+    ) -&gt; Result&lt;Vec&lt;Result&lt;Page, StorageError&gt;&gt;, StorageError&gt;;
+
+    // ---- Write path ------------------------------------------------------
+    /// Durably append WAL records under a valid fence token. Returns the
+    /// commit LSN ONLY after the records are durable. No ack-before-durable.
+    async fn append_wal(
+        &amp;self,
+        token: &amp;FenceToken,
+        records: &amp;[WalRecord],
+    ) -&gt; Result&lt;Lsn, StorageError&gt;;
+
+    /// Force any buffered durable state fully settled. Idempotent.
+    async fn flush(&amp;self) -&gt; Result&lt;(), StorageError&gt;;
+
+    // ---- Durable commit point -------------------------------------------
+    /// Latest LSN known to be durable on this backend (recovery + visibility).
+    async fn durable_lsn(&amp;self) -&gt; Result&lt;Lsn, StorageError&gt;;
+
+    /// Latest LSN that is durable AND a committed transaction boundary.
+    /// Equals the high-water mark a fresh reader may safely read at.
+    async fn get_commit_lsn(&amp;self) -&gt; Result&lt;Lsn, StorageError&gt;;
+
+    // ---- Single-writer fencing (CAS token) ------------------------------
+    /// Acquire the single-writer token. CAS over the previous epoch; a new
+    /// holder strictly increases `epoch`, invalidating all prior tokens.
+    async fn acquire_fence(&amp;self, owner: WriterId) -&gt; Result&lt;FenceToken, StorageError&gt;;
+
+    /// Renew (lease extend) an existing token. Fails if superseded.
+    async fn renew_fence(&amp;self, token: &amp;FenceToken) -&gt; Result&lt;FenceToken, StorageError&gt;;
+
+    /// Voluntarily relinquish the token so the next writer can acquire fast.
+    async fn release_fence(&amp;self, token: FenceToken) -&gt; Result&lt;(), StorageError&gt;;
+
+    // ---- Snapshot / branch (copy-on-write) ------------------------------
+    /// Create a branch as a new LSN pointer over shared immutable layers.
+    async fn create_branch(
+        &amp;self,
+        name: &amp;str,
+        base_lsn: Lsn,
+    ) -&gt; Result&lt;BranchId, StorageError&gt;;
+
+    /// Resolve a branch to (base_lsn, head_lsn). `head == base` for a fresh
+    /// branch; head advances as the branch takes its own writes.
+    async fn resolve_branch(&amp;self, branch: BranchId)
+        -&gt; Result&lt;BranchRef, StorageError&gt;;
+
+    // ---- GC / PITR hooks -------------------------------------------------
+    /// Declare the retention floor: the oldest LSN any live reader or branch
+    /// still needs. The backend MAY reclaim versions strictly older than this.
+    async fn set_retention_floor(&amp;self, lsn: Lsn) -&gt; Result&lt;(), StorageError&gt;;
+
+    /// Oldest LSN still recoverable (start of the PITR window).
+    async fn pitr_floor(&amp;self) -&gt; Result&lt;Lsn, StorageError&gt;;
+}</code></pre>
+
+<div class="callout warning">
+<p class="callout-title">The fence token is on the write path, not ambient</p>
+<p><code>append_wal</code> takes <code>&amp;FenceToken</code> by value-of-reference, not from hidden state. This is deliberate: it makes a stale writer's commit a <em>type-level</em> error path. A backend that accepts a WAL append without checking the token against the current epoch is non-conformant (see the conformance suite, §"fencing rejects stale writer").</p>
+</div>
+</section>
+
+<section>
+<h2>Associated types</h2>
+<p>The trait is generic only over these concrete types. They are part of the stable ABI surface; changing their wire/byte representation is a breaking change governed by the versioning policy.</p>
+
+<pre data-lang="rust"><code>/// Page identity. Stable for the life of the database. `u64` is ample for
+/// addressable pages at the fixed page size; never reused after free.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PageId(pub u64);
+
+/// Log Sequence Number. STRICTLY MONOTONIC, gap-free per database, never
+/// reused. Totally orders every durable mutation and every read snapshot.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Lsn(pub u64);
+
+/// A fixed-size page buffer plus the LSN that produced this version.
+/// `PAGE_SIZE` is a compile-time constant (default 4096; see Configuration).
+pub struct Page {
+    pub id: PageId,
+    pub lsn: Lsn,                 // version stamp: the LSN this image reflects
+    pub bytes: Box&lt;[u8; PAGE_SIZE]&gt;,
+}
+
+/// One opaque WAL record. The backend does NOT interpret it; it only stores
+/// it durably and orders it. Encoding/semantics are owned by Engine Core (02).
+pub struct WalRecord {
+    pub bytes: bytes::Bytes,      // pre-serialized by the engine
+}
+
+/// Single-writer fence token. Monotonic `epoch` is the CAS key; any acquire
+/// strictly increases it, fencing every prior holder. `lease_until` bounds
+/// validity so a crashed holder's token expires.
+#[derive(Clone)]
+pub struct FenceToken {
+    pub epoch: u64,
+    pub owner: WriterId,
+    pub lease_until: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WriterId(pub u128);   // unique per engine instance/process
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BranchId(pub u64);
+
+pub struct BranchRef {
+    pub id: BranchId,
+    pub base_lsn: Lsn,            // fork point on the parent
+    pub head_lsn: Lsn,           // current head of this branch
+}
+
+/// Error taxonomy. Distinguishes RETRYABLE transients from FATAL faults and,
+/// critically, the FENCED case so the engine can step down a stale writer.
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    /// Page/branch/LSN does not exist (e.g. requested LSN below PITR floor).
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// This writer has been fenced; a newer epoch holds the token. The engine
+    /// MUST stop writing immediately and not retry under the same token.
+    #[error("fenced: current epoch {current} &gt; held {held}")]
+    Fenced { held: u64, current: u64 },
+
+    /// CAS lost a race for the fence (another writer won). Caller MAY back off.
+    #[error("contended: fence acquire lost the CAS race")]
+    Contended,
+
+    /// Transient backend failure (S3 5xx, throttling, timeout). RETRYABLE
+    /// with backoff; carries no durability claim either way (see contracts).
+    #[error("transient: {0}")]
+    Transient(String),
+
+    /// Durability could NOT be confirmed. The commit MUST be treated as failed;
+    /// the engine MUST NOT ack. Never silently coerced to success.
+    #[error("durability unconfirmed: {0}")]
+    DurabilityUnconfirmed(String),
+
+    /// Detected corruption / checksum mismatch on a materialized page.
+    #[error("corruption: {0}")]
+    Corruption(String),
+
+    /// Configuration/usage error (bad URL scheme, wrong page size). FATAL.
+    #[error("invalid: {0}")]
+    Invalid(String),
+}</code></pre>
+
+<div class="callout note">
+<p class="callout-title">Why the error taxonomy is load-bearing</p>
+<p><code>Fenced</code> vs <code>Contended</code> vs <code>DurabilityUnconfirmed</code> are not cosmetic. <code>Fenced</code> means "stop writing forever under this token"; <code>Contended</code> means "you may try to acquire again"; <code>DurabilityUnconfirmed</code> means "do not ack this commit." Collapsing them into a generic error is what produces acked-write loss (source Experiment 4) — the one disqualifying failure.</p>
+</div>
+</section>
+
+<section>
+<h2>Per-method contracts</h2>
+<p>Every method below states preconditions, postconditions, ordering, idempotency, durability, and error cases. These are the normative behaviours the conformance suite checks.</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Method</th><th>Pre / Post</th><th>Ordering &amp; idempotency</th><th>Durability</th><th>Key error cases</th></tr></thead>
+<tbody>
+<tr>
+<td><code>get_page(id, lsn)</code></td>
+<td><strong>Pre:</strong> <code>lsn ≥ pitr_floor()</code>. <strong>Post:</strong> returns the page version with the greatest version-LSN that is <code>≤ lsn</code>; <code>Page.lsn ≤ lsn</code> always holds.</td>
+<td>Read-only; fully idempotent — same <code>(id, lsn)</code> always yields the same bytes. No ordering effect.</td>
+<td>None (read).</td>
+<td><code>NotFound</code> (lsn below PITR floor / unknown page), <code>Corruption</code>, <code>Transient</code>.</td>
+</tr>
+<tr>
+<td><code>get_pages(ids, lsn)</code></td>
+<td>As <code>get_page</code> applied per id. <strong>Post:</strong> result vector aligns 1:1 with <code>ids</code>; per-id errors are reported per element, not as a whole-call failure.</td>
+<td>Read-only, idempotent. Backend MAY reorder I/O internally but MUST NOT reorder results.</td>
+<td>None (read).</td>
+<td>Outer <code>Transient</code> (whole batch); inner per-id <code>NotFound</code> / <code>Corruption</code>.</td>
+</tr>
+<tr>
+<td><code>append_wal(token, records)</code></td>
+<td><strong>Pre:</strong> <code>token</code> is the current fence epoch. <strong>Post:</strong> on <code>Ok(lsn)</code>, every record is durable and assigned consecutive LSNs ending at the returned commit LSN; <code>durable_lsn() ≥ lsn</code> thereafter.</td>
+<td>Strictly serialized per database. Returned LSNs are monotonically increasing across calls. <strong>NOT idempotent</strong> by default — a retried append after an unknown outcome MAY double-apply; the engine MUST dedup via WAL record identity (see Failure modes).</td>
+<td><strong>MUST be durable before returning.</strong> No ack-before-durable, ever (source §8).</td>
+<td><code>Fenced</code> (stale token → engine steps down), <code>DurabilityUnconfirmed</code> (do not ack), <code>Transient</code> (retryable, outcome unknown).</td>
+</tr>
+<tr>
+<td><code>flush()</code></td>
+<td><strong>Post:</strong> all previously-acked durable state is fully settled to the durability floor.</td>
+<td><strong>Idempotent.</strong> A no-op if nothing is pending. Safe to call repeatedly.</td>
+<td>Strengthens, never weakens, durability.</td>
+<td><code>Transient</code>, <code>DurabilityUnconfirmed</code>.</td>
+</tr>
+<tr>
+<td><code>durable_lsn()</code></td>
+<td><strong>Post:</strong> returns an LSN <code>L</code> such that everything at-or-below <code>L</code> is durable. Monotonically non-decreasing across calls (never goes backward).</td>
+<td>Read-only, idempotent.</td>
+<td>Reports durability; does not change it.</td>
+<td><code>Transient</code>.</td>
+</tr>
+<tr>
+<td><code>get_commit_lsn()</code></td>
+<td><strong>Post:</strong> greatest durable LSN that is also a committed transaction boundary; the safe read snapshot for a fresh reader.</td>
+<td>Read-only, idempotent, monotonic non-decreasing.</td>
+<td>Reports durability.</td>
+<td><code>Transient</code>.</td>
+</tr>
+<tr>
+<td><code>acquire_fence(owner)</code></td>
+<td><strong>Post:</strong> on <code>Ok</code>, returns a token whose <code>epoch</code> is strictly greater than every previously issued epoch; all prior tokens are now invalid.</td>
+<td>CAS over previous epoch; total order on epochs. Not idempotent (each success burns an epoch).</td>
+<td>Token state itself is durable (CAS on the floor).</td>
+<td><code>Contended</code> (lost CAS — caller may retry), <code>Transient</code>.</td>
+</tr>
+<tr>
+<td><code>renew_fence(token)</code></td>
+<td><strong>Pre:</strong> <code>token</code> still current. <strong>Post:</strong> extended <code>lease_until</code>, same <code>epoch</code>.</td>
+<td>Idempotent within a lease window.</td>
+<td>Durable lease extension.</td>
+<td><code>Fenced</code> (superseded), <code>Transient</code>.</td>
+</tr>
+<tr>
+<td><code>release_fence(token)</code></td>
+<td><strong>Post:</strong> token retired; next <code>acquire_fence</code> succeeds without waiting for lease expiry.</td>
+<td>Idempotent (releasing an already-retired token is <code>Ok</code>).</td>
+<td>Durable.</td>
+<td><code>Transient</code>.</td>
+</tr>
+<tr>
+<td><code>create_branch(name, base_lsn)</code></td>
+<td><strong>Pre:</strong> <code>base_lsn ≥ pitr_floor()</code>. <strong>Post:</strong> new <code>BranchId</code> with <code>head_lsn == base_lsn</code>, sharing all immutable layers (copy-on-write, near-zero marginal storage).</td>
+<td>Not idempotent (each call mints a branch). Creation MUST NOT mutate the base.</td>
+<td>Branch metadata durable on success.</td>
+<td><code>NotFound</code> (base below PITR floor), <code>Transient</code>.</td>
+</tr>
+<tr>
+<td><code>resolve_branch(branch)</code></td>
+<td><strong>Post:</strong> returns <code>{base_lsn, head_lsn}</code> for the branch.</td>
+<td>Read-only, idempotent.</td>
+<td>None.</td>
+<td><code>NotFound</code> (unknown branch).</td>
+</tr>
+<tr>
+<td><code>set_retention_floor(lsn)</code></td>
+<td><strong>Pre:</strong> no live reader or branch needs an LSN below <code>lsn</code>. <strong>Post:</strong> backend MAY GC versions strictly older than <code>lsn</code>; <code>pitr_floor()</code> may rise toward <code>lsn</code>.</td>
+<td>Idempotent (advisory floor). MUST only move forward; a lower value than the current floor is rejected.</td>
+<td>Eventually frees durable bytes; never affects acked-and-still-needed data.</td>
+<td><code>Invalid</code> (floor moved backward).</td>
+</tr>
+<tr>
+<td><code>pitr_floor()</code></td>
+<td><strong>Post:</strong> oldest still-recoverable LSN; reads at-or-above it are guaranteed valid.</td>
+<td>Read-only, idempotent, monotonic non-decreasing.</td>
+<td>Reports.</td>
+<td><code>Transient</code>.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>The two invariants that override everything</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> <strong>append_wal MUST be durable before it returns the commit LSN.</strong> Never ack a commit from an in-memory buffer before the WAL is durably stored (source §8 durability rule). A fast commit path that loses an acked write under crash is disqualifying regardless of latency (source Experiment 4 gate).</li>
+<li><span class="req-tag must">MUST</span> <strong>get_page MUST return the version visible at-or-before the requested LSN.</strong> The returned <code>Page.lsn ≤ requested lsn</code>, and it is the <em>greatest</em> such version. This is the MVCC read floor; violating it breaks snapshot isolation.</li>
+<li><span class="req-tag must">MUST</span> Caching may hide read latency completely; it MUST NEVER hide commit latency. The cache (<a href="05-local-cache.html">05</a>) sits above this trait on the read path only.</li>
+</ul>
+
+<div class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Read path returns version at-or-before requested LSN; write path acks only after durable">
+<defs>
+<marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="currentColor"/></marker>
+</defs>
+<g fill="none" stroke="currentColor" stroke-width="1.5" font-family="var(--font-mono)" font-size="12">
+<rect x="20" y="20" width="150" height="46" rx="6"/>
+<text x="95" y="48" text-anchor="middle" fill="currentColor" stroke="none">Engine (MVCC)</text>
+<rect x="285" y="20" width="170" height="46" rx="6"/>
+<text x="370" y="42" text-anchor="middle" fill="currentColor" stroke="none">trait Storage</text>
+<text x="370" y="58" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">the seam</text>
+<rect x="560" y="20" width="140" height="46" rx="6"/>
+<text x="630" y="48" text-anchor="middle" fill="currentColor" stroke="none">Durable floor</text>
+
+<line x1="170" y1="36" x2="283" y2="36" marker-end="url(#ah)"/>
+<text x="227" y="30" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">get_page@lsn</text>
+<line x1="455" y1="36" x2="558" y2="36" marker-end="url(#ah)"/>
+
+<line x1="558" y1="52" x2="457" y2="52" marker-end="url(#ah)"/>
+<text x="507" y="46" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">page.lsn ≤ lsn</text>
+
+<rect x="20" y="150" width="150" height="46" rx="6"/>
+<text x="95" y="178" text-anchor="middle" fill="currentColor" stroke="none">COMMIT</text>
+<line x1="170" y1="173" x2="283" y2="173" marker-end="url(#ah)"/>
+<text x="227" y="167" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">append_wal</text>
+<line x1="455" y1="173" x2="558" y2="173" marker-end="url(#ah)"/>
+<text x="507" y="167" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">CAS / durable</text>
+<line x1="558" y1="189" x2="172" y2="189" marker-end="url(#ah)" stroke-dasharray="4 3"/>
+<text x="360" y="215" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">ack(commit_lsn) — ONLY after durable</text>
+</g>
+</svg>
+<p class="diagram-caption">Read returns the at-or-before-LSN version; the commit ack crosses back only after the WAL is durable on the floor.</p>
+</div>
+</section>
+
+<section>
+<h2>Backend selection by URL scheme</h2>
+<p>The backend is chosen by the connection string passed at open time — the same engine code path in both cases (source §2.B, §5). The host runtime never changes; only the URL changes.</p>
+
+<pre data-lang="rust"><code>/// Dispatch a storage URL to a concrete backend. Called once per open.
+pub fn open_storage(url: &amp;str) -&gt; Result&lt;Box&lt;dyn Storage&gt;, StorageError&gt; {
+    match Url::parse(url).map_err(|e| StorageError::Invalid(e.to_string()))?.scheme() {
+        // Pure embedded: a single .db file. Zero network. Dev / offline / edge.
+        "file" =&gt; Ok(Box::new(LocalFileStorage::open(url)?)),
+        // Disaggregated: LSM-on-S3 page store + S3-CAS commit log (spec 04).
+        "s3" | "r2" | "gs" =&gt; Ok(Box::new(ObjectStorage::open(url)?)),
+        other =&gt; Err(StorageError::Invalid(format!("unknown scheme: {other}"))),
+    }
+}</code></pre>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Scheme</th><th>Backend</th><th>Shape</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>file://</code></td><td><code>LocalFileStorage</code></td><td>Pure embedded, zero network, in-process function calls</td><td>Dev, offline, edge-local, fastest demo (source §5 rollout step 1)</td></tr>
+<tr><td><code>s3://</code> · <code>r2://</code> · <code>gs://</code></td><td><code>ObjectStorage</code></td><td>Disaggregated: LSM layers + S3-CAS log on object storage</td><td>Scale-to-zero, branching, multi-substrate (source §2.C, §10)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout tip">
+<p class="callout-title">The Bun open call is one string</p>
+<p><code>engine_open("file://./local.db")</code> versus <code>engine_open("s3://bucket/mydb")</code> is the entire difference between pure-embedded and disaggregated (source §5). The trait makes "storage choice is config, not a rebuild" literally true. See <a href="08-bun-integration.html">08</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Reference implementations</h2>
+<h3><code>LocalFileStorage</code> — a single <code>.db</code> file</h3>
+<p>The pure-embedded backend. Specified here in full because it has no separate page (its internals are simple); <code>ObjectStorage</code> internals are deferred to <a href="04-object-storage-backend.html">04</a>.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> Persist all state in a single <code>.db</code> file (source §2.B). Pages, WAL, fence epoch, branch metadata, and PITR floor live in that one file.</li>
+<li><span class="req-tag must">MUST</span> Make <code>append_wal</code> durable via <code>fsync</code> (or <code>F_FULLFSYNC</code> on macOS) before returning — local durability is microseconds, not the network round-trip <code>ObjectStorage</code> pays.</li>
+<li><span class="req-tag must">MUST</span> Implement fencing with an in-file epoch CAS (advisory lock + epoch counter) so it passes the identical conformance suite, even though a single local process is the common case.</li>
+<li><span class="req-tag should">SHOULD</span> Implement branches as additional LSN-pointer roots within the same file, sharing immutable page versions (copy-on-write within the file).</li>
+<li><span class="req-tag may">MAY</span> Use a libSQL/SQLite-compatible on-disk file layout to reuse a battle-tested format (source §2.A, §6).</li>
+</ul>
+
+<h3><code>ObjectStorage</code> — the disaggregated backend (brief)</h3>
+<p>Backs the trait with an LSM page store written to object storage plus an ordered commit log bottoming out on S3 conditional writes (CAS), giving atomic ordered appends and single-writer fencing without a separate Raft/Paxos cluster (source §2.C). It is the realization of <code>acquire_fence</code> (the CAS token) and <code>create_branch</code> (LSN pointer over immutable layers). <strong>Full internals — layer format, compaction, GC past the PITR window, the S3-CAS log mechanics, R2 zero-egress reads — are specified in <a href="04-object-storage-backend.html">04</a>.</strong> From the engine's side it is just another <code>Storage</code>.</p>
+</section>
+
+<section>
+<h2>Conformance test suite</h2>
+<p>A backend-agnostic test battery. <strong>Any</strong> <code>Storage</code> implementation MUST pass the entire suite to be considered conformant. This is what makes a new backend trustworthy — it is run against <code>LocalFileStorage</code>, <code>ObjectStorage</code> (incl. MinIO/R2 targets), and any future backend identically. The suite is parametric over <code>fn() -&gt; Box&lt;dyn Storage&gt;</code>.</p>
+
+<pre data-lang="rust"><code>/// Run the full conformance battery against any backend factory.
+/// Every assertion is normative; a failing backend is non-conformant.
+pub async fn run_conformance(make: impl Fn() -&gt; BoxFut&lt;Box&lt;dyn Storage&gt;&gt;) {
+    durability_after_ack(&amp;make).await;     // C1
+    monotonic_lsn(&amp;make).await;            // C2
+    snapshot_read_correctness(&amp;make).await;// C3
+    fencing_rejects_stale_writer(&amp;make).await; // C4
+    crash_consistency_hooks(&amp;make).await;  // C5
+    batch_read_equivalence(&amp;make).await;   // C6
+    branch_isolation(&amp;make).await;         // C7
+    retention_safety(&amp;make).await;         // C8
+}</code></pre>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Test</th><th>What it proves</th><th>Assertion</th></tr></thead>
+<tbody>
+<tr><td><strong>C1 · durability after ack</strong></td><td>No ack-before-durable.</td><td>After <code>append_wal</code> returns <code>Ok(lsn)</code>, drop and re-open the backend; the records at <code>lsn</code> MUST be present and readable. Inject a crash <em>after CAS-append but before ack</em> and <em>after ack but before page materialization</em> (source Experiment 4 (a)/(b)) — every acked commit survives; no torn/half state; no acked-write loss.</td></tr>
+<tr><td><strong>C2 · monotonic LSN</strong></td><td>LSN total order.</td><td>Across many concurrent and sequential <code>append_wal</code> calls, returned LSNs are strictly increasing and gap-free; <code>durable_lsn()</code> and <code>get_commit_lsn()</code> never decrease.</td></tr>
+<tr><td><strong>C3 · snapshot read correctness</strong></td><td>MVCC read floor.</td><td>Write versions of a page at <code>L1 &lt; L2 &lt; L3</code>; <code>get_page(id, L2)</code> returns the <code>L2</code> image (not <code>L3</code>); <code>get_page(id, L1)</code> returns the <code>L1</code> image; a read at an LSN between two versions returns the lower one. <code>Page.lsn ≤ requested</code> always.</td></tr>
+<tr><td><strong>C4 · fencing rejects stale writer</strong></td><td>Single-writer safety.</td><td>Writer A acquires (epoch e). Writer B acquires (epoch e+1, fencing A). A's <code>append_wal</code> with its old token MUST fail with <code>Fenced</code> — not silently succeed, not corrupt state. B's append succeeds.</td></tr>
+<tr><td><strong>C5 · crash-consistency hooks</strong></td><td>Deterministic recovery.</td><td>Driven by seeded crash injection (and <code>loom</code> / simulation testing, source Experiment 4): kill at adversarial points; on restart, recovered <code>durable_lsn()</code> ≥ every acked commit LSN, and replay is deterministic.</td></tr>
+<tr><td><strong>C6 · batch read equivalence</strong></td><td>get_pages == N × get_page.</td><td>For any <code>ids</code>, <code>get_pages(ids, lsn)</code> returns element-wise identical results to calling <code>get_page</code> per id, in order — batching only changes I/O scheduling, never results.</td></tr>
+<tr><td><strong>C7 · branch isolation</strong></td><td>Copy-on-write branches.</td><td>Branch B off base L0; writes on B advance B's head only; the parent at L0 is unchanged; reading B at its base reflects parent state at L0. Creating a branch does not mutate the base.</td></tr>
+<tr><td><strong>C8 · retention safety</strong></td><td>GC never breaks live reads.</td><td>With a live reader/branch needing L_old, <code>set_retention_floor(L &gt; L_old)</code> either is rejected or does not reclaim L_old; reads at-or-above <code>pitr_floor()</code> always succeed.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout danger">
+<p class="callout-title">C1 and C4 are unconditional gates</p>
+<p>A backend that fails C1 (durability after ack) or C4 (fencing) is rejected outright, no matter how fast it is. Durability is non-negotiable (source Experiment 4 gate / §8 decision rule 3). Hook these into the benchmark plan's fault-injection harness (<a href="09-benchmark-plan.html">09</a>).</p>
+</div>
+</section>
+
+<section>
+<h2>Configuration</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Knob</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>PAGE_SIZE</code></td><td>const usize</td><td><code>4096</code></td><td>Fixed page size; compile-time constant. Backends MUST agree; a mismatch on open is <code>Invalid</code>.</td></tr>
+<tr><td><code>storage_url</code></td><td>string</td><td>(required)</td><td>Selects the backend by scheme (§Backend selection).</td></tr>
+<tr><td><code>fence_lease_ms</code></td><td>u64</td><td><code>10000</code></td><td>Writer lease duration; must be renewed before expiry or the token lapses.</td></tr>
+<tr><td><code>fence_renew_ms</code></td><td>u64</td><td><code>3000</code></td><td>Renewal interval (&lt; lease, with margin for a network round-trip).</td></tr>
+<tr><td><code>pitr_window</code></td><td>duration</td><td><code>7d</code></td><td>How far back point-in-time recovery / branches may fork; drives GC floor.</td></tr>
+<tr><td><code>group_commit_window_ms</code></td><td>u64</td><td><code>2</code></td><td>Hint: how long <code>append_wal</code> may batch concurrent commits to amortize the durable round-trip (W1 mitigation, source §8). Batching never changes durability semantics.</td></tr>
+<tr><td><code>batch_read_max</code></td><td>usize</td><td><code>256</code></td><td>Max page ids per <code>get_pages</code> coalesced request.</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout note">
+<p class="callout-title">Group commit belongs above the durability line</p>
+<p><code>group_commit_window_ms</code> batches the expensive durable handoffs (defeats W1 latency), but it MUST NOT ack any commit before its batch is durable. Group commit defeats commit latency; it never adds write lanes (W2) — that is the many-small-DBs lever (source §8, <a href="10-hot-row-contention.html">10</a>).</p>
+</div>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Scenario</th><th>Backend behaviour</th><th>Engine response</th></tr></thead>
+<tbody>
+<tr><td>Crash after CAS-append, before ack returns</td><td>Record may be durable but unacknowledged.</td><td>On restart, recovery reconciles via <code>durable_lsn()</code>; an unacked commit either fully present or fully absent — never torn (C1, source Exp 4a).</td></tr>
+<tr><td>Crash after ack, before page materialization</td><td>WAL is durable; page image may be unmaterialized.</td><td>Acked commit MUST be recoverable by replay; page is re-materialized on next read (C1, source Exp 4b).</td></tr>
+<tr><td><code>append_wal</code> returns <code>Transient</code> (S3 5xx / timeout)</td><td>Outcome unknown — may or may not be durable.</td><td>Engine MUST NOT ack; MAY retry. Retry safety relies on WAL record identity dedup (append is not idempotent).</td></tr>
+<tr><td>Stale writer returns after controller restart</td><td>Its token's epoch is below current; backend rejects with <code>Fenced</code>.</td><td>Engine steps down immediately; does not retry under the same token (C4).</td></tr>
+<tr><td>Read at an LSN below <code>pitr_floor()</code></td><td><code>NotFound</code>.</td><td>Engine surfaces a snapshot-too-old error; cannot fabricate a reclaimed version.</td></tr>
+<tr><td>Two writers race <code>acquire_fence</code></td><td>One wins CAS, other gets <code>Contended</code>.</td><td>Loser backs off and retries or yields — single-writer-per-DB is preserved (source §4).</td></tr>
+<tr><td>Page checksum mismatch on read</td><td><code>Corruption</code>.</td><td>Engine fails the read loudly; never serves suspect bytes.</td></tr>
+<tr><td>Cold cache after scale-to-zero</td><td>Every read is a backend round-trip (no torn semantics, just slow).</td><td>Mitigated by the cache (<a href="05-local-cache.html">05</a>) and batch reads; not a correctness issue (source Exp 5).</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Trait stability &amp; versioning policy</h2>
+<p>The trait is the stable internal boundary that both reference backends and the engine compile against (and, transitively, the C ABI surface of <code>engine.h</code> for embedded hosts, source §2.A). It is versioned with a <code>STORAGE_TRAIT_VERSION</code> integer.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> Bump <code>STORAGE_TRAIT_VERSION</code> (major) for any signature change, associated-type byte-layout change, or contract weakening. The engine MUST refuse to open a backend reporting an incompatible major version.</li>
+<li><span class="req-tag should">SHOULD</span> Add new capability via <em>new methods with default implementations</em> (e.g. a future <code>get_page_range</code>) rather than altering existing signatures, so existing backends remain conformant. This is a minor bump.</li>
+<li><span class="req-tag must">MUST</span> Treat the durability and snapshot-read invariants (§Per-method contracts) as frozen — they MUST NOT be relaxed across any version.</li>
+<li><span class="req-tag should">SHOULD</span> Gate every published trait version on the full conformance suite for all in-tree backends before release.</li>
+<li><span class="req-tag may">MAY</span> Mark associated types <code>#[non_exhaustive]</code> (e.g. <code>StorageError</code>) so new error variants are a minor, not major, change — callers already handle a default arm.</li>
+<li><span class="req-tag must-not">MUST NOT</span> Leak backend-specific concepts (S3 keys, file offsets, LSM layer ids) into the trait surface; doing so would couple the engine to one backend and break the seam.</li>
+</ul>
+</section>
+
+<section>
+<h2>Normative requirements</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> The engine accesses durable state ONLY through <code>trait Storage</code>; no engine code path touches a file, socket, or S3 SDK directly.</li>
+<li><span class="req-tag must">MUST</span> <code>append_wal</code> returns a commit LSN only after the records are durable on the backend's durability floor.</li>
+<li><span class="req-tag must">MUST</span> <code>get_page(id, lsn)</code> returns the greatest page version with version-LSN <code>≤ lsn</code>.</li>
+<li><span class="req-tag must">MUST</span> LSNs are strictly monotonic, gap-free, and never reused per database.</li>
+<li><span class="req-tag must">MUST</span> <code>append_wal</code> validates the supplied <code>FenceToken</code> against the current epoch and rejects a stale token with <code>Fenced</code>.</li>
+<li><span class="req-tag must">MUST</span> Every backend pass the full conformance suite, with C1 and C4 as unconditional gates.</li>
+<li><span class="req-tag must">MUST</span> <code>set_retention_floor</code> never reclaim a version still needed by a live reader or branch.</li>
+<li><span class="req-tag should">SHOULD</span> <code>get_pages</code> coalesce backend I/O to amortize the per-miss network round-trip.</li>
+<li><span class="req-tag should">SHOULD</span> Backends distinguish <code>Transient</code> (retryable, outcome unknown) from <code>DurabilityUnconfirmed</code> (do not ack) from <code>Fenced</code> (stop writing).</li>
+<li><span class="req-tag may">MAY</span> <code>LocalFileStorage</code> reuse a SQLite/libSQL-compatible on-disk layout.</li>
+<li><span class="req-tag must-not">MUST NOT</span> Any backend interpret <code>WalRecord</code> contents or make MVCC visibility decisions.</li>
+<li><span class="req-tag must-not">MUST NOT</span> Group commit, batching, or caching ack a commit before it is durable.</li>
+</ul>
+</section>
+
+<section>
+<h2>Acceptance criteria — definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> <code>trait Storage</code> (v1) and all associated types compile and are documented with their contracts.</li>
+<li><span class="req-tag must">MUST</span> <code>LocalFileStorage</code> implements every method and passes the full conformance suite (C1–C8).</li>
+<li><span class="req-tag must">MUST</span> <code>ObjectStorage</code> passes the same suite against at least one real object store (MinIO acceptable for CI; R2/S3 for release) — see <a href="04-object-storage-backend.html">04</a>.</li>
+<li><span class="req-tag must">MUST</span> <code>open_storage</code> dispatches <code>file://</code> and <code>s3://</code>/<code>r2://</code> to the correct backend, exercised by the embedded path (<a href="08-bun-integration.html">08</a>).</li>
+<li><span class="req-tag must">MUST</span> Crash-injection tests (C1/C5) run under the benchmark/validation harness (<a href="09-benchmark-plan.html">09</a>) and show zero acked-write loss.</li>
+<li><span class="req-tag should">SHOULD</span> A swap from <code>file://</code> to <code>s3://</code> changes only the URL — no engine recompile and identical query behaviour.</li>
+<li><span class="req-tag should">SHOULD</span> <code>STORAGE_TRAIT_VERSION</code> and an incompatibility-refusal path exist and are tested.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> Resolve: should <code>append_wal</code> become idempotent via a client-supplied request id (exactly-once on retry), or stay non-idempotent with engine-side WAL dedup? Leaning engine-side dedup to keep the trait narrow.</li>
+<li><span class="req-tag should">SHOULD</span> Decide whether branch writes (<code>head_lsn</code> advancing) require their own fence token per branch, or share the parent database's single-writer token.</li>
+<li><span class="req-tag may">MAY</span> Investigate a <code>get_page_range</code> / prefetch hint for scan-heavy plans to further reduce round-trips on a cold cache.</li>
+<li><span class="req-tag may">MAY</span> Consider exposing read-replica / stale-read semantics (read at a slightly older durable LSN) for read scaling — likely a v2 addition.</li>
+<li><span class="req-tag should">SHOULD</span> Constrain the WASM target (<a href="11-deployment-targets.html">11</a>): the async trait must drive object storage through a Worker binding, not a raw S3 SDK; verify the trait surface is binding-agnostic.</li>
+<li><span class="req-tag should">SHOULD</span> Maturity risk: object-storage-native OLTP (SlateDB, S3-CAS log designs) is the active frontier (source §4); the conformance suite is the primary defense — expand it as new failure modes surface.</li>
+</ul>
+</section>
+
+<section>
+<h2>Dependencies &amp; pieces to start from</h2>
+<dl class="fields">
+<dt>Engine Core (<a href="02-engine-core.html">02</a>)</dt><dd>Produces <code>WalRecord</code>s, chooses read LSNs, and is the sole caller of this trait.</dd>
+<dt>ObjectStorage backend (<a href="04-object-storage-backend.html">04</a>)</dt><dd>The disaggregated implementation: LSM-on-S3 + S3-CAS commit log; realizes fencing and branching.</dd>
+<dt>SlateDB / RocksDB lineage</dt><dd>Reference for the LSM page store behind <code>ObjectStorage</code> (source §2.C, §6).</dd>
+<dt>libSQL / SQLite layout</dt><dd>Optional on-disk format reuse for <code>LocalFileStorage</code> (source §2.A, §6).</dd>
+<dt><code>loom</code> / simulation testing</dt><dd>Powers the crash-consistency conformance tests C1/C5 (source Experiment 4).</dd>
+</dl>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">The sole caller of this trait; produces WAL records and chooses read LSNs.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">ObjectStorage internals: LSM-on-S3 layers and the S3-CAS commit log.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Sits above the read path; the trait is the cache's miss path, never the commit path.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Drives fence acquire/release on cold start and branch-on-LSN creation.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">Where this seam sits in the three-slot layer map.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation</span><span class="xref-desc">Hosts the crash-injection harness that gates C1/C5 durability.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="assets/spec.js"></script>
+</body>
+</html>

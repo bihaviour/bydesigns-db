@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tradeoffs &amp; Risk Register · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="assets/spec.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">14 · RISK</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Tradeoffs &amp; Risk Register</h1>
+<p class="lede">Object-storage-native OLTP buys scale-to-zero, true embeddability, and instant branching by paying for them in commit latency, write serialization, cold starts, and ecosystem maturity — this page makes every one of those costs explicit, names who it bites, and consolidates them into a single tracked risk register with mitigations and acceptance gates.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This page is the consolidation point for honest costs and operational risk across the whole specification. It does two jobs:</p>
+<ul>
+<li>Expands the four honest tradeoffs (source §4) into impact-bearing subsections: each names the mechanism, <strong>who it bites</strong>, and the concrete mitigation, with a pointer to the spec that owns the deeper treatment.</li>
+<li>Pulls the risks scattered through specs <a href="01-architecture-overview.html">01</a>–<a href="13-roadmap.html">13</a> into one <strong>risk register</strong> with stable IDs, severity, likelihood, mitigation, residual risk, and the related spec — so nothing lives only in a footnote.</li>
+</ul>
+<p>It is normative for the <em>acceptance gates</em> that decide whether the engine is allowed to hold real data, and for the <strong>decision boundary</strong> that places each tool on the correct backend. It is not a substitute for the benchmark plan (<a href="09-benchmark-plan.html">09</a>) or the contention strategy (<a href="10-hot-row-contention.html">10</a>); those own the measurements and the levers. This page tracks them.</p>
+<div class="callout note">
+<p class="callout-title">Reading order</p>
+<p>If you read only one thing here, read <strong>“The durability non-negotiable”</strong> and the <strong>risk register</strong>. R-02 (acked-write loss) is disqualifying and gates everything else; the rest is tuning and placement.</p>
+</div>
+</section>
+
+<section>
+<h2>Responsibilities &amp; non-goals</h2>
+<h3>Responsibilities</h3>
+<ul>
+<li>State every architectural cost in plain terms, without marketing softening.</li>
+<li>Maintain the canonical risk register and keep risk IDs stable across spec revisions.</li>
+<li>Define the go/no-go decision boundary and the “when NOT to use this engine” guidance.</li>
+<li>Pin the durability invariant and the sign-off criteria that gate production data.</li>
+</ul>
+<h3>Non-goals</h3>
+<ul>
+<li>Re-deriving the W1/W2 mechanics or benchmark methodology — that is <a href="09-benchmark-plan.html">09</a> and <a href="10-hot-row-contention.html">10</a>.</li>
+<li>Choosing a deployment substrate — that is <a href="11-deployment-targets.html">11</a>.</li>
+<li>Sequencing the build — that is <a href="13-roadmap.html">13</a>.</li>
+<li>Inventing new risks not grounded in the design note; this page consolidates, it does not speculate beyond the documented architecture.</li>
+</ul>
+</section>
+
+<section>
+<h2>Normative requirements</h2>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> acknowledge a commit to the client before its WAL records are durably stored (CAS-append acked) on the commit log. Caching may hide read latency completely; it MUST NOT hide commit latency.</li>
+<li><span class="req-tag must">MUST</span> pass Experiment 4 (crash safety of the commit path, <a href="09-benchmark-plan.html">09</a>) unconditionally before any real data is admitted to a database. A fast commit path that loses an acked write under crash is disqualifying regardless of latency numbers.</li>
+<li><span class="req-tag must">MUST</span> run Experiments 1–3 (<a href="09-benchmark-plan.html">09</a>) and record p50/p99/p999 for a tool before that tool is placed on the disaggregated backend.</li>
+<li><span class="req-tag must">MUST</span> route any tool whose writes are same-row, same-DB, high-rate, and latency-critical to coupled Postgres rather than this engine (<a href="10-hot-row-contention.html">10</a>).</li>
+<li><span class="req-tag must">MUST</span> enforce single-writer fencing per database via the commit log’s CAS token (<a href="06-lifecycle-controller.html">06</a>); a writer that loses its lease MUST be fenced before another may append.</li>
+<li><span class="req-tag should">SHOULD</span> mitigate cold start with a keep-warm ping or a longer idle timeout for latency-sensitive tools, tuned from Experiment 5 (<a href="06-lifecycle-controller.html">06</a>, <a href="09-benchmark-plan.html">09</a>).</li>
+<li><span class="req-tag should">SHOULD</span> co-locate compute and object store in the same region/provider to avoid cross-cloud egress and latency surprises (<a href="11-deployment-targets.html">11</a>).</li>
+<li><span class="req-tag should">SHOULD</span> keep the HNSW working-set graph resident in the local cache; vector search leans hardest of anything on the cache (<a href="05-local-cache.html">05</a>, <a href="12-capabilities.html">12</a>).</li>
+<li><span class="req-tag may">MAY</span> reserve a dedicated primitive (e.g. Redis) for a tool that is <em>both</em> extremely contended and latency-critical, accepting the added ops/consistency cost (<a href="10-hot-row-contention.html">10</a>).</li>
+</ul>
+</section>
+
+<section>
+<h2>Honest tradeoff T1 — Write latency</h2>
+<p><strong>Mechanism.</strong> A commit pays a network/S3 round-trip (or quorum/CAS ack) instead of a local <code>fsync</code>. The durability floor moved off the local disk and onto object storage, so the acknowledged-commit path crosses the network by construction. This is the price of disaggregation, not a bug to be cached away.</p>
+<dl class="fields">
+<dt>Impact</dt>
+<dd>Per-commit latency rises from ~µs (local fsync) to ~ms (networked CAS ack). The <em>tail</em> (p99/p999) is what S3 jitter inflates, not the mean.</dd>
+<dt>Who it bites</dt>
+<dd>Sustained <strong>write firehoses</strong> — tools committing at high sequential rate where each commit blocks the next. Read-heavy and bursty workloads barely notice; their commits are infrequent and the read path is served from cache.</dd>
+<dt>Mitigation</dt>
+<dd>Group commit / queue + batch amortizes the round-trip across many concurrent commits (defeats W1). The mitigation that does <strong>not</strong> work: caching — it hides read latency but cannot hide commit latency without breaking durability. Any write-heavy tool MUST be benchmarked explicitly (Exp 1 + Exp 2) before commitment.</dd>
+</dl>
+<div class="callout warning">
+<p class="callout-title">Benchmark, don’t assume</p>
+<p>“Bursty barely notices, firehose must measure” is a guideline, not a guarantee. The sequential-commit ceiling is ~1/latency until group commit kicks in. See Experiment 1 (latency floor) and Experiment 2 (group-commit throughput curve) in <a href="09-benchmark-plan.html">09</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Honest tradeoff T2 — Single writer per database</h2>
+<p><strong>Mechanism.</strong> Without an added coordination layer, the engine permits one writer at a time per database — the SQLite-lineage ceiling. The commit log’s CAS token fences the single writer; there is no built-in multi-writer consensus.</p>
+<dl class="fields">
+<dt>Impact</dt>
+<dd>Write concurrency within a single database does not scale by adding writers; it scales by adding <em>databases</em> (lanes). A naive per-DB lock means every writer in the DB serializes, even on unrelated rows.</dd>
+<dt>Who it bites</dt>
+<dd>One giant, high-concurrency single-database OLTP workload. It does <strong>not</strong> bite the target shape — many small databases / dozens of tools, each its own lane.</dd>
+<dt>Mitigation</dt>
+<dd>Sharding: many small DBs = many independent lanes (defeats W2). Database boundaries substitute for row-level lock granularity (<a href="10-hot-row-contention.html">10</a>). The mitigation that does <strong>not</strong> work: batching — it makes one lane’s commits cheap but adds zero lanes.</dd>
+</dl>
+<div class="callout note">
+<p class="callout-title">Correct-but-slow by default</p>
+<p>The single lane is <em>correct</em> for the hot-row case — every contended write sees the prior committed value, exactly as every serious database serializes contended writers. The cost is performance on the outlier, never correctness. See <a href="10-hot-row-contention.html">10</a> for the layered strategy (serialize universally, shard where you control the SQL, route the irreducible outlier to Postgres).</p>
+</div>
+</section>
+
+<section>
+<h2>Honest tradeoff T3 — Cold start</h2>
+<p><strong>Mechanism.</strong> Compute is stateless: the controller stops the engine when idle (scale-to-zero), so the first request after an idle period pays process-start plus cache-warm. Caches start cold after every idle period by design.</p>
+<dl class="fields">
+<dt>Impact</dt>
+<dd>The first request after idle has elevated latency: process/container/isolate spin-up + a burst of cache-miss reads against object storage. Steady-state requests are unaffected.</dd>
+<dt>Who it bites</dt>
+<dd>Latency-sensitive tools with spiky, intermittent traffic — and, at scale, the <strong>thundering-herd</strong> case of many simultaneous cold starts (e.g. 1,000 at once) saturating spin-up.</dd>
+<dt>Mitigation</dt>
+<dd>A keep-warm ping or a slightly longer idle timeout, tuned from Experiment 5’s warm-vs-cold distributions and its “N concurrent cold starts” extension (<a href="06-lifecycle-controller.html">06</a>, <a href="09-benchmark-plan.html">09</a>). The trade is residual idle billing against tail latency.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Honest tradeoff T4 — Maturity</h2>
+<p><strong>Mechanism.</strong> Object-storage-native OLTP is the active frontier, not a settled field. The load-bearing pieces — SlateDB (LSM on object storage), S3-CAS commit-log designs, the libSQL rewrite — are fast-moving and have fewer battle-tested guarantees than a coupled Postgres.</p>
+<dl class="fields">
+<dt>Impact</dt>
+<dd>Fewer hardened guarantees, thinner operational track record, APIs and durability semantics still evolving. Bugs in dependencies become our correctness bugs.</dd>
+<dt>Who it bites</dt>
+<dd>Anyone treating the engine as a drop-in Postgres replacement for mission-critical data on day one, and the team carrying the integration as dependencies churn.</dd>
+<dt>Mitigation</dt>
+<dd>Keep the <code>Storage</code> trait the fixed point so backends are swappable (<a href="03-storage-interface.html">03</a>); pin and vet dependency versions; lean on the <code>loom</code>/simulation and crash-injection testing (Exp 4) rather than trusting upstream maturity; start tools on this engine that tolerate the risk profile, and reserve coupled Postgres for the ones that don’t.</dd>
+</dl>
+</section>
+
+<section>
+<h2>The two weak axes — recap</h2>
+<p>The architecture has exactly two weak axes. They are routinely conflated; they are <strong>different bottlenecks with different levers</strong>. Conflating them leads to applying the wrong mitigation and concluding the architecture “doesn’t work” when the real fault was the lever choice.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Axis</th><th>Mechanism</th><th>Correct lever</th><th>Lever that does NOT help</th><th>Owns it</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>W1 — commit latency</strong></td>
+<td>each commit = network/S3 round-trip (~ms) instead of local fsync (~µs)</td>
+<td>group commit / queue + batch (and read cache for reads)</td>
+<td>caching cannot hide <em>commit</em> latency without breaking durability</td>
+<td><a href="09-benchmark-plan.html">09</a></td>
+</tr>
+<tr>
+<td><strong>W2 — write serialization</strong></td>
+<td>single writer per database (SQLite lineage)</td>
+<td>many small DBs = many lanes (sharding)</td>
+<td>batching adds no lanes; it only makes one lane’s commits cheap</td>
+<td><a href="10-hot-row-contention.html">10</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout danger">
+<p class="callout-title">The one correction to internalize</p>
+<p>The <strong>queue defeats W1 (latency)</strong>; the <strong>sharded many-DB design defeats W2 (lanes)</strong>. Combined, group commit batches the expensive handoffs and many-small-DBs supplies independent lanes, making the coarse networked engine behave close to a fine-grained local one for most workloads. The only genuinely unsolvable case is many concurrent writers contending on the <em>same row in the same database</em> — that tool belongs on coupled Postgres.</p>
+</div>
+</section>
+
+<section>
+<h2>Consolidated risk register</h2>
+<p>Every risk scattered through the spec, gathered here with a stable ID. <strong>Impact</strong> and <strong>Likelihood</strong> are coarse (Low/Med/High). <strong>Residual</strong> is the risk that remains after the listed mitigation is in place. IDs are stable across revisions; add new risks with new IDs, never renumber.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Risk</th>
+<th>Category</th>
+<th>Impact</th>
+<th>Likelihood</th>
+<th>Mitigation</th>
+<th>Residual</th>
+<th>Related</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R-01</td>
+<td>Commit-latency tail — S3/CAS jitter inflates p99/p999 commit latency beyond a tool’s tolerance</td>
+<td><span class="pill amber">Performance</span></td>
+<td>High</td>
+<td>High</td>
+<td>Group commit / queue + batch; measure p99/p999 (Exp 1+2) per tool; same-region object store</td>
+<td>Med — tail never fully removed; sequential firehose still latency-bound</td>
+<td><a href="09-benchmark-plan.html">09</a></td>
+</tr>
+<tr>
+<td>R-02</td>
+<td>Acked-write loss under crash — process killed after CAS-append/ack but before durability/materialization, losing an acknowledged commit</td>
+<td><span class="pill red">Correctness</span></td>
+<td><strong>Critical</strong></td>
+<td>Low</td>
+<td>Durability invariant (never ack before WAL durable); fencing; <strong>gate via Experiment 4</strong> (adversarial kill-9 + restart verification), loom/simulation</td>
+<td>Low — but disqualifying if it ever recurs; zero tolerance</td>
+<td><a href="09-benchmark-plan.html">09</a>, <a href="02-engine-core.html">02</a></td>
+</tr>
+<tr>
+<td>R-03</td>
+<td>Hot-row red-quadrant tool placed on the wrong backend — same-row, high-rate, latency-critical writes assigned to the disaggregated engine</td>
+<td><span class="pill amber">Performance</span></td>
+<td>High</td>
+<td>Med</td>
+<td>Exp 3 contention wall as red-quadrant detector; route outlier to coupled Postgres; offer shard-counter / event-log patterns where SQL is controlled</td>
+<td>Low — caught at benchmark gate; correctness never at risk, only speed</td>
+<td><a href="10-hot-row-contention.html">10</a>, <a href="09-benchmark-plan.html">09</a></td>
+</tr>
+<tr>
+<td>R-04</td>
+<td>Thundering-herd cold starts — many databases spin up simultaneously after idle, saturating spin-up capacity</td>
+<td><span class="pill blue">Operational</span></td>
+<td>Med</td>
+<td>Med</td>
+<td>Keep-warm ping / longer idle timeout; tune from Exp 5 “N concurrent cold starts”; admission/queueing at controller</td>
+<td>Med — tail under correlated spikes; residual idle billing if kept warm</td>
+<td><a href="06-lifecycle-controller.html">06</a>, <a href="11-deployment-targets.html">11</a></td>
+</tr>
+<tr>
+<td>R-05</td>
+<td>Cross-cloud egress surprise — compute and bucket in different clouds/regions bill cache-miss reads as egress at a premium</td>
+<td><span class="pill blue">Operational</span></td>
+<td>Med</td>
+<td>Med</td>
+<td>Co-locate compute + object store; prefer R2 (zero egress) for read-on-miss workloads; budget egress from miss-rate × cold-start frequency</td>
+<td>Low — once co-located; per-operation fees remain</td>
+<td><a href="11-deployment-targets.html">11</a></td>
+</tr>
+<tr>
+<td>R-06</td>
+<td>WASM port effort/cost for Workers — Cloudflare Workers run only JS/WASM, so the engine is a port (not a recompile); WASM isolates start slower and run larger</td>
+<td><span class="pill amber">Maturity</span></td>
+<td>Med</td>
+<td>High (if edge target chosen)</td>
+<td>Treat WASM as a scoped port; route storage through the Worker R2 binding (not raw S3 SDK); accept single-threaded/no-FS constraints; default to native (FFI) targets unless edge is required</td>
+<td>Med — ongoing maintenance of two build forms; WASM perf gap</td>
+<td><a href="11-deployment-targets.html">11</a>, <a href="08-bun-integration.html">08</a></td>
+</tr>
+<tr>
+<td>R-07</td>
+<td>HNSW cold-traversal latency — vector index is a graph; a cold traversal is many sequential cache-miss round-trips over object storage (cache-miss-is-egress at its worst)</td>
+<td><span class="pill amber">Performance</span></td>
+<td>High</td>
+<td>Med</td>
+<td>Keep working-set graph resident in local cache; S3 as cold floor only; usearch/hnswlib lineage adapted to paged storage; warm before serving</td>
+<td>Med — first-touch / post-eviction traversals stay slow</td>
+<td><a href="12-capabilities.html">12</a>, <a href="05-local-cache.html">05</a></td>
+</tr>
+<tr>
+<td>R-08</td>
+<td>Dependency immaturity — SlateDB / S3-CAS log / libSQL rewrite are fast-moving frontier components with thinner guarantees than coupled Postgres</td>
+<td><span class="pill amber">Maturity</span></td>
+<td>High</td>
+<td>Med</td>
+<td>Keep <code>Storage</code> trait the swappable seam; pin + vet versions; crash-injection + loom rather than trusting upstream; reserve Postgres for data that can’t absorb the risk</td>
+<td>Med — frontier churn persists; correctness rests on our own tests</td>
+<td><a href="03-storage-interface.html">03</a>, <a href="04-object-storage-backend.html">04</a></td>
+</tr>
+<tr>
+<td>R-09</td>
+<td>Lost-lease split-brain writer — a writer believes it still holds the lease after losing it, two writers append to one DB</td>
+<td><span class="pill red">Correctness</span></td>
+<td>High</td>
+<td>Low</td>
+<td>Single-writer fencing via commit-log CAS token; the stale writer’s CAS fails and is fenced before any second appender succeeds</td>
+<td>Low — fencing makes split-brain a fenced rejection, not corruption</td>
+<td><a href="06-lifecycle-controller.html">06</a>, <a href="04-object-storage-backend.html">04</a></td>
+</tr>
+<tr>
+<td>R-10</td>
+<td>Cache / NVMe exhaustion — shared-buffer + local file cache (LFC) outgrows local NVMe; eviction thrash collapses to all-network reads</td>
+<td><span class="pill blue">Operational</span></td>
+<td>Med</td>
+<td>Med</td>
+<td>Size LFC to working set; eviction policy + spill bounds; monitor miss rate and NVMe headroom; scale instance or shard DBs before saturation</td>
+<td>Med — pathological working sets still degrade to network latency</td>
+<td><a href="05-local-cache.html">05</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout danger">
+<p class="callout-title">R-02 is the gate</p>
+<p>R-02 (acked-write loss) is the highest-severity entry in the register and the only one with zero tolerance. It is gated by Experiment 4 and must pass before any real data is admitted. All other risks are managed; R-02 is a hard blocker.</p>
+</div>
+</section>
+
+<section>
+<h2>Risk categories &amp; severity model</h2>
+<p>The register uses four categories and a coarse severity model so risks can be triaged consistently.</p>
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">Correctness</div><div class="metric-label">data integrity — highest severity, zero tolerance for acked-write loss</div></div>
+<div class="metric"><div class="metric-value">Performance</div><div class="metric-label">latency/throughput on the wrong side of the boundary</div></div>
+<div class="metric"><div class="metric-value">Operational</div><div class="metric-label">cost, capacity, cold-start, egress — managed, not blocking</div></div>
+<div class="metric"><div class="metric-value">Maturity</div><div class="metric-label">frontier dependencies / port effort — hedged via the trait seam</div></div>
+</div>
+<p><strong>Severity ordering.</strong> Correctness &gt; Performance &gt; Operational &gt; Maturity for blocking decisions: a Correctness risk that fails its gate stops the release; Performance risks move a tool to a different backend; Operational and Maturity risks are tracked and budgeted. <strong>Likelihood</strong> is reduced by mitigation; <strong>Impact</strong> is intrinsic to the mechanism and generally is not.</p>
+</section>
+
+<section>
+<h2>When NOT to use this engine</h2>
+<p>The platform is not all-or-nothing — benchmark the boundary once, then place each tool on the correct side. Two shapes belong on coupled Postgres, not on this engine:</p>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> host <strong>one giant, high-concurrency, single-database OLTP workload</strong> on this engine. The single-writer-per-DB ceiling (W2) cannot be sharded away when the workload is inherently one database, and per-DB locking serializes unrelated writers.</li>
+<li><span class="req-tag must-not">MUST NOT</span> host the irreducible outlier — <strong>same-row, same-DB, high-rate, latency-critical writes</strong>. This is the red quadrant: contention is genuinely sequential, batching can’t add lanes, and the ~10ms networked handoff is paid per contended write. Route it to coupled Postgres.</li>
+</ul>
+<div class="callout tip">
+<p class="callout-title">Where it lands well</p>
+<p>Most small / bursty / read-heavy internal tools land green: many small databases (independent lanes), reads served from cache, commits infrequent or batchable. The occasional write-heavy outlier gets a different backend. The architecture follows the workload — it does not demand the workload conform to it.</p>
+</div>
+</section>
+
+<section>
+<h2>Decision boundary summary</h2>
+<p>The per-tool go/no-go rule (from <a href="09-benchmark-plan.html">09</a>), restated as the canonical decision boundary:</p>
+<div class="diagram">
+<pre>
+                       run Exp 1 + Exp 2  (latency floor + group-commit curve)
+                                  │
+            p99 single-commit acceptable for the tool's write frequency?
+            AND group-commit throughput &gt; the tool's aggregate write rate?
+                          ┌───────┴───────┐
+                        yes               no ──────────────┐
+                          │                                │
+                  run Exp 3 (contention wall)              │
+                          │                                │
+        heavy CONTENDED writes (same rows, sequential,     │
+        can't batch)?  → RED QUADRANT                      │
+                  ┌───────┴───────┐                        │
+                 no              yes ──► coupled Postgres ◄─┘
+                  │                       (that one tool)
+                  ▼
+        FITS — ship on disaggregated engine
+          (Exp 4 MUST already have passed — durability gate)
+</pre>
+<p class="diagram-caption">Per-tool placement: latency &amp; throughput decide fit; contention detects the red quadrant; Exp 4 is the unconditional durability gate behind all of it.</p>
+</div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Quadrant</th><th>Write shape</th><th>Backend</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td><span class="pill green">Green</span></td><td>read-heavy / bursty / independent-row writes across many small DBs</td><td>this engine</td><td>cache serves reads; group commit + many lanes handle writes</td></tr>
+<tr><td><span class="pill amber">Amber</span></td><td>sustained independent-row write firehose, single DB</td><td>this engine — benchmark first</td><td>group commit may suffice; Exp 1+2 decide</td></tr>
+<tr><td><span class="pill red">Red</span></td><td>same-row, same-DB, high-rate, latency-critical</td><td>coupled Postgres</td><td>contention is sequential; networked handoff too costly per write</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>The durability non-negotiable</h2>
+<p>One invariant overrides every performance consideration in this spec:</p>
+<div class="callout danger">
+<p class="callout-title">Durability rule</p>
+<p>Never acknowledge a commit from an in-memory buffer before its WAL is durably stored. Caching hides read latency completely; it must <strong>never</strong> hide commit latency — doing so produces acked-write loss (R-02 / Experiment 4). A fast commit path that loses an acked write under crash is disqualifying, regardless of latency numbers.</p>
+</div>
+<p>Concretely, the commit path crosses two adversarial points that Experiment 4 attacks with <code>kill -9</code>:</p>
+<dl class="fields">
+<dt>(a) after CAS-append issued, before client ack</dt>
+<dd>On restart: the commit is either fully durable (and MUST be replayed/visible) or never acked — no torn or half state, no client believing a lost write succeeded.</dd>
+<dt>(b) after client ack, before page materialization</dt>
+<dd>On restart: every acked commit MUST be present and recoverable from the durable log; page materialization is a derivable, retryable step, not a durability boundary.</dd>
+</dl>
+<p>Crash injection MUST be deterministic (seeded) and integrate with the loom/simulation testing. This gate is unconditional and runs <em>before</em> any latency optimization is accepted.</p>
+</section>
+
+<section>
+<h2>Acceptance criteria &amp; sign-off</h2>
+<p>Definition of done for the risk posture — the engine may hold real data only when all of the following hold:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> — Experiment 4 passes: zero acked-write loss, no torn/half state across both adversarial crash points, verified on restart (R-02, R-09).</li>
+<li><span class="req-tag must">MUST</span> — Single-writer fencing demonstrated: a writer that loses its lease is fenced (its CAS fails) before any second writer can append (R-09).</li>
+<li><span class="req-tag must">MUST</span> — Per-tool placement recorded: Exp 1+2 results on file, and Exp 3 run for any tool with plausible contention, before that tool goes live (R-01, R-03).</li>
+<li><span class="req-tag must">MUST</span> — No red-quadrant tool on the disaggregated backend; the red-quadrant detector (Exp 3) reviewed for each onboarded tool (R-03).</li>
+<li><span class="req-tag should">SHOULD</span> — Cold-start budget set from Exp 5 (warm/cold distributions + N-concurrent extension); keep-warm/idle-timeout configured for latency-sensitive tools (R-04).</li>
+<li><span class="req-tag should">SHOULD</span> — Egress model validated: compute and object store co-located, or R2 zero-egress confirmed; per-operation fees budgeted (R-05).</li>
+<li><span class="req-tag should">SHOULD</span> — Cache sizing validated against working set; NVMe headroom and miss-rate monitoring in place (R-07, R-10).</li>
+<li><span class="req-tag must">MUST</span> — Every register risk has an owner and a current Residual rating; R-02 reviewed at every release.</li>
+</ul>
+<div class="callout success">
+<p class="callout-title">Sign-off</p>
+<p>Sign-off requires: (1) the durability gate green, (2) the decision boundary applied to every onboarded tool, and (3) the risk register reviewed with no open Critical/High residual lacking a mitigation owner. Maturity (T4 / R-08) is acknowledged, not closed — it is carried as an accepted, monitored risk hedged by the swappable storage seam.</p>
+</div>
+</section>
+
+<section>
+<h2>Open questions</h2>
+<ul>
+<li>What numeric p99/p999 commit-latency threshold separates Amber from Red per tool class — a single platform default, or per-tool budgets? (depends on Exp 1 data)</li>
+<li>At what concurrency does the thundering-herd spin-up saturate, and is admission control needed at the controller? (Exp 5 “N concurrent cold starts”)</li>
+<li>Is the WASM port’s cold-start and size penalty acceptable for the edge target, or does it confine Workers+R2 to read-mostly tools? (R-06)</li>
+<li>What is the eviction policy and LFC sizing heuristic that keeps the HNSW working set resident without starving B-tree pages? (R-07, R-10)</li>
+<li>How are dependency-immaturity regressions (SlateDB / CAS-log upstream) detected before they reach the durability gate — continuous crash-injection in CI? (R-08)</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Owns Exp 1–5; the durability gate (R-02) and decision boundary live here</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOTROW</span><span class="xref-title">Hot-Row Contention Strategy</span><span class="xref-desc">W2 lever and the red-quadrant routing rule (R-03)</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTRL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Scale-to-zero/cold start (R-04) and single-writer fencing (R-09)</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Egress economics (R-05) and the WASM port fork (R-06)</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Cache/NVMe exhaustion (R-10) and HNSW cold traversal (R-07)</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The swappable seam that hedges dependency immaturity (R-08)</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">CAS commit log behind durability (R-02) and fencing (R-09)</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAPS</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">HNSW vector index and its cold-traversal caveat (R-07)</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-id">CORE</span><span class="xref-title">Engine Core</span><span class="xref-desc">WAL/MVCC commit path the durability invariant constrains</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">When each mitigation lands across the build sequence</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="assets/spec.js"></script>
+</body>
+</html>

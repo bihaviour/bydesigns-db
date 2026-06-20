@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serverless OLTP Engine — Development Specification · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="assets/spec.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">OV</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Serverless OLTP Engine — Development Specification</h1>
+<p class="lede">A single OLTP engine that links in-process as an embeddable library <em>and</em> runs as a remote server over the same code, backed by disaggregated storage on S3-compatible object storage, and engineered for scale-to-zero, true embeddability, and instant branching at once — this is the hub that frames the design and indexes the fourteen component specs that build it.</p>
+</header>
+
+<!-- ===================== HERO / ABSTRACT ===================== -->
+<section>
+<h2>Abstract</h2>
+<p>The design target is one OLTP engine that satisfies three properties usually treated as mutually exclusive:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> be <strong>embeddable</strong> — linked in-process as a native library, with function-call latency on the hot path and no socket between the application and the engine.</li>
+<li><span class="req-tag must">MUST</span> be runnable as a <strong>remote server</strong> over the <em>same</em> engine code, exposing a wire protocol for multi-client access.</li>
+<li><span class="req-tag must">MUST</span> ground durable state on <strong>disaggregated storage</strong> — durability bottoms out on object storage (S3 / Cloudflare R2 / MinIO), reached only on cache miss.</li>
+</ul>
+<p>From those it is optimized simultaneously for <strong>scale-to-zero</strong> (stateless compute that idles to nothing, only storage bytes billing at rest), <strong>true embeddability</strong> (the hot path stays in-process function calls, never a network round-trip), and <strong>branching</strong> (a database fork is a cheap LSN pointer over shared immutable layers).</p>
+<div class="callout note">
+<p class="callout-title">Reference shape</p>
+<p>"SQLite that forgot where its file was and found it on S3." The engine keeps SQLite's in-process, link-it-anywhere ergonomics, but its storage backend is pluggable and pointed at the network instead of a local file. The closest shipping analog is <strong>libSQL / Turso</strong>; this specification describes what you would assemble to build your own, owned end-to-end.</p>
+</div>
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">1</div><div class="metric-label">engine, two delivery modes</div></div>
+<div class="metric"><div class="metric-value">in-proc</div><div class="metric-label">embedded hot path</div></div>
+<div class="metric"><div class="metric-value">→0</div><div class="metric-label">idle compute cost</div></div>
+<div class="metric"><div class="metric-value">O(1)</div><div class="metric-label">branch creation</div></div>
+</div>
+</section>
+
+<!-- ===================== §0 TENSION & RESOLUTION ===================== -->
+<section>
+<h2>The tension and its resolution</h2>
+<p>Two of the requirements pull in opposite directions. Embeddability wants the engine to <em>be</em> the application's address space; separated storage wants durable state to live over the network so compute can be stateless. Classic systems pick one side:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Requirement</th><th>Implies</th><th>Classic system that has it</th></tr></thead>
+<tbody>
+<tr><td><strong>Embeddable</strong></td><td>engine = library linked in-process; function-call latency; no protocol between app and engine</td><td>SQLite</td></tr>
+<tr><td><strong>Separate storage</strong></td><td>durable state lives over the network; compute is stateless and disposable</td><td>Neon / Aurora</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout success">
+<p class="callout-title">Resolution — move the seam inward</p>
+<p>Keep the engine a <strong>library</strong>, but make its <strong>storage backend pluggable</strong> and point it at the network instead of a local file. The seam is a <em>storage interface inside the library</em>, not a server boundary. "Embeddable" and "disaggregated" stop being contradictory the moment the storage seam is a pluggable backend rather than a server you connect to.</p>
+</div>
+<div class="callout tip">
+<p class="callout-title">Server mode falls out for free</p>
+<p>Server mode is then just "the same library, wrapped in a wire-protocol listener." The engine, the MVCC manager, the cache, and the storage trait are identical in both modes; the only difference is whether the caller reaches the engine through an FFI function call or through a network socket. There is no second engine to maintain.</p>
+</div>
+<div class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Embedded and server modes share one engine and one storage seam">
+<defs>
+<marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+<path d="M0,0 L8,4 L0,8 z" fill="currentColor"/>
+</marker>
+</defs>
+<g fill="none" stroke="currentColor" stroke-width="1.5" font-family="ui-monospace, monospace" font-size="12">
+<!-- embedded caller -->
+<rect x="20" y="20" width="150" height="50" rx="6"/>
+<text x="95" y="42" text-anchor="middle" fill="currentColor" stroke="none">Bun app</text>
+<text x="95" y="58" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">(embedded, FFI)</text>
+<!-- server caller -->
+<rect x="20" y="180" width="150" height="50" rx="6"/>
+<text x="95" y="202" text-anchor="middle" fill="currentColor" stroke="none">remote clients</text>
+<text x="95" y="218" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">(server, pgwire)</text>
+<!-- wire listener -->
+<rect x="220" y="180" width="120" height="50" rx="6"/>
+<text x="280" y="205" text-anchor="middle" fill="currentColor" stroke="none">wire</text>
+<text x="280" y="220" text-anchor="middle" fill="currentColor" stroke="none">listener</text>
+<!-- engine -->
+<rect x="390" y="80" width="170" height="90" rx="6"/>
+<text x="475" y="108" text-anchor="middle" fill="currentColor" stroke="none">ENGINE (library)</text>
+<text x="475" y="126" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">parser · planner</text>
+<text x="475" y="140" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">MVCC · cache</text>
+<text x="475" y="158" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">Storage trait (seam)</text>
+<!-- storage -->
+<rect x="600" y="95" width="100" height="60" rx="6"/>
+<text x="650" y="120" text-anchor="middle" fill="currentColor" stroke="none">object</text>
+<text x="650" y="136" text-anchor="middle" fill="currentColor" stroke="none">storage</text>
+<!-- arrows -->
+<line x1="170" y1="45" x2="388" y2="100" marker-end="url(#arrow)"/>
+<line x1="170" y1="205" x2="218" y2="205" marker-end="url(#arrow)"/>
+<line x1="340" y1="195" x2="430" y2="168" marker-end="url(#arrow)"/>
+<line x1="560" y1="125" x2="598" y2="125" marker-end="url(#arrow)"/>
+</g>
+</svg>
+<p class="diagram-caption">One engine, two front doors: FFI for embedded callers, a wire listener for remote clients. The storage trait is the only new internal protocol.</p>
+</div>
+</section>
+
+<!-- ===================== §3 THREE BALANCED REQUIREMENTS ===================== -->
+<section>
+<h2>The three balanced requirements</h2>
+<p>The architecture is judged on satisfying these three at the same time, not one at a time. Each is delivered by a specific mechanism, detailed in the linked component specs.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Requirement</th><th>Mechanism</th><th>Owned by</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>Scale-to-zero</strong></td>
+<td>Compute is stateless — all durable state lives in the storage tier. The controller stops the engine when idle; only object-storage bytes bill at rest. Cold start = process start + cache warm.</td>
+<td><a href="06-lifecycle-controller.html">CTL</a></td>
+</tr>
+<tr>
+<td><strong>True embeddability</strong></td>
+<td>A <code>LocalFileStorage</code> backend plus the in-process local cache keep the hot path as function calls, never network calls. The <em>same</em> binary embeds or serves; storage choice is configuration (a connection string), not a rebuild.</td>
+<td><a href="05-local-cache.html">CACHE</a> · <a href="03-storage-interface.html">STOR</a></td>
+</tr>
+<tr>
+<td><strong>Branching</strong></td>
+<td>The page store is versioned by LSN and its layers are immutable, so a branch is a cheap pointer (copy-on-write). Many tools each take a branch off one base with near-zero marginal storage until they diverge.</td>
+<td><a href="06-lifecycle-controller.html">CTL</a> · <a href="04-object-storage-backend.html">OBJ</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3>Scale-to-zero</h3>
+<p>Because compute holds no durable state, the lifecycle controller may terminate the engine process the moment a database goes idle, with no checkpoint to flush beyond what the WAL already made durable. At rest a database costs only its object-storage bytes — no idle compute bill. The price is paid on the first request after idle: process start plus cache warm. Tuning the idle timeout and an optional keep-warm ping trades that cold-start tail against idle cost; see <a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a> and the cold-read measurement in <a href="09-benchmark-plan.html">the benchmark plan</a>.</p>
+<h3>True embeddability</h3>
+<p>Embeddability depends entirely on the local cache. Without it, every read would be a hundreds-of-milliseconds object-storage round-trip and the "in-process" claim would be hollow. The shared-buffer page cache plus a larger local file cache (LFC) spilling to NVMe keep the working set resident, so reads resolve in-process and only cache misses descend to object storage. The pure-embedded path uses <code>LocalFileStorage</code> for zero network at all (dev, offline, edge); the disaggregated path uses <code>ObjectStorage</code> — same code, different connection string.</p>
+<h3>Branching</h3>
+<p>The page store materializes pages by <code>(PageId, Lsn)</code> over immutable delta and image layers. A branch is created by allocating a new LSN pointer that shares all existing layers; writes on the branch append new layers without touching the parent. Storage cost grows only with divergence. This is what makes "dozens of internal tools, each on its own branch off one base" affordable — and unlike Postgres's <code>pgvector</code>, an index built into the engine (e.g. HNSW) branches with the database because it is just more pages through the same trait (see <a href="12-capabilities.html">Capabilities</a>).</p>
+</section>
+
+<!-- ===================== LAYER MAP ===================== -->
+<section>
+<h2>Layer map — the three slots</h2>
+<p>The system is three horizontal slots. The pluggable storage interface sits at the bottom of Slot B and is the only genuinely new protocol; everything below it speaks standard object-storage APIs.</p>
+<div class="diagram"><pre>
+SLOT A — Interface
+  Embedded:  FFI / native addon  → engine runs inside the host process (Bun, etc.)
+  Server:    Postgres wire protocol (pgwire) or HTTP/WS → same engine, network listener
+  Pooler (server mode only): PgBouncer / pgcat, transaction mode
+
+SLOT B — Engine (the library)
+  SQL parser · planner · executor · MVCC/txn manager
+  Local cache (hot pages stay in-process — this is what preserves embeddability)
+  &gt;&gt;&gt; Pluggable Storage Interface &lt;&lt;&lt;  (the seam)
+
+SLOT C — Storage (disaggregated)
+  Log service:  durable ordered commit log; commit = quorum/CAS ack
+  Page store:   LSM layers, versioned by LSN; materializes pages on demand
+  Durability floor: Object storage (S3 / R2), reached only on cache miss
+</pre>
+<p class="diagram-caption">Three slots. The storage interface is the seam; the only new protocol (Engine ↔ Storage) is internal.</p>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Boundary</th><th>Protocol</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>App ↔ Engine (embedded)</td><td>direct function calls</td><td>no protocol on the hot path</td></tr>
+<tr><td>App ↔ Engine (server)</td><td>Postgres wire protocol or HTTP</td><td>see <a href="07-server-mode.html">Server Mode</a></td></tr>
+<tr><td>Engine ↔ Storage</td><td>custom RPC: <code>Append(WAL)</code> for writes, <code>GetPage@LSN</code> for reads</td><td>the only new protocol; internal; see <a href="03-storage-interface.html">Storage Interface</a></td></tr>
+<tr><td>Storage ↔ Durability</td><td>S3 API (GET / PUT, conditional writes)</td><td>conditional write = CAS; see <a href="04-object-storage-backend.html">Object-Storage Backend</a></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- ===================== §4 DOCUMENT MAP ===================== -->
+<section>
+<h2>Document map</h2>
+<p>The fourteen component specifications, grouped by concern. Each builds against the seam and the requirements above; follow the cross-links rather than reading start-to-finish unless you want the whole picture.</p>
+
+<h3>Architecture — the engine and its storage</h3>
+<div class="xref-grid">
+<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">The three slots, the seam, and how embedded and server modes share one engine.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">Rust library: parser → plan → executor, MVCC via LSN-stamped versions, WAL generation, C ABI.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The narrow <code>Storage</code> trait — the single most important artifact and the system's seam.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">LSM page store on S3/R2, delta/image layers, and the S3-CAS commit log.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Shared-buffer cache + LFC spilling to NVMe — the thing that keeps embeddability real.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Cold start, idle stop (scale-to-zero), branch-on-LSN, and single-writer fencing.</span></a>
+</div>
+
+<h3>Interfaces — how callers reach the engine</h3>
+<div class="xref-grid">
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The <code>engine-server</code> binary: same library wrapped in a pgwire / HTTP listener, plus pooler.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">Embedded via <code>bun:ffi</code> over <code>engine.h</code> (or NAPI); server via built-in <code>Bun.sql</code>.</span></a>
+</div>
+
+<h3>Validation — proving the boundary holds</h3>
+<div class="xref-grid">
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">The five experiments that locate W1 (commit latency) and W2 (write serialization) per tool.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention Strategy</span><span class="xref-desc">Serialize same-row writes; shard to recover granularity; route the irreducible outlier to Postgres.</span></a>
+</div>
+
+<h3>Operations &amp; planning</h3>
+<div class="xref-grid">
+<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (Cloud Run + bucket) vs WASM (Workers + R2); why R2's zero egress matters here.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">Vectors/HNSW built IN; auth, REST, OLAP composed AROUND the shared storage floor.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The build order from embedded library to controller, with milestones and component shopping list.</span></a>
+<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-id">RISK</span><span class="xref-title">Tradeoffs &amp; Risk Register</span><span class="xref-desc">Write latency, single-writer ceiling, cold start, maturity — the honest costs, tracked.</span></a>
+</div>
+</section>
+
+<!-- ===================== §5 READING ORDER / ROLLOUT ===================== -->
+<section>
+<h2>Recommended reading order &amp; rollout</h2>
+<p>The build (and the recommended reading order) follows a four-step rollout. Each step is independently shippable and adds exactly one capability; you can stop after any step and have a working system.</p>
+<ol>
+<li><strong>Ship the embedded library first.</strong> <code>bun:ffi</code> binding over the C ABI, with the <code>LocalFileStorage</code> backend. Fastest path to a working demo, zero infrastructure. Read <a href="02-engine-core.html">Engine Core</a>, <a href="03-storage-interface.html">Storage Interface</a>, and <a href="08-bun-integration.html">Bun Integration</a>.</li>
+<li><strong>Add the <code>ObjectStorage</code> backend.</strong> Flip the connection string from <code>file://</code> to <code>s3://</code>. Now it is disaggregated and scale-to-zero capable, still embedded — same code path. Read <a href="04-object-storage-backend.html">Object-Storage Backend</a> and <a href="05-local-cache.html">Local Cache</a>.</li>
+<li><strong>Add <code>engine-server</code> + pgwire.</strong> Remote / server mode for multi-client access and tools that expect Postgres. Read <a href="07-server-mode.html">Server Mode &amp; Wire Protocol</a>.</li>
+<li><strong>Add the controller.</strong> Idle stop and branch-on-LSN deliver scale-to-zero and instant clones for the dozens-of-tools goal. Read <a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a>, then validate with <a href="09-benchmark-plan.html">the benchmark plan</a> and place each tool with <a href="10-hot-row-contention.html">the hot-row strategy</a>.</li>
+</ol>
+<div class="callout tip">
+<p class="callout-title">First-time reader path</p>
+<p>If you are new to the project, read <a href="01-architecture-overview.html">Architecture Overview</a> next for the full picture, then follow the four rollout steps above in order. The remaining specs (<a href="11-deployment-targets.html">Deployment</a>, <a href="12-capabilities.html">Capabilities</a>, <a href="13-roadmap.html">Roadmap</a>, <a href="14-tradeoffs-risks.html">Risks</a>) are reference material consulted as decisions arise.</p>
+</div>
+</section>
+
+<!-- ===================== §6 CONVENTIONS ===================== -->
+<section>
+<h2>Conventions</h2>
+
+<h3>Requirement keywords (RFC 2119)</h3>
+<p>Normative requirements use the RFC 2119 keywords, rendered as coloured tags in requirement lists.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> an absolute requirement of the specification; equivalently <strong>REQUIRED</strong> or <strong>SHALL</strong>. A conforming implementation cannot omit it.</li>
+<li><span class="req-tag should">SHOULD</span> a strong recommendation; equivalently <strong>RECOMMENDED</strong>. May be ignored only with a fully understood, documented reason.</li>
+<li><span class="req-tag may">MAY</span> a truly optional item; equivalently <strong>OPTIONAL</strong>. Implementations interoperate whether or not it is provided.</li>
+<li><span class="req-tag must-not">MUST NOT</span> an absolute prohibition; equivalently <strong>SHALL NOT</strong>.</li>
+</ul>
+
+<h3>Status legend</h3>
+<p>Every page carries a status badge in its header. The lifecycle is:</p>
+<ul>
+<li><span class="badge badge-status status-draft">Draft v0.1</span> — under active authoring; content may change without notice and may contain open questions.</li>
+<li><span class="badge badge-status status-review">In review</span> — content-complete and circulating for engineering sign-off; comments open.</li>
+<li><span class="badge badge-status status-approved">Approved</span> — ratified; changes require a version bump and a changelog entry.</li>
+</ul>
+<p>All pages are currently <span class="badge badge-status status-draft">Draft v0.1</span>, dated 2026-06-20.</p>
+
+<h3>Inline status pills</h3>
+<p>Within prose and tables, the deployment quadrant of a workload is flagged with pills: <span class="pill green">green</span> fits the disaggregated engine, <span class="pill amber">amber</span> needs tuning or measurement, <span class="pill red">red</span> belongs on coupled Postgres, <span class="pill blue">blue</span> informational, and <span class="pill build">build</span> marks a build-it-yourself artifact.</p>
+
+<h3>Cross-links and navigation</h3>
+<p>The left sidebar, the right-hand "On this page" table of contents, heading anchors, code-copy buttons, the theme toggle, and the previous/next links at the foot of each page are all generated by <code>assets/spec.js</code> from a single canonical manifest — page order lives in exactly one place. Hover any <code>h2</code> or <code>h3</code> to reveal its <code>#</code> anchor for deep-linking. Cross-references between specs use the SPEC id (e.g. <code>STOR</code>, <code>OBJ</code>) and appear as the cards in the document map above and in each page's "Related specifications" section. This page is the hub and has no previous link, which is expected.</p>
+</section>
+
+<!-- ===================== §7 GLOSSARY ===================== -->
+<section>
+<h2>Glossary</h2>
+<p>Terms used throughout the specifications. Where a term is the subject of a component spec, the linked page is authoritative.</p>
+<div class="glossary">
+<dl>
+<dt>OLTP</dt><dd>Online Transaction Processing — short, frequent read/write transactions on current data (the workload this engine targets), as opposed to OLAP analytical scans.</dd>
+<dt>MVCC</dt><dd>Multi-Version Concurrency Control — readers see a consistent snapshot without blocking writers, implemented here as snapshot isolation over LSN-stamped row versions.</dd>
+<dt>LSN</dt><dd>Log Sequence Number — a monotonically increasing position in the commit log that stamps every version and identifies the point-in-time a page is materialized at (<code>GetPage@LSN</code>).</dd>
+<dt>WAL</dt><dd>Write-Ahead Log — the ordered record of changes written and made durable <em>before</em> a commit is acknowledged; the engine's write path appends WAL and never acks from an in-memory buffer.</dd>
+<dt>LSM</dt><dd>Log-Structured Merge tree — the storage organization of the page store: buffer writes in memory, flush to immutable on-disk/on-S3 layers, merge via compaction.</dd>
+<dt>delta layer</dt><dd>An immutable LSM layer holding incremental <code>(key, LSN)</code> change records since the last image; replayed over an image to reconstruct a page at a target LSN.</dd>
+<dt>image layer</dt><dd>An immutable LSM layer holding full page snapshots at a given LSN, serving as the base that delta layers are applied on top of.</dd>
+<dt>CAS</dt><dd>Compare-And-Swap — an atomic conditional write (here, an S3 conditional PUT) that succeeds only if the current value matches expectation; the primitive that gives the commit log atomic ordered appends and single-writer fencing without a separate consensus cluster.</dd>
+<dt>PITR</dt><dd>Point-In-Time Recovery — restoring or reading the database as of a chosen LSN/timestamp; the retention window bounds how far back layers are kept before compaction and GC reclaim them.</dd>
+<dt>fencing token</dt><dd>A monotonically increasing token (issued by the commit log's CAS) that lets storage reject writes from a stale or evicted writer, enforcing single-writer-per-database.</dd>
+<dt>FFI</dt><dd>Foreign Function Interface — calling the engine's C ABI directly from a host runtime so it runs in-process; Bun's <code>bun:ffi</code> binds <code>engine.h</code> with no socket.</dd>
+<dt>NAPI</dt><dd>Node-API — a stable native-addon ABI; an alternative engine binding that works in both Bun and Node from one package.</dd>
+<dt>pgwire</dt><dd>The Postgres wire protocol — what <code>engine-server</code> speaks in server mode, so ordinary Postgres clients and tools (and <code>Bun.sql</code>) connect with zero extra dependencies.</dd>
+<dt>pooler</dt><dd>A connection pooler (PgBouncer / pgcat in transaction mode) placed in front of the server to absorb serverless connection bursts.</dd>
+<dt>HNSW</dt><dd>Hierarchical Navigable Small World — the graph-based approximate-nearest-neighbour index used for built-in vector search; its random-access traversal leans hardest of anything on the local cache.</dd>
+<dt>HTAP</dt><dd>Hybrid Transactional/Analytical Processing — served here as a <em>system</em> (the row engine plus DuckDB over shared storage), not as one engine doing both.</dd>
+<dt>LFC</dt><dd>Local File Cache — a large second-tier cache spilling hot pages to local NVMe beneath the in-memory shared-buffer cache, extending the working set that stays off the S3 hot path.</dd>
+<dt>scale-to-zero</dt><dd>Stopping all compute for an idle database so only object-storage bytes bill at rest; the engine restarts on the next request, paying a cold start.</dd>
+<dt>branch</dt><dd>A copy-on-write fork of a database created as a new LSN pointer over shared immutable layers; near-zero marginal storage until the branch diverges.</dd>
+<dt>disaggregated storage</dt><dd>Separating durable storage from compute so state lives over the network on object storage and compute is stateless and disposable.</dd>
+<dt>group commit</dt><dd>Batching several pending commits into one durable storage round-trip to amortize per-commit network/S3 latency (the lever against W1); it does not add write lanes (W2).</dd>
+<dt>egress</dt><dd>Data transferred <em>out</em> of object storage, billed per GB on S3/GCS; cache misses on a disaggregated engine are egress, so a cold cache costs more — which is why R2's zero egress matters structurally here.</dd>
+</dl>
+</div>
+</section>
+
+<!-- ===================== §7 ONE-LINE SUMMARY (closing) ===================== -->
+<section>
+<h2>One-line summary</h2>
+<div class="callout success">
+<p class="callout-title">The whole system in one sentence</p>
+<p>Build a Rust engine that exposes a narrow <code>Storage</code> trait, ship it as both a linkable library and a pgwire server, back the trait with an LSM-on-S3 page store plus an S3-CAS commit log, and bind it into Bun via <code>bun:ffi</code> for embedded use or <code>Bun.sql</code> for server use — embeddable <em>and</em> disaggregated stop being contradictory the moment the storage seam is a pluggable backend instead of a server you connect to.</p>
+</div>
+</section>
+
+<!-- ===================== RELATED SPECS ===================== -->
+<section>
+<h2>Related specifications</h2>
+<p>Start with the architecture overview, then follow the rollout order.</p>
+<div class="xref-grid">
+<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">The full picture of slots, seam, and shared-engine dual mode.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam that makes everything else possible.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The four-step build order, expanded with milestones.</span></a>
+<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-id">RISK</span><span class="xref-title">Tradeoffs &amp; Risk Register</span><span class="xref-desc">Read this before committing real workloads.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="assets/spec.js"></script>
+</body>
+</html>
