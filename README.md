@@ -2,7 +2,7 @@
 
 > DB Management System with separated process and storage layer. Built on Rust, and compatible with PostgreSQL.
 
-**Status: design / specification stage.** This repository currently holds the development specifications; the Rust engine implementation follows the roadmap below.
+**Status: Phase 1 implemented (embedded library).** The repository holds both the development specifications and a working Rust implementation of [Phase 1](specs/13-roadmap.html) — the embeddable `libengine` with a frozen C ABI, the pluggable `Storage` trait + `LocalFileStorage` backend, MVCC snapshot isolation, crash-safe WAL durability + replay, and the `@yourdb/bun` FFI wrapper. Later phases (object storage, server mode, controller) follow the roadmap below.
 
 ## What this is
 
@@ -42,9 +42,47 @@ Selected documents:
 | [Benchmark & Validation Plan](specs/09-benchmark-plan.html) | Latency/throughput/crash-safety experiments |
 | [Roadmap & Build Sequence](specs/13-roadmap.html) | Phased delivery plan |
 
+## Phase 1 — build & run
+
+Phase 1 (the embedded library) is implemented as a Cargo workspace plus a Bun client:
+
+```
+crates/storage   # the pluggable `Storage` trait (the seam) + LocalFileStorage + C1–C8 conformance suite
+crates/engine    # libengine: SQL → MVCC → WAL, and the stable C ABI (include/engine.h)
+clients/bun      # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
+```
+
+Build the engine and run the Rust test suite (correctness, MVCC snapshot isolation, persistence-across-restart, storage conformance, crash recovery):
+
+```bash
+cargo test                                   # all Rust tests
+cargo build -p bydesigns-engine --release    # produces target/release/libengine.{a,so,dylib}
+```
+
+Then the embedded path from Bun (auto-discovers the built library, or set `YOURDB_ENGINE_PATH`):
+
+```bash
+cd clients/bun
+bun test                                     # end-to-end embedded tests
+bun run examples/notes.ts                     # runnable sample app
+```
+
+Embedded quickstart:
+
+```ts
+import { open } from "@yourdb/bun";
+
+using db = open("file://./local.db");          // storage backend chosen by URL scheme
+db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
+db.query("INSERT INTO notes VALUES (?, ?)", [1, "hello"]);
+const rows = db.query("SELECT id, body FROM notes");   // [{ id: "1", body: "hello" }]
+```
+
+The C ABI frozen in this phase is [`crates/engine/include/engine.h`](crates/engine/include/engine.h); every later phase reuses it unchanged.
+
 ## Roadmap
 
-1. **Embedded library first** — `bun:ffi` + `LocalFileStorage`. Fastest path to a working demo, zero infra.
+1. **Embedded library first** — `bun:ffi` + `LocalFileStorage`. Fastest path to a working demo, zero infra. ✅ *implemented*
 2. **Add `ObjectStorage`** — LSM-on-S3 page store + S3-CAS commit log → disaggregated + scale-to-zero, still embedded.
 3. **Add `engine-server` + Postgres wire protocol** — remote/server mode for multi-client and tools that expect Postgres.
 4. **Add the controller** — idle stop + branch-on-LSN → scale-to-zero and instant clones.

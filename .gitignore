@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Engine database files (test/demo artifacts)
+*.db
+
 # Bun / Node (future bindings)
 node_modules/
 .bun/
