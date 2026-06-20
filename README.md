@@ -53,4 +53,6 @@ See the [full roadmap](specs/13-roadmap.html) for milestones, dependencies, and 
 
 ## License
 
-To be decided.
+Licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [`LICENSE`](LICENSE).
+
+If you run a modified version of this software as a network service, the AGPL requires you to make your modified source available to its users.
