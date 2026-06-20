@@ -1,0 +1,16 @@
+# gitleaks configuration: default rules plus a small project allowlist to avoid
+# false positives on lockfile hashes and the secret-scanner's own regex patterns.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Project allowlist"
+paths = [
+  '''Cargo\.lock''',
+  '''bun\.lock''',
+  '''bun\.lockb''',
+  '''\.claude/hooks/security\.sh''',
+  '''\.gitleaks\.toml''',
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+]

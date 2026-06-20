@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/storage",
+    "crates/engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/bihaviour/bydesigns-db"
+rust-version = "1.80"
+
+[workspace.dependencies]
+async-trait = "0.1"
+thiserror = "2"
+
+# Build the engine artifacts unoptimized-but-fast for the demo/test loop,
+# and fully optimized for release distribution of libengine.*
+[profile.release]
+opt-level = 3
+lto = "thin"

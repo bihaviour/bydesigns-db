@@ -1,0 +1,21 @@
+[package]
+name = "bydesigns-engine"
+description = "The bydesigns-db engine core: SQL frontend, MVCC, WAL, and the stable C ABI (libengine)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "engine"
+# cdylib + staticlib for FFI consumers (bun:ffi / NAPI / static link);
+# rlib so engine-server (Phase 3) can depend on the engine as a normal crate.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+bydesigns-storage = { path = "../storage" }
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]

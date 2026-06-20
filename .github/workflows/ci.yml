@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Code quality (fmt, clippy, types)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install Bun deps
+        working-directory: clients/bun
+        run: bun install --frozen-lockfile
+      - name: TypeScript typecheck
+        working-directory: clients/bun
+        run: bun run typecheck
+
+  security:
+    name: Security (deps + secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (Rust advisory DB)
+        run: cargo audit
+      - name: Install gitleaks
+        run: |
+          VER=8.21.2
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" -o gitleaks.tgz
+          tar -xzf gitleaks.tgz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+      - name: Secret scan (gitleaks)
+        run: gitleaks detect --source . --no-git --redact --verbose --config .gitleaks.toml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: bun audit (informational)
+        working-directory: clients/bun
+        continue-on-error: true
+        run: |
+          bun install --frozen-lockfile
+          bun audit
+
+  complexity:
+    name: Cyclomatic complexity (lizard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install lizard
+        run: pip install lizard
+      - name: Complexity gate (CCN <= 25, args <= 8)
+        run: |
+          lizard crates clients/bun/src clients/bun/test clients/bun/examples \
+            --languages rust --languages typescript \
+            -C 25 -a 8
+
+  test:
+    name: Unit tests (Rust + Bun embedded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (workspace)
+        run: cargo test --workspace --all-targets
+      - name: Build release libengine
+        run: cargo build -p bydesigns-engine --release
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install Bun deps
+        working-directory: clients/bun
+        run: bun install --frozen-lockfile
+      - name: Bun embedded e2e
+        working-directory: clients/bun
+        env:
+          YOURDB_ENGINE_PATH: ${{ github.workspace }}/target/release/libengine.so
+        run: bun test
+
+  release:
+    name: Tag & release
+    needs: [quality, security, complexity, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release artifacts
+        run: cargo build -p bydesigns-engine --release
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION=$(awk -F'"' '/^\[workspace.package\]/{f=1} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          if [ -z "$VERSION" ]; then echo "could not parse version"; exit 1; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Create tag & release if new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — nothing to do."
+            exit 0
+          fi
+          cp crates/engine/include/engine.h "engine-${TAG}.h"
+          cp target/release/libengine.so "libengine-${TAG}-linux-x64.so"
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes \
+            "libengine-${TAG}-linux-x64.so" \
+            "engine-${TAG}.h"
+          echo "Created release $TAG."

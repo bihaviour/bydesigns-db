@@ -1,0 +1,18 @@
+[package]
+name = "bydesigns-storage"
+description = "The pluggable Storage trait (the seam) and the LocalFileStorage backend for bydesigns-db."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "bydesigns_storage"
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# block_on for driving the async trait from synchronous conformance tests
