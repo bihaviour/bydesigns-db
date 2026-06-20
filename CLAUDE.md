@@ -7,18 +7,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `bydesigns-db` is a serverless OLTP database engine: an embeddable Rust library
 (SQLite-style, function-call latency) whose **storage backend is pluggable**, so
 the *same* engine runs either purely embedded (`file://`) or storage-disaggregated
-on object storage (`s3://`, future). The full design lives as an HTML spec site
-under `specs/` (start at `specs/13-roadmap.html` for the phased plan).
+on object storage (`s3://`/`r2://`/`gs://`). The full design lives as an HTML spec
+site under `specs/` (start at `specs/13-roadmap.html` for the phased plan).
 
-**Phase 1 (the embedded library) is implemented.** Later phases add the object
-storage backend, a Postgres-wire server, and a lifecycle controller — each is
-*additive* because the storage seam never moves. See `docs/PHASE1.md` for the
-implementation map and the deliberate scope decisions.
+**Phases 1 and 2 are implemented.** Phase 1 is the embedded library (`file://`);
+Phase 2 adds the disaggregated `ObjectStorage` backend (`s3://`/`r2://`/`gs://`) —
+an LSM page store + CAS commit log over a pluggable object-client seam — selected
+purely by connection string, with the engine and C ABI unchanged. Later phases
+add a Postgres-wire server and a lifecycle controller; each is *additive* because
+the storage seam never moves. See `docs/PHASE1.md` and `docs/PHASE2.md` for the
+implementation maps and the deliberate scope decisions.
 
 ## Layout
 
 ```
-crates/storage   # the pluggable `Storage` trait (the seam) + LocalFileStorage + C1–C8 conformance suite
+crates/storage   # the pluggable `Storage` trait (the seam) + LocalFileStorage + ObjectStorage (LSM+CAS over the object/ client seam) + C1–C8 conformance suite
 crates/engine    # libengine: SQL → MVCC → WAL, plus the stable C ABI (include/engine.h)
 clients/bun      # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
 specs/           # the development specification (HTML); the source of truth for design intent
@@ -52,13 +55,15 @@ The whole design rests on one idea — the engine never touches disk; it talks t
 single narrow `Storage` trait (`crates/storage/src/lib.rs`). Keep these invariants
 intact, because every later phase depends on them:
 
-- **The `Storage` trait is `async` and signature-stable.** It is async now (even
+- **The `Storage` trait is `async` and signature-stable.** It is async (even
   though `LocalFileStorage` is synchronous) so Phase 2's network-bound
-  `ObjectStorage` needs no signature change. The synchronous C ABI bridges to it
-  with a tiny dependency-free `block_on` in `crates/storage/src/lib.rs`. Do not
-  make the trait sync or add backend-specific concepts to it.
-- **Backend is chosen by URL scheme** in `open_storage` (`file://` now; `s3://`
-  reserved). Unknown schemes are rejected, never silently defaulted.
+  `ObjectStorage` drops in with no signature change — and it did: `ObjectStorage`
+  is additive, `STORAGE_TRAIT_VERSION` stays `1`. The synchronous C ABI bridges
+  to it with a tiny dependency-free `block_on` in `crates/storage/src/lib.rs`. Do
+  not make the trait sync or add backend-specific concepts to it.
+- **Backend is chosen by URL scheme** in `open_storage` (`file://` →
+  `LocalFileStorage`; `s3://`/`r2://`/`gs://` → `ObjectStorage`). Unknown schemes
+  are rejected, never silently defaulted.
 - **Durability is WAL-centric.** `append_wal` must be durable (fsync) before it
   returns the commit LSN — never ack from a buffer. `LocalFileStorage`
   (`crates/storage/src/local.rs`) writes CRC-checked, length-prefixed frames and

@@ -27,10 +27,15 @@ mod types;
 
 pub mod conformance;
 pub mod local;
+pub mod object;
 
 pub use types::{
     BranchId, BranchRef, FenceToken, LogEntry, Lsn, Page, PageId, StorageError, WalRecord,
     WriterId, PAGE_SIZE,
+};
+
+pub use object::{
+    Config as ObjectConfig, FsObjectStore, MemObjectStore, ObjectError, ObjectStorage, ObjectStore,
 };
 
 use async_trait::async_trait;
@@ -140,9 +145,11 @@ pub use local::LocalFileStorage;
 
 /// Dispatch a storage URL to a concrete backend. Called once per open.
 ///
-/// `file://` selects [`LocalFileStorage`]; `s3://`/`r2://`/`gs://` are reserved
-/// for the Phase-2 `ObjectStorage` backend and currently return `Invalid`. An
-/// unknown scheme is rejected rather than silently defaulting (spec 02 warning).
+/// `file://` selects [`LocalFileStorage`] (pure embedded); `s3://`/`r2://`/`gs://`
+/// select the Phase-2 [`ObjectStorage`] backend (disaggregated, scale-to-zero).
+/// The engine above the seam is identical for both — the connection string is
+/// the only thing that changes (the whole point of the seam). An unknown scheme
+/// is rejected rather than silently defaulting (spec 02 warning).
 pub fn open_storage(url: &str) -> Result<Box<dyn Storage>, StorageError> {
     let scheme = url
         .split_once("://")
@@ -150,9 +157,7 @@ pub fn open_storage(url: &str) -> Result<Box<dyn Storage>, StorageError> {
         .ok_or_else(|| StorageError::Invalid(format!("missing scheme in url: {url}")))?;
     match scheme {
         "file" => Ok(Box::new(LocalFileStorage::open(url)?)),
-        "s3" | "r2" | "gs" => Err(StorageError::Invalid(format!(
-            "scheme '{scheme}://' (ObjectStorage) is a Phase-2 backend, not yet implemented"
-        ))),
+        "s3" | "r2" | "gs" => Ok(Box::new(ObjectStorage::open(url)?)),
         other => Err(StorageError::Invalid(format!("unknown scheme: {other}"))),
     }
 }
