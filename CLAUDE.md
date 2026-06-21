@@ -38,9 +38,11 @@ specs/            # the development specification (HTML); the source of truth fo
 
 ```bash
 # Rust workspace
-cargo test                                    # all tests (engine + FFI + storage conformance)
+cargo test                                    # all tests (engine + FFI + storage conformance + controller)
 cargo test -p bydesigns-engine --test engine  # one test binary
 cargo test -p bydesigns-engine mvcc_snapshot_isolation   # one test by name
+cargo test -p bydesigns-storage --test branching         # Phase 4 copy-on-write branching (both backends)
+cargo test -p bydesigns-controller            # Phase 4 lifecycle: scale-to-zero + thundering herd
 cargo fmt --all                               # format (CI runs `cargo fmt --check`)
 cargo clippy --all-targets                    # lint (CI runs with `-D warnings`)
 cargo build -p bydesigns-engine --release     # build target/release/libengine.{a,so,dylib}
@@ -107,6 +109,24 @@ versions + visibility), `wal.rs` (engine-owned WAL op encoding), `db.rs` (shared
   marker; the returned LSN is the commit LSN at which pending versions are
   published. Recovery replays the log, grouping ops up to each marker.
 
+## Phase 4: branching & lifecycle
+
+- **Branching is a storage-seam concern, not an engine special-case.** A branch is
+  a `BranchStorage` (`crates/storage/src/branch.rs`): a parent `dyn Storage` read
+  at-or-below the fork LSN + a private overlay for diverged writes, composed
+  backend-agnostically (sibling file for `file://`, child key-prefix for `s3://`).
+  `open_branch(url, id)` builds it. The engine just opens a `Database` over it
+  (`db.rs::open_branch` → `conn.rs::branch` → `engine_branch`).
+- **The single-writer lease is durable.** `acquire_fence`/`renew_fence`/
+  `release_fence` carry epoch + owner + expiry; fencing correctness still rests on
+  the monotonic CAS epoch (take-over), the lease timestamp is advisory liveness.
+- **The lifecycle controller (`crates/controller`) owns no durable state.** It
+  composes the engine's registry-shared `Database` (open = fence + replay = warm;
+  `Drop` = release fence = stop) into a `Cold→Warming→Active→Idle→Stopping→Cold`
+  machine with an idle reaper, lease heartbeat (`Database::renew_lease`), and
+  thundering-herd admission. Don't move lifecycle/heartbeat threads into the
+  embedded engine core — embedders must stay thread-free.
+
 ## Phase-1 scope boundaries (intentional)
 
 These are deliberate, not omissions — don't "fix" them without checking the roadmap:
@@ -122,9 +142,10 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
 ## When changing things
 
 - Treat `specs/` as the design source of truth; align changes with the relevant
-  spec page and keep `docs/PHASE1.md` accurate.
-- Storage-trait changes must keep all C1–C8 conformance tests green and bump
-  `STORAGE_TRAIT_VERSION` per the trait's versioning policy.
+  spec page and keep the matching `docs/PHASE*.md` implementation map accurate.
+- Storage-trait changes must keep all C1–C8 conformance tests green (and the
+  Phase-4 branching battery, `crates/storage/tests/branching.rs`) and bump
+  `STORAGE_TRAIT_VERSION` per the trait's versioning policy (currently `2`).
 - Engine-behaviour or ABI changes: update `engine.h`, the Rust FFI tests
   (`crates/engine/tests/ffi.rs`), and re-run `bun test` against a fresh release build.
 
