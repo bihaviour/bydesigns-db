@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bydesigns-server"
+version = "0.1.0"
+dependencies = [
+ "bydesigns-engine",
+]
+
+[[package]]
 name = "bydesigns-storage"
 version = "0.1.0"
 dependencies = [

@@ -36,7 +36,7 @@ pub mod ffi;
 pub use conn::{Connection, Statement};
 pub use error::{EngineError, EngineStatus, Result};
 pub use exec::ResultSet;
-pub use value::Value;
+pub use value::{ColumnType, Value};
 
 /// ABI version embedded in `engine.h`; bindings verify it at load time.
 pub const ENGINE_ABI_VERSION: u32 = 1;

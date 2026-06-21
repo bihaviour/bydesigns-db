@@ -10,19 +10,22 @@ the *same* engine runs either purely embedded (`file://`) or storage-disaggregat
 on object storage (`s3://`/`r2://`/`gs://`). The full design lives as an HTML spec
 site under `specs/` (start at `specs/13-roadmap.html` for the phased plan).
 
-**Phases 1 and 2 are implemented.** Phase 1 is the embedded library (`file://`);
-Phase 2 adds the disaggregated `ObjectStorage` backend (`s3://`/`r2://`/`gs://`) —
-an LSM page store + CAS commit log over a pluggable object-client seam — selected
-purely by connection string, with the engine and C ABI unchanged. Later phases
-add a Postgres-wire server and a lifecycle controller; each is *additive* because
-the storage seam never moves. See `docs/PHASE1.md` and `docs/PHASE2.md` for the
-implementation maps and the deliberate scope decisions.
+**Phases 1, 2, and 3 are implemented.** Phase 1 is the embedded library
+(`file://`); Phase 2 adds the disaggregated `ObjectStorage` backend
+(`s3://`/`r2://`/`gs://`) — an LSM page store + CAS commit log over a pluggable
+object-client seam — selected purely by connection string, with the engine and C
+ABI unchanged. Phase 3 adds `engine-server`: the same engine behind a Postgres-wire
+listener (a defined pgwire subset), serving either backend by connection string.
+A later phase adds the lifecycle controller; it is *additive* because the storage
+seam never moves. See `docs/PHASE1.md`, `docs/PHASE2.md`, and `docs/PHASE3.md` for
+the implementation maps and the deliberate scope decisions.
 
 ## Layout
 
 ```
 crates/storage   # the pluggable `Storage` trait (the seam) + LocalFileStorage + ObjectStorage (LSM+CAS over the object/ client seam) + C1–C8 conformance suite
 crates/engine    # libengine: SQL → MVCC → WAL, plus the stable C ABI (include/engine.h)
+crates/server    # engine-server: the engine behind a Postgres-wire listener (pgwire subset); links the engine unchanged
 clients/bun      # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
 specs/           # the development specification (HTML); the source of truth for design intent
 ```
@@ -37,6 +40,10 @@ cargo test -p bydesigns-engine mvcc_snapshot_isolation   # one test by name
 cargo fmt --all                               # format (CI runs `cargo fmt --check`)
 cargo clippy --all-targets                    # lint (CI runs with `-D warnings`)
 cargo build -p bydesigns-engine --release     # build target/release/libengine.{a,so,dylib}
+
+# Server mode (Phase 3): the engine behind a Postgres-wire listener
+cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
+# any Postgres client connects (cleartext): psql/Bun.sql/pgbench with sslmode=disable
 
 # Bun client (needs the built libengine; auto-discovered from target/{release,debug})
 cd clients/bun

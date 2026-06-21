@@ -1,0 +1,19 @@
+[package]
+name = "bydesigns-server"
+description = "engine-server: the bydesigns-db engine wrapped in a Postgres-wire listener (Phase 3)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "engine-server"
+path = "src/main.rs"
+
+[lib]
+name = "bydesigns_server"
+path = "src/lib.rs"
+
+[dependencies]
+bydesigns-engine = { path = "../engine" }

@@ -10,7 +10,7 @@ use crate::catalog::TableSchema;
 use crate::error::{EngineError, Result};
 use crate::sql::{AggArg, AggFunc, BinOp, Expr, SelItem, SelectStmt, UnOp};
 use crate::store::{RowVersion, Store, PENDING};
-use crate::value::Value;
+use crate::value::{ColumnType, Value};
 use crate::wal::WalOp;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -19,6 +19,11 @@ use std::collections::HashSet;
 #[derive(Debug, Default)]
 pub struct ResultSet {
     pub columns: Vec<String>,
+    /// Best-effort declared type per column (from the catalog for column
+    /// references, inferred for literals/aggregates). Lets the pgwire server
+    /// report accurate type OIDs even for an empty result; the embedded C ABI
+    /// ignores it (it renders every cell to text). Parallel to `columns`.
+    pub types: Vec<ColumnType>,
     pub rows: Vec<Vec<Value>>,
 }
 
@@ -350,19 +355,22 @@ pub fn run_select(
         matched.truncate(n);
     }
 
-    // Projection + column names.
+    // Projection + column names + best-effort column types.
     let mut columns = Vec::new();
+    let mut types: Vec<ColumnType> = Vec::new();
     let mut plan: Vec<ProjItem> = Vec::new();
     for item in &sel.items {
         match item {
             SelItem::Star => {
                 for c in &schema.columns {
                     columns.push(c.name.clone());
+                    types.push(c.ty);
                     plan.push(ProjItem::Column(schema.column_index(&c.name).unwrap()));
                 }
             }
             SelItem::Expr { expr, alias } => {
                 columns.push(column_name(expr, alias, columns.len()));
+                types.push(expr_type(expr, Some(schema)));
                 plan.push(ProjItem::Expr(expr.clone()));
             }
             SelItem::Aggregate { .. } => unreachable!("aggregate handled above"),
@@ -388,12 +396,49 @@ pub fn run_select(
         rows.push(out);
     }
 
-    Ok(ResultSet { columns, rows })
+    Ok(ResultSet {
+        columns,
+        types,
+        rows,
+    })
 }
 
 enum ProjItem {
     Column(usize),
     Expr(Expr),
+}
+
+/// Best-effort static type of a projected expression. A bare column resolves to
+/// its catalog type; literals resolve to their storage class; anything else
+/// defaults to `Text` (the pgwire server reports this as the column OID).
+fn expr_type(expr: &Expr, schema: Option<&TableSchema>) -> ColumnType {
+    match expr {
+        Expr::Int(_) => ColumnType::Integer,
+        Expr::Real(_) => ColumnType::Real,
+        Expr::Str(_) => ColumnType::Text,
+        Expr::Column(name) => schema
+            .and_then(|s| s.column_index(name).map(|i| s.columns[i].ty))
+            .unwrap_or(ColumnType::Text),
+        _ => ColumnType::Text,
+    }
+}
+
+/// Best-effort static type of an aggregate result.
+fn agg_type(func: AggFunc, arg: &AggArg, schema: &TableSchema) -> ColumnType {
+    match func {
+        AggFunc::Count => ColumnType::Integer,
+        AggFunc::Avg => ColumnType::Real,
+        AggFunc::Sum => match arg {
+            AggArg::Expr(e) if matches!(expr_type(e, Some(schema)), ColumnType::Real) => {
+                ColumnType::Real
+            }
+            _ => ColumnType::Integer,
+        },
+        AggFunc::Min | AggFunc::Max => match arg {
+            AggArg::Expr(e) => expr_type(e, Some(schema)),
+            AggArg::Star => ColumnType::Text,
+        },
+    }
 }
 
 fn constant_select(sel: &SelectStmt, params: &[Value]) -> Result<ResultSet> {
@@ -408,15 +453,18 @@ fn constant_select(sel: &SelectStmt, params: &[Value]) -> Result<ResultSet> {
         params,
     };
     let mut columns = Vec::new();
+    let mut types = Vec::new();
     let mut row = Vec::new();
     for item in &sel.items {
         if let SelItem::Expr { expr, alias } = item {
             columns.push(column_name(expr, alias, columns.len()));
+            types.push(expr_type(expr, None));
             row.push(eval(expr, &ctx)?);
         }
     }
     Ok(ResultSet {
         columns,
+        types,
         rows: vec![row],
     })
 }
@@ -437,10 +485,12 @@ fn aggregate_select(
         ));
     }
     let mut columns = Vec::new();
+    let mut types = Vec::new();
     let mut row = Vec::new();
     for item in &sel.items {
         if let SelItem::Aggregate { func, arg, alias } = item {
             columns.push(alias.clone().unwrap_or_else(|| agg_name(*func)));
+            types.push(agg_type(*func, arg, schema));
             row.push(compute_aggregate(*func, arg, schema, matched, params)?);
         }
     }
@@ -450,7 +500,11 @@ fn aggregate_select(
     } else {
         vec![row]
     };
-    Ok(ResultSet { columns, rows })
+    Ok(ResultSet {
+        columns,
+        types,
+        rows,
+    })
 }
 
 fn compute_aggregate(
