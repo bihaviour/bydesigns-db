@@ -1,8 +1,15 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="pages/assets/logo-dark.svg">
+    <img alt="Twill DB" src="pages/assets/logo.svg" width="220">
+  </picture>
+</p>
+
 # Twill DB
 
 > DB Management System with separated process and storage layer. Built on Rust, and compatible with PostgreSQL.
 
-**Status: Phases 1–5 implemented.** The repository holds both the development
+The repository holds both the development
 specifications and a working Rust implementation: the embeddable `libengine`
 with a frozen C ABI, the pluggable `Storage` trait with `LocalFileStorage`
 (`file://`) and `ObjectStorage` (`s3://`/`r2://`/`gs://`) backends, MVCC snapshot
