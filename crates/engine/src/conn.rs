@@ -22,6 +22,10 @@ struct Txn {
     writer: bool,
     /// Buffered WAL ops, flushed durably as one batch at commit.
     wal_ops: Vec<WalOp>,
+    /// In-flight writer id tagging this transaction's pending store versions, so
+    /// group commit can publish/discard exactly this transaction's changes even
+    /// while another commit is in flight (see [`crate::group_commit`]).
+    owner: u64,
 }
 
 pub struct Connection {
@@ -86,11 +90,14 @@ impl Connection {
         self.last_error.as_ptr()
     }
 
-    /// Snapshot LSN and writer flag for a read.
-    fn read_snapshot(&self) -> (u64, bool) {
+    /// Snapshot LSN and, when reading inside our own write transaction, the
+    /// owner id so the read sees this transaction's own pending changes. A
+    /// read-only transaction or autocommit read sees only committed rows.
+    fn read_snapshot(&self) -> (u64, Option<u64>) {
         match &self.txn {
-            Some(t) => (t.snapshot, t.writer),
-            None => (self.db.committed_lsn(), false),
+            Some(t) if t.writer => (t.snapshot, Some(t.owner)),
+            Some(t) => (t.snapshot, None),
+            None => (self.db.committed_lsn(), None),
         }
     }
 
@@ -123,9 +130,9 @@ impl Connection {
                 Ok(ResultSet::default())
             }
             Stmt::Select(sel) => {
-                let (snapshot, as_writer) = self.read_snapshot();
+                let (snapshot, writer) = self.read_snapshot();
                 let store = self.db.store.read().unwrap();
-                let rs = run_select(&store, sel, snapshot, as_writer, params)?;
+                let rs = run_select(&store, sel, snapshot, writer, params)?;
                 self.last_changes = 0;
                 Ok(rs)
             }
@@ -153,6 +160,7 @@ impl Connection {
             snapshot: self.db.committed_lsn(),
             writer: false,
             wal_ops: Vec::new(),
+            owner: crate::db::next_owner(),
         });
         Ok(())
     }
@@ -171,35 +179,29 @@ impl Connection {
             .take()
             .ok_or_else(|| EngineError::txn("no active transaction to roll back"))?;
         if txn.writer {
-            self.db.store.write().unwrap().rollback_pending();
+            self.db.store.write().unwrap().rollback_owner(txn.owner);
             self.db.lane.release();
         }
         Ok(())
     }
 
-    /// Committing → Committed: durably append the WAL batch, then publish the
-    /// pending versions at the returned commit LSN. Never acks before durable.
+    /// Committing → Committed: hand the WAL batch to the group-commit coordinator,
+    /// which coalesces it with concurrent commits into one durable append and
+    /// returns the commit LSN once durable. Never acks before durable. The
+    /// coordinator takes over the write lane (releasing it after enqueue) and, on
+    /// failure, discards this transaction's pending versions.
     fn finish_commit(&mut self, txn: Txn) -> Result<()> {
         if txn.writer {
             if !txn.wal_ops.is_empty() {
                 let mut records: Vec<WalRecord> =
                     txn.wal_ops.iter().map(|op| op.encode()).collect();
                 records.push(WalOp::Commit.encode());
-
-                let commit_lsn =
-                    match block_on(self.db.storage.append_wal(&self.db.token, &records)) {
-                        Ok(l) => l.0,
-                        Err(e) => {
-                            // Durability unconfirmed: abort, discard pending, step down.
-                            self.db.store.write().unwrap().rollback_pending();
-                            self.db.lane.release();
-                            return Err(commit_error(e));
-                        }
-                    };
-                self.db.store.write().unwrap().finalize_pending(commit_lsn);
+                let commit_lsn = self.db.group_commit.commit(&self.db, txn.owner, records)?;
                 self.last_lsn = commit_lsn as i64;
+            } else {
+                // No durable work to do; just release the lane we hold.
+                self.db.lane.release();
             }
-            self.db.lane.release();
         }
         Ok(())
     }
@@ -220,10 +222,12 @@ impl Connection {
                 snapshot: self.db.committed_lsn(),
                 writer: false,
                 wal_ops: Vec::new(),
+                owner: crate::db::next_owner(),
             });
         }
         self.ensure_writer();
         let snapshot = self.txn.as_ref().unwrap().snapshot;
+        let owner = self.txn.as_ref().unwrap().owner;
 
         let result = {
             let mut store = self.db.store.write().unwrap();
@@ -232,14 +236,14 @@ impl Connection {
                     table,
                     columns,
                     rows,
-                } => run_insert(&mut store, table, columns, rows, params),
+                } => run_insert(&mut store, table, columns, rows, owner, params),
                 Stmt::Update {
                     table,
                     sets,
                     filter,
-                } => run_update(&mut store, table, sets, filter, snapshot, params),
+                } => run_update(&mut store, table, sets, filter, snapshot, owner, params),
                 Stmt::Delete { table, filter } => {
-                    run_delete(&mut store, table, filter, snapshot, params)
+                    run_delete(&mut store, table, filter, snapshot, owner, params)
                 }
                 _ => unreachable!(),
             }
@@ -262,7 +266,7 @@ impl Connection {
                 if implicit {
                     let txn = self.txn.take().unwrap();
                     if txn.writer {
-                        self.db.store.write().unwrap().rollback_pending();
+                        self.db.store.write().unwrap().rollback_owner(txn.owner);
                         self.db.lane.release();
                     }
                 }
@@ -280,6 +284,11 @@ impl Connection {
             ));
         }
         self.db.lane.acquire();
+        // DDL is autocommit and appends directly (not via the group-commit
+        // coordinator), so drain any in-flight commits first: holding the lane
+        // blocks new ones from starting, and quiesce waits for those already
+        // queued, giving DDL a consistent, exclusive point to run.
+        self.db.group_commit.quiesce();
         let res = self.do_ddl(stmt);
         self.db.lane.release();
         self.last_changes = 0;
@@ -458,7 +467,7 @@ impl Drop for Connection {
         if let Some(txn) = self.txn.take() {
             if txn.writer {
                 if let Ok(mut s) = self.db.store.write() {
-                    s.rollback_pending();
+                    s.rollback_owner(txn.owner);
                 }
                 self.db.lane.release();
             }

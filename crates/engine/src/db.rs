@@ -9,6 +9,7 @@
 //! outcome").
 
 use crate::error::{EngineError, EngineStatus, Result};
+use crate::group_commit::GroupCommit;
 use crate::store::Store;
 use crate::wal::WalOp;
 use std::collections::HashMap;
@@ -53,6 +54,9 @@ pub struct Database {
     pub(crate) token: FenceToken,
     pub(crate) store: RwLock<Store>,
     pub(crate) lane: WriteLane,
+    /// Coalesces concurrent commits into one durable append (spec 02/09 — the W1
+    /// lever). See [`crate::group_commit`].
+    pub(crate) group_commit: GroupCommit,
     key: String,
     /// The URL this database was opened from (the base URL for a branch).
     url: String,
@@ -66,6 +70,20 @@ pub struct Database {
 fn registry() -> &'static Mutex<HashMap<String, Weak<Database>>> {
     static REG: OnceLock<Mutex<HashMap<String, Weak<Database>>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Allocate a fresh in-flight-writer id, unique among concurrently committing
+/// transactions (it tags their pending store versions through group commit).
+/// `0` is reserved for "fully committed", so ids start at `1`.
+pub(crate) fn next_owner() -> u64 {
+    static OWNER: AtomicU64 = AtomicU64::new(1);
+    let id = OWNER.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        // Astronomically unlikely wrap; skip the reserved sentinel.
+        OWNER.fetch_add(1, Ordering::Relaxed)
+    } else {
+        id
+    }
 }
 
 fn next_writer_id() -> WriterId {
@@ -117,6 +135,7 @@ impl Database {
             token,
             store: RwLock::new(store),
             lane: WriteLane::new(),
+            group_commit: GroupCommit::new(),
             key: key.clone(),
             url: url.to_string(),
             branch: None,
@@ -158,6 +177,7 @@ impl Database {
             token,
             store: RwLock::new(store),
             lane: WriteLane::new(),
+            group_commit: GroupCommit::new(),
             key: key.clone(),
             url: url.to_string(),
             branch: Some(branch),
@@ -174,6 +194,14 @@ impl Database {
 
     pub fn committed_lsn(&self) -> u64 {
         self.store.read().unwrap().committed_lsn
+    }
+
+    /// Group-commit counters `(durable_appends, commits)`. Under concurrency
+    /// `commits > durable_appends` means transactions coalesced into shared
+    /// durable appends (the W1 lever; spec 09 Experiment 2). An observability
+    /// hook — the commit/durability contract does not depend on it.
+    pub fn group_commit_stats(&self) -> (u64, u64) {
+        self.group_commit.metrics()
     }
 
     /// The URL this database (or its base, for a branch) was opened from.

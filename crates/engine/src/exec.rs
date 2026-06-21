@@ -297,11 +297,21 @@ fn predicate(filter: &Option<Expr>, ctx: &EvalCtx) -> Result<bool> {
 
 // ---- SELECT ---------------------------------------------------------------
 
+/// MVCC visibility for a row version given the caller's role: a writer
+/// (`Some(owner)`) sees committed rows plus its own pending changes; a plain
+/// reader (`None`) sees only committed rows at-or-before its snapshot.
+fn row_visible(v: &RowVersion, snapshot: u64, writer: Option<u64>) -> bool {
+    match writer {
+        Some(me) => v.visible_to_writer(snapshot, me),
+        None => v.visible_to_reader(snapshot),
+    }
+}
+
 pub fn run_select(
     store: &Store,
     sel: &SelectStmt,
     snapshot: u64,
-    as_writer: bool,
+    writer: Option<u64>,
     params: &[Value],
 ) -> Result<ResultSet> {
     let Some(table_name) = &sel.from else {
@@ -316,19 +326,14 @@ pub fn run_select(
     // Index-accelerated top-k nearest-neighbour, when the query shape allows it
     // (an HNSW index exists for the ordered-by distance) — answered by the access
     // method, not a full scan plus sort (spec 12).
-    if let Some(rs) = knn_select(store, sel, table_name, snapshot, as_writer, params)? {
+    if let Some(rs) = knn_select(store, sel, table_name, snapshot, writer, params)? {
         return Ok(rs);
     }
 
     // Visible rows passing WHERE.
     let mut matched: Vec<&Vec<Value>> = Vec::new();
     for v in &table.rows {
-        let visible = if as_writer {
-            v.visible_to_writer(snapshot)
-        } else {
-            v.visible_to_reader(snapshot)
-        };
-        if !visible {
+        if !row_visible(v, snapshot, writer) {
             continue;
         }
         let ctx = EvalCtx {
@@ -528,7 +533,7 @@ fn knn_select(
     sel: &SelectStmt,
     table_name: &str,
     snapshot: u64,
-    as_writer: bool,
+    writer: Option<u64>,
     params: &[Value],
 ) -> Result<Option<ResultSet>> {
     let Some(plan) = knn_plan(sel) else {
@@ -570,12 +575,7 @@ fn knn_select(
         let Some(v) = table.version(vid) else {
             continue;
         };
-        let visible = if as_writer {
-            v.visible_to_writer(snapshot)
-        } else {
-            v.visible_to_reader(snapshot)
-        };
-        if !visible {
+        if !row_visible(v, snapshot, writer) {
             continue;
         }
         let ctx = EvalCtx {
@@ -800,6 +800,7 @@ pub fn run_insert(
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
+    owner: u64,
     params: &[Value],
 ) -> Result<(Vec<WalOp>, i64)> {
     let schema = store
@@ -854,12 +855,24 @@ pub fn run_insert(
         staged.push(vals);
     }
 
-    // PRIMARY KEY uniqueness (vs existing visible rows + within this batch).
+    // PRIMARY KEY uniqueness (vs existing visible rows + concurrent pending
+    // inserts + within this batch). A clash with another in-flight writer's
+    // pending insert is reported as a conflict (retryable) rather than a hard
+    // constraint failure, since on retry the key may be free again.
     if let Some(pk) = schema.primary_key_index() {
-        let mut seen = existing_pk_keys(store, table, pk, &[]);
+        let (mut committed, pending) = pk_keys(store, table, pk, owner, &[]);
         for vals in &staged {
             let key = value_key(&vals[pk]);
-            if !seen.insert(key) {
+            if pending.contains(&key) {
+                return Err(EngineError::new(
+                    crate::error::EngineStatus::ErrConflict,
+                    format!(
+                        "write conflict: {}.{} is being inserted by a concurrent transaction",
+                        table, schema.columns[pk].name
+                    ),
+                ));
+            }
+            if !committed.insert(key) {
                 return Err(EngineError::constraint(format!(
                     "UNIQUE constraint failed: {}.{}",
                     table, schema.columns[pk].name
@@ -890,6 +903,7 @@ pub fn run_insert(
                 values: vals,
                 create_lsn: PENDING,
                 delete_lsn: 0,
+                owner,
             });
         }
     }
@@ -937,6 +951,7 @@ pub fn run_delete(
     table: &str,
     filter: &Option<Expr>,
     snapshot: u64,
+    owner: u64,
     params: &[Value],
 ) -> Result<(Vec<WalOp>, i64)> {
     let schema = store
@@ -947,7 +962,7 @@ pub fn run_delete(
     let t = store.table(table).unwrap();
     let mut victims = Vec::new();
     for v in &t.rows {
-        if !v.visible_to_writer(snapshot) {
+        if !v.visible_to_writer(snapshot, owner) {
             continue;
         }
         let ctx = EvalCtx {
@@ -956,7 +971,7 @@ pub fn run_delete(
             params,
         };
         if predicate(filter, &ctx)? {
-            check_no_conflict(v, snapshot)?;
+            check_no_conflict(v, snapshot, owner)?;
             victims.push(v.vid);
         }
     }
@@ -965,6 +980,7 @@ pub fn run_delete(
     for vid in &victims {
         if let Some(rv) = t.version_mut(*vid) {
             rv.delete_lsn = PENDING;
+            rv.owner = owner;
         }
         wal.push(WalOp::Delete {
             table: table.to_string(),
@@ -980,6 +996,7 @@ pub fn run_update(
     sets: &[(String, Expr)],
     filter: &Option<Expr>,
     snapshot: u64,
+    owner: u64,
     params: &[Value],
 ) -> Result<(Vec<WalOp>, i64)> {
     let schema = store
@@ -1001,7 +1018,7 @@ pub fn run_update(
     let t = store.table(table).unwrap();
     let mut updates: Vec<(u64, Vec<Value>)> = Vec::new();
     for v in &t.rows {
-        if !v.visible_to_writer(snapshot) {
+        if !v.visible_to_writer(snapshot, owner) {
             continue;
         }
         let ctx = EvalCtx {
@@ -1012,7 +1029,7 @@ pub fn run_update(
         if !predicate(filter, &ctx)? {
             continue;
         }
-        check_no_conflict(v, snapshot)?;
+        check_no_conflict(v, snapshot, owner)?;
         let mut nv = v.values.clone();
         for (idx, expr) in &targets {
             nv[*idx] = schema.columns[*idx].ty.coerce(eval(expr, &ctx)?);
@@ -1029,13 +1046,23 @@ pub fn run_update(
         updates.push((v.vid, nv));
     }
 
-    // PRIMARY KEY uniqueness for changed keys.
+    // PRIMARY KEY uniqueness for changed keys (vs other rows, concurrent pending
+    // inserts, and within this statement).
     if let Some(pk) = schema.primary_key_index() {
         let updated_vids: Vec<u64> = updates.iter().map(|(vid, _)| *vid).collect();
-        let mut keys = existing_pk_keys(store, table, pk, &updated_vids);
+        let (mut committed, pending) = pk_keys(store, table, pk, owner, &updated_vids);
         for (_, nv) in &updates {
             let key = value_key(&nv[pk]);
-            if !keys.insert(key) {
+            if pending.contains(&key) {
+                return Err(EngineError::new(
+                    crate::error::EngineStatus::ErrConflict,
+                    format!(
+                        "write conflict: {}.{} is being written by a concurrent transaction",
+                        table, schema.columns[pk].name
+                    ),
+                ));
+            }
+            if !committed.insert(key) {
                 return Err(EngineError::constraint(format!(
                     "UNIQUE constraint failed: {}.{}",
                     table, schema.columns[pk].name
@@ -1054,6 +1081,7 @@ pub fn run_update(
         for (old_vid, nv) in updates {
             if let Some(rv) = t.version_mut(old_vid) {
                 rv.delete_lsn = PENDING;
+                rv.owner = owner;
             }
             let new_vid = t.alloc_vid();
             wal.push(WalOp::Delete {
@@ -1073,6 +1101,7 @@ pub fn run_update(
                 values: nv,
                 create_lsn: PENDING,
                 delete_lsn: 0,
+                owner,
             });
         }
     }
@@ -1082,32 +1111,57 @@ pub fn run_update(
     Ok((wal, n))
 }
 
-/// PK keys of writer-visible rows, excluding rows whose vid is in `exclude`.
-fn existing_pk_keys(store: &Store, table: &str, pk: usize, exclude: &[u64]) -> HashSet<String> {
-    let mut set = HashSet::new();
+/// PK keys that would clash with a new value, split into two buckets:
+///
+/// * `committed` — keys of rows live in the latest committed state (checked at
+///   `committed_lsn`, not the possibly-stale txn snapshot, so a value committed
+///   by another transaction after we began is still seen) plus our own pending
+///   inserts. A clash here is a hard `UNIQUE` violation.
+/// * `pending` — keys another *concurrent* in-flight writer is inserting. A
+///   clash here is a (retryable) conflict, since the key may be free on retry.
+///
+/// Rows whose vid is in `exclude` (e.g. the rows an UPDATE is rewriting) are
+/// skipped.
+fn pk_keys(
+    store: &Store,
+    table: &str,
+    pk: usize,
+    me: u64,
+    exclude: &[u64],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut committed = HashSet::new();
+    let mut pending = HashSet::new();
     if let Some(t) = store.table(table) {
         for v in &t.rows {
             if exclude.contains(&v.vid) {
                 continue;
             }
-            // Use the writer snapshot via committed_lsn (pending rows belong to us).
-            if v.visible_to_writer(store.committed_lsn) {
-                set.insert(value_key(&v.values[pk]));
+            if v.visible_to_writer(store.committed_lsn, me) {
+                committed.insert(value_key(&v.values[pk]));
+            } else if v.create_lsn == PENDING && v.owner != me && v.delete_lsn == 0 {
+                // A live pending insert owned by a concurrent in-flight writer.
+                pending.insert(value_key(&v.values[pk]));
             }
         }
     }
-    set
+    (committed, pending)
 }
 
-/// First-committer-wins: a row this writer means to modify must not already
-/// carry a committed supersede newer than the writer's snapshot (i.e. another
-/// transaction committed a change to it after we began). Aborts with
-/// `ENGINE_ERR_CONFLICT` so callers can retry on a fresh snapshot.
-fn check_no_conflict(v: &RowVersion, snapshot: u64) -> Result<()> {
-    if v.delete_lsn != 0 && v.delete_lsn != PENDING && v.delete_lsn > snapshot {
+/// First-committer-wins, extended for concurrent in-flight writers. A row this
+/// writer means to modify must not (a) already carry a committed supersede newer
+/// than our snapshot — another transaction committed a change to it after we
+/// began — or (b) carry a pending modification owned by a different concurrent
+/// writer. Either aborts with `ENGINE_ERR_CONFLICT` so callers retry on a fresh
+/// snapshot (the second case makes same-row writes first-toucher-wins, never a
+/// lost update).
+fn check_no_conflict(v: &RowVersion, snapshot: u64, me: u64) -> Result<()> {
+    let committed_conflict =
+        v.delete_lsn != 0 && v.delete_lsn != PENDING && v.delete_lsn > snapshot;
+    let pending_conflict = v.delete_lsn == PENDING && v.owner != me;
+    if committed_conflict || pending_conflict {
         return Err(EngineError::new(
             crate::error::EngineStatus::ErrConflict,
-            "write conflict: row modified by a concurrent committed transaction",
+            "write conflict: row modified by a concurrent transaction",
         ));
     }
     Ok(())

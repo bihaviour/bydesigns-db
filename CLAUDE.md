@@ -110,20 +110,30 @@ A statement flows `sql.rs` (hand-written lexer + recursive-descent parser →
 state machine + commit durability). Supporting modules: `store.rs` (MVCC row
 versions + visibility, plus the vector-index registry), `wal.rs` (engine-owned WAL
 op encoding), `db.rs` (shared `Database` + cross-handle registry + WAL replay),
-`catalog.rs`, `value.rs`, `vector.rs` (Phase 5: the HNSW access method).
+`group_commit.rs` (coalesces concurrent commits into one durable append — the W1
+lever), `catalog.rs`, `value.rs`, `vector.rs` (Phase 5: the HNSW access method).
 
 - **MVCC / snapshot isolation.** Every row version is stamped `create_lsn` /
   `delete_lsn`; readers capture a snapshot LSN and filter by visibility
-  (`store.rs::RowVersion`). The pending (uncommitted) stamp is `PENDING` (`u64::MAX`).
-- **Single writer per database** via a write lane (`db.rs::WriteLane`); writers
-  serialize, readers never block. A first-committer-wins check
-  (`exec.rs::check_no_conflict`) keeps explicit-transaction SI correct.
+  (`store.rs::RowVersion`). The pending (uncommitted) stamp is `PENDING` (`u64::MAX`),
+  tagged with the in-flight writer's `owner` so several committed-but-not-yet-durable
+  transactions can have pending versions in flight at once (group commit).
+- **Single writer per database** for *store mutation* via a write lane
+  (`db.rs::WriteLane`); writers serialize their mutation, readers never block. A
+  first-committer / first-toucher-wins check (`exec.rs::check_no_conflict`) keeps
+  SI correct, including against concurrent in-flight writers.
 - **Cross-handle sharing.** Multiple connections to the same `file://` URL in one
   process share one `Database` (a process-global registry in `db.rs`), so the
   snapshot-isolation guarantee holds across handles.
 - **Commit = one `append_wal` batch** of the transaction's WAL ops + a `Commit`
   marker; the returned LSN is the commit LSN at which pending versions are
   published. Recovery replays the log, grouping ops up to each marker.
+- **Group commit (`group_commit.rs`).** The write lane is released *before* the
+  durable append, so transactions ready to commit coalesce into one `append_wal`
+  via a leader/follower coordinator — amortizing the `fsync`/CAS round-trip across
+  the batch (defeats W1) without ever acking before durable. Each member publishes
+  at its own commit LSN, carved from the single contiguous LSN range the batched
+  append returns. Don't move the durable append back inside the lane.
 
 ## Phase 4: branching & lifecycle
 

@@ -17,7 +17,7 @@ pub enum EngineStatus {
     ErrInternal = 7,   // bug; engine remains defined, never UB
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EngineError {
     pub status: EngineStatus,
     pub message: String,

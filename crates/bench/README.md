@@ -44,10 +44,14 @@ Set `TWILL_BENCH_GIT_SHA` to pin the recorded commit in CI/automation.
 
 ## Notes
 
-- **Exp 2** only lifts above the Exp 1 ceiling once **group commit** is
-  implemented in the engine commit path; until then exp2 reports a flat plateau
-  with a large tail (writers serialize one round-trip at a time), which is the
-  expected pre-group-commit signal.
+- **Exp 2** measures the **group-commit** lever (implemented in the engine commit
+  path: concurrent commits coalesce into one durable append — see
+  `crates/engine/src/group_commit.rs`). The Exp-2 plateau therefore rises above
+  the Exp-1 single-writer ceiling. On `file://` the lift is modest because a
+  local `fsync` is microseconds, so per-commit overhead dominates rather than the
+  durable handoff; the dramatic 10–100× plateau the spec targets appears on a
+  real object store, where each commit otherwise pays a ~10ms network round-trip
+  that batching amortizes across the group.
 - **Exp 3** counts the first-committer-wins conflicts it retries; the retry loop
   is what keeps a contended counter correct (see `pages/docs/hot-row.html`).
 - Server-mode drivers (`pgbench`, TPC-C via `go-tpc`/BenchBase) cover the same

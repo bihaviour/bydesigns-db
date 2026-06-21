@@ -25,6 +25,7 @@ mod catalog;
 mod db;
 mod error;
 mod exec;
+mod group_commit;
 mod sql;
 mod store;
 mod value;
