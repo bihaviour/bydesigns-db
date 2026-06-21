@@ -374,6 +374,18 @@ impl Statement {
         unsafe { (*self.conn).set_last_error(msg) }
     }
 
+    /// Number of `?`/`$n` parameters this statement expects. Used by the
+    /// pgwire server to answer `Describe` (ParameterDescription).
+    pub fn param_count(&self) -> usize {
+        self.nparams
+    }
+
+    /// Force execution (idempotent), so column metadata is available before the
+    /// first `step` — the pgwire server needs it to emit `RowDescription`.
+    pub fn execute(&mut self) -> Result<()> {
+        self.ensure_executed()
+    }
+
     pub fn bind(&mut self, idx: usize, value: Value) -> Result<()> {
         if idx < 1 || idx > self.nparams {
             return Err(EngineError::misuse(format!(
@@ -435,6 +447,12 @@ impl Statement {
             .as_ref()
             .and_then(|r| r.columns.get(col))
             .map(|s| s.as_str())
+    }
+
+    /// Best-effort declared type of result column `col` (for the pgwire server's
+    /// `RowDescription` type OIDs). Available after [`Statement::execute`].
+    pub fn column_type(&self, col: usize) -> Option<crate::value::ColumnType> {
+        self.result.as_ref().and_then(|r| r.types.get(col).copied())
     }
 
     pub fn column_value(&self, col: usize) -> Option<&Value> {

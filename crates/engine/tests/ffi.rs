@@ -120,14 +120,54 @@ fn misuse_on_null_handle() {
 
 #[test]
 fn unknown_scheme_open_returns_null() {
-    let url = cs("s3://bucket/db");
-    assert!(
-        engine_open(url.as_ptr()).is_null(),
-        "s3 is a Phase-2 backend"
-    );
+    // A scheme with no backend is rejected, never silently defaulted.
     let url = cs("wat://nope");
     assert!(
         engine_open(url.as_ptr()).is_null(),
         "unknown scheme rejected"
     );
+}
+
+#[test]
+fn s3_scheme_opens_the_object_backend() {
+    // Phase 2: the *same* engine binary opens an object-storage database with no
+    // recompile — the connection string is the only thing that changed (the seam
+    // never moved). The object floor is rooted under a temp dir for the test.
+    let root = std::env::temp_dir().join(format!("bydesigns-ffi-obj-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::set_var("BYDESIGNS_OBJECT_ROOT", &root);
+
+    let bucket = format!("s3://buck/{}", std::process::id());
+    let url = cs(&bucket);
+    let h = engine_open(url.as_ptr());
+    assert!(!h.is_null(), "s3:// opens the ObjectStorage backend");
+
+    assert_eq!(
+        engine_exec(
+            h,
+            cs("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)").as_ptr()
+        ),
+        0
+    );
+    assert_eq!(
+        engine_exec(h, cs("INSERT INTO t VALUES (1, 'disaggregated')").as_ptr()),
+        0
+    );
+    assert!(engine_last_lsn(h) > 0);
+
+    let mut out: *mut EngineResult = ptr::null_mut();
+    assert_eq!(
+        engine_query(h, cs("SELECT body FROM t WHERE id = 1").as_ptr(), &mut out),
+        0
+    );
+    assert!(!out.is_null());
+    assert_eq!(engine_result_rows(out), 1);
+    assert_eq!(
+        rd(engine_result_value(out, 0, 0)).as_deref(),
+        Some("disaggregated")
+    );
+    engine_result_free(out);
+    engine_close(h);
+
+    let _ = std::fs::remove_dir_all(&root);
 }
