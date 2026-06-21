@@ -486,8 +486,9 @@ kbd {
   width: 26px; height: 26px; border-radius: 7px; flex: none;
   background: linear-gradient(135deg, var(--accent), var(--teal));
   display: inline-flex; align-items: center; justify-content: center;
-  color: #fff; font-family: var(--font-mono); font-weight: 700; font-size: .82rem;
+  color: #fff;
 }
+.site-header .site-brand .logo svg { width: 16px; height: 16px; display: block; }
 .site-header .site-brand .name { font-weight: 700; color: var(--heading); font-size: .98rem; letter-spacing: -.01em; }
 .site-header .site-nav { display: flex; align-items: center; gap: var(--s1); margin-left: var(--s3); }
 .site-header .site-nav a {

@@ -28,8 +28,12 @@
       return '<a class="' + n.key + cur + '" href="' + BASE + n.href + '">' + n.label + "</a>";
     }).join("");
     header.innerHTML =
-      '<a class="site-brand" href="' + BASE + 'index.html">'
-        + '<span class="logo">td</span><span class="name">Twill DB</span></a>'
+      '<a class="site-brand" href="' + BASE + 'index.html" aria-label="Twill DB — home">'
+        + '<span class="logo">'
+          + '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">'
+          + '<path d="M3 11 L11 3"/><path d="M6 18 L18 6"/><path d="M13 21 L21 13"/>'
+          + '</svg>'
+        + '</span><span class="name">Twill DB</span></a>'
       + '<button class="menu-btn" aria-label="Toggle menu" aria-expanded="false">☰</button>'
       + '<nav class="site-nav" id="site-nav">' + links + "</nav>"
       + '<div class="site-actions">'
