@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C ABI reference · bydesigns-db docs</title>
+<meta name="description" content="The frozen bydesigns-db C ABI (version 2): handles, status codes, every exported function, the typed-literal parameter encoding, and the safety contract.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">ABI</span>
+<span class="badge badge-status status-review">Reference</span>
+<span class="spec-date">Reference</span>
+</div>
+<h1>C ABI reference</h1>
+<p class="lede">The C ABI (<code>engine.h</code>, <code>ENGINE_ABI_VERSION</code> 2) is the single boundary every runtime binds to — <code>bun:ffi</code>, NAPI, or a static link. It is frozen: later phases add backends and listeners behind the same symbols without changing these signatures. Opaque handles only; no Rust panic ever crosses this line.</p>
+</header>
+
+<section>
+<h2>Handles</h2>
+<p>Three opaque handle types. Callers never see the Rust layout behind them; they move them only through the functions below.</p>
+<dl class="fields">
+<dt><code>EngineHandle</code></dt><dd>A connection. Created by <code>engine_open</code> or <code>engine_branch</code>; freed by <code>engine_close</code>.</dd>
+<dt><code>EngineResult</code></dt><dd>A buffered query result (all rows materialised). Produced by <code>engine_query</code>; freed by <code>engine_result_free</code>.</dd>
+<dt><code>EngineStmt</code></dt><dd>A prepared statement with a row cursor. Produced by <code>engine_prepare</code>; freed by <code>engine_finalize</code>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Status codes</h2>
+<p>Every non-constructor function returns an <code>EngineStatus</code>. The seven codes are exhaustive.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Code</th><th>Value</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>ENGINE_OK</code></td><td>0</td><td>Success.</td></tr>
+<tr><td><code>ENGINE_ERR_SQL</code></td><td>1</td><td>Parse / plan / type error.</td></tr>
+<tr><td><code>ENGINE_ERR_CONSTRAINT</code></td><td>2</td><td>Unique / foreign-key / check violation.</td></tr>
+<tr><td><code>ENGINE_ERR_CONFLICT</code></td><td>3</td><td>Serialization / write conflict — retryable.</td></tr>
+<tr><td><code>ENGINE_ERR_STORAGE</code></td><td>4</td><td>Backend I/O, CAS rejected, or S3 fault.</td></tr>
+<tr><td><code>ENGINE_ERR_TXN</code></td><td>5</td><td>Illegal state-machine transition (e.g. DDL inside a transaction).</td></tr>
+<tr><td><code>ENGINE_ERR_MISUSE</code></td><td>6</td><td>Null handle, use-after-free, or bad argument.</td></tr>
+<tr><td><code>ENGINE_ERR_INTERNAL</code></td><td>7</td><td>A bug — a caught panic. The engine stays defined; never UB.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Lifecycle</h2>
+<dl class="fields">
+<dt><code>EngineHandle* engine_open(const char* url)</code></dt>
+<dd>Open a connection. The NUL-terminated <code>url</code> selects the storage backend by scheme (<code>file://./local.db</code>, <code>s3://bucket/mydb?region=…</code>). Returns <code>NULL</code> on failure — the caller then has no handle to query.</dd>
+<dt><code>void engine_close(EngineHandle* h)</code></dt>
+<dd>Close and free a connection. Idempotent on <code>NULL</code>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>One-shot execution</h2>
+<dl class="fields">
+<dt><code>EngineStatus engine_exec(EngineHandle* h, const char* sql)</code></dt>
+<dd>Run DDL/DML with no result set. The affected row count is read afterward with <code>engine_changes</code>.</dd>
+<dt><code>EngineStatus engine_query(EngineHandle* h, const char* sql, EngineResult** out)</code></dt>
+<dd>Run a query. On <code>ENGINE_OK</code>, <code>*out</code> receives an owned <code>EngineResult</code>; otherwise <code>*out</code> is <code>NULL</code>. Values are NUL-terminated text; a SQL <code>NULL</code> is reported as a <code>NULL</code> pointer. Free the result with <code>engine_result_free</code>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Prepared statements</h2>
+<p>Prepare once, bind typed parameters, and step the cursor row by row. Reuse with <code>engine_reset</code> (bindings are kept).</p>
+<dl class="fields">
+<dt><code>EngineStatus engine_prepare(EngineHandle* h, const char* sql, EngineStmt** out)</code></dt>
+<dd>Compile <code>sql</code> into a statement. On <code>ENGINE_OK</code>, <code>*out</code> receives the owned <code>EngineStmt</code>.</dd>
+<dt><code>EngineStatus engine_bind(EngineStmt* s, int idx, const char* value)</code></dt>
+<dd>Bind a parameter by 1-based positional <code>idx</code>. <code>value</code> is a NUL-terminated typed literal (see <a href="#parameters">Parameter encoding</a>).</dd>
+<dt><code>EngineStatus engine_step(EngineStmt* s, int* done)</code></dt>
+<dd>Advance the cursor. On <code>ENGINE_OK</code>, <code>*done == 0</code> means a row is current (read its columns with <code>engine_column_value</code>); <code>*done == 1</code> means there are no more rows.</dd>
+<dt><code>EngineStatus engine_finalize(EngineStmt* s)</code></dt>
+<dd>Free the statement.</dd>
+<dt><code>EngineStatus engine_reset(EngineStmt* s)</code></dt>
+<dd>Re-execute from the start, keeping the current bindings.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Transactions</h2>
+<dl class="fields">
+<dt><code>EngineStatus engine_begin(EngineHandle* h)</code></dt>
+<dd>Start an explicit transaction.</dd>
+<dt><code>EngineStatus engine_commit(EngineHandle* h)</code></dt>
+<dd>Commit. Blocks until the WAL is durable before returning.</dd>
+<dt><code>EngineStatus engine_rollback(EngineHandle* h)</code></dt>
+<dd>Discard the transaction's pending changes.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Branching</h2>
+<dl class="fields">
+<dt><code>EngineHandle* engine_branch(EngineHandle* h, const char* name)</code></dt>
+<dd>Create a copy-on-write branch off the database <code>h</code> is connected to, at its current committed LSN, and return a <strong>new</strong> connection handle bound to that branch. The branch shares the base's immutable history but writes in isolation — neither the base nor any sibling sees a branch's writes. The returned handle is owned by the caller and freed with <code>engine_close</code>. Returns <code>NULL</code> on failure (e.g. inside an active transaction, or branch-of-branch); the reason is available via <code>engine_last_error(h)</code>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Result and row access</h2>
+<p>Read a buffered <code>EngineResult</code> by row and column. Returned <code>const char*</code> pointers are borrowed and valid until <code>engine_result_free(r)</code>.</p>
+<dl class="fields">
+<dt><code>int engine_result_rows(const EngineResult* r)</code></dt>
+<dd>Number of rows in the result.</dd>
+<dt><code>int engine_result_cols(const EngineResult* r)</code></dt>
+<dd>Number of columns.</dd>
+<dt><code>const char* engine_result_colname(const EngineResult* r, int col)</code></dt>
+<dd>Borrowed column name for <code>col</code>.</dd>
+<dt><code>const char* engine_result_value(const EngineResult* r, int row, int col)</code></dt>
+<dd>Borrowed cell value at <code>(row, col)</code>. <code>NULL</code> for a SQL <code>NULL</code> cell. Valid until <code>engine_result_free(r)</code>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Statement cursor access</h2>
+<p>Read the column metadata and the current row of a stepping <code>EngineStmt</code>.</p>
+<dl class="fields">
+<dt><code>int engine_column_count(const EngineStmt* s)</code></dt>
+<dd>Number of columns the statement produces.</dd>
+<dt><code>const char* engine_column_name(const EngineStmt* s, int col)</code></dt>
+<dd>Borrowed name of column <code>col</code>.</dd>
+<dt><code>const char* engine_column_value(const EngineStmt* s, int col)</code></dt>
+<dd>Borrowed value of column <code>col</code> for the <em>current</em> row. <code>NULL</code> for a SQL <code>NULL</code> cell. Valid only until the next <code>engine_step</code> / <code>engine_reset</code> / <code>engine_finalize</code> on <code>s</code>.</dd>
+</dl>
+<div class="callout warning">
+<p class="callout-title">Copy borrowed pointers before they expire</p>
+<p>A cursor value pointer is invalidated by the next <code>step</code>/<code>reset</code>/<code>finalize</code>; a result value pointer is invalidated by <code>engine_result_free</code>. Copy any value you need to keep out before the owning object advances or is freed.</p>
+</div>
+</section>
+
+<section>
+<h2>Errors and metadata</h2>
+<dl class="fields">
+<dt><code>const char* engine_last_error(EngineHandle* h)</code></dt>
+<dd>Borrowed, per-handle C string describing the last error on <code>h</code>. Valid until the next call on <code>h</code>. Empty string if there is none.</dd>
+<dt><code>long long engine_changes(EngineHandle* h)</code></dt>
+<dd>Rows affected by the last statement.</dd>
+<dt><code>long long engine_last_lsn(EngineHandle* h)</code></dt>
+<dd>Commit LSN of the last commit.</dd>
+<dt><code>int engine_abi_version(void)</code></dt>
+<dd>The ABI version this library exports — currently <code>2</code>. Check it against <code>ENGINE_ABI_VERSION</code> at load time.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Freeing</h2>
+<dl class="fields">
+<dt><code>void engine_result_free(EngineResult* r)</code></dt>
+<dd>Free a query result. Idempotent on <code>NULL</code>.</dd>
+</dl>
+<p>Statements are freed by <code>engine_finalize</code>; handles by <code>engine_close</code>.</p>
+</section>
+
+<section id="parameters">
+<h2>Parameter encoding</h2>
+<p><code>engine_bind</code> takes each parameter as a NUL-terminated <em>typed literal</em>: a one-character tag followed by the encoded value. This is how the string-only ABI carries a typed argument.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Tag</th><th>Type</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td><code>i</code></td><td>Integer</td><td><code>i42</code></td></tr>
+<tr><td><code>f</code></td><td>Float</td><td><code>f3.5</code></td></tr>
+<tr><td><code>s</code></td><td>Text</td><td><code>shello</code></td></tr>
+<tr><td><code>b</code></td><td>Bytes (base64)</td><td><code>b&lt;base64&gt;</code></td></tr>
+<tr><td><code>n</code></td><td>NULL</td><td><code>n</code></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Safety contract</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> assume <strong>no Rust panic crosses the boundary</strong> — a caught panic becomes <code>ENGINE_ERR_INTERNAL</code> and the handle stays defined and queryable.</li>
+<li><span class="req-tag must">MUST</span> treat a null or invalid handle as <code>ENGINE_ERR_MISUSE</code> — null handles, use-after-free, and bad arguments all map to this code rather than undefined behaviour.</li>
+<li><span class="req-tag must">MUST</span> read every value as NUL-terminated text; a SQL <code>NULL</code> is a <code>NULL</code> pointer, distinct from the empty string.</li>
+<li><span class="req-tag must">MUST</span> copy a borrowed <code>const char*</code> out before the owning object advances or is freed — cursor values expire on the next <code>step</code>/<code>reset</code>/<code>finalize</code>; result values on <code>engine_result_free</code>; error strings on the next call to the handle.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use a single handle concurrently from multiple threads. Distinct handles are thread-safe with respect to one another; one handle is not.</li>
+</ul>
+</section>
+
+<section>
+<h2>Minimal C example</h2>
+<p>Open, run a one-shot statement, query, then free and close. All <code>&lt;</code> / <code>&gt;</code> below are literal C source.</p>
+<pre data-lang="c"><code>#include &lt;stdio.h&gt;
+#include "engine.h"
+
+int main(void) {
+    EngineHandle* h = engine_open("file://./demo.db");
+    if (!h) return 1;
+
+    engine_exec(h, "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT)");
+    engine_exec(h, "INSERT INTO notes (id, title) VALUES (1, 'hello')");
+
+    EngineResult* r = NULL;
+    if (engine_query(h, "SELECT id, title FROM notes ORDER BY id", &amp;r) == ENGINE_OK) {
+        int rows = engine_result_rows(r);
+        int cols = engine_result_cols(r);
+        for (int i = 0; i &lt; rows; i++) {
+            for (int c = 0; c &lt; cols; c++) {
+                const char* v = engine_result_value(r, i, c);
+                printf("%s%s", v ? v : "NULL", c + 1 &lt; cols ? "\t" : "\n");
+            }
+        }
+        engine_result_free(r);
+    } else {
+        printf("query failed: %s\n", engine_last_error(h));
+    }
+
+    engine_close(h);
+    return 0;
+}</code></pre>
+<div class="callout tip">
+<p class="callout-title">From Bun you rarely touch this directly</p>
+<p>The <code>@yourdb/bun</code> client wraps every function here over <code>bun:ffi</code>, encodes the typed-literal parameters, and pins <code>EXPECTED_ABI_VERSION</code> to catch a stale binary. See <a href="connect-bun.html">Connect from Bun</a> for the ergonomic typed API.</p>
+</div>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="sql-reference.html"><span class="xref-id">SQL</span><span class="xref-title">SQL reference</span><span class="xref-desc">The exact SQL surface the engine parses and runs.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-id">BUN</span><span class="xref-title">Connect from Bun</span><span class="xref-desc">The typed wrapper over this ABI via <code>bun:ffi</code>.</span></a>
+<a class="xref" href="branching.html"><span class="xref-id">BR</span><span class="xref-title">Branching</span><span class="xref-desc">What <code>engine_branch</code> does under the hood.</span></a>
+<a class="xref" href="../specs/02-engine-core.html"><span class="xref-id">02</span><span class="xref-title">Engine core</span><span class="xref-desc">The engine the ABI exposes: SQL, MVCC, WAL.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

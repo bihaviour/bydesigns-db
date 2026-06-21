@@ -20,8 +20,9 @@ Phase 4 adds copy-on-write branching (the `engine_branch` stub is now a working
 branch — `STORAGE_TRAIT_VERSION` 2, `ENGINE_ABI_VERSION` 2), a durable
 single-writer lease (acquire/renew/release), and the `bydesigns-controller`
 lifecycle controller (scale-to-zero + keep-warm); all *additive* because the
-storage seam never moves. See `docs/PHASE1.md`–`docs/PHASE4.md` for the
-implementation maps and the deliberate scope decisions.
+storage seam never moves. See the per-phase implementation maps under
+`pages/specs/phase-1-embedded.html`–`pages/specs/phase-4-branching-lifecycle.html`
+for the implementation maps and the deliberate scope decisions.
 
 ## Layout
 
@@ -31,7 +32,13 @@ crates/engine     # libengine: SQL → MVCC → WAL, plus the stable C ABI (incl
 crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset); links the engine unchanged
 crates/controller # lifecycle controller: scale-to-zero instances, lease heartbeat, keep-warm + thundering-herd admission (Phase 4)
 clients/bun       # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
-specs/            # the development specification (HTML); the source of truth for design intent
+pages/            # the website + documentation (static HTML, deployed to GitHub Pages):
+                  #   index.html  — home (project overview)
+                  #   docs/       — user documentation (connect, branch, pool, operate)
+                  #   specs/      — development guidelines: the 14 design specs (the source of
+                  #                 truth for design intent) + per-phase implementation maps
+                  #   release/    — releases & upcoming roadmap
+                  #   assets/     — one shared design system (app.css + app.js + section manifests)
 ```
 
 ## Commands
@@ -56,6 +63,9 @@ cd clients/bun
 bun test                                      # end-to-end embedded tests
 YOURDB_ENGINE_PATH=/abs/path/libengine.so bun test   # explicit library override
 bun run examples/notes.ts                      # runnable sample app
+
+# Website + docs (static HTML in pages/, no build step; deployed to GitHub Pages)
+bunx serve pages                               # preview the site locally (uses bunx, not python3)
 ```
 
 The Bun layer loads the native library via `bun:ffi`; if a change touches the C
@@ -141,8 +151,10 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
 
 ## When changing things
 
-- Treat `specs/` as the design source of truth; align changes with the relevant
-  spec page and keep the matching `docs/PHASE*.md` implementation map accurate.
+- Treat `pages/specs/` as the design source of truth; align changes with the
+  relevant spec page and keep the matching `pages/specs/phase-*.html` implementation
+  map accurate. User-facing behaviour changes should also be reflected in the docs
+  under `pages/docs/`.
 - Storage-trait changes must keep all C1–C8 conformance tests green (and the
   Phase-4 branching battery, `crates/storage/tests/branching.rs`) and bump
   `STORAGE_TRAIT_VERSION` per the trait's versioning policy (currently `2`).

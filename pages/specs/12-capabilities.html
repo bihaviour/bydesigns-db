@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capabilities: Build-in vs Compose · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">12 · CAP</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Capabilities: Build-in vs Compose</h1>
+<p class="lede">The platform grows by deciding, per capability, whether it belongs <em>inside</em> the engine (storage and execution: types, indexes, operators) or <em>around</em> it (interfaces and services: auth, REST, analytics) — keeping the core small while the platform expands by composition over one shared object-storage floor.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This specification governs how new capabilities are added to the platform without bloating the engine. It is the placement contract: for any proposed feature it answers the binary question <em>"build it into the engine, or compose it around the engine?"</em> and then specifies <em>how</em> each placement attaches to the existing layers (engine core, storage trait, server mode, object-storage floor).</p>
+<p>It expands source §11 into a buildable specification: the deciding rule, the one capability that is built <strong>in</strong> (vector search), the three capabilities that are composed <strong>around</strong> (better-auth, PostgREST, DuckDB), the canonical composition map, the contrast with the Postgres-plus-extensions monolith, and the normative requirements that keep the core from accreting interface code.</p>
+<div class="callout note">
+<p class="callout-title">Relationship to the rest of the spec</p>
+<p>This page does not introduce new storage or commit machinery. It composes the pieces already specified elsewhere: the <a href="03-storage-interface.html">Storage trait</a> (vector index attaches here), <a href="07-server-mode.html">server mode / pg wire protocol</a> (PostgREST attaches here), <a href="08-bun-integration.html">Bun integration</a> (better-auth attaches here), and the <a href="04-object-storage-backend.html">object-storage backend</a> (DuckDB attaches here). Capabilities inherit branching, scale-to-zero, and S3-backing only to the extent they sit on top of those existing seams.</p>
+</div>
+</section>
+
+<section>
+<h2>The deciding rule</h2>
+<div class="callout tip">
+<p class="callout-title">The rule (normative)</p>
+<p><strong>If it is a STORAGE or EXECUTION capability — a type, an index, a query operator — build it INTO the engine.</strong></p>
+<p><strong>If it is an INTERFACE or a SERVICE — auth, REST, an analytics frontend — COMPOSE it AROUND the engine.</strong></p>
+</div>
+<p>The rule exists because the two kinds of capability have different cost models and different lifecycles. A storage/execution capability is exercised on the data path on every query; it must live where the executor and the page cache live, behind the same <code>Storage</code> trait, or it cannot share MVCC, snapshots, branching, and the cache. An interface/service capability is exercised at the boundary; it is request-shaped, optional, and frequently absent (an embedded deployment has no REST surface at all). Welding a boundary concern into the core would make it un-optional, un-branchable as an independent unit, and impossible to scale or idle separately.</p>
+
+<h3>How to classify a proposed capability</h3>
+<p>Apply this test in order; the first match decides placement.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Question</th><th>If yes</th><th>Placement</th></tr></thead>
+<tbody>
+<tr><td>Does it add or change a column type the executor must read/compare/index?</td><td>storage capability</td><td><span class="pill build">build IN</span></td></tr>
+<tr><td>Is it a new access method (index) the planner can choose?</td><td>storage capability</td><td><span class="pill build">build IN</span></td></tr>
+<tr><td>Is it a query operator the executor evaluates over rows/pages?</td><td>execution capability</td><td><span class="pill build">build IN</span></td></tr>
+<tr><td>Is it an authentication / authorization service holding its own state?</td><td>service</td><td><span class="pill blue">compose</span></td></tr>
+<tr><td>Is it a request/response surface (REST/GraphQL/RPC) over the data?</td><td>interface</td><td><span class="pill blue">compose</span></td></tr>
+<tr><td>Is it a second engine with a different physical layout (columnar/OLAP)?</td><td>execution, but separable</td><td><span class="pill blue">compose</span></td></tr>
+</tbody>
+</table>
+</div>
+<p>The OLAP row at the bottom is the one subtlety: analytics <em>is</em> an execution capability, but it demands a columnar physical layout the row engine deliberately does not have (the HTAP boundary, see DuckDB below). When an execution capability requires a fundamentally different storage layout, it does not go into the row engine — it becomes a second engine composed over the same storage floor.</p>
+
+<h3>Contrast: monolith-plus-extensions vs small-core-plus-composition</h3>
+<p>Postgres is a monolith: a single process that bundles types, indexes, planner, executor, REST-via-extension, vectors-via-extension, analytics-via-extension. Everything is welded into one address space, one scaling unit, one branch unit, one fate. You take the whole thing or none of it; an extension you do not use still ships in the binary, still couples to the same WAL, still scales as one.</p>
+<p>This engine is the opposite shape by design (storage is decoupled at the <code>Storage</code> trait, see <a href="01-architecture-overview.html">Architecture Overview</a>): a <strong>small core</strong> (rows + vectors + the storage trait) surrounded by <strong>composable layers</strong> that share one object-storage floor. Each composed piece scales, scales-to-zero, and branches <em>independently</em> because it was never welded into the core.</p>
+<div class="diagram">
+<pre>
+   POSTGRES (monolith + extensions)        THIS ENGINE (small core + composition)
+
+   ┌───────────────────────────────┐       better-auth   PostgREST     DuckDB
+   │  planner · executor · types   │       (in-proc lib)  (front layer) (2nd engine)
+   │  ┌────────┐ ┌─────────────┐   │            │             │             │
+   │  │pgvector│ │ PostgREST*  │   │            ▼             ▼             ▼
+   │  ├────────┤ ├─────────────┤   │       ┌─────────────────────────────────┐
+   │  │ OLAP*  │ │   auth*     │   │       │   small engine core (rows +       │
+   │  └────────┘ └─────────────┘   │       │   vectors + Storage trait)        │
+   │        one WAL / one fate     │       └────────────────┬──────────────────┘
+   └───────────────┬───────────────┘                        │
+                   ▼                        ┌───────────────▼───────────────┐
+            one storage volume              │   shared object-storage floor  │
+                                            │        (S3 / R2 / GCS)         │
+        all scale/branch as one unit        └────────────────────────────────┘
+                                              each layer scales/idles/branches
+                                                       independently
+</pre>
+<p class="diagram-caption">Left: one welded binary, one storage volume, one fate. Right: a small core plus composable layers, all sharing one object-storage floor, each independently scalable.</p>
+</div>
+</section>
+
+<section>
+<h2>Built IN — vector search (pgvector-equivalent)</h2>
+<p>Vector search is a storage/index capability, not an interface, so by the rule it belongs <em>inside</em> the engine. It is also the single highest-value addition for agent workloads: vector search <strong>is</strong> how agent memory and retrieval work, so this capability converts the engine from "a small SQL store" into "the substrate an agent runs its memory on."</p>
+
+<h3>What is added to the core</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> add a <strong>vector type</strong> to the type system — a fixed-length array of <code>f32</code>, length declared at column definition time (e.g. <code>vector(768)</code>), validated on insert.</li>
+<li><span class="req-tag must">MUST</span> add an <strong>HNSW index</strong> as a new access method behind the <em>same</em> <code>Storage</code> trait the B-trees already use; the HNSW graph is stored as pages, not as a side file.</li>
+<li><span class="req-tag must">MUST</span> expose distance operators the planner can push into the index scan (cosine, L2, inner-product) so a top-<em>k</em> nearest-neighbour query is answerable by the access method, not by a full scan plus sort.</li>
+<li><span class="req-tag should">SHOULD</span> reuse the <code>usearch</code> / <code>hnswlib</code> algorithm lineage adapted to paged storage rather than inventing an ANN algorithm.</li>
+</ul>
+
+<h3>Why it inherits branching, scale-to-zero, and S3-backing for free</h3>
+<p>The HNSW graph is just more pages flowing through the same <code>Storage</code> trait. Because the trait is the only path the index has to durable bytes, the index automatically participates in everything the trait provides:</p>
+<dl class="fields">
+<dt>scale-to-zero</dt><dd>the graph pages live in object storage like any other page; idle compute can be torn down and the index re-warmed on cold start from S3 (see <a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a>).</dd>
+<dt>branching</dt><dd>a branch is a new LSN pointer over shared immutable layers; the vector index is made of those layers, so <strong>branching the database branches the vector index with it</strong>. An agent forks its memory, experiments on the fork, and discards it at near-zero marginal storage cost. Postgres's pgvector cannot do this — its index is welded to a single monolithic volume.</dd>
+<dt>S3-backing / PITR</dt><dd>the graph is versioned by LSN exactly like row pages, so point-in-time recovery and the durability floor cover it without special-casing.</dd>
+</dl>
+<div class="callout success">
+<p class="callout-title">The branching payoff is the differentiator</p>
+<p>An agent that can fork its own retrieval memory, run a speculative episode against the fork, and throw the fork away is doing something pgvector structurally cannot. This capability exists <em>only</em> because the index rides the same versioned, immutable-layer storage trait as the rows.</p>
+</div>
+
+<h3>The caveat: HNSW is the nastiest cache case in the engine</h3>
+<div class="callout warning">
+<p class="callout-title">Cold-traversal amplification</p>
+<p>HNSW is a graph, and traversal is random-access pointer-chasing. Over object storage a <em>cold</em> traversal can become many sequential round-trips — each hop is a potential cache miss, and on egress-billed stores a cache miss is egress. This is "cache-miss-is-egress" at its absolute worst, because the misses are <em>serial</em> (you cannot prefetch hop <em>n+1</em> until hop <em>n</em> resolves).</p>
+</div>
+<p>Vector search therefore leans harder on the <a href="05-local-cache.html">local cache</a> than anything else in the engine. The mitigation is structural, not incidental:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> keep the working-set graph resident in the local cache; object storage is the cold floor, not the traversal medium.</li>
+<li><span class="req-tag should">SHOULD</span> size the cache against the <em>graph</em> working set, not just the row working set — the two compete and the graph's miss penalty is multiplied by traversal depth.</li>
+<li><span class="req-tag should">SHOULD</span> warm the upper HNSW layers (the small, dense entry-point layers) eagerly on cold start so the first hops never miss.</li>
+<li><span class="req-tag may">MAY</span> pin frequently-queried sub-graphs to keep latency-critical retrieval off the cold path entirely.</li>
+</ul>
+</section>
+
+<section>
+<h2>Composed AROUND — overview</h2>
+<p>The next three capabilities are NOT built into the core. They wrap the engine, they are optional, and they are <strong>absent when the engine is embedded in-process</strong> (an embedded deployment has rows and vectors but no auth service, no REST surface, no second analytics engine unless the host app composes them). Each attaches at a different seam, and the seam determines how it scales and branches.</p>
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">in-process</div><div class="metric-label">better-auth — library in the Bun app</div></div>
+<div class="metric"><div class="metric-value">in-front</div><div class="metric-label">PostgREST — layer over server mode</div></div>
+<div class="metric"><div class="metric-value">over-storage</div><div class="metric-label">DuckDB — second engine on shared S3</div></div>
+</div>
+</section>
+
+<section>
+<h2>Composed AROUND — better-auth (auth)</h2>
+<p>better-auth fills the "auth" slot of the original BaaS wishlist. It is a <strong>library</strong>, not a service, and that is exactly why it composes cleanly: it stores its own state — users, sessions, accounts — in <em>your</em> database rather than in an external auth provider.</p>
+
+<h3>How it attaches</h3>
+<p>better-auth runs <em>in-process</em>, inside the Bun app, alongside the embedded engine. It writes users and sessions to the same in-process database via the engine's FFI/native binding (see <a href="08-bun-integration.html">Bun Integration</a>). That database syncs to object storage like any other write. There is <strong>no external auth service</strong> and no second network hop for a login.</p>
+<div class="diagram">
+<pre>
+Bun process
+ ├─ better-auth (library)  ──  writes users / sessions ─┐
+ │                                                      │
+ └─ engine (embedded lib)  ←───────────────────────────┘  ──►  object storage
+        (rows + vectors,                                        (S3 / R2 / GCS)
+         in-process via FFI)
+</pre>
+<p class="diagram-caption">better-auth is a library co-resident in the Bun process; it persists into the embedded engine, which syncs to the shared object-storage floor. No external auth service.</p>
+</div>
+
+<h3>Behaviour &amp; consequences</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> be built into the engine core — auth is a service holding its own schema, and the engine must remain auth-agnostic so it can be embedded with or without it.</li>
+<li><span class="req-tag must">MUST</span> persist all auth state (users, sessions, accounts, verification tokens) through the normal engine write path so it inherits durability, branching, and PITR.</li>
+<li><span class="req-tag should">SHOULD</span> live in the same database (or a same-instance branch) as the application data so a session lookup is a local function call, not a cross-service round-trip.</li>
+<li><span class="req-tag may">MAY</span> be omitted entirely in deployments that do not need auth — its absence costs nothing because it was never welded in.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Why "library, in-process" is the right shape here</p>
+<p>Because better-auth's state lives in the engine, branching the database branches the auth state with it (a staging branch gets its own user table for free), and because the lookup is in-process it does not pay the networked-commit handoff for reads. This is the most drop-in deployment shape — see <a href="11-deployment-targets.html">Deployment Targets</a>, scenario 3 (Bun app + better-auth on Cloud Run + bucket).</p>
+</div>
+</section>
+
+<section>
+<h2>Composed AROUND — PostgREST (REST API)</h2>
+<p>PostgREST introspects a schema and auto-generates a REST API from it. It is a <strong>separate process that sits in front of the database</strong> — and that is the correct placement, because an auto-REST layer is an interface, and interfaces belong at the boundary wrapping <em>server mode</em> (not the embedded mode).</p>
+
+<h3>The key payoff: you may not build a REST layer at all</h3>
+<p>Because the engine speaks the <strong>Postgres wire protocol</strong> in server mode (see <a href="07-server-mode.html">Server Mode &amp; Wire Protocol</a>), <strong>PostgREST can point at the engine directly</strong>. PostgREST already exists, already introspects pg-compatible catalogs, and already maps HTTP verbs to SQL. The engine inherits a mature REST surface for free — wire-compatibility means you do not write a REST layer, you adopt the existing one.</p>
+<div class="diagram">
+<pre>
+HTTP client
+    │  GET /items?select=name&amp;price=gt.10
+    ▼
+PostgREST  (introspects schema, maps HTTP ⇄ SQL, auto-generates REST)
+    │  pg wire protocol
+    ▼
+engine (server mode, speaks pgwire)
+    │  Storage trait
+    ▼
+object storage  (S3 / R2 / GCS)
+</pre>
+<p class="diagram-caption">PostgREST is a front layer over server mode. Because the engine is wire-compatible, PostgREST attaches with zero engine changes — the REST API is inherited, not built.</p>
+</div>
+
+<h3>Requirements</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> be built into the engine — it is an interface and must remain optional and absent in embedded deployments.</li>
+<li><span class="req-tag must">MUST</span> attach only over <a href="07-server-mode.html">server mode</a>; the engine's pg-wire compatibility is the contract that makes PostgREST work unmodified.</li>
+<li><span class="req-tag should">SHOULD</span> be deployed as its own process/container so it scales and idles independently of the engine.</li>
+<li><span class="req-tag should">SHOULD</span> sit behind the same pooler the server mode uses for connection-burst absorption (PgBouncer/pgcat, transaction mode).</li>
+<li><span class="req-tag may">MAY</span> be replaced by any other pg-wire-speaking front layer (GraphQL gateways, ORMs, BI tools) for the same reason — wire-compatibility is the general unlock, PostgREST is one instance of it.</li>
+</ul>
+<div class="callout tip">
+<p class="callout-title">Acceptance check for "REST for free"</p>
+<p>The deliverable is not "we built REST"; it is "unmodified PostgREST, pointed at the engine's pgwire endpoint, serves a working REST API against a real schema." If that holds, the engine's wire-compatibility is doing its job and no REST code was written.</p>
+</div>
+</section>
+
+<section>
+<h2>Composed AROUND — DuckDB (analytics / OLAP)</h2>
+<p>Analytics is an execution capability, but it demands a <strong>columnar physical layout the row engine deliberately does not have</strong>. This is the HTAP boundary: do <em>not</em> make the row engine analytical — OLAP scans want column-at-a-time vectorized execution over compressed columnar storage, which is structurally at odds with the row-oriented, MVCC, single-writer OLTP layout the engine is built for. Bolting OLAP into the row engine would compromise both.</p>
+
+<h3>How it attaches: a second engine over shared storage</h3>
+<p>Instead of one HTAP engine, build an HTAP <em>system</em>: point DuckDB at the <strong>same object storage</strong> as Parquet/Iceberg. The row engine handles transactions; DuckDB handles aggregations; <strong>both see one S3 dataset</strong>. This is possible precisely because storage is decoupled — the durability floor is shared, so a second engine can read it without going through the first.</p>
+<div class="diagram">
+<pre>
+              ┌─ engine (row, OLTP)   ── writes ──┐
+              │                                    │
+ shared S3 ───┤                                    ├── one dataset
+ (R2/GCS)     │                                    │
+              └─ DuckDB (columnar, OLAP) ── reads ─┘
+
+ periodic:  engine row data ──► materialize columnar
+            (Parquet / Iceberg) snapshots on S3 ──► DuckDB queries them
+</pre>
+<p class="diagram-caption">Two engines, one storage floor. The row engine writes; DuckDB reads materialized columnar snapshots of the same S3 dataset. A legitimate HTAP system, not a single HTAP engine.</p>
+</div>
+
+<h3>The materialization contract</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> add columnar/OLAP execution to the row engine; the HTAP boundary is held by separation, not by a hybrid layout.</li>
+<li><span class="req-tag must">MUST</span> publish row data to the shared store in an open columnar format (Parquet, optionally catalogued via Iceberg) that DuckDB reads directly.</li>
+<li><span class="req-tag should">SHOULD</span> materialize columnar snapshots periodically (batch/CDC), accepting analytic staleness bounded by the snapshot interval; OLTP stays the source of truth.</li>
+<li><span class="req-tag should">SHOULD</span> run DuckDB as its own process so the analytic workload neither contends with nor blocks the transactional lane.</li>
+<li><span class="req-tag may">MAY</span> expose the Iceberg table to other readers (BI tools) — the columnar snapshot is a shared artifact, not a private one.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Why this is legitimate HTAP and not a hack</p>
+<p>It is two engines over one storage floor, each playing to its layout's strength, sharing a dataset rather than copying it through a pipeline. The decoupled storage trait is what makes a second engine on the same bytes possible — a coupled OLTP database would force an export/replicate hop instead.</p>
+</div>
+</section>
+
+<section>
+<h2>The composition map</h2>
+<p>The canonical placement table. Each capability's <em>kind</em> determines its <em>placement</em>, and the placement determines <em>how it attaches</em> to the existing layers.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Capability</th><th>Kind</th><th>Placement</th><th>How it attaches</th></tr></thead>
+<tbody>
+<tr>
+<td>Vector search (pgvector-equiv)</td>
+<td>storage / index</td>
+<td><span class="pill build">built IN</span></td>
+<td>new index type via the <code>Storage</code> trait; inherits branching + scale-to-zero + S3-backing</td>
+</tr>
+<tr>
+<td>better-auth</td>
+<td>service (auth)</td>
+<td><span class="pill blue">composed in-process</span></td>
+<td>library; stores its state in the embedded engine, syncs to object storage</td>
+</tr>
+<tr>
+<td>PostgREST</td>
+<td>interface (REST)</td>
+<td><span class="pill blue">composed in front</span></td>
+<td>wraps server mode; free via pg wire-compatibility, no engine changes</td>
+</tr>
+<tr>
+<td>DuckDB</td>
+<td>execution (OLAP)</td>
+<td><span class="pill blue">composed over storage</span></td>
+<td>second engine reading shared S3 (Parquet / Iceberg snapshots)</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Why this beats Postgres + extensions</h2>
+<p>The capabilities are the same; the <em>bundling</em> is the opposite. Postgres ships them welded into one binary, one WAL, one scaling unit. This engine ships them <strong>unbundled</strong>: a tool that needs vectors + auth but not REST pulls exactly those, in-process, and pays for nothing else.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Property</th><th>Postgres + extensions</th><th>Small core + composition</th></tr></thead>
+<tbody>
+<tr><td>Granularity of adoption</td><td>whole monolith; unused extensions still ship</td><td>pull exactly the capabilities a tool needs</td></tr>
+<tr><td>Scaling unit</td><td>one process scales as a unit</td><td>each layer scales / idles independently</td></tr>
+<tr><td>Branching</td><td>monolithic volume; pgvector cannot branch its index</td><td>built-in capabilities branch with the DB; composed layers branch with their own state</td></tr>
+<tr><td>Scale-to-zero</td><td>coupled compute + storage; not idle-friendly</td><td>stateless compute over object storage; idle to zero</td></tr>
+<tr><td>Embedded form</td><td>not embeddable as a library</td><td>core embeds in-process; interface layers simply absent</td></tr>
+<tr><td>Engine size / blast radius</td><td>large; one fate shared across features</td><td>engine stays small; failures isolated per layer</td></tr>
+</tbody>
+</table>
+</div>
+<p>The structural claim: each layer scales, idles, and branches independently because nothing is welded to the core. The engine stays small; the platform grows by composition around shared object storage. That is the inversion of the monolith, and it is only possible because storage was decoupled at the <code>Storage</code> trait in the first place.</p>
+</section>
+
+<section>
+<h2>Normative requirements</h2>
+<h3>Placement discipline</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> classify every proposed capability with the deciding rule before implementation: storage/execution → in-core; interface/service → composed.</li>
+<li><span class="req-tag must">MUST</span> keep the engine core limited to rows, vectors, and the storage trait; no interface or service code may enter the core.</li>
+<li><span class="req-tag must-not">MUST NOT</span> add an interface or service (auth, REST, analytics frontend) into the engine binary; such capabilities are composed and optional.</li>
+<li><span class="req-tag must-not">MUST NOT</span> add columnar/OLAP execution to the row engine; OLAP is composed as a second engine over shared storage.</li>
+</ul>
+<h3>Built-in capabilities (vector search)</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> implement the vector type and HNSW access method behind the existing <code>Storage</code> trait, storing the graph as pages so it inherits branching, scale-to-zero, and S3-backing.</li>
+<li><span class="req-tag must">MUST</span> ensure branching the database branches the vector index atomically with it.</li>
+<li><span class="req-tag must">MUST</span> keep the working-set HNSW graph resident in the local cache; object storage is the cold floor, never the traversal medium.</li>
+</ul>
+<h3>Composed capabilities</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> compose better-auth in-process as a library persisting into the embedded engine; no external auth service.</li>
+<li><span class="req-tag must">MUST</span> let any pg-wire client (PostgREST and others) attach over server mode with no engine modification.</li>
+<li><span class="req-tag must">MUST</span> compose DuckDB over the shared object store via open columnar snapshots (Parquet/Iceberg), keeping OLTP as source of truth.</li>
+<li><span class="req-tag should">SHOULD</span> deploy each composed layer as its own process so it scales and idles independently.</li>
+<li><span class="req-tag may">MAY</span> omit any composed layer entirely; its absence must cost nothing in the core.</li>
+</ul>
+</section>
+
+<section>
+<h2>Configuration knobs</h2>
+<dl class="fields">
+<dt>vector.dim</dt><dd>declared fixed length of a vector column (e.g. 768, 1536); enforced on insert.</dd>
+<dt>vector.metric</dt><dd>distance metric for the HNSW index — <code>cosine</code> | <code>l2</code> | <code>inner_product</code>.</dd>
+<dt>hnsw.m</dt><dd>graph out-degree; higher = better recall, larger graph, more pages to keep resident.</dd>
+<dt>hnsw.ef_construction</dt><dd>build-time candidate-list size; build quality vs build cost.</dd>
+<dt>hnsw.ef_search</dt><dd>query-time candidate-list size; recall vs latency, the primary online tuning knob.</dd>
+<dt>cache.vector_working_set</dt><dd>cache budget reserved for the HNSW graph, separate from the row page budget.</dd>
+<dt>auth.database</dt><dd>which database/branch better-auth persists into (defaults to the application DB).</dd>
+<dt>rest.enabled</dt><dd>whether a PostgREST layer is provisioned in front of server mode (absent in embedded deployments).</dd>
+<dt>olap.snapshot_interval</dt><dd>cadence of columnar materialization to S3; bounds analytic staleness.</dd>
+<dt>olap.format</dt><dd>columnar publish format — <code>parquet</code> or <code>iceberg</code>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Failure / edge case</th><th>Where</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Cold HNSW traversal cache-misses serially over S3</td><td>vector search</td><td>keep working-set graph resident; warm upper layers on cold start; size cache for the graph (see <a href="05-local-cache.html">Local Cache</a>)</td></tr>
+<tr><td>Egress amplification on miss-heavy ANN over egress-billed stores</td><td>vector search</td><td>prefer R2 (zero egress) for vector-heavy workloads; raise cache budget (see <a href="11-deployment-targets.html">Deployment Targets</a>)</td></tr>
+<tr><td>Vector-index branch diverges from row branch</td><td>vector search</td><td>index pages ride the same LSN/layers — branch atomically; never store the graph as a side file</td></tr>
+<tr><td>Auth state lost on branch or restore</td><td>better-auth</td><td>persist all auth state through the normal write path so PITR/branching cover it</td></tr>
+<tr><td>PostgREST sees a pg-wire incompatibility (catalog/type quirk)</td><td>PostgREST</td><td>treat as a server-mode wire-compat gap, fix in <a href="07-server-mode.html">Server Mode</a>; do not fork PostgREST</td></tr>
+<tr><td>DuckDB reads a half-materialized snapshot</td><td>DuckDB</td><td>publish snapshots atomically (Iceberg commit / atomic Parquet swap); readers see whole snapshots only</td></tr>
+<tr><td>Analytic queries contend with the transactional lane</td><td>DuckDB</td><td>run DuckDB as its own process reading materialized snapshots, never the live OLTP pages</td></tr>
+<tr><td>Composed layer welded in over time (scope creep)</td><td>placement discipline</td><td>enforce the must-not rules; reject PRs that add interface/service code to the core</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Dependencies / existing pieces to start from</h2>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> adapt the <code>usearch</code> / <code>hnswlib</code> lineage for the HNSW access method rather than authoring an ANN algorithm from scratch.</li>
+<li><span class="req-tag should">SHOULD</span> adopt better-auth unmodified as an in-process library, supplying it the engine's binding as its persistence layer.</li>
+<li><span class="req-tag should">SHOULD</span> adopt PostgREST unmodified, relying on the engine's pg-wire compatibility (see <a href="07-server-mode.html">Server Mode</a>).</li>
+<li><span class="req-tag should">SHOULD</span> adopt DuckDB unmodified, pointed at the shared object store via the Parquet/Iceberg readers it already ships.</li>
+<li><span class="req-tag must">MUST</span> build only the thin glue: the vector type + HNSW-over-<code>Storage</code> integration, and the columnar materialization job. The composed engines/libraries are not built in-house.</li>
+</ul>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> support a <code>vector(N)</code> column, an HNSW index over it, and a top-<em>k</em> nearest-neighbour query answered by the index.</li>
+<li><span class="req-tag must">MUST</span> demonstrate that branching a database produces a branch whose vector index is independently mutable and whose changes do not leak back to the base.</li>
+<li><span class="req-tag must">MUST</span> demonstrate vector-search latency staying flat while the working set is cache-resident and degrading gracefully (not catastrophically) on a forced cold traversal.</li>
+<li><span class="req-tag must">MUST</span> demonstrate a Bun app where better-auth persists users/sessions into the embedded engine with no external auth service, surviving a branch and a restore.</li>
+<li><span class="req-tag must">MUST</span> demonstrate unmodified PostgREST serving a working REST API against the engine's pg-wire endpoint.</li>
+<li><span class="req-tag must">MUST</span> demonstrate DuckDB querying a materialized columnar snapshot of the same dataset the row engine writes, with both reading one S3 location.</li>
+<li><span class="req-tag should">SHOULD</span> demonstrate that omitting any composed layer leaves the core unchanged in size and behaviour.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> — HNSW page layout: what page granularity and node-packing minimize serial round-trips on cold traversal? Needs benchmarking against the <a href="09-benchmark-plan.html">benchmark plan</a> (cold-read experiment extended to graph traversal).</li>
+<li><span class="req-tag may">MAY</span> — incremental vs full HNSW rebuild on heavy update churn; how does graph quality degrade with deletes, and when must the index be rebuilt?</li>
+<li><span class="req-tag may">MAY</span> — columnar staleness bound: what snapshot interval keeps DuckDB analytics "fresh enough" without overwhelming the materialization job, and should CDC replace batch?</li>
+<li><span class="req-tag may">MAY</span> — does any other high-value capability (full-text search, geospatial) belong in-core by the rule, or are they better composed?</li>
+<li><span class="req-tag may">MAY</span> — pg-wire surface completeness: which catalog/type details must server mode expose so the long tail of pg-wire tools (not just PostgREST) attach unmodified?</li>
+<li><span class="req-tag may">MAY</span> — authorization beyond authentication: where do row-level security / policy enforcement live — in the engine, in PostgREST, or in the app composing them?</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">the trait the HNSW vector index attaches behind, inheriting branching and S3-backing</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">pg-wire compatibility is why PostgREST attaches for free</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">the in-process binding better-auth uses to persist into the embedded engine</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">vector search leans hardest on the cache; cold HNSW traversal is the worst case</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the shared S3 floor DuckDB reads as Parquet/Iceberg snapshots</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">R2 zero-egress matters most for miss-heavy vector search; composed-layer placement</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">the small-core-plus-composition shape this page applies to new capabilities</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">when vector search and each composed layer land in the build order</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

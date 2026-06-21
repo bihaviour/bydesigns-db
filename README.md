@@ -84,33 +84,38 @@ storage seam.
 
 ## Documentation
 
+The website and documentation live under [`pages/`](pages/) and are deployed to
+GitHub Pages from that directory (see [`.github/workflows/pages.yml`](.github/workflows/pages.yml)).
+
 | Resource | Where | Status |
 |---|---|---|
-| **User & API guides** (how to embed, deploy, operate) | _published docs site_ | **pending** |
-| **Implementation maps** (per-phase: what's built, where, and why) | [`docs/PHASE1.md`](docs/PHASE1.md) · [`PHASE2`](docs/PHASE2.md) · [`PHASE3`](docs/PHASE3.md) · [`PHASE4`](docs/PHASE4.md) | available |
-| **Development specifications** (the design source of truth) | [`specs/`](specs/) — open [`specs/index.html`](specs/index.html) | available |
+| **Home** (project overview / marketing) | [`pages/index.html`](pages/index.html) | available |
+| **User documentation** (connect, branch, pool, operate) | [`pages/docs/`](pages/docs/) — open [`pages/docs/index.html`](pages/docs/index.html) | available |
+| **Development guidelines** (design specs + per-phase implementation maps) | [`pages/specs/`](pages/specs/) — open [`pages/specs/index.html`](pages/specs/index.html) | available |
+| **Releases & roadmap** | [`pages/release/index.html`](pages/release/index.html) | available |
 | **C ABI** (the stable embedding contract) | [`crates/engine/include/engine.h`](crates/engine/include/engine.h) | frozen (ABI v2) |
 | **Contributor guidance** | [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) | available |
 
-The full development spec is a self-contained HTML site under [`specs/`](specs/).
-Open [`specs/index.html`](specs/index.html), or serve the folder locally:
+The whole site is self-contained static HTML (no build step). Open
+[`pages/index.html`](pages/index.html) directly, or serve the folder locally:
 
 ```bash
-cd specs && python3 -m http.server   # then visit http://localhost:8000
+bunx serve pages   # then visit the printed http://localhost:3000
 ```
 
-Selected specs:
+Selected development specs (under [`pages/specs/`](pages/specs/)):
 
 | Spec | |
 |---|---|
-| [Architecture Overview](specs/01-architecture-overview.html) | The three slots and inter-layer protocols |
-| [Engine Core](specs/02-engine-core.html) | C ABI, MVCC, WAL, execution pipeline |
-| [Storage Interface](specs/03-storage-interface.html) | The pluggable `Storage` trait (the seam) |
-| [Object-Storage Backend](specs/04-object-storage-backend.html) | LSM page store + S3-CAS commit log |
-| [Lifecycle & Controller](specs/06-lifecycle-controller.html) | Scale-to-zero, branching, fencing |
-| [Server Mode & Wire Protocol](specs/07-server-mode.html) | The pgwire subset |
-| [Benchmark & Validation Plan](specs/09-benchmark-plan.html) | Latency/throughput/crash-safety experiments |
-| [Roadmap & Build Sequence](specs/13-roadmap.html) | Phased delivery plan |
+| [Architecture Overview](pages/specs/01-architecture-overview.html) | The three slots and inter-layer protocols |
+| [Engine Core](pages/specs/02-engine-core.html) | C ABI, MVCC, WAL, execution pipeline |
+| [Storage Interface](pages/specs/03-storage-interface.html) | The pluggable `Storage` trait (the seam) |
+| [Object-Storage Backend](pages/specs/04-object-storage-backend.html) | LSM page store + S3-CAS commit log |
+| [Lifecycle & Controller](pages/specs/06-lifecycle-controller.html) | Scale-to-zero, branching, fencing |
+| [Server Mode & Wire Protocol](pages/specs/07-server-mode.html) | The pgwire subset |
+| [Benchmark & Validation Plan](pages/specs/09-benchmark-plan.html) | Latency/throughput/crash-safety experiments |
+| [Roadmap & Build Sequence](pages/specs/13-roadmap.html) | Phased delivery plan |
+| Implementation maps | [Phase 1](pages/specs/phase-1-embedded.html) · [Phase 2](pages/specs/phase-2-object-storage.html) · [Phase 3](pages/specs/phase-3-server.html) · [Phase 4](pages/specs/phase-4-branching-lifecycle.html) |
 
 ## Repository layout
 
@@ -120,8 +125,9 @@ crates/engine     # libengine: SQL → MVCC → WAL, and the stable C ABI (inclu
 crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset)
 crates/controller # lifecycle controller: scale-to-zero, lease heartbeat, keep-warm + thundering-herd admission
 clients/bun       # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
-docs/             # per-phase implementation maps (PHASE1–PHASE4)
-specs/            # the development specification (HTML); the source of truth for design intent
+pages/            # the website + documentation (static HTML, deployed to GitHub Pages):
+                  #   index.html (home) · docs/ (user docs) · specs/ (development guidelines
+                  #   + implementation maps) · release/ (releases & roadmap) · assets/ (design system)
 ```
 
 ## Build & test
@@ -143,7 +149,7 @@ cargo build -p bydesigns-engine --release && (cd clients/bun && bun test)
 4. **Controller** — idle stop (scale-to-zero) + branch-on-LSN (instant clones) + single-writer fencing. ✅ *implemented*
 5. **Capabilities** — built-in vector search; compose auth / REST / OLAP over the shared storage floor. *planned*
 
-See the [full roadmap](specs/13-roadmap.html) for milestones, dependencies, and exit criteria.
+See [Releases & roadmap](pages/release/index.html) and the [full build sequence](pages/specs/13-roadmap.html) for milestones, dependencies, and exit criteria.
 
 ## License
 

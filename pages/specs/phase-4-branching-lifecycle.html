@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 4 — Branching &amp; Lifecycle · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">P4 · MAP</span>
+<span class="badge badge-status status-approved">Implemented</span>
+<span class="spec-date">Phase 4</span>
+</div>
+<h1>Phase 4 — Branching &amp; Lifecycle</h1>
+<p class="lede">The implementation map for the lifecycle layer: instant copy-on-write branches, a durable single-writer lease, and a scale-to-zero controller — all additive, because the storage seam never moves.</p>
+</header>
+
+<section>
+<h2>Overview</h2>
+<p>Phase 4 adds the lifecycle layer the roadmap calls for — <strong>instant copy-on-write branches</strong>, a <strong>durable single-writer lease</strong>, and a <strong>scale-to-zero lifecycle controller</strong> — without moving the storage seam. Everything is additive: <code>STORAGE_TRAIT_VERSION</code> goes to <strong>2</strong> (additive trait surface), <code>ENGINE_ABI_VERSION</code> goes to <strong>2</strong> (<code>engine_branch</code> stub → working, same signature), and the C ABI gains no new symbols.</p>
+<p>Epic: #4. Tasks: #21 (lifecycle), #22 (branching), #23 (fencing), #24 (keep-warm/herd).</p>
+</section>
+
+<section>
+<h2>#22 Branching — copy-on-write (the headline)</h2>
+<p>A branch is a cheap LSN pointer over shared immutable layers. Reads at-or-below the fork point fall through to the parent's already-durable history; writes land only in a branch-private overlay. Creating a branch is O(1) and copies no pages, so the base and every sibling are untouched until the branch diverges.</p>
+<ul>
+<li><strong><code>BranchStorage</code></strong> (<code>crates/storage/src/branch.rs</code>) — a backend-agnostic adaptor composing a parent <code>Arc&lt;dyn Storage&gt;</code> + a private overlay <code>Box&lt;dyn Storage&gt;</code>. LSNs are continuous across the fork: the overlay assigns local LSNs from 1 and the adaptor presents them shifted by <code>base_lsn</code>, so the engine above sees one gap-free stream (<code>1..=base</code> parent, then <code>base+1..</code> overlay). One adaptor serves both backends.</li>
+<li><strong><code>open_branch(url, id)</code></strong> (<code>crates/storage/src/lib.rs</code>) — opens a branch's overlay: a sibling <code>*.branch-&lt;id&gt;</code> file for <code>file://</code>, a child <code>branches/&lt;id&gt;/</code> key-prefix <code>ObjectStorage</code> for <code>s3://</code>/<code>r2://</code>/<code>gs://</code>.</li>
+<li><strong>Trait surface (v2):</strong> <code>BranchRef</code> gains <code>parent</code>; <code>list_branches</code> and <code>delete_branch</code> are added. <code>delete_branch</code> reclaims only the branch's diverged data (its overlay), refuses a branch with live children, and never touches shared base layers. Both backends persist <code>parent</code> in the branch pointer (<code>branches/&lt;id&gt;.ptr</code> objects; a <code>T_BRANCH</code> frame + a <code>T_BRANCH_DEL</code> tombstone in <code>LocalFileStorage</code>).</li>
+<li><strong>Engine + C ABI:</strong> <code>Database::open_branch</code> + <code>Connection::branch</code> open a branch over the overlay (replaying parent-up-to-base, then the branch's own log). <code>engine_branch(h, name)</code> forks at the connection's committed LSN and returns a new branch-bound handle (owned by the caller, freed with <code>engine_close</code>). Branch-of-branch and branching inside a transaction are rejected. The Bun wrapper's <code>branch()</code> works unchanged against ABI v2.</li>
+<li><strong>Tests:</strong> conformance C7 strengthened (parent + list + delete); <code>crates/storage/tests/branching.rs</code> proves write-isolation, sibling isolation, O(1) create, reopen persistence, and delete-reclaim on <strong>both</strong> backends; <code>ffi.rs</code> and the Bun embedded test drive a real branch end-to-end.</li>
+</ul>
+</section>
+
+<section>
+<h2>#23 Single-writer fencing — durable lease</h2>
+<p>Split-brain was already prevented by the take-over CAS epoch (a fresh acquire strictly bumps the epoch, fencing every prior token). Phase 4 makes the lease <strong>durable and observable</strong> so the controller can heartbeat it and a peer can tell a live writer from a dead one.</p>
+<ul>
+<li>The <code>ObjectStorage</code> lease object now carries <code>epoch | owner | expires_at_ms</code> (epoch stays first, so the legacy reader is unaffected). <code>acquire_fence</code> stamps a live expiry; <strong><code>renew_fence</code> durably re-stamps</strong> it under the same epoch (the heartbeat), failing <code>Fenced</code> if superseded; <strong><code>release_fence</code> durably frees</strong> it (expiry 0) while keeping the epoch, for a fast clean handoff.</li>
+<li>Fencing correctness still rests on the monotonic epoch, not the wall clock; the lease timestamp is advisory liveness only.</li>
+<li>The active heartbeat <em>loop</em> lives in the controller (below), not the embedded engine core, so embedders pay for no background thread.</li>
+<li><strong>Tests:</strong> conformance C4 strengthened (renew keeps the holder committing; release then a fresh acquire fences the released token) on both backends; a new object test asserts the durable acquire/renew/release lease lifecycle.</li>
+</ul>
+</section>
+
+<section>
+<h2>#21 / #24 Lifecycle controller — <code>crates/controller</code></h2>
+<p>The controller composes the engine's existing registry-shared <code>Database</code> primitive: opening one acquires the fence and replays the WAL (that <em>is</em> the cache warm); dropping it releases the fence (that <em>is</em> the stop). On top of that it adds the state machine, idle reaper, lease heartbeat, and thundering-herd handling.</p>
+<ul>
+<li><strong>State machine (#21):</strong> <code>Cold → Warming → Active → Idle → Stopping → Cold</code>. <code>start(url)</code> cold-starts on the first connection and returns a <code>Lease</code> that keeps the instance Active until dropped. A background reaper idles instances with no leases and tears them down past a configurable <code>idle_timeout</code>; <code>status()</code> makes the phase observable. The controller holds <strong>no durable state</strong>, so stop/start loses nothing (all state is in storage) — gated by a write/stop/restart/read test.</li>
+<li><strong>Heartbeat (#23):</strong> the reaper renews each warm instance's lease via <code>Database::renew_lease</code>; on a fence loss it steps the instance down.</li>
+<li><strong>Thundering herd (#24):</strong> N concurrent <code>start()</code> for one cold database warm <strong>exactly once</strong> (the rest wait on the in-flight transition); a bounded warm-admission semaphore caps how many distinct databases warm at once; <code>keep_warm</code> holds idle instances resident to cut post-idle latency. Config is validated at construction.</li>
+</ul>
+</section>
+
+<section>
+<h2>Deliberate scope boundaries</h2>
+<ul>
+<li><strong>Branch-of-branch</strong> is rejected at the engine boundary (the storage adaptor supports nesting, but <code>Connection::branch</code>/<code>engine_branch</code> fork only off a base database for now). Rebase / fast-forward / merge and divergence accounting are deferred (spec "MAY").</li>
+<li>The controller is an <strong>in-process library</strong> API; container/Cloud-Run supervision and HTTP control endpoints are out of scope here.</li>
+<li>Experiment 5 (cold-read percentiles) and the N-concurrent-cold-start saturation curve belong to the benchmark harness (cross-cutting epic #6), not this phase.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">The state machine, branch-on-LSN, and single-writer CAS fencing this map implements.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">The LSN-versioned immutable layers and CAS lease the branch overlay and durable fence build on.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam that stays put: branching is an additive <code>BranchStorage</code> adaptor, not an engine special-case.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The phased plan whose Phase 4 controller, branching, and fencing gates this map implements.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db — internal development specification. Implementation map.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

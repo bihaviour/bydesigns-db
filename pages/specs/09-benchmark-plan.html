@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmark &amp; Validation Plan · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">09 · BENCH</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Benchmark &amp; Validation Plan</h1>
+<p class="lede">A formal, falsifiable test plan that measures exactly where the two structural weaknesses of a storage-disaggregated engine bite — commit latency and write serialization — so that every tool can be placed on the correct side of the boundary before it ever carries real data.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>The architecture has two weak axes and exactly two corresponding levers. This plan exists to <strong>measure each axis independently</strong>, prove that the intended mitigation actually moves the right number, and produce a per-tool go/no-go verdict that an engineer can defend with data rather than intuition.</p>
+<p>The plan is deliberately adversarial. It does not try to show the engine in a good light; it tries to find the workloads that break it, locate the breaking point precisely, and hand those workloads to a coupled Postgres while keeping the disaggregated engine for everything else. The platform is <strong>not all-or-nothing</strong>: benchmark the boundary once, then route per workload.</p>
+<div class="callout note">
+<p class="callout-title">What this plan governs</p>
+<p>Five experiments (latency floor, group-commit curve, contention wall, crash safety, cold read), a fixed measurement methodology (percentiles via HDR histogram, never means), and a decision rule that converts experiment outputs into a ship / route / block verdict. It applies to both the embedded (<a href="08-bun-integration.html">FFI</a>) and server (<a href="07-server-mode.html">pgwire</a>) paths.</p>
+</div>
+</section>
+
+<section>
+<h2>Responsibilities &amp; non-goals</h2>
+<h3>Responsibilities</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> measure the single-commit latency floor against the real <a href="04-object-storage-backend.html">ObjectStorage</a> backend, reported as a distribution (p50/p99/p999), not an average.</li>
+<li><span class="req-tag must">MUST</span> quantify what group commit buys (the W1 lever) as a throughput-vs-concurrency curve.</li>
+<li><span class="req-tag must">MUST</span> isolate single-writer serialization cost (the W2 axis) and prove that the many-DB sharding lever recovers linear scaling.</li>
+<li><span class="req-tag must">MUST</span> prove crash safety of the commit path under adversarial <kbd>kill -9</kbd> as a hard correctness gate.</li>
+<li><span class="req-tag should">SHOULD</span> characterize cold-read latency after scale-to-zero to inform idle-timeout and keep-warm tuning.</li>
+</ul>
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> report mean-only latency for any commit-path experiment; the mean hides the tail that decides this architecture.</li>
+<li><span class="req-tag must-not">MUST NOT</span> conflate W1 (latency) and W2 (lanes); they are different bottlenecks with different levers and are measured by different experiments.</li>
+<li><span class="req-tag may">MAY</span> defer OLAP / analytics benchmarking; that is a separate columnar concern (see <a href="12-capabilities.html">Capabilities</a>), not part of OLTP boundary validation.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use the benchmark numbers to justify shipping a workload that fails the Experiment 4 durability gate, regardless of how good its latency looks.</li>
+</ul>
+</section>
+
+<section>
+<h2>The two bottlenecks (do not conflate them)</h2>
+<p>Before any experiment, internalize the distinction. The engine has two independent weak axes. Mixing them is the single most common analysis error, because both feel like "the writes are slow" from the outside while having completely different causes and cures.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Weakness</th><th>Mechanism</th><th>Mitigation that works</th><th>Mitigation that does NOT</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>W1 — commit latency</strong></td>
+<td>each commit = network / S3 round-trip (~ms) instead of a local fsync (~µs)</td>
+<td>group commit / queue + batch; cache serves <em>reads</em></td>
+<td>cache cannot hide <em>commit</em> latency without breaking durability</td>
+</tr>
+<tr>
+<td><strong>W2 — write serialization</strong></td>
+<td>single writer per database (SQLite-lineage ceiling)</td>
+<td>many small DBs = many lanes (sharding)</td>
+<td>batching does NOT add lanes; it only makes one lane's commits cheap</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">Key correction to internalize</p>
+<p>The <strong>queue defeats W1</strong> (latency); the <strong>sharded many-DB design defeats W2</strong> (lanes). They are different levers for different bottlenecks. Batching a single lane never adds lanes; sharding into more lanes never makes one lane's commit cheaper. The only genuinely unsolvable case is <strong>many concurrent writers contending on the same row in the same database</strong> — that tool belongs on coupled Postgres (see <a href="10-hot-row-contention.html">Hot-Row Contention</a>).</p>
+</div>
+<div class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two-axis map of W1 latency versus W2 lanes and which lever applies">
+<rect x="80" y="20" width="560" height="180" fill="none" stroke="currentColor" stroke-width="1.5"/>
+<line x1="360" y1="20" x2="360" y2="200" stroke="currentColor" stroke-width="1" stroke-dasharray="4 4"/>
+<line x1="80" y1="110" x2="640" y2="110" stroke="currentColor" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="200" y="65" text-anchor="middle" font-size="13" fill="currentColor">low contention</text>
+<text x="200" y="82" text-anchor="middle" font-size="13" fill="currentColor">batchable → GREEN</text>
+<text x="200" y="99" text-anchor="middle" font-size="11" fill="currentColor" opacity="0.7">queue beats W1</text>
+<text x="510" y="65" text-anchor="middle" font-size="13" fill="currentColor">many lanes needed</text>
+<text x="510" y="82" text-anchor="middle" font-size="13" fill="currentColor">shard DBs → GREEN</text>
+<text x="510" y="99" text-anchor="middle" font-size="11" fill="currentColor" opacity="0.7">sharding beats W2</text>
+<text x="200" y="150" text-anchor="middle" font-size="13" fill="currentColor">sequential commits</text>
+<text x="200" y="167" text-anchor="middle" font-size="11" fill="currentColor" opacity="0.7">Exp-1 ceiling ~ 1/latency</text>
+<text x="510" y="150" text-anchor="middle" font-size="13" fill="currentColor">same-row, same-DB</text>
+<text x="510" y="167" text-anchor="middle" font-size="13" fill="currentColor">RED → route to Postgres</text>
+<text x="510" y="184" text-anchor="middle" font-size="11" fill="currentColor" opacity="0.7">no lever helps</text>
+<text x="360" y="218" text-anchor="middle" font-size="11" fill="currentColor" opacity="0.7">← W1 axis (latency / batchability) · W2 axis (lanes / contention) →</text>
+</svg>
+<p class="diagram-caption">The two axes are orthogonal. Experiments 1–2 probe the W1 axis; Experiment 3 probes the W2 axis; the red quadrant (same-row, same-DB, high-rate) is where neither lever applies.</p>
+</div>
+<h3>The durability rule</h3>
+<div class="callout danger">
+<p class="callout-title">Non-negotiable</p>
+<p>Never ack a commit from an in-memory buffer before the WAL is durably stored. Caching hides <em>read</em> latency completely; it MUST never hide <em>commit</em> latency, or you get acked-write loss — exactly the failure Experiment 4 is designed to catch. A fast commit path that loses an acked write is disqualifying regardless of its latency numbers.</p>
+</div>
+</section>
+
+<section>
+<h2>Normative requirements</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> capture all latency as percentiles (p50, p99, p999) via an HDR histogram; mean-only reporting is prohibited.</li>
+<li><span class="req-tag must">MUST</span> run Experiment 1 against the real network object store, not a local file backend, since W1 is defined by the round-trip.</li>
+<li><span class="req-tag must">MUST</span> run Experiment 1 (latency floor) and Experiment 2 (group-commit curve) before any throughput claim is made about a tool.</li>
+<li><span class="req-tag must">MUST</span> run Experiment 3 (contention wall) for any tool whose write profile includes repeated updates to a shared row.</li>
+<li><span class="req-tag must">MUST</span> pass Experiment 4 (crash safety) unconditionally before any tool stores real data.</li>
+<li><span class="req-tag should">SHOULD</span> run Experiment 5 (cold read) for any tool that relies on scale-to-zero, and extend it to N concurrent cold starts for high-fan-out deployments.</li>
+<li><span class="req-tag should">SHOULD</span> pin the object-store region, instance type, and engine commit (git SHA + storage backend SHA) in every results record for reproducibility.</li>
+<li><span class="req-tag should">SHOULD</span> repeat each measurement run at least three times and report the median run plus run-to-run spread, to separate engine behavior from cloud noise.</li>
+<li><span class="req-tag may">MAY</span> use TPC-C (via <code>go-tpc</code> or BenchBase) in place of synthetic workloads where a realistic OLTP mix is more informative than an isolated micro-benchmark.</li>
+</ul>
+</section>
+
+<section>
+<h2>Experiment 1 — single-commit latency floor</h2>
+<p><span class="pill red">highest priority</span> This is the foundational measurement. Every other throughput number is read relative to the ceiling this experiment establishes.</p>
+<dl class="fields">
+<dt>What</dt>
+<dd>One transaction, <code>BEGIN; INSERT 1 row; COMMIT</code>, against the <a href="04-object-storage-backend.html">ObjectStorage</a> backend. No concurrency, no batching — a single sequential commit measured in isolation.</dd>
+<dt>Report</dt>
+<dd>The latency distribution — p50, p99, p999. <strong>Not</strong> the average: the tail is what S3 jitter does to you, and the average launders it away.</dd>
+<dt>Variants</dt>
+<dd>Same-region vs cross-region object store, to isolate the network component from engine overhead. Optionally first-write (cold connection) vs steady-state.</dd>
+<dt>Sets</dt>
+<dd>The worst-case ceiling for the sequential-commit quadrant: roughly <code>1 / latency</code> commits per second per lane. If p99 is 10&nbsp;ms, the sequential ceiling is ~100 commits/s per lane.</dd>
+</dl>
+<h3>How to run</h3>
+<p>Server mode (pgwire), built-in percentile reporting:</p>
+<pre data-lang="bash"><code># -c 1: one client (sequential) · -T 60: 60s · -P 1: per-second progress · -r: per-statement latency
+pgbench -c 1 -j 1 -T 60 -P 1 -r -n -f single_commit.sql "postgres://user@host:5432/benchdb"</code></pre>
+<pre data-lang="sql"><code>-- single_commit.sql
+BEGIN;
+INSERT INTO ledger (k, v) VALUES (:client_id || '-' || :scale, 1);
+COMMIT;</code></pre>
+<p>Embedded mode (FFI), a direct micro-loop feeding an HDR histogram so the engine overhead and the S3 round-trip are both inside the timed region:</p>
+<pre data-lang="rust"><code>use hdrhistogram::Histogram;
+let mut hist = Histogram::&lt;u64&gt;::new_with_bounds(1, 60_000_000, 3).unwrap(); // 1µs..60s, 3 sig digits
+let deadline = Instant::now() + Duration::from_secs(60);
+let mut i: u64 = 0;
+while Instant::now() &lt; deadline {
+    let t0 = Instant::now();
+    engine.execute("BEGIN")?;
+    engine.execute(&amp;format!("INSERT INTO ledger(k,v) VALUES ('{i}', 1)"))?;
+    engine.execute("COMMIT")?;            // returns only after WAL durable
+    hist.record(t0.elapsed().as_micros() as u64).unwrap();
+    i += 1;
+}
+println!("p50={}µs p99={}µs p999={}µs",
+    hist.value_at_quantile(0.50), hist.value_at_quantile(0.99), hist.value_at_quantile(0.999));</code></pre>
+<div class="callout note">
+<p class="callout-title">Acceptance for this experiment</p>
+<p>A clean, monotone distribution with a p999 that is a small multiple of p50 (network jitter, not engine stalls). A p999 that is orders of magnitude above p50 signals a stall in the commit path (e.g. a synchronous compaction or a CAS retry storm) that must be investigated before trusting any downstream curve.</p>
+</div>
+</section>
+
+<section>
+<h2>Experiment 2 — group-commit throughput curve</h2>
+<p><span class="pill green">proves W1 is beaten</span> This experiment demonstrates that the queue lever works: that batching independent commits lifts aggregate throughput far above the per-lane Experiment-1 ceiling.</p>
+<dl class="fields">
+<dt>What</dt>
+<dd>Concurrent writers at <strong>1, 2, 4, 8, 16, 32, 64</strong>, with group commit enabled. Each writer inserts <em>independent</em> rows (no row contention).</dd>
+<dt>Report</dt>
+<dd>Throughput (commits/sec) vs writer count. Plot the curve and find the plateau — the point where adding writers stops adding throughput.</dd>
+<dt>Read as</dt>
+<dd>The gap between Experiment-1's implied ceiling (<code>1 / latency</code>) and this plateau is what batching buys. If group commit works, the plateau is <strong>10–100×</strong> the Exp-1 ceiling.</dd>
+</dl>
+<h3>How to run</h3>
+<pre data-lang="bash"><code># sweep N over the writer set; -c N clients, -j N threads, independent rows
+for N in 1 2 4 8 16 32 64; do
+  pgbench -c "$N" -j "$N" -T 60 -r -n -f insert_independent.sql \
+    "postgres://user@host:5432/benchdb" | tee "exp2_N${N}.log"
+done</code></pre>
+<pre data-lang="sql"><code>-- insert_independent.sql — each client writes its own keyspace, zero contention
+\set rowid random(1, 1000000000)
+BEGIN;
+INSERT INTO events (writer, rowid, payload)
+  VALUES (:client_id, :rowid, repeat('x', 64));
+COMMIT;</code></pre>
+<p>For a realistic OLTP mix rather than a synthetic insert, drive TPC-C instead:</p>
+<pre data-lang="bash"><code>go-tpc tpcc --warehouses 16 --threads 32 --time 5m run -H host -P 5432 -D benchdb
+# or BenchBase: java -jar benchbase.jar -b tpcc -c config/tpcc_engine.xml --execute=true</code></pre>
+<div class="callout tip">
+<p class="callout-title">Interpreting the plateau</p>
+<p>The plateau is the engine's sustained group-commit throughput for one database. If the plateau is comfortably above the tool's aggregate write rate, W1 is not a problem for that tool. If the plateau is barely above the Exp-1 ceiling, group commit is not engaging — check that commits are actually being coalesced and not serialized one round-trip at a time.</p>
+</div>
+</section>
+
+<section>
+<h2>Experiment 3 — write contention wall</h2>
+<p><span class="pill amber">proves W2 is the other axis</span> Identical setup to Experiment 2 except all writers hammer the <em>same</em> row. This is the red-quadrant detector.</p>
+<dl class="fields">
+<dt>What</dt>
+<dd>Repeat Experiment 2's writer sweep, but every writer issues the same contended update: <code>UPDATE counter SET n = n + 1 WHERE id = 1</code>.</dd>
+<dt>Report</dt>
+<dd>Throughput vs writer count — expect it to flatten or <em>drop</em> far earlier than Experiment 2, because every writer must serialize behind the previous one's committed value.</dd>
+<dt>Read as</dt>
+<dd>The delta between Experiment 2 (independent) and Experiment 3 (contended) isolates the single-writer serialization cost that batching <strong>cannot</strong> fix. Batching makes one lane's commits cheap; it does not let two writers occupy the same row's lane at once.</dd>
+</dl>
+<h3>How to run</h3>
+<pre data-lang="bash"><code>for N in 1 2 4 8 16 32 64; do
+  pgbench -c "$N" -j "$N" -T 60 -r -n -f update_same_row.sql \
+    "postgres://user@host:5432/benchdb" | tee "exp3_N${N}.log"
+done</code></pre>
+<pre data-lang="sql"><code>-- update_same_row.sql — every client contends on id=1
+BEGIN;
+UPDATE counter SET n = n + 1 WHERE id = 1;
+COMMIT;</code></pre>
+<h3>Then: validate the sharding lever</h3>
+<p>Repeat the contended workload across <strong>N separate databases</strong> (one contended counter each) to confirm that N independent lanes scale linearly. This is the experiment that validates the many-small-DBs design from <a href="01-architecture-overview.html">Architecture</a> and <a href="10-hot-row-contention.html">Hot-Row Contention</a>: per-DB contention stops meaning "everything waits" and starts meaning "only related writes wait."</p>
+<pre data-lang="bash"><code># M databases, each with one writer hammering its own counter — should scale ~linearly
+for M in 1 2 4 8 16 32; do
+  for db in $(seq 1 "$M"); do
+    pgbench -c 1 -j 1 -T 60 -r -n -f update_same_row.sql \
+      "postgres://user@host:5432/shard_${db}" &amp;
+  done
+  wait
+done   # aggregate commits/sec across the M shards is the metric</code></pre>
+<div class="callout warning">
+<p class="callout-title">Red-quadrant signal</p>
+<p>If Experiment 3 (single DB, same row) is flat while the N-database variant scales linearly, the diagnosis is unambiguous: the workload is in the red quadrant <em>only</em> when forced into one DB. Sharding rescues it. If a tool genuinely cannot be sharded — one logical counter that must be globally serialized at high rate — that tool goes to coupled Postgres per the decision rule.</p>
+</div>
+</section>
+
+<section>
+<h2>Experiment 4 — crash safety of the commit path</h2>
+<p><span class="pill red">correctness gate · not speed</span> This experiment is a hard gate. It does not produce a number to optimize; it produces a pass/fail that blocks shipping.</p>
+<dl class="fields">
+<dt>What</dt>
+<dd><kbd>kill -9</kbd> the process at two adversarial points in the commit path:
+  <strong>(a)</strong> after the S3 CAS-append is issued but before the client ack;
+  <strong>(b)</strong> after the client ack but before page materialization.</dd>
+<dt>Verify on restart</dt>
+<dd>Every acked commit is present; no torn or half state; no acked-write loss. An ack is a promise — recovery MUST honor every promise made.</dd>
+<dt>Gate</dt>
+<dd>A fast commit path that loses an acked write under crash is <strong>disqualifying</strong>, regardless of its latency numbers.</dd>
+</dl>
+<h3>The two adversarial windows</h3>
+<div class="diagram">
+<pre>
+  client          engine                 S3-CAS log            page store
+    |   COMMIT       |                        |                     |
+    |--------------&gt;|                        |                     |
+    |               |  CAS-append(WAL) ----&gt;|  (durable)          |
+    |               |                  &lt;-- ack                     |
+    |               |                        |                     |
+    |               |   [crash point a] kill -9 here              |
+    |   ack         |                        |                     |
+    |&lt;--------------|   [crash point b] kill -9 here              |
+    |               |   materialize page ------------------------&gt;|
+    |               |                        |                     |
+  invariant a: a half-issued CAS that was NOT acked may be absent
+  invariant b: any commit the client SAW acked MUST survive restart
+</pre>
+<p class="diagram-caption">Crash point (a) tests that a non-acked, in-flight commit is allowed to disappear cleanly. Crash point (b) tests that an acked commit survives even though page materialization never ran — recovery must replay the WAL.</p>
+</div>
+<h3>How to run</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> use deterministic, seeded crash injection so a failing schedule is reproducible from its seed.</li>
+<li><span class="req-tag should">SHOULD</span> implement a fault-injection wrapper around the object-store client that can fail or pause any GET/PUT/CAS at a chosen sequence number.</li>
+<li><span class="req-tag should">SHOULD</span> tie into the <code>loom</code> / deterministic-simulation testing referenced by the <a href="02-engine-core.html">Engine Core</a> quality plan, exhaustively exploring interleavings around the commit/ack/materialize boundary.</li>
+</ul>
+<pre data-lang="rust"><code>// fault-injection wrapper: deterministically crash after the Nth CAS-append
+struct CrashAfterCas { inner: ObjectStore, fire_at: u64, seq: AtomicU64, mode: CrashMode }
+
+impl ObjectStore for CrashAfterCas {
+    fn cas_append(&amp;self, key: &amp;str, expect: Etag, body: &amp;[u8]) -&gt; Result&lt;Etag&gt; {
+        let n = self.seq.fetch_add(1, Ordering::SeqCst);
+        let r = self.inner.cas_append(key, expect, body)?;   // durable in S3
+        if n == self.fire_at &amp;&amp; self.mode == CrashMode::AfterCasBeforeAck {
+            std::process::abort();   // crash point (a): durable but not yet acked
+        }
+        Ok(r)
+    }
+}
+// Recovery oracle, post-restart:
+//   for every commit whose ack the client observed -&gt; row MUST be readable
+//   no row may exist in a torn/partial state
+//   replaying the WAL from the last durable CAS LSN MUST be idempotent</code></pre>
+<pre data-lang="bash"><code># harness loop: inject, crash, restart, run oracle, assert
+for seed in $(seq 1 500); do
+  CRASH_SEED="$seed" CRASH_MODE="after_cas_before_ack" ./engine-server --db crashdb &amp;
+  ./driver --seed "$seed" --workload commit_storm   # records every ack it sees
+  # process aborts mid-run; restart and verify
+  ./engine-server --db crashdb --recover-only
+  ./oracle --seed "$seed" --assert no-acked-loss --assert no-torn-state || exit 1
+done</code></pre>
+<div class="callout danger">
+<p class="callout-title">Definition of pass</p>
+<p>Across every injected crash point and seed: zero acked-write losses and zero torn states. One failure anywhere is a fail. This gate runs before any tool stores real data — durability is non-negotiable and is checked first, before latency is even discussed.</p>
+</div>
+</section>
+
+<section>
+<h2>Experiment 5 — cold read after scale-to-zero</h2>
+<p><span class="pill blue">informs tuning</span> Scale-to-zero means caches start cold after every idle period. This experiment quantifies that penalty so idle-timeout and keep-warm can be set with data.</p>
+<dl class="fields">
+<dt>What</dt>
+<dd>Warm-cache read vs forced cold read. The cold variant evicts the cache (or starts fresh compute) so the read must hit S3 through the full <a href="05-local-cache.html">cache</a> miss path.</dd>
+<dt>Report</dt>
+<dd>Both distributions — p50 and p99 for warm and for cold — as latency CDFs. The cold p99 is the number a user feels on the first request after idle.</dd>
+<dt>Informs</dt>
+<dd>Idle-timeout (how long to keep compute alive) and keep-warm cadence (how often to ping to avoid the cold path). See <a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a>.</dd>
+</dl>
+<h3>How to run</h3>
+<pre data-lang="bash"><code># warm: prime cache, then measure
+pgbench -c 1 -T 30 -r -n -f point_read.sql "$DSN"            # warm-up + measure
+
+# cold: force eviction / fresh compute before each measured read
+for i in $(seq 1 200); do
+  ./controller --scale-to-zero --db colddb   # tear down, evict cache
+  ./driver --one-read --hdr cold_reads.hdr "$DSN"   # first read after wake = cold
+done</code></pre>
+<pre data-lang="sql"><code>-- point_read.sql
+\set id random(1, 1000000)
+SELECT v FROM ledger WHERE k = :id;</code></pre>
+<h3>Extension: N concurrent cold starts (thundering herd)</h3>
+<div class="callout warning">
+<p class="callout-title">Required for high-fan-out deployments</p>
+<p>Extend Experiment 5 to <strong>N simultaneous cold starts</strong> to find the spin-up saturation point — e.g. 1,000 clients arriving at once after a global idle period. This is the thundering-herd case called out in <a href="11-deployment-targets.html">Deployment Targets</a> and the lifecycle controller in <a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a>. Report the knee of the curve: the concurrency at which cold-start latency degrades non-linearly.</p>
+</div>
+</section>
+
+<section>
+<h2>Harness &amp; tooling</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Concern</th><th>Tool</th><th>Used for</th></tr>
+</thead>
+<tbody>
+<tr><td>Server-mode driver</td><td><code>pgbench</code></td><td>built-in percentile reporting; Exp 1, 2, 3, 5 in server mode</td></tr>
+<tr><td>Realistic OLTP mix</td><td>TPC-C via <code>go-tpc</code> / BenchBase</td><td>Exp 2 (and 3) with a representative transaction profile, not just synthetic inserts</td></tr>
+<tr><td>Embedded-mode driver</td><td>direct FFI micro-loop</td><td>Exp 1 (and contention micro-tests) on the <a href="08-bun-integration.html">embedded</a> path, no wire overhead</td></tr>
+<tr><td>Latency capture</td><td>HDR histogram</td><td>p50/p99/p999 for every experiment; <strong>never mean-only</strong></td></tr>
+<tr><td>Crash injection</td><td>seeded fault-injection wrapper + <code>loom</code></td><td>Exp 4 deterministic crash schedules and interleaving exploration</td></tr>
+</tbody>
+</table>
+</div>
+<h3>Plots to produce</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> produce throughput-vs-concurrency curves for Experiments 2 and 3 (the plateau and the wall, overlaid for the delta).</li>
+<li><span class="req-tag must">MUST</span> produce latency CDFs for Experiments 1 and 5 (the commit floor and the cold/warm split).</li>
+<li><span class="req-tag should">SHOULD</span> overlay same-region vs cross-region CDFs on the Experiment 1 plot to make the network component visible.</li>
+</ul>
+<div class="callout danger">
+<p class="callout-title">Mean-only is banned</p>
+<p>The mean hides the tail that decides this architecture. Every latency figure is a percentile drawn from an HDR histogram. A report that quotes an average commit latency is rejected on sight.</p>
+</div>
+</section>
+
+<section>
+<h2>Configuration knobs under test</h2>
+<p>These are the engine and harness knobs that materially move the experiment outputs. Sweep or pin each explicitly; record the value in every results row.</p>
+<dl class="fields">
+<dt>group_commit_window</dt>
+<dd>Max time the commit queue waits to coalesce independent commits before flushing. Drives the Exp-2 plateau height vs the Exp-1 tail. Larger window = higher throughput, higher per-commit p99.</dd>
+<dt>group_commit_max_batch</dt>
+<dd>Max records per group-commit flush. Caps the batch so a single CAS-append stays bounded.</dd>
+<dt>object_store_region</dt>
+<dd>Same-region vs cross-region; the dominant term in Exp-1 latency. Pin per variant.</dd>
+<dt>cache_size / lfc_size</dt>
+<dd>Shared-buffer and local-file-cache sizing (<a href="05-local-cache.html">Local Cache</a>); governs the warm/cold split in Exp-5 and the miss rate.</dd>
+<dt>idle_timeout</dt>
+<dd>How long compute stays alive before scale-to-zero; the variable Exp-5 is meant to inform.</dd>
+<dt>cas_retry_backoff</dt>
+<dd>Backoff policy on CAS contention at the commit log; affects Exp-3 tail behavior under high writer counts.</dd>
+<dt>writers / clients (-c)</dt>
+<dd>The swept axis for Exp-2 and Exp-3 (1…64).</dd>
+<dt>shard_count</dt>
+<dd>Number of separate databases in the Exp-3 sharding variant; the lane count for the W2 lever.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Failure modes &amp; what each experiment catches</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Symptom in results</th><th>Likely cause</th><th>Caught by</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td>p999 ≫ p50 in single commits</td><td>commit-path stall (sync compaction, CAS retry storm)</td><td>Exp 1</td><td>investigate before trusting any throughput curve</td></tr>
+<tr><td>Exp-2 plateau ≈ Exp-1 ceiling</td><td>group commit not coalescing</td><td>Exp 2</td><td>verify batching is engaged, not 1 round-trip per commit</td></tr>
+<tr><td>Throughput flat from N=1</td><td>workload hitting the same row (W2)</td><td>Exp 3</td><td>shard or route to Postgres</td></tr>
+<tr><td>N-DB variant does NOT scale linearly</td><td>shared resource serializing across DBs (e.g. one log lane)</td><td>Exp 3 sharding</td><td>architectural bug — lanes are not independent</td></tr>
+<tr><td>Acked write missing after crash</td><td>ack before WAL durable (durability-rule violation)</td><td>Exp 4</td><td><strong>block ship</strong> — disqualifying</td></tr>
+<tr><td>Torn / half row after crash</td><td>non-idempotent recovery / partial materialization</td><td>Exp 4</td><td><strong>block ship</strong> — disqualifying</td></tr>
+<tr><td>Cold p99 unacceptable</td><td>cache cold after idle; spin-up cost</td><td>Exp 5</td><td>tune idle_timeout / keep-warm</td></tr>
+<tr><td>Cold latency knee at low N</td><td>thundering-herd spin-up saturation</td><td>Exp 5 (N concurrent)</td><td>cap concurrency / pre-warm pool</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Decision rule (go / no-go, per tool)</h2>
+<p>The output of this plan is a per-tool verdict, applied in order. The platform is not all-or-nothing; each tool is placed on the correct side of the boundary.</p>
+<ol class="reqs">
+<li><span class="req-tag must">STEP 1</span> Run Experiments 1 + 2 first. If p99 single-commit latency is acceptable for the tool's <strong>write frequency</strong>, AND group-commit throughput (the Exp-2 plateau) exceeds the tool's aggregate write rate → <span class="pill green">fits — ship it</span>.</li>
+<li><span class="req-tag should">STEP 2</span> Run Experiment 3. If the tool has heavy <strong>contended</strong> writes (same rows, sequential, cannot batch, cannot shard) → it is in the red quadrant → <span class="pill red">give that one tool coupled Postgres</span>, keep the disaggregated engine for the rest.</li>
+<li><span class="req-tag must">STEP 3</span> Experiment 4 MUST pass unconditionally before any real data → <span class="pill red">durability is non-negotiable</span>. This gate is checked first in practice even though it is stated last; a tool that fails it never ships, no matter its latency.</li>
+</ol>
+<div class="callout success">
+<p class="callout-title">The boundary is measured once, then reused</p>
+<p>Most small / bursty / read-heavy internal tools land green on Steps 1–2. The occasional write-heavy outlier gets a different backend at Step 2. Step 3 gates everyone. Benchmark the boundary once; then route each new tool by comparing its write profile against the curves this plan produced.</p>
+</div>
+</section>
+
+<section>
+<h2>Results-reporting template</h2>
+<p>Every benchmark run records its findings in this table. <code>Target/Gate</code> is set per tool before the run; <code>Verdict</code> follows mechanically from result vs target.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Experiment</th><th>Metric</th><th>Target / Gate</th><th>Result</th><th>Verdict</th></tr>
+</thead>
+<tbody>
+<tr><td>Exp 1 — latency floor</td><td>commit p99 (same-region)</td><td>≤ tool write-interval budget</td><td>&lt;fill&gt; ms</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 1 — latency floor</td><td>commit p999 / p50 ratio</td><td>small multiple (no stalls)</td><td>&lt;fill&gt;×</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 2 — group-commit curve</td><td>plateau commits/sec</td><td>≥ tool aggregate write rate</td><td>&lt;fill&gt; /s</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 2 — group-commit curve</td><td>plateau / Exp-1 ceiling</td><td>10–100× (batching works)</td><td>&lt;fill&gt;×</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 3 — contention wall</td><td>contended throughput vs independent</td><td>understood &amp; acceptable, else shard/route</td><td>&lt;fill&gt;</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 3 — sharding</td><td>N-DB aggregate scaling</td><td>~linear in N</td><td>&lt;fill&gt;</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 4 — crash safety</td><td>acked-write loss</td><td><strong>GATE: zero</strong></td><td>&lt;fill&gt;</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 4 — crash safety</td><td>torn / half state</td><td><strong>GATE: zero</strong></td><td>&lt;fill&gt;</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 5 — cold read</td><td>cold-read p99</td><td>≤ first-request budget</td><td>&lt;fill&gt; ms</td><td><span class="pill build">pending</span></td></tr>
+<tr><td>Exp 5 — herd</td><td>cold-start knee (N)</td><td>≥ expected peak fan-out</td><td>&lt;fill&gt;</td><td><span class="pill build">pending</span></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Dependencies / existing pieces to start from</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> have a working <a href="04-object-storage-backend.html">ObjectStorage</a> backend (S3-CAS commit log + LSM page store) before Exp 1 — the network round-trip is the thing under test.</li>
+<li><span class="req-tag must">MUST</span> have group commit implemented in the <a href="02-engine-core.html">Engine Core</a> commit path before Exp 2.</li>
+<li><span class="req-tag should">SHOULD</span> have the <a href="07-server-mode.html">pgwire server</a> running for <code>pgbench</code> / TPC-C; embedded experiments use the <a href="08-bun-integration.html">FFI</a> path instead.</li>
+<li><span class="req-tag should">SHOULD</span> have the fault-injection wrapper around the object-store client and the <code>loom</code> harness from the Engine Core quality plan available for Exp 4.</li>
+<li><span class="req-tag should">SHOULD</span> have the <a href="06-lifecycle-controller.html">Lifecycle Controller</a> able to scale-to-zero / evict on demand for Exp 5.</li>
+<li><span class="req-tag may">MAY</span> reuse off-the-shelf drivers (<code>pgbench</code>, <code>go-tpc</code>, BenchBase, <code>hdrhistogram</code>) rather than building harnesses — only the crash oracle is bespoke.</li>
+</ul>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> Experiment 4 passes across all adversarial crash points and all seeds with zero acked-write loss and zero torn state. This is the blocking gate.</li>
+<li><span class="req-tag must">MUST</span> Experiments 1–3 have published distributions (p50/p99/p999) and curves, with same-region vs cross-region variants for Exp 1.</li>
+<li><span class="req-tag must">MUST</span> the Exp-3 N-database variant demonstrate near-linear scaling, validating the sharding lever for W2.</li>
+<li><span class="req-tag should">SHOULD</span> Experiment 5 publish warm and cold CDFs plus an N-concurrent-cold-start knee.</li>
+<li><span class="req-tag should">SHOULD</span> every run be reproducible: pinned engine SHA, storage backend SHA, region, instance type, and (for Exp 4) crash seed recorded in the results template.</li>
+<li><span class="req-tag must">MUST</span> a documented go/no-go verdict exist for each tool slated to use the engine, derived by the decision rule from its own runs.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> resolve: what group-commit window best trades Exp-2 plateau against Exp-1 tail for the platform's typical write frequency? Sweep it; it is the central tuning knob.</li>
+<li><span class="req-tag should">SHOULD</span> resolve: does the S3-CAS commit log itself become a cross-DB serialization point in the Exp-3 sharding variant? If lanes do not scale linearly, the bottleneck is architectural, not workload.</li>
+<li><span class="req-tag may">MAY</span> investigate: how much does cross-cloud egress / latency (compute and bucket on different providers, per <a href="11-deployment-targets.html">Deployment Targets</a>) shift the Exp-1 and Exp-5 distributions?</li>
+<li><span class="req-tag may">MAY</span> investigate: the cold-traversal cost of an HNSW vector index over object storage (<a href="12-capabilities.html">Capabilities</a>) — the nastiest cache-miss case — likely warrants a dedicated Exp-5 variant.</li>
+<li><span class="req-tag should">SHOULD</span> track maturity risk: object-storage-native OLTP is an active frontier; re-run this plan against each engine/storage version bump, since the numbers move (see <a href="14-tradeoffs-risks.html">Tradeoffs &amp; Risks</a>).</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">S3-CAS commit log + LSM page store — the system under test for Exp 1–4.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-id">CORE</span><span class="xref-title">Engine Core</span><span class="xref-desc">Group commit, WAL durability rule, and the loom/simulation harness Exp 4 ties into.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention</span><span class="xref-desc">The red-quadrant strategy that Exp 3 detects and routes around.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Warm/cold split measured by Exp 5; the read path that hides S3 latency.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">LIFE</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Scale-to-zero, idle-timeout, and the thundering-herd cold start Exp 5 informs.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode</span><span class="xref-desc">The pgwire listener that pgbench and TPC-C drive against.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Same-region vs cross-region and egress factors that shift the distributions.</span></a>
+<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-id">RISK</span><span class="xref-title">Tradeoffs &amp; Risks</span><span class="xref-desc">The honest tradeoffs (write latency, single writer, cold start) this plan quantifies.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

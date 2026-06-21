@@ -16,7 +16,8 @@
 //! simple query protocol, and the full extended query protocol (Parse / Bind /
 //! Describe / Execute / Sync / Close), with text and binary parameter/result
 //! formats and field-tagged `ErrorResponse`s. SCRAM auth, TLS termination, and
-//! `CancelRequest` are deliberate non-goals for this phase (see `docs/PHASE3.md`).
+//! `CancelRequest` are deliberate non-goals for this phase
+//! (see `pages/specs/phase-3-server.html`).
 
 mod introspect;
 mod protocol;

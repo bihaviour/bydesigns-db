@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Branching · bydesigns-db docs</title>
+<meta name="description" content="Copy-on-write branches in bydesigns-db: an instant LSN pointer over shared immutable layers, write isolation, the embedded API, and the rules and limits.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">BR</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Guide</span>
+</div>
+<h1>Branching</h1>
+<p class="lede">A branch is an instant copy-on-write fork of your database: a cheap LSN pointer over shared immutable layers that sees the base's committed data but writes in complete isolation. Creating one copies no pages, so you can mint dozens of them off a single base and let each diverge only as it writes.</p>
+</header>
+
+<section>
+<h2>What a branch is</h2>
+<p>A branch is not a copy. It is a <strong>cheap LSN pointer over shared immutable layers</strong>: the database's history is already durable and versioned by LSN, so a branch only has to record a parent and a fork point. From that, every read resolves one of two ways:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> a read at or below the fork LSN falls through to the <strong>parent's already-durable history</strong> — shared, immutable bytes that the base and every sibling read too.</li>
+<li><span class="req-tag must">MUST</span> a read above the fork point prefers the branch's <strong>private write overlay</strong>; if the branch has not touched that page, it sees the version visible at the fork point (the parent's at-or-before-base image).</li>
+</ul>
+<p>Because the parent history below the fork is shared and the overlay holds only what the branch has diverged, <strong>creating a branch copies no pages</strong> and adds no storage until the branch's first write. This is implemented at the storage seam as <code>BranchStorage</code> (<code>crates/storage/src/branch.rs</code>), not as an engine special-case — the engine just opens a <code>Database</code> over the composed branch view.</p>
+
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">O(1)</div><div class="metric-label">branch creation</div></div>
+<div class="metric"><div class="metric-value">0</div><div class="metric-label">pages copied</div></div>
+<div class="metric"><div class="metric-value">1</div><div class="metric-label">writer lane per branch</div></div>
+<div class="metric"><div class="metric-value">gap-free</div><div class="metric-label">LSN stream across the fork</div></div>
+</div>
+
+<div class="callout note">
+<p class="callout-title">LSNs stay continuous across the seam</p>
+<p>The overlay assigns its own local LSNs from 1; the branch presents them shifted by the fork LSN, so the engine above sees one gap-free stream — the parent's <code>1..=base</code> followed by the branch's <code>base+1..</code>. Branching never breaks the strictly-monotonic, never-reused LSN invariant.</p>
+</div>
+</section>
+
+<section>
+<h2>Write isolation</h2>
+<p>Branch writes are private by construction. A branch's <code>append_wal</code> and page writes land <strong>only in its own overlay</strong>, which owns the branch's commit log and fence token:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> a branch's writes never touch the base or any sibling branch — copy-on-write produces new layers only; a parent's layers are never mutated by a child write.</li>
+<li><span class="req-tag must">MUST</span> the base and siblings are equally invisible to each other — the base never observes a branch's write, and a write to one branch never fences another. Each branch is an independent single-writer database with its own CAS epoch.</li>
+</ul>
+<div class="callout success">
+<p class="callout-title">Both directions are isolated</p>
+<p>Isolation is symmetric: the branch cannot see uncommitted-on-the-base writes that happen after the fork, and the base cannot see the branch's writes at all. Two branches off one base diverge independently and never collide.</p>
+</div>
+</section>
+
+<section>
+<h2>Create a branch (embedded)</h2>
+<p>From the embedded Bun client, <code>db.branch(name)</code> forks the database at its current committed LSN and returns a <strong>new <code>Database</code></strong> bound to the branch. The returned handle is independent — close it when you are done (or let <code>using</code> dispose it).</p>
+<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+
+using db = open("file://./app.db");
+db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
+db.query("INSERT INTO notes VALUES (?, ?)", [1, "base"]);
+
+// Fork at the base's current committed LSN — copies no pages.
+using preview = db.branch("preview");
+preview.query("INSERT INTO notes VALUES (?, ?)", [2, "branch-only"]);
+
+preview.query("SELECT id, body FROM notes");  // sees row 1 (shared) + row 2 (private)
+db.query("SELECT id, body FROM notes");        // sees only row 1 — the base never saw row 2</code></pre>
+<p>The fork is taken at <code>db.lastLsn</code> — the commit LSN of the last commit on that connection — so the branch starts from exactly the committed state you can observe at branch time. The returned <code>Database</code> behaves like any other: run SQL, prepare statements, open transactions, all against the branch's isolated overlay.</p>
+<div class="callout tip">
+<p class="callout-title">Close branches you open</p>
+<p>A branch handle owns engine resources just like the base handle. Prefer <code>using</code> so it is released deterministically at scope exit; otherwise call <code>.close()</code> when the branch is no longer needed.</p>
+</div>
+</section>
+
+<section>
+<h2>Rules and limits</h2>
+<p>Branching has a deliberately narrow contract. Violations return <code>NULL</code> + an error rather than guessing:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> a branch is taken at the connection's <strong>current committed LSN</strong>. Uncommitted work on the base is not part of the fork.</li>
+<li><span class="req-tag must-not">MUST NOT</span> branch a branch — <strong>branch-of-branch is rejected</strong> (NULL + error). Fork from the base.</li>
+<li><span class="req-tag must-not">MUST NOT</span> branch inside an active transaction — <strong>branching mid-transaction is rejected</strong> (NULL + error). Commit or roll back first, then branch.</li>
+<li><span class="req-tag should">SHOULD</span> treat each branch as its own single-writer database: it gets its own writer lane and fence, so contention on one branch never serializes against another.</li>
+</ul>
+<div class="callout warning">
+<p class="callout-title">Rejections surface as NULL + error</p>
+<p>In the Bun wrapper, an illegal branch call throws an <code>EngineError</code> carrying the engine status; over the C ABI, <code>engine_branch</code> returns a null handle. Check for it rather than assuming success.</p>
+</div>
+</section>
+
+<section>
+<h2>Backend-agnostic by design</h2>
+<p>Branching lives at the storage seam, so the <em>same</em> copy-on-write semantics serve every backend with no per-backend branch logic. Only the overlay's physical home differs:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Backend</th><th>Connection</th><th>Branch overlay</th></tr></thead>
+<tbody>
+<tr><td><code>LocalFileStorage</code></td><td><code>file://</code></td><td>a sibling file alongside the base</td></tr>
+<tr><td><code>ObjectStorage</code></td><td><code>s3://</code> / <code>r2://</code> / <code>gs://</code></td><td>a child key-prefix under the base</td></tr>
+</tbody>
+</table>
+</div>
+<p>Parent and overlay are both <code>dyn Storage</code>, composed by <code>BranchStorage</code>, so the engine and the embedded API are identical regardless of where the bytes live.</p>
+</section>
+
+<section>
+<h2>Use cases</h2>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> <strong>many tools, one base.</strong> Provision one seed database and branch it once per tool; each tool diverges only as it writes, so storage stays near the seed size until tools actually mutate data — branching is the lever that makes "many small databases" affordable.</li>
+<li><span class="req-tag may">MAY</span> <strong>agent memory.</strong> An agent branches its memory to explore a line of work in isolation, then keeps or discards the branch without touching the base.</li>
+<li><span class="req-tag may">MAY</span> <strong>preview &amp; test.</strong> Fork the live data, run a migration or a risky change against the branch, verify, and throw the branch away — the base is never at risk.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="scale-to-zero.html"><span class="xref-id">S0</span><span class="xref-title">Scale-to-zero &amp; lifecycle</span><span class="xref-desc">Branches are orthogonal to running instances — many branches, zero compute at rest.</span></a>
+<a class="xref" href="connect.html"><span class="xref-id">CONN</span><span class="xref-title">Connect to your database</span><span class="xref-desc">URL schemes and choosing a storage backend.</span></a>
+<a class="xref" href="getting-started.html"><span class="xref-id">QS</span><span class="xref-title">Quickstart</span><span class="xref-desc">Build the engine and run your first branch in minutes.</span></a>
+<a class="xref" href="../specs/06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller (spec)</span><span class="xref-desc">The branching model, divergence semantics, and fencing in the design spec.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

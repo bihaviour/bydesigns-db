@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connection pooling · bydesigns-db docs</title>
+<meta name="description" content="Place a transaction-mode pooler (PgBouncer or pgcat) in front of engine-server to absorb serverless connection bursts, with config and the single-writer caveats.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">POOL</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Connect</span>
+</div>
+<h1>Connection pooling</h1>
+<p class="lede">Serverless clients open many short-lived connections; the engine's write path is a single lane per database. A transaction-mode pooler (PgBouncer or pgcat) sits in front of <code>engine-server</code> to absorb the connection burst and multiplex it onto a few backend connections. The pooler is composed in front, never bundled into the server.</p>
+</header>
+
+<section>
+<h2>Why pool</h2>
+<p>Pooling matters only in server mode — the embedded path has no sockets and no pool. Two pressures make a pooler worthwhile in front of <code>engine-server</code>:</p>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> pool when clients are serverless or bursty: each invocation opens a connection, so a spike produces thousands of short-lived connections that would otherwise each hold engine resources (a session, cached statements, a snapshot).</li>
+<li><span class="req-tag should">SHOULD</span> pool to enable scale-to-zero: with idle backends drained, the engine can idle-stop and the storage bytes bill at rest while compute goes to nothing.</li>
+<li><span class="req-tag may">MAY</span> skip pooling for a small, fixed set of long-lived clients — there is no burst to absorb.</li>
+</ul>
+</section>
+
+<section>
+<h2>Use transaction mode</h2>
+<p>Run the pooler in <strong>transaction mode</strong>. It multiplexes <em>N</em> client connections onto a small pool of backend connections, returning a backend to the pool at each transaction boundary (<code>COMMIT</code>/<code>ROLLBACK</code>) rather than pinning it for the client's whole lifetime.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Pool mode</th><th>Backend held for</th><th>Fit here</th></tr></thead>
+<tbody>
+<tr><td>session</td><td>the entire client connection</td><td>Defeats the purpose — bursty clients exhaust backends.</td></tr>
+<tr><td><strong>transaction</strong></td><td>one transaction</td><td>Target. Maximizes reuse under burst; backend returns at commit.</td></tr>
+<tr><td>statement</td><td>one statement</td><td>Breaks multi-statement transactions; too aggressive for OLTP.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>PgBouncer config sketch</h2>
+<p>A minimal transaction-mode PgBouncer in front of <code>engine-server</code>. The client edge absorbs the burst; the backend pool stays small and can drain to zero so the engine idle-stops.</p>
+<pre data-lang="bash"><code># pgbouncer.ini (sketch)
+[databases]
+srv = host=127.0.0.1 port=5433 dbname=srv
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+
+pool_mode           = transaction   # the required mode
+default_pool_size   = 20            # backend conns per (db,user)
+min_pool_size       = 0            # allow scale-to-zero: no idle backends
+max_client_conn     = 5000         # absorb the burst on the client edge
+server_idle_timeout = 30           # drop idle backends → engine can idle-stop</code></pre>
+<p>Clients then connect to the pooler (port <code>6432</code>) instead of the server directly:</p>
+<pre data-lang="bash"><code>psql "host=127.0.0.1 port=6432 user=postgres dbname=srv sslmode=disable"</code></pre>
+<p><strong>pgcat</strong> is the alternative when you also want sharding or load-balancing across many backend nodes; it offers the same transaction pooling plus query routing. Either way the pooler is a separate process — keep it out of <code>engine-server</code>.</p>
+</section>
+
+<section>
+<h2>Transaction-mode caveats</h2>
+<p>In transaction mode a backend is not pinned to a client across transactions, so session-scoped state does not survive between transactions. This is standard PgBouncer guidance and applies unchanged here.</p>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> rely on session-level <code>SET</code>, advisory session locks, <code>LISTEN</code>/<code>NOTIFY</code>, or server-side prepared statements persisting across transactions when pooled in transaction mode.</li>
+<li><span class="req-tag should">SHOULD</span> keep each unit of work inside one transaction so the backend can be returned to the pool cleanly at its boundary.</li>
+<li><span class="req-tag should">SHOULD</span> set <code>min_pool_size = 0</code> and a short <code>server_idle_timeout</code> so idle backends drain and the engine can scale to zero.</li>
+</ul>
+</section>
+
+<section>
+<h2>Pooling does not add write parallelism</h2>
+<p>A pooler multiplies <em>connections</em>, not <em>write lanes</em>. The engine enforces <strong>one writer per database</strong> — writers serialize through a single write lane while readers run concurrently against a snapshot and never block. A pool of 5,000 client connections all writing the same database still serializes at the engine; the pooler only keeps those clients from each tying up a backend.</p>
+<div class="callout warning">
+<p class="callout-title">Single-writer is a deliberate ceiling</p>
+<p>Pooling absorbs connection count, not write contention. Many readers and many independent databases/branches parallelize freely; concurrent writes to one database do not. If a single hot row is the bottleneck, no pool setting fixes it — see <a href="../specs/10-hot-row-contention.html">Hot-row contention</a> for the analysis and the sharding/branching levers that recover write throughput.</p>
+</div>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> spread write load across many databases or branches to recover write lanes — per-DB fan-out is the parallelism lever, not the pool size.</li>
+<li><span class="req-tag may">MAY</span> route reads and writes to the same backend pool; reads attach to a snapshot LSN and do not contend with the single writer.</li>
+</ul>
+</section>
+
+<section>
+<h2>Operational notes</h2>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> terminate TLS at the pooler when exposing the service beyond a trusted network; the server itself serves cleartext (<code>sslmode=disable</code>).</li>
+<li><span class="req-tag should">SHOULD</span> coordinate drain with the pooler on shutdown (pause new backend connections) so clients see graceful reconnects rather than reset sockets.</li>
+<li><span class="req-tag must-not">MUST NOT</span> expect the pooler to buffer writes for durability — a commit is durable only after the engine's WAL append returns; the pooler is a connection multiplexer, not a write cache.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-postgres.html"><span class="xref-id">PG</span><span class="xref-title">Connect with a Postgres client</span><span class="xref-desc">Start the server and connect clients over pgwire.</span></a>
+<a class="xref" href="scale-to-zero.html"><span class="xref-id">S2Z</span><span class="xref-title">Scale-to-zero</span><span class="xref-desc">Idle teardown the pooler's drained backends enable.</span></a>
+<a class="xref" href="../specs/10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-row contention</span><span class="xref-desc">Why single-writer serialization is the limit pooling cannot lift.</span></a>
+<a class="xref" href="../specs/07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The pooler's place in the server-mode architecture.</span></a>
+<a class="xref" href="connect.html"><span class="xref-id">CONN</span><span class="xref-title">Connect to your database</span><span class="xref-desc">The connection model and how to choose a backend.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 3 — Server + pgwire · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">P3 · MAP</span>
+<span class="badge badge-status status-approved">Implemented</span>
+<span class="spec-date">Phase 3</span>
+</div>
+<h1>Phase 3 — Server + pgwire</h1>
+<p class="lede">The implementation map for <code>engine-server</code>: the same engine behind a Postgres-wire listener — a defined pgwire subset that serves either backend by connection string, adding one front door and zero new dependencies.</p>
+</header>
+
+<section>
+<h2>Overview</h2>
+<p>This document maps the implemented code to the Phase 3 deliverables, exit criteria, and Definition of Done in <a href="13-roadmap.html">the roadmap</a> and the <a href="07-server-mode.html">server-mode spec</a>, and records the deliberate scope decisions.</p>
+<p>The Phase-3 claim — <strong>the same engine, a second front door</strong> — holds literally: <code>engine-server</code> links the engine's Rust API unchanged and adds exactly one thing, a Postgres-wire listener. SQL, MVCC, WAL, the C ABI, and the storage seam are all untouched. A <code>file://</code> URL serves the embedded backend; an <code>s3://</code>/<code>r2://</code>/<code>gs://</code> URL serves the Phase-2 disaggregated backend — the listener is oblivious, because it only ever calls <code>Connection</code>. (Verified: psql runs DDL/DML/SELECT against an <code>s3://</code>-backed server, and the durable CAS log segments land on the object floor.)</p>
+</section>
+
+<section>
+<h2>What shipped</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Deliverable (spec 13 §Phase 3 / spec 07)</th><th>Where</th></tr>
+</thead>
+<tbody>
+<tr><td><code>engine-server</code> binary — the engine behind a network listener</td><td><code>crates/server/src/main.rs</code>, <code>lib.rs</code> (thread-per-connection TCP listener)</td></tr>
+<tr><td>Protocol 3.0 startup, SSL/GSS probe handling, trust auth</td><td><code>session.rs::serve</code></td></tr>
+<tr><td>Simple query protocol (<code>Query</code>)</td><td><code>session.rs::simple_query</code></td></tr>
+<tr><td>Extended query protocol (<code>Parse</code>/<code>Bind</code>/<code>Describe</code>/<code>Execute</code>/<code>Sync</code>/<code>Close</code>)</td><td><code>session.rs</code></td></tr>
+<tr><td>Text <strong>and</strong> binary parameter/result formats</td><td><code>types.rs</code> (<code>encode_value</code>/<code>decode_param</code>)</td></tr>
+<tr><td>Field-tagged <code>ErrorResponse</code> with SQLSTATEs (incl. a defined code for fenced/serialization)</td><td><code>session.rs::describe_error</code></td></tr>
+<tr><td>Connect-time introspection answers (<code>version()</code>, <code>SHOW</code>, <code>current_*</code>, <code>SET</code>)</td><td><code>introspect.rs</code></td></tr>
+<tr><td>Hand-rolled wire codec (no new dependencies)</td><td><code>protocol.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The server adds <strong>zero</strong> dependencies (it links only <code>bydesigns-engine</code>) and the only engine-side change is additive and Rust-API-only: <code>ResultSet</code> gained a <code>types</code> field and <code>Statement</code> a <code>column_type</code> accessor, so the server can report accurate type OIDs. The C ABI (<code>engine.h</code>) and <code>ENGINE_ABI_VERSION</code> are unchanged.</p>
+</section>
+
+<section>
+<h2>Exit criteria → evidence</h2>
+<ul>
+<li><strong>Serve a connection from Bun.sql and from pgbench with no client-side adapter.</strong> Verified live in this environment:
+<ul>
+<li><strong>psql</strong> (libpq): <code>CREATE</code>/<code>INSERT</code>/<code>SELECT</code> round-trip with correct command tags and output, over both <code>file://</code> and <code>s3://</code> backends.</li>
+<li><strong>Bun.sql</strong>: connects, runs parameterized queries (<code>… WHERE id = $1</code>) via the extended protocol, returns correct rows.</li>
+<li><strong>pgbench</strong>: low-contention run, <strong>0 failed transactions</strong> in both <code>simple</code> and <code>-M extended</code> modes.</li>
+</ul>
+</li>
+<li><strong>Re-run Experiment 2 (group-commit throughput) in server mode.</strong> <code>pgbench</code> sustains hundreds of tps end-to-end through the wire protocol with zero failures when contention is spread across many rows.</li>
+<li><strong>Experiment 3 (write-contention wall) over the wire.</strong> With many clients hammering a few rows, the engine's first-committer-wins check surfaces as <code>40001</code> serialization failures over the protocol — the same red-quadrant behavior the embedded engine exhibits, now observable through the listener.</li>
+<li><strong>Same engine, two front doors.</strong> The listener calls <code>Connection::{open, query, prepare, …}</code> — the identical entry points <code>bun:ffi</code> drives in-process. No engine fork; an <code>s3://</code> URL transparently serves the disaggregated backend.</li>
+</ul>
+<p>In-process protocol tests (<code>crates/server/tests/wire.rs</code>) cover the simple path, NULL handling, introspection, error-then-recover, and the extended path with a bound parameter — all driven by a minimal in-test pg client over a real socket.</p>
+</section>
+
+<section>
+<h2>Architecture decisions (and why)</h2>
+<ul>
+<li><strong>Hand-rolled framing, zero new deps.</strong> Spec 07 SHOULD-suggests starting from the <code>pgwire</code> crate; the project rule is minimal, deliberate dependencies (it hand-rolls the WAL codec, base64, and the object codecs). The supported subset is small and the message shapes follow the protocol exactly, so hand-rolling keeps the dependency surface at zero with full control. Documented deviation.</li>
+<li><strong>Thread per connection.</strong> The engine is synchronous and single-writer-per-DB; a thread per connection matches that model with no async runtime. A transaction-mode pooler (PgBouncer/pgcat) in front absorbs serverless connection bursts (spec 07) — deliberately <em>not</em> bundled into the server.</li>
+<li><strong><code>Describe</code> materializes once.</strong> Our engine learns a query's columns by executing it, so a portal <code>Describe</code> runs the statement once and caches the result; the following <code>Execute</code> reuses it — a DML statement is never run twice. A statement <code>Describe</code> (which Bun.sql uses) dummy-runs a <em>SELECT</em> with NULL params to learn its columns (side-effect-free); a DML statement returns <code>NoData</code> (it is never executed at describe time).</li>
+<li><strong>Type OIDs from declared column types.</strong> <code>ResultSet.types</code> carries each column's catalog type, so <code>RowDescription</code> reports accurate OIDs even for an empty result. <code>INTEGER</code> maps to <code>int8</code> (the engine stores 64-bit integers); like node-postgres, Bun returns <code>bigint</code> as a string to preserve precision — faithful Postgres <code>bigint</code> behavior, not a defect.</li>
+</ul>
+</section>
+
+<section>
+<h2>Deliberate Phase-3 boundaries (documented, not accidental)</h2>
+<ul>
+<li><strong>Trust auth only; TLS terminates out-of-process.</strong> SSL/GSS probes are declined (<code>N</code>) and the client proceeds cleartext; SCRAM-SHA-256 and in-process TLS are spec 07 SHOULDs deferred to a hardening pass. Put a TLS-terminating proxy / pooler in front for untrusted networks. No credentials live in the repo.</li>
+<li><strong>One server, one database URL (<code>--db</code>).</strong> The startup <code>database</code> field is accepted but the listener serves the configured backend; per-database routing (mapping the startup database to a backend URL / branch) is a controller-era refinement (Phase 4).</li>
+<li><strong><code>COPY</code> and <code>CancelRequest</code> are not implemented.</strong> <code>pgbench -i</code> uses <code>COPY</code> for bulk load, so seed tables with <code>INSERT</code> (or <code>psql -f</code>); the benchmark scripts themselves run fine. <code>COPY</code> is a spec 07 MAY ("not required for the initial client set").</li>
+<li><strong>Introspection is a pragmatic subset.</strong> The handshake queries real clients issue (<code>version()</code>, <code>current_schema/database/user</code>, <code>SHOW</code>, <code>SET</code>) are answered; deep <code>pg_catalog</code> / <code>information_schema</code> introspection (psql's <code>\d</code>, full PostgREST schema reflection) is not. PostgREST itself was not exercised here.</li>
+<li><strong>Statement-<code>Describe</code> row types.</strong> A statement <code>Describe</code> reports accurate OIDs from the engine's declared column types; a portal <code>Describe</code> (after <code>Bind</code>) additionally reflects materialized-row inference. Both paths are implemented.</li>
+</ul>
+</section>
+
+<section>
+<h2>Running</h2>
+<pre data-lang="bash"><code>cargo build -p bydesigns-server --release      # target/release/engine-server
+engine-server --listen 127.0.0.1:5433 --db file://./srv.db        # embedded
+engine-server --listen 127.0.0.1:5433 --db s3://bucket/mydb       # disaggregated
+
+# any standard Postgres client connects (sslmode=disable — cleartext):
+psql "host=127.0.0.1 port=5433 user=app dbname=app sslmode=disable"
+#  Bun:  new SQL("postgres://app@127.0.0.1:5433/app?sslmode=disable")
+#  pgbench -n -f script.sql -T 5 -c 8 "host=127.0.0.1 port=5433 user=app dbname=app sslmode=disable"
+
+cargo test -p bydesigns-server                 # in-process wire protocol tests</code></pre>
+<p>Set <code>BYDESIGNS_WIRE_DEBUG=1</code> to trace startup parameters and each frontend message (off by default).</p>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The listener, the pgwire subset, and pooler guidance this map implements as <code>engine-server</code>.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">The <code>Bun.sql</code> client path unlocked by speaking the Postgres wire protocol.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">PostgREST and other tools that attach in front of server mode for free.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The phased plan whose Phase 3 deliverables and server-mode gates this map implements.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db — internal development specification. Implementation map.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

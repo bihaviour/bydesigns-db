@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect to your database · bydesigns-db docs</title>
+<meta name="description" content="The bydesigns-db connection model: URL schemes, embedded vs server access, connection-string anatomy, and how to choose a storage backend.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">CONN</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Connect</span>
+</div>
+<h1>Connect to your database</h1>
+<p class="lede">There is one engine and two ways to reach it — embedded (in-process) or server (over the Postgres wire protocol) — and one connection string decides where it durably writes. This page explains the connection model so the rest of the Connect section is just detail.</p>
+</header>
+
+<section>
+<h2>Two front doors, one engine</h2>
+<p>Pick how your application talks to the engine. The choice is about <em>access shape</em>, not about a different database:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Mode</th><th>How you connect</th><th>Best for</th><th>Latency</th></tr></thead>
+<tbody>
+<tr><td><strong>Embedded</strong></td><td>Link the native library; call it over the C ABI (<code>bun:ffi</code> / <code>@yourdb/bun</code>)</td><td>A single app that owns the database; edge / offline; lowest latency</td><td>Function call (no socket)</td></tr>
+<tr><td><strong>Server</strong></td><td>Connect a Postgres client to <code>engine-server</code> over the wire protocol</td><td>Multiple clients; existing Postgres tooling; REST via PostgREST</td><td>Network round-trip</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout tip">
+<p class="callout-title">Server mode is the same library, wrapped</p>
+<p>The server is the embedded engine behind a network listener — there is no second engine. You can develop embedded and deploy as a server (or vice versa) without changing your SQL or your data.</p>
+</div>
+</section>
+
+<section>
+<h2>The connection string selects the backend</h2>
+<p>Both modes open the database with a URL whose <strong>scheme</strong> selects the durable storage backend. Unknown schemes are rejected — never silently defaulted.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Scheme</th><th>Backend</th><th>What it gives you</th></tr></thead>
+<tbody>
+<tr><td><code>file://path/to.db</code></td><td><code>LocalFileStorage</code></td><td>Pure-embedded, zero network. Dev, offline, edge, single-node.</td></tr>
+<tr><td><code>s3://bucket/db</code></td><td rowspan="3"><code>ObjectStorage</code><br>(LSM + S3-CAS log)</td><td rowspan="3">Storage-disaggregated and scale-to-zero. Durability bottoms out on object storage; the local cache keeps reads off the network hot path.</td></tr>
+<tr><td><code>r2://bucket/db</code></td></tr>
+<tr><td><code>gs://bucket/db</code></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout note">
+<p class="callout-title">Same binary, no rebuild</p>
+<p>Switching from <code>file://</code> to <code>s3://</code> is a connection-string change, not a recompile. The engine and the C ABI are unchanged; only the backend behind the storage seam differs.</p>
+</div>
+</section>
+
+<section>
+<h2>Connection-string anatomy</h2>
+<p>Embedded callers pass the URL to <code>open()</code>. Server callers use a standard Postgres URI pointing at the listener; the server itself was started with the storage URL.</p>
+<pre data-lang="ts"><code>// Embedded — the storage URL is the connection string
+open("file://./local.db");
+open("s3://my-bucket/app");      // bucket credentials come from the environment</code></pre>
+<pre data-lang="bash"><code># Server — start it with the storage URL, connect with a Postgres URI
+cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db s3://my-bucket/app
+psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
+</section>
+
+<section>
+<h2>Choosing a backend</h2>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> use <code>file://</code> for development, tests, examples, embedded single-node apps, and edge/offline use — it needs no infrastructure and keeps the hot path entirely in-process.</li>
+<li><span class="req-tag should">SHOULD</span> use <code>s3://</code> / <code>r2://</code> / <code>gs://</code> when you want disaggregated durability and scale-to-zero: stateless compute that idles to nothing while only object-storage bytes bill at rest.</li>
+<li><span class="req-tag may">MAY</span> prefer Cloudflare R2 (<code>r2://</code>) where egress cost matters — a cold cache reads from object storage, and R2's zero egress makes those misses structurally cheaper.</li>
+</ul>
+</section>
+
+<section>
+<h2>Security</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> keep real bucket credentials in the environment, never in code, tests, or examples — those use <code>file://</code> only.</li>
+<li><span class="req-tag must">MUST</span> treat the connection string as configuration: it determines durability and single-writer fencing, both of which are security properties of the engine.</li>
+</ul>
+</section>
+
+<section>
+<h2>Where to next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-bun.html"><span class="xref-id">BUN</span><span class="xref-title">Connect from Bun (embedded)</span><span class="xref-desc">The full embedded API over <code>bun:ffi</code>.</span></a>
+<a class="xref" href="connect-postgres.html"><span class="xref-id">PG</span><span class="xref-title">Connect with a Postgres client</span><span class="xref-desc"><code>psql</code>, <code>Bun.sql</code>, drivers, PostgREST.</span></a>
+<a class="xref" href="connection-pooling.html"><span class="xref-id">POOL</span><span class="xref-title">Connection pooling</span><span class="xref-desc">Absorb serverless connection bursts.</span></a>
+<a class="xref" href="branching.html"><span class="xref-id">BR</span><span class="xref-title">Branching</span><span class="xref-desc">Connect to a copy-on-write fork.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

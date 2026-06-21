@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scale-to-zero &amp; lifecycle · bydesigns-db docs</title>
+<meta name="description" content="How bydesigns-db idles stateless compute to nothing on an object-storage backend: the lifecycle controller's state machine, cold-start budget, lease heartbeat, keep-warm, and the cost trade-off.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">S0</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Guide</span>
+</div>
+<h1>Scale-to-zero &amp; lifecycle</h1>
+<p class="lede">On an object-storage backend the engine's compute is stateless, so it can idle all the way to nothing — only the bytes in object storage bill at rest. The <code>bydesigns-controller</code> turns that into an elastic service: cold-start on first connection, scale to zero when idle, and survive a burst of simultaneous wakeups.</p>
+</header>
+
+<section>
+<h2>The idea</h2>
+<p>Scale-to-zero rests on one invariant: <strong>compute is stateless — all durable state lives in object storage</strong> behind the <code>Storage</code> seam. A warm instance is just a cache plus a CPU; destroying it loses nothing durable, so the controller is free to stop the engine whenever a database is idle and reconstruct an equivalent instance on the next connection.</p>
+
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">$0</div><div class="metric-label">compute cost at rest</div></div>
+<div class="metric"><div class="metric-value">bytes</div><div class="metric-label">only object storage bills idle</div></div>
+<div class="metric"><div class="metric-value">start + warm</div><div class="metric-label">cold-start cost</div></div>
+<div class="metric"><div class="metric-value">1</div><div class="metric-label">writer lease per DB</div></div>
+</div>
+
+<div class="callout warning">
+<p class="callout-title">Scale-to-zero needs an <code>s3://</code> backend</p>
+<p>Idling compute to nothing requires storage disaggregation: durability must bottom out on object storage so that stopping the engine loses nothing. A pure-embedded <code>file://</code> app has no disaggregation — its durable state is a local file the process owns, so there is nothing to scale <em>to</em>. Use <code>s3://</code>, <code>r2://</code>, or <code>gs://</code> for scale-to-zero.</p>
+</div>
+</section>
+
+<section>
+<h2>The lifecycle controller</h2>
+<p>The <code>bydesigns-controller</code> crate is a thin, stateless supervisor. It composes the engine's existing primitives rather than reimplementing them: opening a <code>Database</code> acquires the writer fence and replays the WAL — that <em>is</em> the cache warm — and dropping it releases the fence. On top of that the controller adds the state machine, an idle-timeout reaper, a lease heartbeat, and thundering-herd handling.</p>
+
+<div class="callout note">
+<p class="callout-title">The controller owns no durable state</p>
+<p>Every durable byte lives in object storage behind the storage seam. The controller holds only in-memory lifecycle bookkeeping; it is restartable and replaceable, and reconstructs from storage. It is never on the data path — it supervises instances, it does not proxy SQL.</p>
+</div>
+
+<div class="diagram">
+<pre>
+  Cold ──start──▶ Warming ──opened──▶ Active ──no work──▶ Idle ──timeout──▶ Stopping
+   ▲                 │  (open fails)       ▲     │                              │
+   │                 ▼                     └─────┘  (new connection re-activates)│
+   └─────────────────┴───────────────────────────────────────────────────────────┘
+                                  (Stopping always lands back in Cold)
+</pre>
+<p class="diagram-caption">Cold → Warming → Active → Idle → Stopping → Cold. A new connection pulls an Idle instance back to Active; a failed warm returns cleanly to Cold; Stopping releases the fence and lands back in Cold.</p>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>State</th><th>Meaning</th><th>Leaves to</th></tr></thead>
+<tbody>
+<tr><td><strong>Cold</strong></td><td>No process. Only object-storage bytes bill at rest.</td><td>Warming (on first connection)</td></tr>
+<tr><td><strong>Warming</strong></td><td>Cold-starting: handle open + fence acquire + WAL replay (cache warm).</td><td>Active (opened) / Cold (open fails)</td></tr>
+<tr><td><strong>Active</strong></td><td>Serving connections; cache warm; writer lease held.</td><td>Idle (no active leases)</td></tr>
+<tr><td><strong>Idle</strong></td><td>Warm but with zero active connections; lease still heartbeat.</td><td>Active (new connection) / Stopping (idle timeout)</td></tr>
+<tr><td><strong>Stopping</strong></td><td>Tearing down: drop the handle so the engine releases the fence.</td><td>Cold</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Cold start</h3>
+<p>A cold start is exactly: <strong>process start + cache warm + fence acquire + WAL replay</strong>. In the controller these collapse into one step — <code>Database::open(url)</code> acquires the single-writer fence and replays the durable WAL, which is what warms the instance. The dominant tail term is cache warm: the first reads after a cold start miss the local cache and fall through to object storage, so a large random working set is the worst case.</p>
+
+<h3>Idle reaper</h3>
+<p>A background reaper runs every <code>reap_interval</code>. For each warm instance with no active leases it moves Active → Idle, and once an instance has sat Idle past <code>idle_timeout</code> (and <code>keep_warm</code> is off) it tears the handle down — Stopping → Cold — releasing the fence. The lifecycle and heartbeat threads live in the controller, deliberately <strong>not</strong> in the embedded engine core, which stays thread-free so embedders own their own scheduling.</p>
+
+<h3>Single-writer lease heartbeat</h3>
+<p>The writer lease is durable and fenced by a monotonic CAS epoch. The reaper heartbeats it for every warm instance (Active or Idle) by calling <code>Database::renew_lease()</code>; if a renewal fails — the instance has been fenced by a newer writer — the controller treats it as fatal, drops the handle, and returns the instance to Cold. Split-brain is impossible by construction: only one CAS epoch wins each append, so a stalled writer's appends are simply rejected.</p>
+
+<h3>Keep-warm &amp; thundering-herd admission</h3>
+<p>Two mechanisms bound the cold-start tail under load:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> <strong>dedupe:</strong> N concurrent <code>start</code> calls for one cold database trigger exactly one Warming transition; the rest wait on that single warm rather than each spawning a process.</li>
+<li><span class="req-tag should">SHOULD</span> <strong>admit under a cap:</strong> a bounded warm-admission semaphore (<code>max_concurrent_warms</code>) limits how many <em>distinct</em> databases warm at once, so a herd of many cold databases cannot saturate CPU or the object store's request budget.</li>
+<li><span class="req-tag may">MAY</span> <strong>keep warm:</strong> with <code>keep_warm</code> on, idle instances stay resident past <code>idle_timeout</code> to cut post-idle latency for latency-critical, low-traffic databases.</li>
+</ul>
+</section>
+
+<section>
+<h2>The cost trade-off</h2>
+<p>Scale-to-zero trades a cold-start tail for zero idle compute. The single knob with the most leverage is <code>idle_timeout</code>:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Workload shape</th><th>idle_timeout</th><th>keep_warm</th></tr></thead>
+<tbody>
+<tr><td>Bursty, recurring (every few minutes)</td><td>longer</td><td>off</td></tr>
+<tr><td>Latency-critical, low traffic</td><td>moderate</td><td>on</td></tr>
+<tr><td>Truly rare / archival</td><td>short (default 30 s)</td><td>off</td></tr>
+<tr><td>Predictable spike (deploy / cron)</td><td>default</td><td>pre-warm ahead</td></tr>
+</tbody>
+</table>
+</div>
+<p>Too short an <code>idle_timeout</code> pays the cold-start tax repeatedly on bursty-but-recurring traffic; too long wastes compute and defeats scale-to-zero. Tune it against each database's inter-arrival distribution, and reach for <code>keep_warm</code> only where the cold-start tail actually hurts.</p>
+<div class="callout tip">
+<p class="callout-title">Stopping is never a stopped commit</p>
+<p>Scale-to-zero never compromises durability. The controller stops an <em>idle</em> engine, never a commit: an instance only tears down once it has no active leases, and the engine's <code>append_wal</code> is durable before any commit is acked. Dropping the warm handle releases the fence cleanly for the next writer.</p>
+</div>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="connect.html"><span class="xref-id">CONN</span><span class="xref-title">Connect to your database</span><span class="xref-desc">Pick the <code>s3://</code> backend that makes scale-to-zero possible.</span></a>
+<a class="xref" href="branching.html"><span class="xref-id">BR</span><span class="xref-title">Branching</span><span class="xref-desc">Many branches can exist with zero running instances — branches are orthogonal to lifecycle.</span></a>
+<a class="xref" href="getting-started.html"><span class="xref-id">QS</span><span class="xref-title">Quickstart</span><span class="xref-desc">Go disaggregated with a one-line connection-string change.</span></a>
+<a class="xref" href="../specs/06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller (spec)</span><span class="xref-desc">The full state machine, fencing, and thundering-herd model in the design spec.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

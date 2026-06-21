@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documentation · bydesigns-db</title>
+<meta name="description" content="User documentation for bydesigns-db: connect from Bun or a Postgres client, branch your data, scale to zero, and operate the engine.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">DOCS</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">bydesigns-db v0.2</span>
+</div>
+<h1>Documentation</h1>
+<p class="lede">Everything you need to use bydesigns-db — open a database with a connection string, embed it in your app or run it as a Postgres-wire server, branch your data copy-on-write, and let it scale to zero. New here? Start with the <a href="getting-started.html">Quickstart</a>.</p>
+</header>
+
+<section>
+<h2>How bydesigns-db is delivered</h2>
+<p>There is <strong>one engine</strong> and you reach it through one of two front doors. The backend it durably writes to is chosen by the <em>connection string</em>, not by a rebuild.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>You want…</th><th>Use</th><th>Backend by URL</th></tr></thead>
+<tbody>
+<tr><td>In-process, function-call latency (one app)</td><td><strong>Embedded</strong> via <code>bun:ffi</code> / the C ABI</td><td><code>file://</code> (local) or <code>s3://</code> (disaggregated)</td></tr>
+<tr><td>Multi-client access / existing Postgres tools</td><td><strong>Server</strong> via the Postgres wire protocol</td><td><code>file://</code> or <code>s3://</code>/<code>r2://</code>/<code>gs://</code></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout tip">
+<p class="callout-title">The one thing to remember</p>
+<p>The storage backend is selected purely by the URL scheme passed at open time. <code>file://</code> is pure-embedded with zero network; <code>s3://</code> / <code>r2://</code> / <code>gs://</code> is storage-disaggregated and scale-to-zero. The engine, the C ABI, and your SQL are identical either way.</p>
+</div>
+</section>
+
+<section>
+<h2>Browse the docs</h2>
+<div class="doc-card-grid">
+<a class="doc-card" href="getting-started.html">
+<div class="ic">⚡</div><h3>Quickstart</h3>
+<p>Build the library, open your first embedded database, run SQL, and start a server — in a few minutes.</p>
+</a>
+<a class="doc-card" href="connect.html">
+<div class="ic">🔌</div><h3>Connect to your database</h3>
+<p>The connection model: URL schemes, embedded vs server, and how to choose a backend.</p>
+</a>
+<a class="doc-card" href="connect-bun.html">
+<div class="ic">📦</div><h3>Connect from Bun</h3>
+<p>Use the <code>@yourdb/bun</code> wrapper over <code>bun:ffi</code> — open, query, parameter-bind, transact, and branch.</p>
+</a>
+<a class="doc-card" href="connect-postgres.html">
+<div class="ic">🐘</div><h3>Connect with a Postgres client</h3>
+<p>Point <code>psql</code>, <code>Bun.sql</code>, drivers, or PostgREST at the engine-server over the wire protocol.</p>
+</a>
+<a class="doc-card" href="connection-pooling.html">
+<div class="ic">🪣</div><h3>Connection pooling</h3>
+<p>Absorb serverless connection bursts with PgBouncer / pgcat in transaction mode.</p>
+</a>
+<a class="doc-card" href="branching.html">
+<div class="ic">🌿</div><h3>Branching</h3>
+<p>Fork a database in O(1) as a copy-on-write branch; writes diverge in isolation from the base.</p>
+</a>
+<a class="doc-card" href="scale-to-zero.html">
+<div class="ic">💤</div><h3>Scale-to-zero &amp; lifecycle</h3>
+<p>Cold-start on first connection, idle teardown, lease heartbeat, and keep-warm — how compute idles to nothing.</p>
+</a>
+<a class="doc-card" href="sql-reference.html">
+<div class="ic">📄</div><h3>SQL reference</h3>
+<p>The supported SQL surface: DDL, DML, queries, transactions, types, and parameters.</p>
+</a>
+<a class="doc-card" href="c-abi.html">
+<div class="ic">🔧</div><h3>C ABI reference</h3>
+<p>The frozen embedding contract every runtime binds to — open, exec, query, prepare, transactions.</p>
+</a>
+</div>
+</section>
+
+<section>
+<h2>Looking for design intent?</h2>
+<p>This section is the <em>user</em> documentation. If you want to understand how and why the engine is built the way it is — the storage seam, MVCC, the S3-CAS commit log, the lifecycle controller — read the <a href="../specs/index.html">Development Guidelines</a> (the fourteen design specifications and per-phase implementation maps). To see what has shipped and what is next, see <a href="../release/index.html">Releases &amp; Roadmap</a>.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

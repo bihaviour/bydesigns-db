@@ -28,7 +28,7 @@
 //! machinery is a *derived read cache* over the log; losing it loses nothing,
 //! because recovery replays the durable log forward to rebuild it.
 //!
-//! ## Phase-2 boundaries (deliberate, see `docs/PHASE2.md`)
+//! ## Phase-2 boundaries (deliberate, see `pages/specs/phase-2-object-storage.html`)
 //!
 //! * The async [`ObjectStore`] futures are driven to completion synchronously
 //!   under the backend's lock (via the crate `block_on`), mirroring the
