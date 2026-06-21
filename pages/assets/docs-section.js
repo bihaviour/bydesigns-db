@@ -18,6 +18,7 @@ window.SECTION = {
     { label: "Guides", items: [
       { file: "branching.html",     id: "BR", title: "Branching" },
       { file: "scale-to-zero.html", id: "S0", title: "Scale-to-zero & lifecycle" },
+      { file: "hot-row.html",       id: "HOT", title: "Hot-row contention" },
     ]},
     { label: "Reference", items: [
       { file: "sql-reference.html", id: "SQL", title: "SQL reference" },

@@ -9,8 +9,7 @@
 
 > DB Management System with separated process and storage layer. Built on Rust, and compatible with PostgreSQL.
 
-The repository holds both the development
-specifications and a working Rust implementation: the embeddable `libengine`
+The repository a working Rust implementation: the embeddable `libengine`
 with a frozen C ABI, the pluggable `Storage` trait with `LocalFileStorage`
 (`file://`) and `ObjectStorage` (`s3://`/`r2://`/`gs://`) backends, MVCC snapshot
 isolation, crash-safe WAL durability + replay, an `engine-server` that speaks a

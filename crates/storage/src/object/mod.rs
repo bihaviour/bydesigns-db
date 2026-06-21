@@ -41,10 +41,12 @@
 //!   for cutting LIST cost at scale, not a correctness requirement here.
 
 mod codec;
+mod fault;
 mod fs;
 mod mem;
 mod store;
 
+pub use fault::{FaultKind, FaultMode, FaultObjectStore, FaultPlan};
 pub use fs::FsObjectStore;
 pub use mem::MemObjectStore;
 pub use store::{ETag, GetResult, ObjectError, ObjectStore};

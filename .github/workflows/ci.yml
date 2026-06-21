@@ -91,6 +91,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Durability gate (spec 09 Experiment 4 / spec 14 R-02): every acked commit
+      # must survive crash injection with no torn/half state. This is the hard,
+      # non-negotiable gate that runs before any tool stores real data — kept as an
+      # explicit, named step so a regression is unmissable in the CI log.
+      - name: Durability gate — Experiment 4 crash safety
+        run: cargo test -p twill-storage --test crash_safety
       - name: cargo test (workspace)
         run: cargo test --workspace --all-targets
       - name: Build release libengine

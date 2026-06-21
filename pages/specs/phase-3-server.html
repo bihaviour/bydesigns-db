@@ -67,6 +67,7 @@
 <li><strong>Same engine, two front doors.</strong> The listener calls <code>Connection::{open, query, prepare, …}</code> — the identical entry points <code>bun:ffi</code> drives in-process. No engine fork; an <code>s3://</code> URL transparently serves the disaggregated backend.</li>
 </ul>
 <p>In-process protocol tests (<code>crates/server/tests/wire.rs</code>) cover the simple path, NULL handling, introspection, error-then-recover, and the extended path with a bound parameter — all driven by a minimal in-test pg client over a real socket.</p>
+<p>The benchmark harness also drives the server path directly: <code>twill-bench --transport pgwire</code> runs Experiments 1–3 over the wire through a small in-crate pg client (<code>crates/bench/src/pgclient.rs</code>), either against a running <code>engine-server</code> (<code>--server HOST:PORT</code>) or — with neither flag — an in-process listener it spins up itself. That keeps the server-path experiments reproducible without external Postgres tooling and gives a CI-checked gate (<code>crates/bench/tests/pgwire.rs</code>) that a <code>40001</code> conflict is classified and retried over the wire and that a contended counter loses no update; <code>pgbench</code> / TPC-C remain the off-the-shelf drivers for real-host numbers.</p>
 </section>
 
 <section>
@@ -101,7 +102,12 @@ psql "host=127.0.0.1 port=5433 user=app dbname=app sslmode=disable"
 #  Bun:  new SQL("postgres://app@127.0.0.1:5433/app?sslmode=disable")
 #  pgbench -n -f script.sql -T 5 -c 8 "host=127.0.0.1 port=5433 user=app dbname=app sslmode=disable"
 
-cargo test -p twill-server                 # in-process wire protocol tests</code></pre>
+cargo test -p twill-server                 # in-process wire protocol tests
+
+# benchmark the server path (spins up an in-process listener on the --url backend):
+cargo run -p twill-bench --release -- exp2 --transport pgwire --url file://./srv.db --writers 8
+# …or drive a running engine-server:
+cargo run -p twill-bench --release -- exp2 --server 127.0.0.1:5433 --url file://./srv.db --writers 8</code></pre>
 <p>Set <code>TWILL_WIRE_DEBUG=1</code> to trace startup parameters and each frontend message (off by default).</p>
 </section>
 

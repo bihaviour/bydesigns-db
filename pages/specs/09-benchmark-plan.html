@@ -339,9 +339,9 @@ SELECT v FROM ledger WHERE k = :id;</code></pre>
 <tr><th>Concern</th><th>Tool</th><th>Used for</th></tr>
 </thead>
 <tbody>
-<tr><td>Server-mode driver</td><td><code>pgbench</code></td><td>built-in percentile reporting; Exp 1, 2, 3, 5 in server mode</td></tr>
+<tr><td>Server-mode driver</td><td><code>twill-bench --transport pgwire</code> · <code>pgbench</code></td><td>Exp 1, 2, 3 over the <a href="07-server-mode.html">pgwire</a> path with HDR percentiles; the in-crate driver needs no external Postgres tooling (and is CI-gated), <code>pgbench</code> for real-host runs</td></tr>
 <tr><td>Realistic OLTP mix</td><td>TPC-C via <code>go-tpc</code> / BenchBase</td><td>Exp 2 (and 3) with a representative transaction profile, not just synthetic inserts</td></tr>
-<tr><td>Embedded-mode driver</td><td>direct FFI micro-loop</td><td>Exp 1 (and contention micro-tests) on the <a href="08-bun-integration.html">embedded</a> path, no wire overhead</td></tr>
+<tr><td>Embedded-mode driver</td><td><code>twill-bench</code> (direct FFI micro-loop)</td><td>Exp 1, 2, 3 on the <a href="08-bun-integration.html">embedded</a> path, no wire overhead — the same harness, <code>--transport embedded</code> (default)</td></tr>
 <tr><td>Latency capture</td><td>HDR histogram</td><td>p50/p99/p999 for every experiment; <strong>never mean-only</strong></td></tr>
 <tr><td>Crash injection</td><td>seeded fault-injection wrapper + <code>loom</code></td><td>Exp 4 deterministic crash schedules and interleaving exploration</td></tr>
 </tbody>

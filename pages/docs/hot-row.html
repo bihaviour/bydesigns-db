@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hot-row contention · Twill DB docs</title>
+<meta name="description" content="How Twill DB keeps concurrent same-row writes correct, when they get slow, and the three levers — retry, shard, route — for keeping a hot counter fast.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">HOT</span>
+<span class="badge badge-status status-review">Guide</span>
+<span class="spec-date">Guide</span>
+</div>
+<h1>Hot-row contention</h1>
+<p class="lede">When many writers update the <em>same</em> row — a counter, an inventory level, a balance — those writes must serialize, and on a disaggregated engine each handoff crosses the network. Twill DB keeps the result <strong>always correct</strong>; this guide shows when it gets slow and the three levers — <strong>retry</strong>, <strong>shard</strong>, <strong>route</strong> — for keeping it fast.</p>
+</header>
+
+<section>
+<h2>The guarantee: correct by default</h2>
+<p>Concurrent writes to the same row have a read-modify-write dependency: each must see the previous committed value. Twill DB enforces <a href="sql-reference.html">snapshot isolation</a> with <strong>first-committer-wins</strong> — if two transactions modify the same row concurrently, the first to commit wins and the other is rejected with a write-conflict error rather than silently overwriting it. A lost update is never reachable; the cost of contention is latency and the occasional retry, never wrong data.</p>
+<div class="callout note">
+<p class="callout-title">Contention is correct semantics, not a defect</p>
+<p>Every serious database serializes same-row writers — none parallelizes two writes to one value, because the problem is inherently sequential. The only thing that differs on a disaggregated engine is the price of each handoff: a durable network round-trip (~ms) instead of a local fsync (~µs).</p>
+</div>
+</section>
+
+<section>
+<h2>Lever 1 — retry the conflict (correct, just slower)</h2>
+<p>A naive contended increment will, under concurrency, sometimes return a write-conflict (<code>ENGINE_ERR_CONFLICT</code> / SQLSTATE <code>40001</code>-style serialization failure). The fix is a short retry loop: on conflict, re-run the statement — it re-reads the freshly committed value and reapplies the change. This requires nothing structural and is safe under any SQL.</p>
+<pre data-lang="sql"><code>-- The contended write. Correct under concurrency; may need a retry.
+UPDATE counter SET n = n + 1 WHERE id = 1;</code></pre>
+<pre data-lang="ts"><code>// Retry the first-committer-wins conflict; the loser re-reads and reapplies.
+function increment(db: Database) {
+  for (;;) {
+    try { db.exec("UPDATE counter SET n = n + 1 WHERE id = 1"); return; }
+    catch (e) { if (isConflict(e)) continue; throw e; }
+  }
+}</code></pre>
+<p>This is the floor: because correctness is guaranteed regardless of SQL quality, the worst outcome for any tool is "slow," never "wrong." Retry handles the occasional race; the next two levers handle <em>sustained</em> contention.</p>
+</section>
+
+<section>
+<h2>Lever 2 — shard the hot row (turn one row into many)</h2>
+<p>If one row is hammered hard enough that retries pile up, split it so writers stop colliding. Both patterns convert "same row" into "different rows," which commit in parallel.</p>
+
+<h3>Sharded counter</h3>
+<p>Keep <kbd>N</kbd> sub-counter rows; each writer increments one shard, reads sum across all of them.</p>
+<pre data-lang="sql"><code>CREATE TABLE counter_shards (
+  counter_id TEXT    NOT NULL,
+  shard      INTEGER NOT NULL,           -- 0 .. N-1
+  n          INTEGER NOT NULL,
+  PRIMARY KEY (counter_id, shard)
+);
+
+-- WRITE: pick a shard (app-side; spread writers across N different rows)
+UPDATE counter_shards SET n = n + 1 WHERE counter_id = 'video:42' AND shard = 7;
+
+-- READ: aggregate the shards into the logical total
+SELECT SUM(n) AS total FROM counter_shards WHERE counter_id = 'video:42';</code></pre>
+<div class="callout tip">
+<p class="callout-title">Choosing the shard</p>
+<p>Twill DB's SQL subset has no <code>random()</code>; pick the shard in your app (a random or round-robin index in <code>0 .. N-1</code>). Start with <code>N = 16</code> and raise it if writes still cluster. Reads stay correct at any <code>N</code> — only throughput changes.</p>
+</div>
+
+<h3>Event log + aggregate on read</h3>
+<p>Never update a count at all: append one immutable row per event (always a different row, never contends) and fold them on read.</p>
+<pre data-lang="sql"><code>CREATE TABLE counter_events (
+  id         INTEGER PRIMARY KEY,
+  counter_id TEXT    NOT NULL,
+  delta      INTEGER NOT NULL
+);
+
+-- WRITE: a pure INSERT — never contends
+INSERT INTO counter_events (counter_id, delta) VALUES ('video:42', 1);
+
+-- READ: fold the events (roll up into a snapshot row periodically if it grows)
+SELECT SUM(delta) AS total FROM counter_events WHERE counter_id = 'video:42';</code></pre>
+<div class="callout note">
+<p class="callout-title">Sharding has a limit</p>
+<p>Sharding recovers parallelism for writes to <em>different</em> rows. It does nothing for two writes that genuinely target the same logical value at the same instant — that dependency is sequential by definition. For the rare tool where it is also high-rate and latency-critical, use the last lever.</p>
+</div>
+</section>
+
+<section>
+<h2>Lever 3 — route the irreducible outlier to Postgres</h2>
+<p>One shape cannot be helped by retry or sharding: <strong>same-row, same-database, high-rate, latency-critical</strong> writes. The contention is genuinely sequential, batching cannot add lanes, and each contended handoff pays the network round-trip. This is the mandatory safety net: move that <em>one</em> tool to a coupled Postgres and keep the disaggregated engine for everything else. The platform is not all-or-nothing — benchmark the boundary once, then place each tool on the correct side.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Write shape</th><th>Lever</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Occasional same-row contention</td><td><strong>Retry</strong></td><td>conflicts are rare; a retry loop is enough</td></tr>
+<tr><td>Sustained hot counter you control</td><td><strong>Shard</strong> / event-log</td><td>distinct rows commit in parallel; sum on read</td></tr>
+<tr><td>Same-row, high-rate, latency-critical</td><td><strong>Route to Postgres</strong></td><td>irreducibly sequential; networked handoff too costly</td></tr>
+<tr><td>Many writers, but different rows / DBs</td><td>nothing — already fast</td><td>independent lanes; no real conflict</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Diagnose by dependency, not by rate</h2>
+<p>A million inserts a second into a million distinct rows is <em>not</em> a hot-row problem — that is throughput, solved by more lanes (separate databases) and batching. A thousand updates a second to <em>one</em> row is a hot-row problem at any volume. Diagnose by whether writes depend on each other's value, never by request rate. Spreading independent write streams across separate databases gives each its own writer lane and keeps unrelated writes from ever queuing behind each other.</p>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="sql-reference.html"><span class="xref-id">SQL</span><span class="xref-title">SQL reference</span><span class="xref-desc">The transaction model and the exact statement surface these patterns use.</span></a>
+<a class="xref" href="scale-to-zero.html"><span class="xref-id">S0</span><span class="xref-title">Scale-to-zero &amp; lifecycle</span><span class="xref-desc">Why commits cross the network — the source of the handoff cost.</span></a>
+<a class="xref" href="../specs/10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention Strategy (spec)</span><span class="xref-desc">The full design rationale, cost model, and decision algorithm.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

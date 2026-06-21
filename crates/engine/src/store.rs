@@ -3,17 +3,23 @@
 //! it. Readers see a consistent snapshot LSN; they never block writers and are
 //! never blocked by them (spec 02 — snapshot isolation).
 //!
-//! There is a single writer per database (serialized by the write lane in
-//! [`crate::db`]), so every pending (uncommitted) version belongs to the current
-//! writer — which keeps visibility and rollback rules simple.
+//! Store *mutation* is single-writer (serialized by the write lane in
+//! [`crate::db`]), but with group commit several committed-but-not-yet-durable
+//! transactions can have pending versions in flight at once — each waiting on
+//! the same batched durable append. A pending version is therefore tagged with
+//! its in-flight writer's [`RowVersion::owner`] so the right transaction's
+//! versions are published (or discarded) when its commit resolves, and so a
+//! writer sees only its own pending changes (snapshot isolation across the
+//! in-flight set). `owner == 0` means fully committed (no pending stamp).
 
 use crate::catalog::TableSchema;
 use crate::value::Value;
 use crate::vector::{IndexDef, VectorIndex};
 use std::collections::HashMap;
 
-/// Stamp marking a version created or deleted by the in-flight writer; not yet
-/// durable, never visible to other connections' snapshots.
+/// Stamp marking a version created or deleted by an in-flight writer; not yet
+/// durable, never visible to other connections' snapshots. The owning writer is
+/// recorded in [`RowVersion::owner`].
 pub const PENDING: u64 = u64::MAX;
 
 #[derive(Clone, Debug)]
@@ -25,21 +31,36 @@ pub struct RowVersion {
     pub create_lsn: u64,
     /// `0` = live; otherwise the commit LSN that deleted it, or [`PENDING`].
     pub delete_lsn: u64,
+    /// In-flight writer that owns this version's [`PENDING`] stamp(s), or `0`
+    /// when fully committed. A row can carry at most one pending stamp at a time
+    /// (a concurrent writer touching it conflicts at DML time), so a single
+    /// owner covers both a pending create and a pending delete.
+    pub owner: u64,
 }
 
 impl RowVersion {
     /// Visible to a reader at snapshot `s`: created at-or-before `s` and not yet
-    /// deleted as of `s`.
+    /// deleted as of `s`. Pending stamps ([`PENDING`]) are never `<= s`, so a
+    /// reader never sees another transaction's uncommitted create or delete.
     pub fn visible_to_reader(&self, s: u64) -> bool {
         self.create_lsn <= s && (self.delete_lsn == 0 || self.delete_lsn > s)
     }
 
-    /// Visible to the in-flight writer (snapshot `s`): committed-and-visible OR
-    /// our own pending insert, and not deleted by a committed delete or our own
-    /// pending delete.
-    pub fn visible_to_writer(&self, s: u64) -> bool {
-        let created = self.create_lsn == PENDING || self.create_lsn <= s;
-        let deleted = self.delete_lsn == PENDING || (self.delete_lsn != 0 && self.delete_lsn <= s);
+    /// Visible to the in-flight writer `me` at snapshot `s`: committed-and-visible
+    /// OR *my own* pending insert, and not deleted by a committed delete or *my
+    /// own* pending delete. Another in-flight writer's pending create is invisible
+    /// to me, and its pending delete does not hide an otherwise-visible row.
+    pub fn visible_to_writer(&self, s: u64, me: u64) -> bool {
+        let created = if self.create_lsn == PENDING {
+            self.owner == me
+        } else {
+            self.create_lsn <= s
+        };
+        let deleted = if self.delete_lsn == PENDING {
+            self.owner == me
+        } else {
+            self.delete_lsn != 0 && self.delete_lsn <= s
+        };
         created && !deleted
     }
 }
@@ -244,6 +265,7 @@ impl Store {
                 values,
                 create_lsn: commit_lsn,
                 delete_lsn: 0,
+                owner: 0,
             });
             t.next_vid = t.next_vid.max(vid + 1);
         }
@@ -258,36 +280,48 @@ impl Store {
 
     // ---- commit / rollback ----------------------------------------------
 
-    /// Publish all pending versions at `commit_lsn` (Committing → Committed).
-    pub fn finalize_pending(&mut self, commit_lsn: u64) {
+    /// Publish one in-flight writer's pending versions at `commit_lsn`
+    /// (Committing → Committed). Only versions tagged with `owner` are stamped,
+    /// leaving any concurrently in-flight transaction's pending versions
+    /// untouched. The caller advances [`Store::committed_lsn`] once the whole
+    /// group-commit batch is durable (see [`crate::group_commit`]), so reader
+    /// visibility moves forward atomically for the batch.
+    pub fn finalize_owner(&mut self, owner: u64, commit_lsn: u64) {
         for t in self.tables.values_mut() {
             for r in &mut t.rows {
+                if r.owner != owner {
+                    continue;
+                }
                 if r.create_lsn == PENDING {
                     r.create_lsn = commit_lsn;
                 }
                 if r.delete_lsn == PENDING {
                     r.delete_lsn = commit_lsn;
                 }
+                r.owner = 0;
             }
         }
-        self.committed_lsn = commit_lsn;
     }
 
-    /// Discard every pending version (whole-transaction rollback). Single-writer
-    /// invariant: all remaining pending stamps belong to the aborting txn. Any
-    /// pending insert removed here is also tombstoned out of the vector indexes.
-    pub fn rollback_pending(&mut self) {
+    /// Discard one in-flight writer's pending versions (whole-transaction
+    /// rollback): remove its pending inserts and clear its pending deletes,
+    /// leaving any other concurrently in-flight transaction's versions intact.
+    /// Any pending insert removed here is also tombstoned out of the vector
+    /// indexes.
+    pub fn rollback_owner(&mut self, owner: u64) {
         let mut discarded: Vec<u64> = Vec::new();
         for t in self.tables.values_mut() {
             for r in &t.rows {
-                if r.create_lsn == PENDING {
+                if r.owner == owner && r.create_lsn == PENDING {
                     discarded.push(r.vid);
                 }
             }
-            t.rows.retain(|r| r.create_lsn != PENDING);
+            t.rows
+                .retain(|r| !(r.owner == owner && r.create_lsn == PENDING));
             for r in &mut t.rows {
-                if r.delete_lsn == PENDING {
+                if r.owner == owner && r.delete_lsn == PENDING {
                     r.delete_lsn = 0;
+                    r.owner = 0;
                 }
             }
         }
