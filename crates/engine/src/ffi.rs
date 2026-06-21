@@ -78,7 +78,8 @@ fn from_result(rs: ResultSet) -> EngineResult {
 }
 
 /// Decode the string-only typed bind encoding (spec 02 "parameter encoding"):
-/// `i` int, `f` float, `s` text, `b` base64-bytes, `n` NULL, `v` vector.
+/// `i` int, `f` float, `s` text, `b` base64-bytes, `n` NULL, `v` vector
+/// (`v[1,2,3]` or `v1,2,3`, the Phase-5 capability).
 fn decode_param(s: &str) -> Value {
     let mut it = s.chars();
     match it.next() {
@@ -87,8 +88,10 @@ fn decode_param(s: &str) -> Value {
         Some('s') => Value::Text(s[1..].to_string()),
         Some('b') => Value::Blob(crate::value::base64_decode(&s[1..]).unwrap_or_default()),
         Some('n') => Value::Null,
-        // Vector type is a Phase 5 capability; carry the literal as text for now.
-        Some('v') => Value::Text(s[1..].to_string()),
+        Some('v') => match crate::value::parse_vector(&s[1..]) {
+            Some(v) => Value::Vector(v),
+            None => Value::Text(s[1..].to_string()),
+        },
         _ => Value::Text(s.to_string()),
     }
 }

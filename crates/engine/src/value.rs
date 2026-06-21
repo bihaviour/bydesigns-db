@@ -2,7 +2,8 @@
 
 use std::cmp::Ordering;
 
-/// A single SQL value (NULL or one of four storage classes).
+/// A single SQL value (NULL or one of the storage classes). `Vector` is the
+/// Phase-5 fixed-length `f32` array (spec 12 — vector search in-core).
 #[derive(Clone, Debug)]
 pub enum Value {
     Null,
@@ -10,6 +11,7 @@ pub enum Value {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -24,11 +26,13 @@ impl Value {
             Value::Real(_) => "REAL",
             Value::Text(_) => "TEXT",
             Value::Blob(_) => "BLOB",
+            Value::Vector(_) => "VECTOR",
         }
     }
 
     /// Render to the text form returned across the string-only C ABI. NULL has
-    /// no text form here (the FFI layer returns a null pointer for it).
+    /// no text form here (the FFI layer returns a null pointer for it). A vector
+    /// renders as `[1,2,3]` — the same literal form clients send back.
     pub fn render(&self) -> Option<String> {
         match self {
             Value::Null => None,
@@ -36,6 +40,7 @@ impl Value {
             Value::Real(r) => Some(format_real(*r)),
             Value::Text(s) => Some(s.clone()),
             Value::Blob(b) => Some(base64_encode(b)),
+            Value::Vector(v) => Some(format_vector(v)),
         }
     }
 
@@ -47,6 +52,15 @@ impl Value {
             Value::Real(r) => Some(*r != 0.0),
             Value::Text(s) => Some(!s.is_empty() && s != "0"),
             Value::Blob(b) => Some(!b.is_empty()),
+            Value::Vector(v) => Some(!v.is_empty()),
+        }
+    }
+
+    /// Borrow the vector payload, if this value is a vector.
+    pub fn as_vector(&self) -> Option<&[f32]> {
+        match self {
+            Value::Vector(v) => Some(v),
+            _ => None,
         }
     }
 
@@ -96,18 +110,22 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Real(b)) | (Value::Real(b), Value::Int(a)) => (*a as f64) == *b,
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Blob(a), Value::Blob(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a == b,
             _ => false,
         }
     }
 }
 
-/// Declared column storage class.
+/// Declared column storage class. `Vector(dim)` is the Phase-5 fixed-length
+/// `f32` array; the dimension is declared at column-definition time and enforced
+/// on insert (spec 12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnType {
     Integer,
     Real,
     Text,
     Blob,
+    Vector(u32),
 }
 
 impl ColumnType {
@@ -121,6 +139,10 @@ impl ColumnType {
             || n.contains("STRING")
         {
             ColumnType::Text
+        } else if n.contains("VEC") {
+            // Dimension is captured by the parser from the `(n)` suffix; a bare
+            // `vector` with no size defaults to 0 (rejected at column build).
+            ColumnType::Vector(0)
         } else if n.contains("REAL")
             || n.contains("FLOA")
             || n.contains("DOUB")
@@ -136,12 +158,18 @@ impl ColumnType {
         }
     }
 
+    /// True for a `vector(n)` declaration.
+    pub fn is_vector(self) -> bool {
+        matches!(self, ColumnType::Vector(_))
+    }
+
     pub fn tag(self) -> u8 {
         match self {
             ColumnType::Integer => 0,
             ColumnType::Real => 1,
             ColumnType::Text => 2,
             ColumnType::Blob => 3,
+            ColumnType::Vector(_) => 4,
         }
     }
 
@@ -150,19 +178,70 @@ impl ColumnType {
             0 => ColumnType::Integer,
             1 => ColumnType::Real,
             3 => ColumnType::Blob,
+            // Vector dimension is encoded alongside the tag by the WAL codec;
+            // this fallback is only hit for a malformed tag.
+            4 => ColumnType::Vector(0),
             _ => ColumnType::Text,
         }
     }
 
     /// Light type affinity: coerce a value toward the column's class where it is
-    /// lossless / natural; otherwise leave it unchanged.
+    /// lossless / natural; otherwise leave it unchanged. A `'[1,2,3]'` text
+    /// literal bound to a vector column parses into a vector (pgvector-style).
     pub fn coerce(self, v: Value) -> Value {
         match (self, v) {
             (ColumnType::Real, Value::Int(i)) => Value::Real(i as f64),
             (ColumnType::Integer, Value::Real(r)) if r.fract() == 0.0 => Value::Int(r as i64),
+            (ColumnType::Vector(_), Value::Text(s)) => match parse_vector(&s) {
+                Some(v) => Value::Vector(v),
+                None => Value::Text(s),
+            },
             (_, other) => other,
         }
     }
+}
+
+/// Render an `f32` vector as the `[a,b,c]` literal both `SELECT` and the wire
+/// path use. Each component is formatted compactly (no trailing zeros).
+pub fn format_vector(v: &[f32]) -> String {
+    let mut out = String::with_capacity(2 + v.len() * 4);
+    out.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format_f32(*x));
+    }
+    out.push(']');
+    out
+}
+
+fn format_f32(x: f32) -> String {
+    if x.fract() == 0.0 && x.is_finite() && x.abs() < 1e15 {
+        format!("{x:.0}")
+    } else {
+        format!("{x}")
+    }
+}
+
+/// Parse a vector literal: `[1, 2, 3]`, `1,2,3`, or whitespace-separated. Used
+/// for text→vector coercion and the `'v…'` FFI parameter encoding. Returns
+/// `None` if any component is not a finite number.
+pub fn parse_vector(s: &str) -> Option<Vec<f32>> {
+    let inner = s.trim();
+    let inner = inner
+        .strip_prefix('[')
+        .map(|r| r.strip_suffix(']').unwrap_or(r))
+        .unwrap_or(inner)
+        .trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    inner
+        .split([',', ' ', '\t'])
+        .filter(|t| !t.is_empty())
+        .map(|t| t.trim().parse::<f32>().ok().filter(|x| x.is_finite()))
+        .collect()
 }
 
 fn format_real(r: f64) -> String {

@@ -145,6 +145,68 @@ fn c_abi_roundtrip() {
 }
 
 #[test]
+fn vector_search_via_c_abi() {
+    // Phase 5: the vector type, an HNSW index, and a top-k query drive through the
+    // same C ABI bun:ffi binds — vectors flow as their `[..]` text literal and as
+    // the `v…` typed bind encoding; no new symbols are involved.
+    let p = db_path();
+    let url = cs(&format!("file://{}", p.display()));
+    let h = engine_open(url.as_ptr());
+    assert!(!h.is_null());
+
+    assert_eq!(
+        engine_exec(
+            h,
+            cs("CREATE TABLE docs (id INTEGER PRIMARY KEY, e VECTOR(3))").as_ptr()
+        ),
+        0
+    );
+    assert_eq!(
+        engine_exec(
+            h,
+            cs("CREATE INDEX docs_e ON docs USING hnsw (e) WITH (metric='l2')").as_ptr()
+        ),
+        0
+    );
+    for (id, v) in [(1, "[1,0,0]"), (2, "[0,1,0]"), (3, "[0,0,1]")] {
+        let sql = cs(&format!("INSERT INTO docs VALUES ({id}, {v})"));
+        assert_eq!(engine_exec(h, sql.as_ptr()), 0);
+    }
+
+    // Top-1 nearest to [0,1,0] via a bound vector parameter (the "v…" encoding).
+    let mut st: *mut EngineStmt = ptr::null_mut();
+    assert_eq!(
+        engine_prepare(
+            h,
+            cs("SELECT id FROM docs ORDER BY e <-> ? LIMIT 1").as_ptr(),
+            &mut st
+        ),
+        0
+    );
+    assert_eq!(engine_bind(st, 1, cs("v[0,1,0]").as_ptr()), 0);
+    let mut done = -1;
+    assert_eq!(engine_step(st, &mut done), 0);
+    assert_eq!(done, 0, "a nearest neighbour should be found");
+    assert_eq!(rd(engine_column_value(st, 0)).as_deref(), Some("2"));
+    assert_eq!(engine_finalize(st), 0);
+
+    // A vector renders as its [..] literal across the string-only ABI.
+    let mut out: *mut EngineResult = ptr::null_mut();
+    assert_eq!(
+        engine_query(h, cs("SELECT e FROM docs WHERE id = 1").as_ptr(), &mut out),
+        0
+    );
+    assert_eq!(
+        rd(engine_result_value(out, 0, 0)).as_deref(),
+        Some("[1,0,0]")
+    );
+    engine_result_free(out);
+
+    engine_close(h);
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
 fn misuse_on_null_handle() {
     // Operating on a NULL handle is misuse, not a crash.
     assert_eq!(engine_exec(ptr::null_mut(), cs("SELECT 1").as_ptr()), 6); // ENGINE_ERR_MISUSE

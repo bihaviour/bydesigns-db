@@ -9,6 +9,7 @@
 
 use crate::catalog::TableSchema;
 use crate::value::Value;
+use crate::vector::{IndexDef, VectorIndex};
 use std::collections::HashMap;
 
 /// Stamp marking a version created or deleted by the in-flight writer; not yet
@@ -68,12 +69,20 @@ impl Table {
     pub fn version_mut(&mut self, vid: u64) -> Option<&mut RowVersion> {
         self.rows.iter_mut().find(|r| r.vid == vid)
     }
+
+    pub fn version(&self, vid: u64) -> Option<&RowVersion> {
+        self.rows.iter().find(|r| r.vid == vid)
+    }
 }
 
 #[derive(Default)]
 pub struct Store {
     /// Keyed by lowercased table name; `schema.name` keeps the original casing.
     tables: HashMap<String, Table>,
+    /// HNSW vector indexes, keyed by lowercased index name (spec 12). Derived
+    /// structures over a table's vector column — rebuilt from the rows on replay,
+    /// so they branch and scale-to-zero with the database (see `vector.rs`).
+    indexes: HashMap<String, VectorIndex>,
     /// Highest committed transaction boundary published to readers.
     pub committed_lsn: u64,
 }
@@ -101,7 +110,122 @@ impl Store {
     }
 
     pub fn drop_table(&mut self, name: &str) -> bool {
-        self.tables.remove(&Self::key(name)).is_some()
+        let existed = self.tables.remove(&Self::key(name)).is_some();
+        // A table's indexes go with it.
+        self.indexes
+            .retain(|_, ix| !ix.def.table.eq_ignore_ascii_case(name));
+        existed
+    }
+
+    // ---- vector indexes (spec 12) ---------------------------------------
+
+    pub fn has_index(&self, name: &str) -> bool {
+        self.indexes.contains_key(&Self::key(name))
+    }
+
+    /// Whether `table` has any vector index (lets the write path skip index
+    /// maintenance entirely when there is none).
+    pub fn table_has_index(&self, table: &str) -> bool {
+        self.indexes
+            .values()
+            .any(|ix| ix.def.table.eq_ignore_ascii_case(table))
+    }
+
+    /// Register an index definition with an empty graph (replay path — the
+    /// graph is filled by [`Store::rebuild_indexes`] once all rows are present).
+    pub fn register_index(&mut self, def: IndexDef) {
+        self.indexes
+            .insert(Self::key(&def.name), VectorIndex::new(def));
+    }
+
+    /// Create and immediately populate an index from the table's current rows
+    /// (live DDL path).
+    pub fn create_index(&mut self, def: IndexDef) {
+        let name = def.name.clone();
+        self.register_index(def);
+        self.populate_index(&name);
+    }
+
+    pub fn drop_index(&mut self, name: &str) -> bool {
+        self.indexes.remove(&Self::key(name)).is_some()
+    }
+
+    /// The HNSW index on `(table, column)`, if any — the planner's lookup for
+    /// pushing a nearest-neighbour query into the access method.
+    pub fn index_for(&self, table: &str, column: &str) -> Option<&VectorIndex> {
+        self.indexes.values().find(|ix| {
+            ix.def.table.eq_ignore_ascii_case(table) && ix.def.column.eq_ignore_ascii_case(column)
+        })
+    }
+
+    /// Fill one index's graph from every row version of its table that carries a
+    /// vector (MVCC visibility is resolved later, at query time, against the vids).
+    fn populate_index(&mut self, name: &str) {
+        let key = Self::key(name);
+        let Some(ix) = self.indexes.get(&key) else {
+            return;
+        };
+        let table = Self::key(&ix.def.table);
+        let column = ix.def.column.clone();
+        let Some(t) = self.tables.get(&table) else {
+            return;
+        };
+        let Some(col) = t.schema.column_index(&column) else {
+            return;
+        };
+        let entries: Vec<(u64, Vec<f32>)> = t
+            .rows
+            .iter()
+            .filter_map(|r| {
+                r.values
+                    .get(col)
+                    .and_then(Value::as_vector)
+                    .map(|v| (r.vid, v.to_vec()))
+            })
+            .collect();
+        if let Some(ix) = self.indexes.get_mut(&key) {
+            for (vid, vec) in entries {
+                ix.insert(vid, vec);
+            }
+        }
+    }
+
+    /// Rebuild every index graph from final table state. Called once after WAL
+    /// replay — the cold-start "warm" of the vector index (spec 12 §scale-to-zero).
+    pub fn rebuild_indexes(&mut self) {
+        let names: Vec<String> = self.indexes.keys().cloned().collect();
+        for n in &names {
+            if let Some(ix) = self.indexes.get_mut(n) {
+                let def = ix.def.clone();
+                *ix = VectorIndex::new(def);
+            }
+            self.populate_index(n);
+        }
+    }
+
+    /// Maintain every index on `table` after a row version `(vid, values)` is
+    /// inserted (live insert/update path).
+    pub fn index_row_inserted(&mut self, table: &str, vid: u64, values: &[Value]) {
+        let Some(t) = self.tables.get(&Self::key(table)) else {
+            return;
+        };
+        let schema = &t.schema;
+        let mut adds: Vec<(String, Vec<f32>)> = Vec::new();
+        for (k, ix) in &self.indexes {
+            if !ix.def.table.eq_ignore_ascii_case(table) {
+                continue;
+            }
+            if let Some(col) = schema.column_index(&ix.def.column) {
+                if let Some(v) = values.get(col).and_then(Value::as_vector) {
+                    adds.push((k.clone(), v.to_vec()));
+                }
+            }
+        }
+        for (k, v) in adds {
+            if let Some(ix) = self.indexes.get_mut(&k) {
+                ix.insert(vid, v);
+            }
+        }
     }
 
     // ---- recovery (replay) ----------------------------------------------
@@ -150,14 +274,29 @@ impl Store {
     }
 
     /// Discard every pending version (whole-transaction rollback). Single-writer
-    /// invariant: all remaining pending stamps belong to the aborting txn.
+    /// invariant: all remaining pending stamps belong to the aborting txn. Any
+    /// pending insert removed here is also tombstoned out of the vector indexes.
     pub fn rollback_pending(&mut self) {
+        let mut discarded: Vec<u64> = Vec::new();
         for t in self.tables.values_mut() {
+            for r in &t.rows {
+                if r.create_lsn == PENDING {
+                    discarded.push(r.vid);
+                }
+            }
             t.rows.retain(|r| r.create_lsn != PENDING);
             for r in &mut t.rows {
                 if r.delete_lsn == PENDING {
                     r.delete_lsn = 0;
                 }
+            }
+        }
+        if discarded.is_empty() {
+            return;
+        }
+        for ix in self.indexes.values_mut() {
+            for &vid in &discarded {
+                ix.remove(vid);
             }
         }
     }

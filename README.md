@@ -2,14 +2,16 @@
 
 > DB Management System with separated process and storage layer. Built on Rust, and compatible with PostgreSQL.
 
-**Status: Phases 1–4 implemented.** The repository holds both the development
+**Status: Phases 1–5 implemented.** The repository holds both the development
 specifications and a working Rust implementation: the embeddable `libengine`
 with a frozen C ABI, the pluggable `Storage` trait with `LocalFileStorage`
 (`file://`) and `ObjectStorage` (`s3://`/`r2://`/`gs://`) backends, MVCC snapshot
 isolation, crash-safe WAL durability + replay, an `engine-server` that speaks a
 Postgres-wire subset, **copy-on-write branching**, a durable single-writer lease,
-and a **scale-to-zero lifecycle controller**. See the [roadmap](#roadmap) and the
-[documentation](#documentation) entry points below.
+a **scale-to-zero lifecycle controller**, and **in-core vector search** (a
+`vector(N)` type + HNSW index whose graph branches and scales-to-zero with the
+database). See the [roadmap](#roadmap) and the [documentation](#documentation)
+entry points below.
 
 ## What this is
 
@@ -66,6 +68,21 @@ preview.exec("INSERT INTO notes VALUES (2, 'branch-only')");
 // the base never sees the branch's write
 ```
 
+Vector search is in-core (Phase 5): a `vector(N)` column, an HNSW index, and a
+top-k nearest-neighbour query — and because the index rides the same storage as
+the rows, **branching the database branches the vector index** (an agent forks its
+memory at near-zero cost):
+
+```ts
+db.exec(`CREATE TABLE memories (id INTEGER PRIMARY KEY, note TEXT, embedding VECTOR(3))`);
+db.exec(`CREATE INDEX mem_e ON memories USING hnsw (embedding) WITH (metric = 'cosine')`);
+db.exec(`INSERT INTO memories VALUES (1, 'apples', [1, 0, 0]), (2, 'oranges', [0, 1, 0])`);
+
+// nearest neighbour, query vector passed as a parameter:
+const near = db.query("SELECT note FROM memories ORDER BY embedding <=> ? LIMIT 1", [[0.9, 0.1, 0]]);
+// → [{ note: "apples" }]
+```
+
 ### Server mode (Postgres wire)
 
 The same engine behind a Postgres-wire listener; any Postgres client connects
@@ -87,9 +104,9 @@ storage seam.
 | Resource | Where | Status |
 |---|---|---|
 | **User & API guides** (how to embed, deploy, operate) | _published docs site_ | **pending** |
-| **Implementation maps** (per-phase: what's built, where, and why) | [`docs/PHASE1.md`](docs/PHASE1.md) · [`PHASE2`](docs/PHASE2.md) · [`PHASE3`](docs/PHASE3.md) · [`PHASE4`](docs/PHASE4.md) | available |
+| **Implementation maps** (per-phase: what's built, where, and why) | [`docs/PHASE1.md`](docs/PHASE1.md) · [`PHASE2`](docs/PHASE2.md) · [`PHASE3`](docs/PHASE3.md) · [`PHASE4`](docs/PHASE4.md) · [`PHASE5`](docs/PHASE5.md) | available |
 | **Development specifications** (the design source of truth) | [`specs/`](specs/) — open [`specs/index.html`](specs/index.html) | available |
-| **C ABI** (the stable embedding contract) | [`crates/engine/include/engine.h`](crates/engine/include/engine.h) | frozen (ABI v2) |
+| **C ABI** (the stable embedding contract) | [`crates/engine/include/engine.h`](crates/engine/include/engine.h) | frozen (ABI v3) |
 | **Contributor guidance** | [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) | available |
 
 The full development spec is a self-contained HTML site under [`specs/`](specs/).
@@ -119,8 +136,8 @@ crates/storage    # the pluggable `Storage` trait (the seam) + LocalFileStorage 
 crates/engine     # libengine: SQL → MVCC → WAL, and the stable C ABI (include/engine.h)
 crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset)
 crates/controller # lifecycle controller: scale-to-zero, lease heartbeat, keep-warm + thundering-herd admission
-clients/bun       # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
-docs/             # per-phase implementation maps (PHASE1–PHASE4)
+clients/bun       # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + examples (notes, vector-memory, compose)
+docs/             # per-phase implementation maps (PHASE1–PHASE5)
 specs/            # the development specification (HTML); the source of truth for design intent
 ```
 
@@ -141,7 +158,7 @@ cargo build -p bydesigns-engine --release && (cd clients/bun && bun test)
 2. **`ObjectStorage`** — LSM-on-S3 page store + S3-CAS commit log → disaggregated + scale-to-zero, still embedded. ✅ *implemented*
 3. **`engine-server` + Postgres wire protocol** — remote/server mode for multi-client and tools that expect Postgres. ✅ *implemented*
 4. **Controller** — idle stop (scale-to-zero) + branch-on-LSN (instant clones) + single-writer fencing. ✅ *implemented*
-5. **Capabilities** — built-in vector search; compose auth / REST / OLAP over the shared storage floor. *planned*
+5. **Capabilities** — built-in vector search (`vector(N)` + HNSW); compose auth / REST / OLAP over the shared storage floor. ✅ *implemented*
 
 See the [full roadmap](specs/13-roadmap.html) for milestones, dependencies, and exit criteria.
 

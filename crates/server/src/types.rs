@@ -17,13 +17,16 @@ pub const OID_INT4: i32 = 23;
 pub const OID_TEXT: i32 = 25;
 pub const OID_FLOAT8: i32 = 701;
 
-/// Map the engine's declared column type to a Postgres type OID.
+/// Map the engine's declared column type to a Postgres type OID. A vector has no
+/// core Postgres OID, so it is advertised as text (its `[1,2,3]` literal form),
+/// which is exactly how pg-wire clients without the pgvector extension see it.
 pub fn column_type_oid(ct: ColumnType) -> i32 {
     match ct {
         ColumnType::Integer => OID_INT8,
         ColumnType::Real => OID_FLOAT8,
         ColumnType::Text => OID_TEXT,
         ColumnType::Blob => OID_BYTEA,
+        ColumnType::Vector(_) => OID_TEXT,
     }
 }
 
@@ -61,7 +64,8 @@ pub fn infer_column_oid(rows: &[Vec<Value>], col: usize) -> i32 {
                 all_int = false;
                 all_real = false;
             }
-            Some(Value::Text(_)) => {
+            // A vector reports as text (its `[1,2,3]` literal).
+            Some(Value::Text(_)) | Some(Value::Vector(_)) => {
                 seen = true;
                 all_int = false;
                 all_real = false;
@@ -101,6 +105,7 @@ fn encode_text(v: &Value) -> Vec<u8> {
         Value::Real(r) => format_float(*r).into_bytes(),
         Value::Text(s) => s.clone().into_bytes(),
         Value::Blob(b) => hex_bytea(b).into_bytes(),
+        Value::Vector(_) => v.render().unwrap_or_default().into_bytes(),
     }
 }
 
@@ -111,6 +116,8 @@ fn encode_binary(v: &Value) -> Vec<u8> {
         Value::Real(r) => r.to_bits().to_be_bytes().to_vec(),
         Value::Text(s) => s.clone().into_bytes(),
         Value::Blob(b) => b.clone(),
+        // No pg binary wire form for a vector; send its text literal.
+        Value::Vector(_) => v.render().unwrap_or_default().into_bytes(),
     }
 }
 
