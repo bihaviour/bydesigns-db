@@ -70,7 +70,7 @@ TWILLDB_ENGINE_PATH=/abs/path/libengine.so bun test   # explicit library overrid
 bun run examples/notes.ts                      # runnable sample app
 
 # Website + docs (static HTML in pages/, no build step; deployed to GitHub Pages)
-bunx serve pages                               # preview the site locally (uses bunx, not python3)
+bunx http-server pages -c-1                     # preview the site locally (uses bunx, not python3)
 ```
 
 The Bun layer loads the native library via `bun:ffi`; if a change touches the C

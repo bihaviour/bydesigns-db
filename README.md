@@ -117,7 +117,7 @@ The whole site is self-contained static HTML (no build step). Open
 [`pages/index.html`](pages/index.html) directly, or serve the folder locally:
 
 ```bash
-bunx serve pages   # then visit the printed http://localhost:3000
+bunx http-server pages -c-1   # then visit http://localhost:8080
 ```
 
 Selected development specs (under [`pages/specs/`](pages/specs/)):

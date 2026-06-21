@@ -12,6 +12,6 @@
 - The website + documentation are static HTML under `pages/` (home, `docs/`,
   `specs/`, `release/`, shared `assets/`). They deploy to GitHub Pages from the
   `pages/` directory via `.github/workflows/pages.yml` on push to `main`. There is
-  no build step — edit the HTML/CSS/JS directly and preview with `bunx serve pages`.
+  no build step — edit the HTML/CSS/JS directly and preview with `bunx http-server pages`.
   Keep `pages/specs/` (design source of truth) and `pages/docs/` (user docs) in sync
   with behaviour changes.
