@@ -1,0 +1,53 @@
+# Twill DB
+
+> Twill DB is a serverless OLTP database engine: an embeddable Rust library
+> (SQLite-style, function-call latency) whose storage backend is pluggable, so the
+> same engine runs either purely embedded (`file://`) or storage-disaggregated on
+> object storage (`s3://`/`r2://`/`gs://`), selected purely by connection string.
+> It offers scale-to-zero, true embeddability, instant copy-on-write branching, and
+> an in-core vector capability (HNSW), all riding one narrow WAL-centric storage seam.
+
+Notes for agents:
+
+- The docs (under `/docs/`) are the user-facing guides; the specs (under `/specs/`)
+  are the design source of truth. Each docs page also has a "Copy as Markdown"
+  button that exports that page as clean Markdown.
+- Connection strings in examples use `file://` (embedded) or `s3://`/`r2://`/`gs://`
+  (disaggregated). The engine and C ABI are identical across backends.
+
+## Docs
+
+- [Documentation overview](https://bihaviour.github.io/twill-db/docs/index.html): Entry point to the user documentation — connect, branch, scale to zero, operate.
+- [Quickstart](https://bihaviour.github.io/twill-db/docs/getting-started.html): Build the native library, open an embedded database from Bun, run SQL, and start a Postgres-wire server.
+- [Connect to your database](https://bihaviour.github.io/twill-db/docs/connect.html): The connection model — URL schemes, embedded vs server access, and how to choose a storage backend.
+- [Connect from Bun (embedded)](https://bihaviour.github.io/twill-db/docs/connect-bun.html): The full embedded API over bun:ffi — open, exec, parameterized query, prepared statements, transactions, branching, error handling.
+- [Connect with a Postgres client](https://bihaviour.github.io/twill-db/docs/connect-postgres.html): Start engine-server and connect with psql, Bun's SQL client, generic Postgres drivers, or PostgREST over the supported pgwire subset.
+- [Connection pooling](https://bihaviour.github.io/twill-db/docs/connection-pooling.html): Place a transaction-mode pooler (PgBouncer or pgcat) in front of engine-server to absorb serverless connection bursts, with the single-writer caveats.
+- [Branching](https://bihaviour.github.io/twill-db/docs/branching.html): Copy-on-write branches — an instant LSN pointer over shared immutable layers, write isolation, the embedded API, and the limits.
+- [Scale-to-zero & lifecycle](https://bihaviour.github.io/twill-db/docs/scale-to-zero.html): How stateless compute idles to nothing on object storage — the controller state machine, cold-start budget, lease heartbeat, keep-warm, cost trade-off.
+- [SQL reference](https://bihaviour.github.io/twill-db/docs/sql-reference.html): The exact SQL surface — DDL, DML, queries, transactions, types, parameters, and what is out of scope.
+- [C ABI reference](https://bihaviour.github.io/twill-db/docs/c-abi.html): The frozen C ABI (version 3) — handles, status codes, every exported function, typed-literal parameter encoding, and the safety contract.
+
+## Specs
+
+- [Specs index](https://bihaviour.github.io/twill-db/specs/index.html): The development specification — 14 design specs plus per-phase implementation maps.
+- [Architecture Overview](https://bihaviour.github.io/twill-db/specs/01-architecture-overview.html): The whole-system shape and the storage seam that makes it embeddable and disaggregated.
+- [Engine Core](https://bihaviour.github.io/twill-db/specs/02-engine-core.html): SQL → MVCC → WAL flow, snapshot isolation, single-writer lane, commit durability.
+- [Pluggable Storage Interface](https://bihaviour.github.io/twill-db/specs/03-storage-interface.html): The async, signature-stable Storage trait — the single load-bearing seam.
+- [Object-Storage Backend](https://bihaviour.github.io/twill-db/specs/04-object-storage-backend.html): The LSM page store + CAS commit log over a pluggable object-client seam.
+- [Local Cache](https://bihaviour.github.io/twill-db/specs/05-local-cache.html): Read-path caching that hides latency without ever hiding commit latency.
+- [Lifecycle & Controller](https://bihaviour.github.io/twill-db/specs/06-lifecycle-controller.html): Scale-to-zero, lease heartbeat, keep-warm, and thundering-herd admission.
+- [Server Mode & Wire Protocol](https://bihaviour.github.io/twill-db/specs/07-server-mode.html): The engine behind a Postgres-wire listener (a defined pgwire subset).
+- [Bun Integration](https://bihaviour.github.io/twill-db/specs/08-bun-integration.html): The bun:ffi bindings and the ergonomic typed wrapper.
+- [Benchmark & Validation Plan](https://bihaviour.github.io/twill-db/specs/09-benchmark-plan.html): How performance and correctness are measured and validated.
+- [Hot-Row Contention Strategy](https://bihaviour.github.io/twill-db/specs/10-hot-row-contention.html): Handling write contention on hot rows.
+- [Deployment Targets](https://bihaviour.github.io/twill-db/specs/11-deployment-targets.html): Where and how the engine is deployed.
+- [Capabilities: Built-in vs Compose](https://bihaviour.github.io/twill-db/specs/12-capabilities.html): What lives in the core (vector search) versus what is composed around it.
+- [Roadmap & Build Sequence](https://bihaviour.github.io/twill-db/specs/13-roadmap.html): The phased plan (Phases 1–5 implemented) and build order.
+- [Tradeoffs & Risk Register](https://bihaviour.github.io/twill-db/specs/14-tradeoffs-risks.html): The deliberate scope decisions and known risks.
+
+## Optional
+
+- [Home](https://bihaviour.github.io/twill-db/index.html): Project overview and the three headline properties.
+- [Release & roadmap](https://bihaviour.github.io/twill-db/release/index.html): Releases and the upcoming roadmap.
+- [Source repository](https://github.com/bihaviour/twill-db): The Rust workspace, Bun client, and this website.
