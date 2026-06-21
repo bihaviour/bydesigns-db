@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Rust workspace (root Cargo.lock covers all crates)
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # Bun client (npm ecosystem reads package.json / bun.lock)
+  - package-ecosystem: npm
+    directory: "/clients/bun"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      bun:
+        patterns: ["*"]
+
+  # Keep pinned GitHub Actions (@v4/@v2/...) current
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
