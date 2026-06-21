@@ -52,6 +52,17 @@
   }
   buildHeader();
 
+  // ---- Site-wide pre-1.0 banner ---------------------------------------------
+  function buildBanner() {
+    var bar = document.createElement("div");
+    bar.className = "dev-banner";
+    bar.innerHTML = '⚠ <strong>Pre-1.0 — active development.</strong> '
+      + 'Backward compatibility is not guaranteed until 1.0.0. '
+      + '<a href="' + BASE + 'release/index.html">Details →</a>';
+    document.body.insertBefore(bar, document.body.firstChild);
+  }
+  buildBanner();
+
   // ---- Theme toggle (persisted) ---------------------------------------------
   function applyTheme(theme) {
     document.documentElement.setAttribute("data-theme", theme);
