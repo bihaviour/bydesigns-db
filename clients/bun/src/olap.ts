@@ -22,6 +22,7 @@
 // falls back to CSV, which DuckDB also reads via read_csv_auto — so the snapshot
 // is always publishable, only the encoding changes.
 
+import { randomBytes } from "node:crypto";
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Database } from "./index";
@@ -76,10 +77,20 @@ function csvCell(v: string | null): string {
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 
+// An unguessable token for intermediate filenames. The final snapshot paths are
+// deterministic (a known location to read from), but the staging/.tmp files we
+// write-then-rename must not be predictable: a predictable name in a shared
+// directory invites a symlink/race attack (CodeQL js/insecure-temporary-file).
+function tmpToken(): string {
+  return randomBytes(8).toString("hex");
+}
+
 function writeCsv(rows: Record<string, string | null>[], columns: string[], path: string): void {
   const header = columns.join(",");
   const body = rows.map((r) => columns.map((c) => csvCell(r[c])).join(",")).join("\n");
-  writeFileSync(path, rows.length ? `${header}\n${body}\n` : `${header}\n`);
+  // Exclusive create ("wx"): never follow/overwrite a pre-existing file or
+  // symlink at this (randomized) staging path — fail instead.
+  writeFileSync(path, rows.length ? `${header}\n${body}\n` : `${header}\n`, { flag: "wx" });
 }
 
 // Escape a path for embedding as a single-quoted DuckDB SQL literal. The table
@@ -92,7 +103,7 @@ function sqlLit(path: string): string {
 // Convert a staged CSV to Parquet with DuckDB, publishing atomically (write to a
 // .tmp then rename) so a reader only ever sees a whole snapshot.
 function csvToParquet(csvPath: string, outPath: string): void {
-  const tmp = `${outPath}.tmp`;
+  const tmp = `${outPath}.${tmpToken()}.tmp`;
   const sql = `COPY (SELECT * FROM read_csv_auto('${sqlLit(csvPath)}', header=true)) TO '${sqlLit(tmp)}' (FORMAT PARQUET)`;
   const r = Bun.spawnSync(["duckdb", "-c", sql]);
   if (!r.success) {
@@ -124,14 +135,14 @@ export function materialize(db: Database, opts: MaterializeOptions): SnapshotRes
 
   if (!useParquet) {
     const path = join(opts.dir, `${opts.table}.csv`);
-    const tmp = `${path}.tmp`;
+    const tmp = `${path}.${tmpToken()}.tmp`;
     writeCsv(rows, columns, tmp);
     renameSync(tmp, path); // atomic publish
     return { path, rows: rows.length, format: "csv" };
   }
 
   // Stage to CSV next to the output, convert to Parquet, drop the stage.
-  const staging = join(opts.dir, `.${opts.table}.staging.csv`);
+  const staging = join(opts.dir, `.${opts.table}.${tmpToken()}.staging.csv`);
   writeCsv(rows, columns, staging);
   const path = join(opts.dir, `${opts.table}.parquet`);
   try {
