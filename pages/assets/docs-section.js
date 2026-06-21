@@ -3,7 +3,7 @@
 window.SITE_BASE = "../";
 window.SITE_SECTION = "docs";
 window.SECTION = {
-  brand: { title: "Documentation", sub: "Use & operate bydesigns-db" },
+  brand: { title: "Documentation", sub: "Use & operate Twill DB" },
   groups: [
     { label: "Get started", items: [
       { file: "index.html",          id: "OV", title: "Introduction" },

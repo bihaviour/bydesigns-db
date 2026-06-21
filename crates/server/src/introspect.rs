@@ -64,7 +64,7 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
         "select version()" => {
             return one_row(
                 "version",
-                &format!("PostgreSQL {SERVER_VERSION} (bydesigns-db engine-server)"),
+                &format!("PostgreSQL {SERVER_VERSION} (twill-db engine-server)"),
             )
         }
         "select current_schema()" | "select current_schema" => {

@@ -9,7 +9,7 @@ fn unique_url(tag: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("bydesigns-ctl-{tag}-{}-{n}.db", std::process::id()));
+    p.push(format!("twill-ctl-{tag}-{}-{n}.db", std::process::id()));
     let _ = std::fs::remove_file(&p);
     format!("file://{}", p.display())
 }

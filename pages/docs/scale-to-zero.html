@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Scale-to-zero &amp; lifecycle · bydesigns-db docs</title>
-<meta name="description" content="How bydesigns-db idles stateless compute to nothing on an object-storage backend: the lifecycle controller's state machine, cold-start budget, lease heartbeat, keep-warm, and the cost trade-off.">
+<title>Scale-to-zero &amp; lifecycle · Twill DB docs</title>
+<meta name="description" content="How Twill DB idles stateless compute to nothing on an object-storage backend: the lifecycle controller's state machine, cold-start budget, lease heartbeat, keep-warm, and the cost trade-off.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -22,7 +22,7 @@
 <span class="spec-date">Guide</span>
 </div>
 <h1>Scale-to-zero &amp; lifecycle</h1>
-<p class="lede">On an object-storage backend the engine's compute is stateless, so it can idle all the way to nothing — only the bytes in object storage bill at rest. The <code>bydesigns-controller</code> turns that into an elastic service: cold-start on first connection, scale to zero when idle, and survive a burst of simultaneous wakeups.</p>
+<p class="lede">On an object-storage backend the engine's compute is stateless, so it can idle all the way to nothing — only the bytes in object storage bill at rest. The <code>twill-controller</code> turns that into an elastic service: cold-start on first connection, scale to zero when idle, and survive a burst of simultaneous wakeups.</p>
 </header>
 
 <section>
@@ -44,7 +44,7 @@
 
 <section>
 <h2>The lifecycle controller</h2>
-<p>The <code>bydesigns-controller</code> crate is a thin, stateless supervisor. It composes the engine's existing primitives rather than reimplementing them: opening a <code>Database</code> acquires the writer fence and replays the WAL — that <em>is</em> the cache warm — and dropping it releases the fence. On top of that the controller adds the state machine, an idle-timeout reaper, a lease heartbeat, and thundering-herd handling.</p>
+<p>The <code>twill-controller</code> crate is a thin, stateless supervisor. It composes the engine's existing primitives rather than reimplementing them: opening a <code>Database</code> acquires the writer fence and replays the WAL — that <em>is</em> the cache warm — and dropping it releases the fence. On top of that the controller adds the state machine, an idle-timeout reaper, a lease heartbeat, and thundering-herd handling.</p>
 
 <div class="callout note">
 <p class="callout-title">The controller owns no durable state</p>
@@ -126,7 +126,7 @@
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

@@ -1,5 +1,5 @@
 /* =============================================================================
-   bydesigns-db — site behaviour (single source of truth).
+   twill-db — site behaviour (single source of truth).
    Injects the top site-header nav (shared across home, docs, specs, release),
    wires the theme toggle, and — when a page declares window.SECTION — builds the
    left sidebar, "on this page" TOC, prev/next, heading anchors, code-copy
@@ -10,7 +10,7 @@
 
   var BASE = (typeof window.SITE_BASE === "string") ? window.SITE_BASE : "";
   var SECTION_KEY = window.SITE_SECTION || "";
-  var REPO = "https://github.com/bihaviour/bydesigns-db";
+  var REPO = "https://github.com/bihaviour/twill-db";
 
   // ---- Top site header (Home / Docs / Specs / Release) ----------------------
   var NAV = [
@@ -29,7 +29,7 @@
     }).join("");
     header.innerHTML =
       '<a class="site-brand" href="' + BASE + 'index.html">'
-        + '<span class="logo">bd</span><span class="name">bydesigns-db</span></a>'
+        + '<span class="logo">td</span><span class="name">Twill DB</span></a>'
       + '<button class="menu-btn" aria-label="Toggle menu" aria-expanded="false">☰</button>'
       + '<nav class="site-nav" id="site-nav">' + links + "</nav>"
       + '<div class="site-actions">'
@@ -51,6 +51,17 @@
     }
   }
   buildHeader();
+
+  // ---- Site-wide pre-1.0 banner ---------------------------------------------
+  function buildBanner() {
+    var bar = document.createElement("div");
+    bar.className = "dev-banner";
+    bar.innerHTML = '⚠ <strong>Pre-1.0 — active development.</strong> '
+      + 'Backward compatibility is not guaranteed until 1.0.0. '
+      + '<a href="' + BASE + 'release/index.html">Details →</a>';
+    document.body.insertBefore(bar, document.body.firstChild);
+  }
+  buildBanner();
 
   // ---- Theme toggle (persisted) ---------------------------------------------
   function applyTheme(theme) {

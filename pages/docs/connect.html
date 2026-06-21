@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect to your database · bydesigns-db docs</title>
-<meta name="description" content="The bydesigns-db connection model: URL schemes, embedded vs server access, connection-string anatomy, and how to choose a storage backend.">
+<title>Connect to your database · Twill DB docs</title>
+<meta name="description" content="The Twill DB connection model: URL schemes, embedded vs server access, connection-string anatomy, and how to choose a storage backend.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -32,7 +32,7 @@
 <table>
 <thead><tr><th>Mode</th><th>How you connect</th><th>Best for</th><th>Latency</th></tr></thead>
 <tbody>
-<tr><td><strong>Embedded</strong></td><td>Link the native library; call it over the C ABI (<code>bun:ffi</code> / <code>@yourdb/bun</code>)</td><td>A single app that owns the database; edge / offline; lowest latency</td><td>Function call (no socket)</td></tr>
+<tr><td><strong>Embedded</strong></td><td>Link the native library; call it over the C ABI (<code>bun:ffi</code> / <code>@twilldb/bun</code>)</td><td>A single app that owns the database; edge / offline; lowest latency</td><td>Function call (no socket)</td></tr>
 <tr><td><strong>Server</strong></td><td>Connect a Postgres client to <code>engine-server</code> over the wire protocol</td><td>Multiple clients; existing Postgres tooling; REST via PostgREST</td><td>Network round-trip</td></tr>
 </tbody>
 </table>
@@ -70,7 +70,7 @@
 open("file://./local.db");
 open("s3://my-bucket/app");      // bucket credentials come from the environment</code></pre>
 <pre data-lang="bash"><code># Server — start it with the storage URL, connect with a Postgres URI
-cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db s3://my-bucket/app
+cargo run -p twill-server -- --listen 127.0.0.1:5433 --db s3://my-bucket/app
 psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
 </section>
 
@@ -103,7 +103,7 @@ psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

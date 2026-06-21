@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Quickstart · bydesigns-db docs</title>
-<meta name="description" content="Build the native library, open your first embedded bydesigns-db database from Bun, run SQL, and start a Postgres-wire server.">
+<title>Quickstart · Twill DB docs</title>
+<meta name="description" content="Build the native library, open your first embedded Twill DB database from Bun, run SQL, and start a Postgres-wire server.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -37,10 +37,10 @@
 <section>
 <h2>1 · Build the engine</h2>
 <p>Clone the repository and build the release <code>libengine</code>. This produces the static and dynamic libraries plus the frozen C ABI header.</p>
-<pre data-lang="bash"><code>git clone https://github.com/bihaviour/bydesigns-db
-cd bydesigns-db
+<pre data-lang="bash"><code>git clone https://github.com/bihaviour/twill-db
+cd twill-db
 
-cargo build -p bydesigns-engine --release
+cargo build -p twill-engine --release
 # → target/release/libengine.{a,so,dylib}  +  crates/engine/include/engine.h</code></pre>
 <div class="callout note">
 <p class="callout-title">When to rebuild</p>
@@ -50,9 +50,9 @@ cargo build -p bydesigns-engine --release
 
 <section>
 <h2>2 · Your first embedded database</h2>
-<p>The <code>@yourdb/bun</code> wrapper auto-discovers the library from <code>target/{release,debug}</code> (or set <code>YOURDB_ENGINE_PATH</code> to an explicit path). Open a <code>file://</code> database and run SQL at function-call latency.</p>
+<p>The <code>@twilldb/bun</code> wrapper auto-discovers the library from <code>target/{release,debug}</code> (or set <code>TWILLDB_ENGINE_PATH</code> to an explicit path). Open a <code>file://</code> database and run SQL at function-call latency.</p>
 <pre data-lang="ts"><code>// notes.ts
-import { open } from "@yourdb/bun";
+import { open } from "@twilldb/bun";
 
 using db = open("file://./local.db");          // pure-embedded, zero network
 
@@ -78,7 +78,7 @@ bun test                        # the end-to-end embedded test suite</code></pre
 <section>
 <h2>4 · Start a server</h2>
 <p>Run the same engine behind a Postgres-wire listener and connect with any Postgres client (cleartext / <code>sslmode=disable</code>).</p>
-<pre data-lang="bash"><code>cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
+<pre data-lang="bash"><code>cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
 
 psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
 <pre data-lang="ts"><code>// Or from Bun's built-in client:
@@ -107,7 +107,7 @@ preview.exec("INSERT INTO notes VALUES (2, 'branch-only')");
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

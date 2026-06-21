@@ -1,6 +1,6 @@
 // Phase 5 example — composing capabilities AROUND the engine (spec 12).
 //
-// Run: cargo build -p bydesigns-engine --release
+// Run: cargo build -p twill-engine --release
 //      bun run examples/compose.ts
 //
 // The deciding rule (spec 12): storage/execution capabilities go INTO the engine

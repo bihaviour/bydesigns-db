@@ -21,7 +21,7 @@
 <span class="spec-date">Phase 1</span>
 </div>
 <h1>Phase 1 — Embedded Library</h1>
-<p class="lede">The implementation map for the in-process embeddable library: <code>libengine</code> + the frozen C ABI + the <code>@yourdb/bun</code> wrapper, backed by <code>LocalFileStorage</code> over a stable <code>Storage</code> seam.</p>
+<p class="lede">The implementation map for the in-process embeddable library: <code>libengine</code> + the frozen C ABI + the <code>@twilldb/bun</code> wrapper, backed by <code>LocalFileStorage</code> over a stable <code>Storage</code> seam.</p>
 </header>
 
 <section>
@@ -39,7 +39,7 @@
 <tbody>
 <tr><td><code>libengine.a</code> / <code>libengine.so</code> (+<code>.dylib</code>/<code>.dll</code>) static &amp; dynamic libs</td><td><code>crates/engine</code> (<code>crate-type = ["cdylib","staticlib","rlib"]</code>)</td></tr>
 <tr><td><code>engine.h</code> — the stable C ABI (<code>engine_open</code>/<code>exec</code>/<code>query</code>/<code>prepare</code>/<code>begin</code>/<code>commit</code>/…)</td><td><code>crates/engine/include/engine.h</code>, implemented in <code>crates/engine/src/ffi.rs</code></td></tr>
-<tr><td><code>@yourdb/bun</code> thin TypeScript wrapper over <code>bun:ffi</code></td><td><code>clients/bun/</code> (<code>src/ffi.ts</code> raw bindings, <code>src/index.ts</code> typed API)</td></tr>
+<tr><td><code>@twilldb/bun</code> thin TypeScript wrapper over <code>bun:ffi</code></td><td><code>clients/bun/</code> (<code>src/ffi.ts</code> raw bindings, <code>src/index.ts</code> typed API)</td></tr>
 <tr><td><code>LocalFileStorage</code> — first concrete <code>Storage</code> impl</td><td><code>crates/storage/src/local.rs</code></td></tr>
 <tr><td>Local cache / in-process working set (the SHOULD)</td><td>the engine's in-process MVCC store (<code>crates/engine/src/store.rs</code>) is the buffer; durability is the WAL</td></tr>
 </tbody>
@@ -52,7 +52,7 @@
 <ul>
 <li><strong>Open a <code>file://</code> DB from Bun via FFI; DDL + DML + queries; correct results across a process restart.</strong> <code>clients/bun/test/embedded.test.ts</code> (<code>persists across reopen</code>) and <code>crates/engine/tests/engine.rs</code> (<code>persists_across_restart</code>). State is rebuilt purely by replaying the durable WAL (<code>crates/engine/src/db.rs::replay</code>).</li>
 <li><strong>Basic correctness gate + MVCC snapshot isolation</strong> (a reader sees a stable snapshot across a concurrent committed write). <code>engine.rs::mvcc_snapshot_isolation</code> and <code>embedded.test.ts</code> (<code>MVCC snapshot isolation across two handles</code>). Visibility rules: <code>store.rs::RowVersion</code>.</li>
-<li><strong><code>@yourdb/bun</code> demonstrated end-to-end with no native build step beyond the prebuilt library.</strong> <code>clients/bun/examples/notes.ts</code>.</li>
+<li><strong><code>@twilldb/bun</code> demonstrated end-to-end with no native build step beyond the prebuilt library.</strong> <code>clients/bun/examples/notes.ts</code>.</li>
 <li><strong>Storage seam conformance</strong> (durability-after-ack, monotonic LSN, snapshot reads, fencing, crash hooks, batch reads, branch creation, retention). C1–C8 in <code>crates/storage/src/conformance.rs</code>, run against <code>LocalFileStorage</code> in <code>crates/storage/tests/conformance.rs</code>, plus a torn-trailing-frame recovery test (the in-process analog of <kbd>kill -9</kbd> mid-append).</li>
 <li><strong>No panics across FFI; misuse is defined, not UB.</strong> Every export is wrapped in <code>catch_unwind</code> → <code>ENGINE_ERR_INTERNAL</code>; null handles → <code>ENGINE_ERR_MISUSE</code> (<code>crates/engine/tests/ffi.rs</code>).</li>
 </ul>
@@ -83,7 +83,7 @@
 <section>
 <h2>Running</h2>
 <pre data-lang="bash"><code>cargo test                                   # storage conformance + engine correctness + FFI
-cargo build -p bydesigns-engine --release    # target/release/libengine.{a,so}
+cargo build -p twill-engine --release    # target/release/libengine.{a,so}
 cd clients/bun &amp;&amp; bun test                    # embedded end-to-end</code></pre>
 </section>
 
@@ -92,14 +92,14 @@ cd clients/bun &amp;&amp; bun test                    # embedded end-to-end</cod
 <div class="xref-grid">
 <a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">Rust library: parser → plan → executor, MVCC via LSN-stamped versions, WAL generation, C ABI.</span></a>
 <a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The narrow <code>Storage</code> trait frozen here and satisfied first by <code>LocalFileStorage</code>.</span></a>
-<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">The <code>bun:ffi</code> binding over <code>engine.h</code> and the <code>@yourdb/bun</code> wrapper shipped in Phase 1.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">The <code>bun:ffi</code> binding over <code>engine.h</code> and the <code>@twilldb/bun</code> wrapper shipped in Phase 1.</span></a>
 <a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The phased plan whose Phase 1 deliverables and Definition of Done this map implements.</span></a>
 </div>
 </section>
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db — internal development specification. Implementation map.</footer>
+<footer class="doc-footer">Twill DB — internal development specification. Implementation map. · <a href="../author/index.html">Author</a></footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

@@ -10,10 +10,10 @@ use crate::sql::{self, Stmt};
 use crate::value::Value;
 use crate::vector::{IndexDef, IndexParams};
 use crate::wal::WalOp;
-use bydesigns_storage::{block_on, Lsn, WalRecord};
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Arc;
+use twill_storage::{block_on, Lsn, WalRecord};
 
 struct Txn {
     /// MVCC snapshot LSN captured at transaction start.

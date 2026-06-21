@@ -1,9 +1,9 @@
-// Phase 5 — vector search through @yourdb/bun (bun:ffi -> libengine). Covers the
+// Phase 5 — vector search through @twilldb/bun (bun:ffi -> libengine). Covers the
 // vector(N) type, an HNSW index, a top-k nearest-neighbour query (with a vector
 // passed as a `number[]` parameter), and the headline payoff: branching the
 // database branches the vector index, so an agent can fork its memory.
 //
-// Run: YOURDB_ENGINE_PATH=/abs/path/to/libengine.so bun test
+// Run: TWILLDB_ENGINE_PATH=/abs/path/to/libengine.so bun test
 // (the engine must be a release build at ABI v3; rebuild after engine changes.)
 
 import { test, expect, beforeEach, afterEach } from "bun:test";
@@ -16,7 +16,7 @@ let dbFile: string;
 let url: string;
 
 beforeEach(() => {
-  dbFile = join(tmpdir(), `yourdb-vec-${process.pid}-${Math.random().toString(36).slice(2)}.db`);
+  dbFile = join(tmpdir(), `twilldb-vec-${process.pid}-${Math.random().toString(36).slice(2)}.db`);
   url = `file://${dbFile}`;
 });
 

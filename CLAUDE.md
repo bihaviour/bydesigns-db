@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`bydesigns-db` is a serverless OLTP database engine: an embeddable Rust library
+Twill DB is a serverless OLTP database engine: an embeddable Rust library
 (SQLite-style, function-call latency) whose **storage backend is pluggable**, so
 the *same* engine runs either purely embedded (`file://`) or storage-disaggregated
 on object storage (`s3://`/`r2://`/`gs://`). The full design lives as an HTML spec
@@ -18,7 +18,7 @@ ABI unchanged. Phase 3 adds `engine-server`: the same engine behind a Postgres-w
 listener (a defined pgwire subset), serving either backend by connection string.
 Phase 4 adds copy-on-write branching (the `engine_branch` stub is now a working
 branch — `STORAGE_TRAIT_VERSION` 2, `ENGINE_ABI_VERSION` 2 at Phase 4), a durable
-single-writer lease (acquire/renew/release), and the `bydesigns-controller`
+single-writer lease (acquire/renew/release), and the `twill-controller`
 lifecycle controller (scale-to-zero + keep-warm). Phase 5 adds the in-core
 **vector capability** — a `vector(N)` type, an HNSW access method
 (`CREATE INDEX … USING hnsw`), the distance operators `<->`/`<=>`/`<#>`, and a
@@ -36,7 +36,7 @@ crates/storage    # the pluggable `Storage` trait (the seam) + LocalFileStorage 
 crates/engine     # libengine: SQL → MVCC → WAL, plus the stable C ABI (include/engine.h)
 crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset); links the engine unchanged
 crates/controller # lifecycle controller: scale-to-zero instances, lease heartbeat, keep-warm + thundering-herd admission (Phase 4)
-clients/bun       # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
+clients/bun       # @twilldb/bun: bun:ffi bindings + ergonomic typed wrapper + example
 pages/            # the website + documentation (static HTML, deployed to GitHub Pages):
                   #   index.html  — home (project overview)
                   #   docs/       — user documentation (connect, branch, pool, operate)
@@ -51,26 +51,26 @@ pages/            # the website + documentation (static HTML, deployed to GitHub
 ```bash
 # Rust workspace
 cargo test                                    # all tests (engine + FFI + storage conformance + controller)
-cargo test -p bydesigns-engine --test engine  # one test binary
-cargo test -p bydesigns-engine mvcc_snapshot_isolation   # one test by name
-cargo test -p bydesigns-storage --test branching         # Phase 4 copy-on-write branching (both backends)
-cargo test -p bydesigns-controller            # Phase 4 lifecycle: scale-to-zero + thundering herd
+cargo test -p twill-engine --test engine  # one test binary
+cargo test -p twill-engine mvcc_snapshot_isolation   # one test by name
+cargo test -p twill-storage --test branching         # Phase 4 copy-on-write branching (both backends)
+cargo test -p twill-controller            # Phase 4 lifecycle: scale-to-zero + thundering herd
 cargo fmt --all                               # format (CI runs `cargo fmt --check`)
 cargo clippy --all-targets                    # lint (CI runs with `-D warnings`)
-cargo build -p bydesigns-engine --release     # build target/release/libengine.{a,so,dylib}
+cargo build -p twill-engine --release     # build target/release/libengine.{a,so,dylib}
 
 # Server mode (Phase 3): the engine behind a Postgres-wire listener
-cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
+cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
 # any Postgres client connects (cleartext): psql/Bun.sql/pgbench with sslmode=disable
 
 # Bun client (needs the built libengine; auto-discovered from target/{release,debug})
 cd clients/bun
 bun test                                      # end-to-end embedded tests
-YOURDB_ENGINE_PATH=/abs/path/libengine.so bun test   # explicit library override
+TWILLDB_ENGINE_PATH=/abs/path/libengine.so bun test   # explicit library override
 bun run examples/notes.ts                      # runnable sample app
 
 # Website + docs (static HTML in pages/, no build step; deployed to GitHub Pages)
-bunx serve pages                               # preview the site locally (uses bunx, not python3)
+bunx http-server pages -c-1                     # preview the site locally (uses bunx, not python3)
 ```
 
 The Bun layer loads the native library via `bun:ffi`; if a change touches the C

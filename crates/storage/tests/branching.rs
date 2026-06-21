@@ -4,18 +4,18 @@
 //! sibling are untouched by a branch's writes — and creating a branch copies no
 //! pages (near-zero marginal storage until divergence).
 
-use bydesigns_storage::{
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use twill_storage::{
     block_on, open_branch, open_storage, BranchStorage, FenceToken, Lsn, MemObjectStore,
     ObjectConfig, ObjectStorage, ObjectStore, PageId, Storage, StorageError, WalRecord, WriterId,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("bydesigns-branch-{tag}-{}-{n}", std::process::id()));
+    p.push(format!("twill-branch-{tag}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p

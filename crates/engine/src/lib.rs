@@ -1,8 +1,8 @@
-//! # bydesigns-db · Engine Core (spec 02) — `libengine`
+//! # twill-db · Engine Core (spec 02) — `libengine`
 //!
 //! The single Rust library that parses, plans, and executes SQL, manages MVCC
 //! transactions under snapshot isolation, and generates the WAL — routing every
-//! durable byte through the pluggable [`bydesigns_storage::Storage`] seam rather
+//! durable byte through the pluggable [`twill_storage::Storage`] seam rather
 //! than touching disk directly. It ships as `cdylib` + `staticlib` (for FFI
 //! consumers such as `bun:ffi`) and `rlib` (for native Rust embedding and the
 //! future `engine-server`).

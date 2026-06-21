@@ -81,7 +81,7 @@
 <ul class="reqs">
 <li><span class="req-tag must">MUST</span> produce <code>libengine.a</code> / <code>libengine.so</code> / <code>libengine.dylib</code> — the embeddable static and dynamic libraries.</li>
 <li><span class="req-tag must">MUST</span> publish <code>engine.h</code>, the C-ABI header that is the stable boundary every runtime binds to (<code>engine_open</code>, <code>engine_query</code>, <code>engine_close</code>).</li>
-<li><span class="req-tag must">MUST</span> ship the <code>@yourdb/bun</code> thin TypeScript wrapper over the raw <code>bun:ffi</code> symbols for ergonomic embedded use.</li>
+<li><span class="req-tag must">MUST</span> ship the <code>@twilldb/bun</code> thin TypeScript wrapper over the raw <code>bun:ffi</code> symbols for ergonomic embedded use.</li>
 <li><span class="req-tag must">MUST</span> implement <code>LocalFileStorage</code> as the first concrete <code>Storage</code> impl, satisfying the trait the engine already calls.</li>
 <li><span class="req-tag should">SHOULD</span> include the local cache (shared-buffer page cache) so the hot path is in-process even before disaggregation arrives.</li>
 </ul>
@@ -104,12 +104,12 @@ const { symbols: db } = dlopen(`libengine.${suffix}`, {
 const h = db.engine_open(Buffer.from("file://./local.db\0"));   // P1: pure embedded
 const rows = db.engine_query(h, Buffer.from("select 1 as n\0"));</code></pre>
 <h3>Specs it draws on</h3>
-<p><a href="02-engine-core.html">Engine Core</a> (parser → plan → executor, MVCC, WAL) · <a href="03-storage-interface.html">Storage Interface</a> (the trait + <code>LocalFileStorage</code>) · <a href="05-local-cache.html">Local Cache</a> (in-process page cache) · <a href="08-bun-integration.html">Bun Integration</a> (<code>bun:ffi</code> + <code>@yourdb/bun</code>).</p>
+<p><a href="02-engine-core.html">Engine Core</a> (parser → plan → executor, MVCC, WAL) · <a href="03-storage-interface.html">Storage Interface</a> (the trait + <code>LocalFileStorage</code>) · <a href="05-local-cache.html">Local Cache</a> (in-process page cache) · <a href="08-bun-integration.html">Bun Integration</a> (<code>bun:ffi</code> + <code>@twilldb/bun</code>).</p>
 <h3>Exit criteria &amp; gate</h3>
 <ul class="reqs">
 <li><span class="req-tag must">MUST</span> open a <code>file://</code> database from Bun via FFI, run DDL + DML + queries, and read back correct results across a process restart (file persistence).</li>
 <li><span class="req-tag must">MUST</span> pass a <strong>basic correctness</strong> gate: a SQL conformance smoke suite plus MVCC snapshot-isolation checks (a reader sees a consistent snapshot across a concurrent committed write).</li>
-<li><span class="req-tag should">SHOULD</span> demonstrate the <code>@yourdb/bun</code> wrapper end-to-end in a sample Bun app with no native build step beyond the prebuilt library.</li>
+<li><span class="req-tag should">SHOULD</span> demonstrate the <code>@twilldb/bun</code> wrapper end-to-end in a sample Bun app with no native build step beyond the prebuilt library.</li>
 </ul>
 <div class="callout success">
 <p class="callout-title">Phase 1 payoff</p>
@@ -319,7 +319,7 @@ P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
 <p>A phase is Done only when its deliverables ship, its gate experiments are green, and the artifact below is demonstrable end-to-end.</p>
 <dl class="fields">
 <dt>Phase 1 DoD</dt>
-<dd>Prebuilt <code>libengine.*</code> + <code>engine.h</code> + <code>@yourdb/bun</code> bind from a sample Bun app; <code>file://</code> DB persists across restart; basic-correctness + MVCC snapshot suite green. C ABI declared frozen.</dd>
+<dd>Prebuilt <code>libengine.*</code> + <code>engine.h</code> + <code>@twilldb/bun</code> bind from a sample Bun app; <code>file://</code> DB persists across restart; basic-correctness + MVCC snapshot suite green. C ABI declared frozen.</dd>
 <dt>Phase 2 DoD</dt>
 <dd>Same binary opens an <code>s3://</code> DB with no recompile; correctness suite green on object storage; Exp 1, Exp 2, and Exp 4 all pass — Exp 4 unconditionally (no acked-write loss under <kbd>kill -9</kbd>).</dd>
 <dt>Phase 3 DoD</dt>
@@ -341,7 +341,7 @@ P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
 <tbody>
 <tr>
 <td><strong>M1 — Embedded</strong></td>
-<td>libengine + engine.h + @yourdb/bun + LocalFileStorage</td>
+<td>libengine + engine.h + @twilldb/bun + LocalFileStorage</td>
 <td>02, 03, 05, 08</td>
 <td>Basic correctness + MVCC snapshot</td>
 <td>In-process persistent DB, zero infra</td>
@@ -423,7 +423,7 @@ P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20. · <a href="../author/index.html">Author</a></footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

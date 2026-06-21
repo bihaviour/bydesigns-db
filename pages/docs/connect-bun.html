@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect from Bun (embedded) · bydesigns-db docs</title>
-<meta name="description" content="The full embedded bydesigns-db API over bun:ffi: open, exec, parameterized query, prepared statements, transactions, branching, and error handling.">
+<title>Connect from Bun (embedded) · Twill DB docs</title>
+<meta name="description" content="The full embedded Twill DB API over bun:ffi: open, exec, parameterized query, prepared statements, transactions, branching, and error handling.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -22,16 +22,16 @@
 <span class="spec-date">Connect</span>
 </div>
 <h1>Connect from Bun (embedded)</h1>
-<p class="lede">The embedded path links the native engine in-process and drives it over the C ABI through <code>bun:ffi</code>. The <code>@yourdb/bun</code> wrapper hides the raw pointers behind a small typed surface — <code>open</code>, <code>exec</code>, <code>query</code>, <code>prepare</code>, <code>transaction</code>, and <code>branch</code> — at function-call latency, with deterministic resource cleanup.</p>
+<p class="lede">The embedded path links the native engine in-process and drives it over the C ABI through <code>bun:ffi</code>. The <code>@twilldb/bun</code> wrapper hides the raw pointers behind a small typed surface — <code>open</code>, <code>exec</code>, <code>query</code>, <code>prepare</code>, <code>transaction</code>, and <code>branch</code> — at function-call latency, with deterministic resource cleanup.</p>
 </header>
 
 <section>
 <h2>Load the library</h2>
-<p>The wrapper auto-discovers the built native library from <code>target/release</code> then <code>target/debug</code>. Build it once before running anything that imports <code>@yourdb/bun</code>; the loader binds whatever it finds, so a stale binary runs silently if you forget to rebuild after an engine change.</p>
-<pre data-lang="bash"><code>cargo build -p bydesigns-engine --release   # → target/release/libengine.{a,so,dylib}
+<p>The wrapper auto-discovers the built native library from <code>target/release</code> then <code>target/debug</code>. Build it once before running anything that imports <code>@twilldb/bun</code>; the loader binds whatever it finds, so a stale binary runs silently if you forget to rebuild after an engine change.</p>
+<pre data-lang="bash"><code>cargo build -p twill-engine --release   # → target/release/libengine.{a,so,dylib}
 cd clients/bun &amp;&amp; bun install</code></pre>
-<p>To point at a specific build (a non-standard target dir, a packaged artifact, or a CI path), set <code>YOURDB_ENGINE_PATH</code> to the absolute library path; it overrides auto-discovery.</p>
-<pre data-lang="bash"><code>YOURDB_ENGINE_PATH=/abs/path/libengine.so bun test</code></pre>
+<p>To point at a specific build (a non-standard target dir, a packaged artifact, or a CI path), set <code>TWILLDB_ENGINE_PATH</code> to the absolute library path; it overrides auto-discovery.</p>
+<pre data-lang="bash"><code>TWILLDB_ENGINE_PATH=/abs/path/libengine.so bun test</code></pre>
 <div class="callout note">
 <p class="callout-title">Rebuild after engine or ABI changes</p>
 <p>The wrapper pins an expected ABI version. After any change that touches the C ABI or engine behaviour, rebuild the release <code>libengine</code> before running Bun — otherwise you are testing a stale binary against the new wrapper.</p>
@@ -41,7 +41,7 @@ cd clients/bun &amp;&amp; bun install</code></pre>
 <section>
 <h2>Open a database</h2>
 <p><code>open(url)</code> returns a <code>Database</code> handle. The URL scheme selects the durable storage backend — <code>file://</code> for pure-embedded, <code>s3://</code>/<code>r2://</code>/<code>gs://</code> for disaggregated. An unknown scheme or a storage-init failure throws an <code>EngineError</code>; nothing is silently defaulted.</p>
-<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
 
 using db = open("file://./local.db");   // pure-embedded, zero network
 // using db = open("s3://my-bucket/app");  // disaggregated; creds from the environment</code></pre>
@@ -151,7 +151,7 @@ try { /* ... */ } finally { db2.close(); }</code></pre>
 <section>
 <h2>Errors, retries, and the commit LSN</h2>
 <p>Failures throw an <code>EngineError</code> carrying the numeric engine <code>status</code> and a <code>retryable</code> flag. <code>retryable</code> is <code>true</code> for a write–write conflict (<code>ERR_CONFLICT</code>, first-committer-wins lost) or a transient storage error (<code>ERR_STORAGE</code>) — retry the transaction in those cases. Other statuses (SQL errors, misuse) are not worth retrying.</p>
-<pre data-lang="ts"><code>import { EngineError } from "@yourdb/bun";
+<pre data-lang="ts"><code>import { EngineError } from "@twilldb/bun";
 
 function withRetry&lt;R&gt;(fn: () =&gt; R, attempts = 3): R {
   for (let i = 0; ; i++) {
@@ -198,7 +198,7 @@ preview.query("SELECT id FROM notes WHERE id = 40"); // [{ id: "40" }]</code></p
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

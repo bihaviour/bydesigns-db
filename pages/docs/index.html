@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Documentation · bydesigns-db</title>
-<meta name="description" content="User documentation for bydesigns-db: connect from Bun or a Postgres client, branch your data, scale to zero, and operate the engine.">
+<title>Documentation · Twill DB</title>
+<meta name="description" content="User documentation for Twill DB: connect from Bun or a Postgres client, branch your data, scale to zero, and operate the engine.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -19,14 +19,14 @@
 <div class="spec-meta">
 <span class="badge badge-id">DOCS</span>
 <span class="badge badge-status status-review">User guide</span>
-<span class="spec-date">bydesigns-db v0.2</span>
+<span class="spec-date">Twill DB v0.3</span>
 </div>
 <h1>Documentation</h1>
-<p class="lede">Everything you need to use bydesigns-db — open a database with a connection string, embed it in your app or run it as a Postgres-wire server, branch your data copy-on-write, and let it scale to zero. New here? Start with the <a href="getting-started.html">Quickstart</a>.</p>
+<p class="lede">Everything you need to use Twill DB — open a database with a connection string, embed it in your app or run it as a Postgres-wire server, branch your data copy-on-write, and let it scale to zero. New here? Start with the <a href="getting-started.html">Quickstart</a>.</p>
 </header>
 
 <section>
-<h2>How bydesigns-db is delivered</h2>
+<h2>How Twill DB is delivered</h2>
 <p>There is <strong>one engine</strong> and you reach it through one of two front doors. The backend it durably writes to is chosen by the <em>connection string</em>, not by a rebuild.</p>
 <div class="table-wrap">
 <table>
@@ -56,7 +56,7 @@
 </a>
 <a class="doc-card" href="connect-bun.html">
 <div class="ic">📦</div><h3>Connect from Bun</h3>
-<p>Use the <code>@yourdb/bun</code> wrapper over <code>bun:ffi</code> — open, query, parameter-bind, transact, and branch.</p>
+<p>Use the <code>@twilldb/bun</code> wrapper over <code>bun:ffi</code> — open, query, parameter-bind, transact, and branch.</p>
 </a>
 <a class="doc-card" href="connect-postgres.html">
 <div class="ic">🐘</div><h3>Connect with a Postgres client</h3>
@@ -87,12 +87,12 @@
 
 <section>
 <h2>Looking for design intent?</h2>
-<p>This section is the <em>user</em> documentation. If you want to understand how and why the engine is built the way it is — the storage seam, MVCC, the S3-CAS commit log, the lifecycle controller — read the <a href="../specs/index.html">Development Guidelines</a> (the fourteen design specifications and per-phase implementation maps). To see what has shipped and what is next, see <a href="../release/index.html">Releases &amp; Roadmap</a>.</p>
+<p>This section is the <em>user</em> documentation. If you want to understand how and why the engine is built the way it is — the storage seam, MVCC, the S3-CAS commit log, the lifecycle controller — read the <a href="../specs/index.html">Development Guidelines</a> (the fourteen design specifications and implementation maps). To see what has shipped and what is next, see <a href="../release/index.html">Releases &amp; Roadmap</a>.</p>
 </section>
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

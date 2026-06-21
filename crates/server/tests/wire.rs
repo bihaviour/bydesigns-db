@@ -13,7 +13,7 @@ fn unique_db() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("bydesigns-srv-{}-{n}.db", std::process::id()));
+    p.push(format!("twill-srv-{}-{n}.db", std::process::id()));
     let _ = std::fs::remove_file(&p);
     format!("file://{}", p.display())
 }
@@ -24,7 +24,7 @@ fn start_server() -> String {
     let addr = listener.local_addr().unwrap().to_string();
     let db = unique_db();
     thread::spawn(move || {
-        let _ = bydesigns_server::serve_listener(listener, &db);
+        let _ = twill_server::serve_listener(listener, &db);
     });
     addr
 }
@@ -179,7 +179,7 @@ fn introspection_version_is_answered() {
     let r = c.simple("select version()");
     let rows = data_rows(&r);
     assert_eq!(rows.len(), 1);
-    assert!(rows[0][0].as_deref().unwrap().contains("bydesigns-db"));
+    assert!(rows[0][0].as_deref().unwrap().contains("twill-db"));
 }
 
 #[test]

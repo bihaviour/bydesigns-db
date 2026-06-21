@@ -1,4 +1,4 @@
-//! `engine-server` — the bydesigns-db engine behind a Postgres-wire listener.
+//! `engine-server` — the twill-db engine behind a Postgres-wire listener.
 //!
 //! ```text
 //! engine-server [--listen HOST:PORT] [--db URL]
@@ -33,7 +33,7 @@ fn main() -> ExitCode {
     }
 
     eprintln!("engine-server: listening on {listen}, serving {db}");
-    match bydesigns_server::run(&listen, &db) {
+    match twill_server::run(&listen, &db) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("engine-server: fatal: {e}");

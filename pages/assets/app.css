@@ -1,5 +1,5 @@
 /* =============================================================================
-   bydesigns-db — Site & Documentation Design System
+   twill-db — Site & Documentation Design System
    A self-contained stylesheet for the whole site (home, docs, specs, release).
    No external dependencies. Light + dark themes via [data-theme]. A sticky
    top site-header sits above an optional 3-column layout (nav | content | toc).
@@ -442,6 +442,20 @@ kbd {
 /* =============================================================================
    Site header (top navigation) — shared across home, docs, specs, release
    ============================================================================= */
+.dev-banner {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-bottom: 1px solid var(--warn-bd);
+  text-align: center;
+  font-family: var(--font-sans);
+  font-size: .8rem;
+  line-height: 1.35;
+  padding: 7px var(--s5);
+}
+.dev-banner strong { font-weight: 700; }
+.dev-banner a { color: inherit; text-decoration: underline; white-space: nowrap; }
+.dev-banner a:hover { opacity: .8; }
+
 .site-header {
   position: sticky; top: 0; z-index: 60;
   height: var(--site-header-h);

@@ -1,4 +1,4 @@
-# bydesigns-db
+# Twill DB
 
 > DB Management System with separated process and storage layer. Built on Rust, and compatible with PostgreSQL.
 
@@ -13,9 +13,12 @@ a **scale-to-zero lifecycle controller**, and **in-core vector search** (a
 database). See the [roadmap](#roadmap) and the [documentation](#documentation)
 entry points below.
 
+> [!WARNING]
+> **Pre-1.0 — active development.** Twill DB is under active development (currently `0.x`). Interfaces, the SQL surface, on-disk and storage formats, and behaviour may change between releases — **backward compatibility is not guaranteed until the `1.0.0` release**. Pin an exact version and review the release notes before upgrading.
+
 ## What this is
 
-`bydesigns-db` is an OLTP database engine that is, at the same time:
+**Twill DB** is an OLTP database engine that is, at the same time:
 
 - **Embeddable** — links in-process as a library, at function-call latency (SQLite-style), and
 - **Storage-disaggregated** — durable state lives on object storage (S3 / Cloudflare R2 / MinIO), so compute is stateless.
@@ -35,8 +38,8 @@ branching** (copy-on-write over LSN-versioned immutable layers).
 - **Engine (Rust library)** — SQL parser → planner → executor, MVCC (snapshot isolation via LSN-stamped versions), WAL generation. Ships as `cdylib` + `staticlib` with a stable C ABI (`engine.h`), plus an `engine-server` binary.
 - **Pluggable `Storage` trait** — the central seam. Backends: `LocalFileStorage` (pure embedded, zero network), `ObjectStorage` (disaggregated), and `BranchStorage` (copy-on-write overlay composing the two).
 - **Object-storage backend** — an LSM page store (versioned by LSN) plus an ordered commit log whose durability bottoms out on **S3 conditional writes (compare-and-swap)** — atomic ordered appends and single-writer fencing without a separate consensus cluster.
-- **Branching & lifecycle** — a branch is a cheap LSN pointer over shared immutable layers (writes diverge into a private overlay); the `bydesigns-controller` crate cold-starts instances on first connection and tears them down when idle (scale-to-zero), heartbeating each instance's durable writer lease.
-- **Interfaces** — embedded via `bun:ffi` (`@yourdb/bun`) / NAPI; server via the **Postgres wire protocol**, so existing tooling (PostgREST, `Bun.sql`, standard `psql`/pg drivers) connects unchanged.
+- **Branching & lifecycle** — a branch is a cheap LSN pointer over shared immutable layers (writes diverge into a private overlay); the `twill-controller` crate cold-starts instances on first connection and tears them down when idle (scale-to-zero), heartbeating each instance's durable writer lease.
+- **Interfaces** — embedded via `bun:ffi` (`@twilldb/bun`) / NAPI; server via the **Postgres wire protocol**, so existing tooling (PostgREST, `Bun.sql`, standard `psql`/pg drivers) connects unchanged.
 
 ## Getting started
 
@@ -45,17 +48,17 @@ pure-embedded, `s3://`/`r2://`/`gs://` for disaggregated — with no recompile.
 
 ### Embedded (Bun + FFI)
 
-Build the native library, then use the `@yourdb/bun` wrapper (it auto-discovers
-the built library, or set `YOURDB_ENGINE_PATH`):
+Build the native library, then use the `@twilldb/bun` wrapper (it auto-discovers
+the built library, or set `TWILLDB_ENGINE_PATH`):
 
 ```bash
-cargo build -p bydesigns-engine --release    # target/release/libengine.{a,so,dylib}
+cargo build -p twill-engine --release    # target/release/libengine.{a,so,dylib}
 cd clients/bun && bun test                    # end-to-end embedded tests
 bun run examples/notes.ts                      # runnable sample app
 ```
 
 ```ts
-import { open } from "@yourdb/bun";
+import { open } from "@twilldb/bun";
 
 using db = open("file://./local.db");          // or "s3://bucket/db"
 db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
@@ -89,13 +92,13 @@ The same engine behind a Postgres-wire listener; any Postgres client connects
 (cleartext, `sslmode=disable`):
 
 ```bash
-cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
+cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
 psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"
 ```
 
 ### Scale-to-zero (controller, library API)
 
-`bydesigns-controller` manages engine instances: cold-start on first connection,
+`twill-controller` manages engine instances: cold-start on first connection,
 keep-warm, idle teardown, and thundering-herd admission — all over the same
 storage seam.
 
@@ -117,7 +120,7 @@ The whole site is self-contained static HTML (no build step). Open
 [`pages/index.html`](pages/index.html) directly, or serve the folder locally:
 
 ```bash
-bunx serve pages   # then visit the printed http://localhost:3000
+bunx http-server pages -c-1   # then visit http://localhost:8080
 ```
 
 Selected development specs (under [`pages/specs/`](pages/specs/)):
@@ -141,7 +144,7 @@ crates/storage    # the pluggable `Storage` trait (the seam) + LocalFileStorage 
 crates/engine     # libengine: SQL → MVCC → WAL, and the stable C ABI (include/engine.h)
 crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset)
 crates/controller # lifecycle controller: scale-to-zero, lease heartbeat, keep-warm + thundering-herd admission
-clients/bun       # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + examples (notes, vector-memory, compose)
+clients/bun       # @twilldb/bun: bun:ffi bindings + ergonomic typed wrapper + examples (notes, vector-memory, compose)
 pages/            # the website + documentation (static HTML, deployed to GitHub Pages):
                   #   index.html (home) · docs/ (user docs) · specs/ (development guidelines
                   #   + implementation maps) · release/ (releases & roadmap) · assets/ (design system)
@@ -151,11 +154,11 @@ pages/            # the website + documentation (static HTML, deployed to GitHub
 
 ```bash
 cargo test                                   # all Rust tests (engine + FFI + storage conformance + controller)
-cargo build -p bydesigns-engine --release    # produces target/release/libengine.{a,so,dylib}
+cargo build -p twill-engine --release    # produces target/release/libengine.{a,so,dylib}
 cargo fmt --all && cargo clippy --all-targets -- -D warnings   # CI gates
 
 # Bun embedded client (rebuild libengine first after any C-ABI/engine change):
-cargo build -p bydesigns-engine --release && (cd clients/bun && bun test)
+cargo build -p twill-engine --release && (cd clients/bun && bun test)
 ```
 
 ## Roadmap

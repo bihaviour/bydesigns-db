@@ -6,7 +6,7 @@ argument-hint: "open|merge|close|status [pr-number] [notes…]"
 
 # /gh — pull request operations
 
-Drive PR lifecycle for `bihaviour/bydesigns-db`. The first argument is the action.
+Drive PR lifecycle for `bihaviour/twill-db`. The first argument is the action.
 
 ## Pick a backend (in this order)
 
@@ -40,7 +40,7 @@ Read-only: summarize the PR's state, CI checks, review threads, and mergeability
 - MCP: `mcp__github__pull_request_read` (`get`, `get_status`, `get_check_runs`, `get_review_comments`). CLI: `gh pr view <n>` + `gh pr checks <n>`.
 
 ## Guardrails
-- Repo scope is `bihaviour/bydesigns-db`; don't touch other repos.
+- Repo scope is `bihaviour/twill-db`; don't touch other repos.
 - Never open a PR unless explicitly asked.
 - Be frugal with PR comments — only when genuinely useful.
 - If a PR number isn't given for merge/close/status, resolve it from the current branch (`gh pr view --json number` or `mcp__github__list_pull_requests` filtered by head), and confirm which PR you mean.

@@ -1,9 +1,9 @@
-// End-to-end test of the embedded path: @yourdb/bun -> bun:ffi -> libengine,
+// End-to-end test of the embedded path: @twilldb/bun -> bun:ffi -> libengine,
 // backed by a file:// database. Covers exec/query/prepared/transaction, MVCC
 // snapshot isolation across two handles, persistence across reopen, NULL
 // handling, typed errors, and deterministic disposal.
 //
-// Run: YOURDB_ENGINE_PATH=/abs/path/to/libengine.so bun test
+// Run: TWILLDB_ENGINE_PATH=/abs/path/to/libengine.so bun test
 // (the loader also auto-discovers target/{release,debug} in this repo).
 
 import { test, expect, beforeEach, afterEach } from "bun:test";
@@ -16,7 +16,7 @@ let dbFile: string;
 let url: string;
 
 beforeEach(() => {
-  dbFile = join(tmpdir(), `yourdb-bun-${process.pid}-${Math.random().toString(36).slice(2)}.db`);
+  dbFile = join(tmpdir(), `twilldb-bun-${process.pid}-${Math.random().toString(36).slice(2)}.db`);
   url = `file://${dbFile}`;
 });
 

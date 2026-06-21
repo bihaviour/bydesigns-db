@@ -1,13 +1,13 @@
-//! # bydesigns-db · Lifecycle Controller (spec 06)
+//! # twill-db · Lifecycle Controller (spec 06)
 //!
 //! Scale-to-zero for engine instances: cold-start on the first connection, tear
 //! down when idle, and survive a burst of simultaneous cold starts. The
 //! controller owns no durable state — every byte lives in object storage behind
-//! the [`Storage`](bydesigns_storage) seam — so stopping an instance loses
+//! the [`Storage`](twill_storage) seam — so stopping an instance loses
 //! nothing and the next connection cold-starts it again.
 //!
 //! It composes the engine's existing primitives rather than reimplementing them:
-//! a warm instance is an [`bydesigns_engine::Database`] (opening one acquires the
+//! a warm instance is an [`twill_engine::Database`] (opening one acquires the
 //! writer fence and replays the WAL — that *is* the cache warm); stopping drops
 //! it (the engine's `Drop` releases the fence). On top of that the controller
 //! adds the state machine, an idle-timeout reaper, a lease heartbeat, and

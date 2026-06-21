@@ -1,4 +1,4 @@
-/* engine.h — bydesigns-db stable C ABI (spec 02 — Engine Core).
+/* engine.h — twill-db stable C ABI (spec 02 — Engine Core).
  *
  * The single boundary every runtime binds to (bun:ffi, NAPI, static link). All
  * functions are thread-safe across distinct handles; a single handle must not be
@@ -12,8 +12,8 @@
  * hnsw, the distance operators <-> / <=> / <#>, and the "v…" bind encoding) — all
  * over these unchanged symbols; vectors are carried as their "[1,2,3]" text form.
  */
-#ifndef BYDESIGNS_ENGINE_H
-#define BYDESIGNS_ENGINE_H
+#ifndef TWILL_ENGINE_H
+#define TWILL_ENGINE_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -109,4 +109,4 @@ void          engine_result_free(EngineResult* r); /* idempotent on NULL */
 #ifdef __cplusplus
 }
 #endif
-#endif /* BYDESIGNS_ENGINE_H */
+#endif /* TWILL_ENGINE_H */

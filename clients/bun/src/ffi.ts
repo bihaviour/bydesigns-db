@@ -9,9 +9,9 @@ import { dlopen, FFIType, suffix, CString, ptr, type Pointer } from "bun:ffi";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-/** Locate libengine.{so,dylib,dll}. Override with YOURDB_ENGINE_PATH. */
+/** Locate libengine.{so,dylib,dll}. Override with TWILLDB_ENGINE_PATH. */
 function resolveLibraryPath(): string {
-  const override = process.env.YOURDB_ENGINE_PATH;
+  const override = process.env.TWILLDB_ENGINE_PATH;
   if (override) return override;
 
   const file = `libengine.${suffix}`;
@@ -74,9 +74,9 @@ try {
   opened = dlopen(LIB_PATH, ABI);
 } catch (e) {
   throw new Error(
-    `@yourdb/bun: failed to load the engine library at "${LIB_PATH}". ` +
-      `Set YOURDB_ENGINE_PATH to the built libengine.${suffix}, or build it with ` +
-      `\`cargo build -p bydesigns-engine --release\`. Original error: ${(e as Error).message}`,
+    `@twilldb/bun: failed to load the engine library at "${LIB_PATH}". ` +
+      `Set TWILLDB_ENGINE_PATH to the built libengine.${suffix}, or build it with ` +
+      `\`cargo build -p twill-engine --release\`. Original error: ${(e as Error).message}`,
   );
 }
 
@@ -92,8 +92,8 @@ export const EXPECTED_ABI_VERSION = 3;
   const got = lib.engine_abi_version();
   if (got !== EXPECTED_ABI_VERSION) {
     throw new Error(
-      `@yourdb/bun: engine ABI v${got}, wrapper expects v${EXPECTED_ABI_VERSION}. ` +
-        `Upgrade @yourdb/bun or the engine binary.`,
+      `@twilldb/bun: engine ABI v${got}, wrapper expects v${EXPECTED_ABI_VERSION}. ` +
+        `Upgrade @twilldb/bun or the engine binary.`,
     );
   }
 }
