@@ -22,6 +22,7 @@ window.SECTION = {
     ]},
     { label: "Compose", items: [
       { file: "auth.html",     id: "AUTH", title: "Auth (better-auth)" },
+      { file: "olap.html",     id: "OLAP", title: "Analytics (DuckDB / HTAP)" },
     ]},
     { label: "Reference", items: [
       { file: "sql-reference.html", id: "SQL", title: "SQL reference" },

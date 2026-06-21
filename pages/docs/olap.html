@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Analytics (DuckDB / HTAP) · Twill DB docs</title>
+<meta name="description" content="Compose DuckDB over the same storage floor as the Twill DB row engine: a thin materialization job publishes open columnar (Parquet) snapshots that DuckDB queries directly — HTAP as two engines over one floor, the row engine staying OLTP.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">OLAP</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Guide</span>
+</div>
+<h1>Analytics (DuckDB / HTAP)</h1>
+<p class="lede">Analytics is added as a <em>second engine over the same storage floor</em> — not by making the row engine columnar. A thin materialization job periodically snapshots a table to an open columnar format (Parquet) on the shared store, and <a href="https://duckdb.org/">DuckDB</a> queries those snapshots directly. The row engine stays OLTP; DuckDB does the aggregations. This is possible precisely because storage is decoupled.</p>
+</header>
+
+<section>
+<h2>The idea: two engines, one floor</h2>
+<p>The deciding rule (<a href="../specs/12-capabilities.html">spec 12</a>) is that you add analytics by <strong>composing a second engine</strong>, not by bloating the OLTP engine with a columnar path. Twill DB keeps its row engine focused on transactions. DuckDB — an off-the-shelf analytical engine — reads an open columnar snapshot of the same data. The only code you own is the <strong>materialization job</strong>: the glue that publishes the snapshot.</p>
+
+<div class="callout note">
+<p class="callout-title">Why this works</p>
+<p>Because durable state lives behind the storage seam, the columnar snapshots can sit beside the database's own objects on the same bucket. DuckDB reads object storage natively, so the analytical engine and the transactional engine share one floor without a pipeline between two systems.</p>
+</div>
+
+<div class="diagram">
+<pre>
+  writes ──▶  Twill row engine (OLTP)  ──┐
+                                          │ materialization job (thin glue we own)
+                                          ▼
+                         Parquet snapshot on shared store  ◀── DuckDB (OLAP) ──▶ aggregations
+</pre>
+</div>
+</section>
+
+<section>
+<h2>Materialize a snapshot</h2>
+<p>The <code>@twilldb/bun/olap</code> helper snapshots a table to an open columnar file, publishing atomically (write to a temp file, then rename) so a reader only ever sees a whole snapshot.</p>
+<pre><code>import { open } from "@twilldb/bun";
+import { materialize } from "@twilldb/bun/olap";
+
+using db = open("file://./app.db"); // or s3://bucket/app — snapshot lands on the same store
+
+db.exec("CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT, amount REAL)");
+db.exec("INSERT INTO events VALUES (1,'click',1.5),(2,'view',0.0),(3,'click',2.5)");
+
+const snap = materialize(db, { table: "events", dir: "./olap", format: "parquet" });
+// → { path: "./olap/events.parquet", rows: 3, format: "parquet" }</code></pre>
+<p>Parquet is the production format. DuckDB is also the off-the-shelf <em>writer</em> the job shells out to (<code>COPY … TO … (FORMAT PARQUET)</code>); when DuckDB is not installed the job falls back to CSV, which DuckDB still reads via <code>read_csv_auto</code> — so a snapshot is always publishable, only the encoding changes.</p>
+</section>
+
+<section>
+<h2>Query it from DuckDB</h2>
+<p>DuckDB reads the snapshot unmodified — no import step, no second copy of the schema:</p>
+<pre data-lang="bash"><code>duckdb -c "SELECT kind, count(*) AS n, sum(amount) AS total
+           FROM './olap/events.parquet' GROUP BY kind ORDER BY kind"</code></pre>
+<p>The aggregation runs entirely in DuckDB over the columnar snapshot; the row engine is never on this path. A runnable end-to-end version is <code>clients/bun/examples/duckdb-olap.ts</code> (<code>bun run examples/duckdb-olap.ts</code>).</p>
+</section>
+
+<section>
+<h2>Configurable cadence</h2>
+<p>Snapshots refresh on a cadence you choose. <code>Materializer</code> wraps <code>materialize</code> with a configurable interval; the row engine keeps serving OLTP while snapshots refresh in the background, and DuckDB always reads the last whole snapshot.</p>
+<pre><code>import { Materializer } from "@twilldb/bun/olap";
+
+const m = new Materializer(db, { table: "events", dir: "./olap", cadenceMs: 60_000 });
+m.start();   // publish now, then every 60s
+// … later …
+m.stop();</code></pre>
+<p>Pick the cadence by how fresh the analytics need to be versus how often you want to pay the snapshot cost — seconds for near-real-time dashboards, minutes or hours for periodic reporting.</p>
+</section>
+
+<section>
+<h2>Scope</h2>
+<div class="callout warning">
+<p class="callout-title">The row engine stays OLTP-only</p>
+<p>This composition deliberately adds <em>no</em> columnar code to the engine — there is no second on-disk format, no analytical query path in <code>crates/engine</code>. Analytics is DuckDB's job over a published snapshot. The trade-off is that DuckDB queries the snapshot, not live rows: results are as fresh as the last materialization. Iceberg can replace Parquet as the snapshot format when you want table-level snapshot/branch semantics on the lake side; the materialization job is the only piece that changes.</p>
+</div>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="connect.html"><span class="xref-id">CONN</span><span class="xref-title">Connect to your database</span><span class="xref-desc">Use an <code>s3://</code> backend so snapshots share the database's floor.</span></a>
+<a class="xref" href="auth.html"><span class="xref-id">AUTH</span><span class="xref-title">Auth (better-auth)</span><span class="xref-desc">The other composed capability — a library in-process rather than an engine in front.</span></a>
+<a class="xref" href="../specs/12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities (spec)</span><span class="xref-desc">The built-in-vs-composed rule that keeps OLAP out of the core.</span></a>
+<a class="xref" href="../specs/04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-storage backend (spec)</span><span class="xref-desc">The decoupled storage that lets a second engine share the floor.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

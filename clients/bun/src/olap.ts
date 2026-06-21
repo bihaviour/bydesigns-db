@@ -1,0 +1,158 @@
+// @twilldb/bun — OLAP materialization glue (issue #28): publish row data to
+// open columnar snapshots that a second engine (DuckDB) queries directly.
+//
+// This is the HTAP shape spec 12 describes: two engines over one storage floor.
+// The row engine stays OLTP-only — it never goes columnar. Instead the only code
+// we own, a thin materialization job, periodically snapshots a table to an open
+// format (Parquet) on the shared store; DuckDB reads those snapshots unmodified.
+// Possible precisely because storage is decoupled: the snapshots can live beside
+// the database's own objects on the same bucket.
+//
+//   import { open } from "@twilldb/bun";
+//   import { Materializer } from "@twilldb/bun/olap";
+//
+//   using db = open("file://./app.db");
+//   const m = new Materializer(db, { table: "events", dir: "./olap", cadenceMs: 60_000 });
+//   m.start();                       // snapshot every 60s
+//   // … DuckDB: SELECT kind, sum(amount) FROM './olap/events.parquet' GROUP BY kind
+//   m.stop();
+//
+// Parquet is the production format; DuckDB is also the off-the-shelf writer we
+// shell out to (COPY … TO … (FORMAT PARQUET)). When DuckDB is absent the job
+// falls back to CSV, which DuckDB also reads via read_csv_auto — so the snapshot
+// is always publishable, only the encoding changes.
+
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Database } from "./index";
+
+export type SnapshotFormat = "parquet" | "csv";
+
+export interface MaterializeOptions {
+  /** Table to snapshot. */
+  table: string;
+  /** Directory the snapshot is published into (created if missing). */
+  dir: string;
+  /** Columns to include; defaults to all (`SELECT *`). */
+  columns?: string[];
+  /** Output format. Defaults to "parquet", falling back to "csv" if DuckDB is absent. */
+  format?: SnapshotFormat;
+}
+
+export interface SnapshotResult {
+  /** Absolute-or-relative path to the published snapshot file. */
+  path: string;
+  /** Number of rows written. */
+  rows: number;
+  /** Format actually produced (may differ from the request if DuckDB is absent). */
+  format: SnapshotFormat;
+}
+
+/** Whether the DuckDB CLI is on PATH (used as the Parquet writer and reader). */
+export function duckdbAvailable(): boolean {
+  try {
+    const r = Bun.spawnSync(["duckdb", "--version"]);
+    return r.success;
+  } catch {
+    return false;
+  }
+}
+
+function csvCell(v: string | null): string {
+  if (v === null) return "";
+  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+function writeCsv(rows: Record<string, string | null>[], columns: string[], path: string): void {
+  const header = columns.join(",");
+  const body = rows.map((r) => columns.map((c) => csvCell(r[c])).join(",")).join("\n");
+  writeFileSync(path, rows.length ? `${header}\n${body}\n` : `${header}\n`);
+}
+
+// Convert a staged CSV to Parquet with DuckDB, publishing atomically (write to a
+// .tmp then rename) so a reader only ever sees a whole snapshot.
+function csvToParquet(csvPath: string, outPath: string): void {
+  const tmp = `${outPath}.tmp`;
+  const sql = `COPY (SELECT * FROM read_csv_auto('${csvPath}', header=true)) TO '${tmp}' (FORMAT PARQUET)`;
+  const r = Bun.spawnSync(["duckdb", "-c", sql]);
+  if (!r.success) {
+    throw new Error(`duckdb parquet COPY failed: ${r.stderr.toString()}`);
+  }
+  renameSync(tmp, outPath); // atomic publish
+}
+
+/**
+ * Snapshot one table to an open columnar file on the shared store, atomically.
+ * Returns the published path, row count, and the format actually written.
+ */
+export function materialize(db: Database, opts: MaterializeOptions): SnapshotResult {
+  mkdirSync(opts.dir, { recursive: true });
+  const cols = opts.columns ?? ["*"];
+  const rows = db.query<Record<string, string | null>>(
+    `SELECT ${cols.join(", ")} FROM ${opts.table}`,
+  );
+  // Column order from the first row when projecting "*", else the requested set.
+  const columns = cols[0] === "*" ? Object.keys(rows[0] ?? {}) : cols;
+
+  const wantParquet = (opts.format ?? "parquet") === "parquet";
+  const useParquet = wantParquet && duckdbAvailable();
+
+  if (!useParquet) {
+    const path = join(opts.dir, `${opts.table}.csv`);
+    const tmp = `${path}.tmp`;
+    writeCsv(rows, columns, tmp);
+    renameSync(tmp, path); // atomic publish
+    return { path, rows: rows.length, format: "csv" };
+  }
+
+  // Stage to CSV next to the output, convert to Parquet, drop the stage.
+  const staging = join(opts.dir, `.${opts.table}.staging.csv`);
+  writeCsv(rows, columns, staging);
+  const path = join(opts.dir, `${opts.table}.parquet`);
+  try {
+    csvToParquet(staging, path);
+  } finally {
+    rmSync(staging, { force: true });
+  }
+  return { path, rows: rows.length, format: "parquet" };
+}
+
+/**
+ * Periodic materializer: snapshots a table on a configurable cadence. The row
+ * engine keeps serving OLTP while snapshots refresh in the background; DuckDB
+ * always reads the last whole snapshot (publishes are atomic).
+ */
+export class Materializer {
+  readonly #db: Database;
+  readonly #opts: MaterializeOptions;
+  readonly #cadenceMs: number;
+  #timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(db: Database, opts: MaterializeOptions & { cadenceMs: number }) {
+    this.#db = db;
+    this.#opts = opts;
+    this.#cadenceMs = opts.cadenceMs;
+  }
+
+  /** Publish one snapshot immediately. */
+  materializeOnce(): SnapshotResult {
+    return materialize(this.#db, this.#opts);
+  }
+
+  /** Begin publishing a snapshot every `cadenceMs` (one immediately). */
+  start(): void {
+    if (this.#timer !== null) return;
+    this.materializeOnce();
+    this.#timer = setInterval(() => this.materializeOnce(), this.#cadenceMs);
+    // Don't keep the process alive solely for the materializer.
+    (this.#timer as { unref?: () => void }).unref?.();
+  }
+
+  /** Stop publishing. */
+  stop(): void {
+    if (this.#timer !== null) {
+      clearInterval(this.#timer);
+      this.#timer = null;
+    }
+  }
+}
