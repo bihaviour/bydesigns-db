@@ -184,6 +184,19 @@ body {
 .spec-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); margin-bottom: var(--s4); }
 .spec-date { font-size: .78rem; color: var(--text-muted); margin-left: auto; }
 
+/* "Copy as Markdown" — export a docs page for pasting into an AI agent. */
+.md-copy-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-sans); font-size: .74rem; font-weight: 600;
+  cursor: pointer; padding: 5px 11px; border-radius: 999px;
+  background: var(--surface); color: var(--text-soft);
+  border: 1px solid var(--border-strong);
+  transition: color .12s, border-color .12s, background .12s;
+}
+.md-copy-btn .md-copy-ico { font-size: .92em; line-height: 1; }
+.md-copy-btn:hover { color: var(--heading); border-color: var(--accent); background: var(--bg-soft); }
+.md-copy-btn.copied { color: var(--success); border-color: var(--success-bd); }
+
 .badge {
   display: inline-flex; align-items: center; gap: 5px;
   font-size: .72rem; font-weight: 600; line-height: 1;
@@ -433,7 +446,7 @@ kbd {
 }
 
 @media print {
-  .site-header, .sidebar, .toc, .nav-toggle, .copy-btn, .controls, .page-nav { display: none !important; }
+  .site-header, .sidebar, .toc, .nav-toggle, .copy-btn, .md-copy-btn, .controls, .page-nav { display: none !important; }
   .layout { grid-template-columns: 1fr; }
   .content { padding: 0; }
   a { color: inherit; border: 0; }
@@ -469,13 +482,10 @@ kbd {
   display: inline-flex; align-items: center; gap: var(--s2);
   text-decoration: none; border: 0; flex: none;
 }
-.site-header .site-brand .logo {
-  width: 26px; height: 26px; border-radius: 7px; flex: none;
-  background: linear-gradient(135deg, var(--accent), var(--teal));
-  display: inline-flex; align-items: center; justify-content: center;
-  color: #fff; font-family: var(--font-mono); font-weight: 700; font-size: .82rem;
+.site-header .site-brand .brand-logo {
+  height: 22px; width: auto; display: block; flex: none;
+  color: var(--heading);
 }
-.site-header .site-brand .name { font-weight: 700; color: var(--heading); font-size: .98rem; letter-spacing: -.01em; }
 .site-header .site-nav { display: flex; align-items: center; gap: var(--s1); margin-left: var(--s3); }
 .site-header .site-nav a {
   color: var(--text-soft); text-decoration: none; border: 0;

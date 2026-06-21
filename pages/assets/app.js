@@ -28,8 +28,25 @@
       return '<a class="' + n.key + cur + '" href="' + BASE + n.href + '">' + n.label + "</a>";
     }).join("");
     header.innerHTML =
-      '<a class="site-brand" href="' + BASE + 'index.html">'
-        + '<span class="logo">td</span><span class="name">Twill DB</span></a>'
+      '<a class="site-brand" href="' + BASE + 'index.html" aria-label="Twill DB — home">'
+        + '<svg class="brand-logo" viewBox="0 0 206 48" fill="currentColor" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">'
+          + '<defs>'
+            + '<clipPath id="bd-lt"><path d="M 1 0.238281 L 27 0.238281 L 27 47 L 1 47 Z M 1 0.238281 "/></clipPath>'
+            + '<clipPath id="bd-lw"><path d="M 26 0.238281 L 75 0.238281 L 75 47 L 26 47 Z M 26 0.238281 "/></clipPath>'
+            + '<clipPath id="bd-li"><path d="M 75 0.238281 L 88 0.238281 L 88 47 L 75 47 Z M 75 0.238281 "/></clipPath>'
+            + '<clipPath id="bd-l1"><path d="M 89 0.238281 L 110 0.238281 L 110 47 L 89 47 Z M 89 0.238281 "/></clipPath>'
+            + '<clipPath id="bd-l2"><path d="M 111 0.238281 L 131 0.238281 L 131 47 L 111 47 Z M 111 0.238281 "/></clipPath>'
+            + '<clipPath id="bd-ld"><path d="M 147 0.238281 L 176 0.238281 L 176 47 L 147 47 Z M 147 0.238281 "/></clipPath>'
+            + '<clipPath id="bd-lb"><path d="M 178 0.238281 L 206 0.238281 L 206 47 L 178 47 Z M 178 0.238281 "/></clipPath>'
+          + '</defs>'
+          + '<g clip-path="url(#bd-lt)"><g transform="translate(0.964051, 46.624745)"><path d="M 25.859375 -36.484375 L 18.875 -36.484375 L 18.875 0 L 7.109375 0 L 7.109375 -36.484375 L 0.125 -36.484375 L 0.125 -45.703125 L 25.859375 -45.703125 Z M 25.859375 -36.484375 "/></g></g>'
+          + '<g clip-path="url(#bd-lw)"><g transform="translate(26.945526, 46.624745)"><path d="M 14.078125 -14.078125 L 14.203125 -14.078125 L 17.46875 -45.703125 L 29.828125 -45.703125 L 33.15625 -14.078125 L 33.28125 -14.078125 L 36.03125 -45.703125 L 47.421875 -45.703125 L 42.046875 0 L 27.140625 0 L 23.9375 -26.5 L 23.8125 -26.5 L 20.28125 0 L 5.3125 0 L 0 -45.703125 L 11.390625 -45.703125 Z M 14.078125 -14.078125 "/></g></g>'
+          + '<g clip-path="url(#bd-li)"><g transform="translate(74.364923, 46.624745)"><path d="M 12.984375 0 L 1.21875 0 L 1.21875 -45.703125 L 12.984375 -45.703125 Z M 12.984375 0 "/></g></g>'
+          + '<g clip-path="url(#bd-l1)"><g transform="translate(88.571545, 46.624745)"><path d="M 13.1875 -8.828125 L 20.984375 -8.828125 L 20.984375 0 L 1.40625 0 L 1.40625 -45.703125 L 13.1875 -45.703125 Z M 13.1875 -8.828125 "/></g></g>'
+          + '<g clip-path="url(#bd-l2)"><g transform="translate(109.881477, 46.624745)"><path d="M 13.1875 -8.828125 L 20.984375 -8.828125 L 20.984375 0 L 1.40625 0 L 1.40625 -45.703125 L 13.1875 -45.703125 Z M 13.1875 -8.828125 "/></g></g>'
+          + '<g clip-path="url(#bd-ld)"><g transform="translate(146.54992, 46.624745)"><path d="M 29.4375 -34.296875 L 29.4375 -8.578125 C 29.4375 -5.765625 28.5 -3.628906 26.625 -2.171875 C 24.75 -0.722656 22.296875 0 19.265625 0 L 1.40625 0 L 1.40625 -45.703125 L 16.703125 -45.703125 C 19.515625 -45.703125 21.835938 -45.390625 23.671875 -44.765625 C 25.515625 -44.148438 26.9375 -43.007812 27.9375 -41.34375 C 28.9375 -39.675781 29.4375 -37.328125 29.4375 -34.296875 Z M 17.65625 -11.078125 L 17.65625 -34.625 C 17.65625 -35.476562 17.410156 -36.253906 16.921875 -36.953125 C 16.429688 -37.660156 15.804688 -38.015625 15.046875 -38.015625 L 13.1875 -38.015625 L 13.1875 -7.6875 L 15.046875 -7.6875 C 15.804688 -7.6875 16.429688 -8.023438 16.921875 -8.703125 C 17.410156 -9.390625 17.65625 -10.179688 17.65625 -11.078125 Z M 17.65625 -11.078125 "/></g></g>'
+          + '<g clip-path="url(#bd-lb)"><g transform="translate(177.394914, 46.624745)"><path d="M 27.84375 -37.5 L 27.84375 -32 C 27.84375 -29.570312 27.171875 -27.863281 25.828125 -26.875 C 24.484375 -25.894531 22.59375 -25.382812 20.15625 -25.34375 L 20.03125 -25.21875 C 22.882812 -25.039062 25.023438 -24.160156 26.453125 -22.578125 C 27.890625 -21.003906 28.609375 -19.023438 28.609375 -16.640625 L 28.609375 -9.796875 C 28.609375 -6.421875 27.679688 -3.941406 25.828125 -2.359375 C 23.972656 -0.785156 21.25 0 17.65625 0 L 1.40625 0 L 1.40625 -45.703125 L 18.375 -45.703125 C 21.570312 -45.703125 23.945312 -45.039062 25.5 -43.71875 C 27.0625 -42.394531 27.84375 -40.320312 27.84375 -37.5 Z M 14.140625 -27.90625 C 15.035156 -27.90625 15.707031 -28.179688 16.15625 -28.734375 C 16.601562 -29.285156 16.828125 -29.90625 16.828125 -30.59375 L 16.828125 -35.71875 C 16.828125 -36.3125 16.613281 -36.90625 16.1875 -37.5 C 15.757812 -38.101562 15.035156 -38.40625 14.015625 -38.40625 L 12.796875 -38.40625 L 12.796875 -27.90625 Z M 16.828125 -10.4375 L 16.828125 -18.234375 C 16.828125 -19.128906 16.582031 -19.8125 16.09375 -20.28125 C 15.601562 -20.75 14.910156 -20.984375 14.015625 -20.984375 L 12.796875 -20.984375 L 12.796875 -7.6875 C 12.972656 -7.632812 13.207031 -7.609375 13.5 -7.609375 C 14.53125 -7.609375 15.34375 -7.820312 15.9375 -8.25 C 16.53125 -8.675781 16.828125 -9.40625 16.828125 -10.4375 Z M 16.828125 -10.4375 "/></g></g>'
+        + '</svg></a>'
       + '<button class="menu-btn" aria-label="Toggle menu" aria-expanded="false">☰</button>'
       + '<nav class="site-nav" id="site-nav">' + links + "</nav>"
       + '<div class="site-actions">'
@@ -176,6 +193,182 @@
     });
     pre.appendChild(btn);
   });
+
+  // ---- "Copy as Markdown" — export the page for pasting into an AI agent ----
+  // Docs pages get a header button that serialises the article body to clean
+  // Markdown (headings, prose, code fences, lists, tables, callouts) so it can be
+  // dropped straight into an LLM chat. Pairs with /llms.txt for crawl-time access.
+  if (SECTION_KEY === "docs" && article) buildMarkdownCopy(article);
+
+  function buildMarkdownCopy(art) {
+    var header = art.querySelector(".page-header");
+    var meta = header && header.querySelector(".spec-meta");
+    var host = meta || header;
+    if (!host) return;
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "md-copy-btn";
+    btn.title = "Copy this page as Markdown to paste into an AI agent";
+    btn.setAttribute("aria-label", "Copy this page as Markdown");
+    btn.innerHTML = '<span class="md-copy-ico" aria-hidden="true">⧉</span>'
+      + '<span class="md-copy-label">Copy as Markdown</span>';
+    if (meta && !meta.querySelector(".spec-date")) btn.style.marginLeft = "auto";
+    host.appendChild(btn);
+
+    var label = btn.querySelector(".md-copy-label");
+    btn.addEventListener("click", function () {
+      var md = pageToMarkdown(art);
+      var done = function () {
+        btn.classList.add("copied");
+        if (label) label.textContent = "Copied";
+        setTimeout(function () {
+          btn.classList.remove("copied");
+          if (label) label.textContent = "Copy as Markdown";
+        }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(md).then(done, fallback);
+      } else { fallback(); }
+      function fallback() {
+        var ta = document.createElement("textarea"); ta.value = md;
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); done(); } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    });
+  }
+
+  // ---- HTML → Markdown (powers the "Copy as Markdown" button) ----------------
+  var MD_SKIP = ["page-nav", "doc-footer", "toc", "heading-anchor", "spec-meta", "md-copy-btn", "copy-btn", "nav-toggle"];
+  function mdSkip(el) {
+    if (el.classList) for (var i = 0; i < MD_SKIP.length; i++) { if (el.classList.contains(MD_SKIP[i])) return true; }
+    var tag = el.tagName ? el.tagName.toLowerCase() : "";
+    return tag === "script" || tag === "style" || tag === "button";
+  }
+
+  function mdInline(node) {
+    var out = "";
+    Array.prototype.forEach.call(node.childNodes, function (n) {
+      if (n.nodeType === 3) { out += n.nodeValue.replace(/\s+/g, " "); return; }
+      if (n.nodeType !== 1 || mdSkip(n)) return;
+      var tag = n.tagName.toLowerCase();
+      if (tag === "code") out += "`" + n.textContent + "`";
+      else if (tag === "strong" || tag === "b") out += "**" + mdInline(n).trim() + "**";
+      else if (tag === "em" || tag === "i") out += "*" + mdInline(n).trim() + "*";
+      else if (tag === "br") out += "  \n";
+      else if (tag === "a") {
+        var txt = mdInline(n).trim(), href = n.getAttribute("href") || "";
+        out += href ? "[" + txt + "](" + href + ")" : txt;
+      } else out += mdInline(n);
+    });
+    return out;
+  }
+
+  function mdHeadingText(h) {
+    var c = h.cloneNode(true), a = c.querySelector(".heading-anchor");
+    if (a) a.remove();
+    return c.textContent.trim();
+  }
+
+  function mdList(list, ordered, indent) {
+    var md = "", i = 1;
+    Array.prototype.forEach.call(list.children, function (li) {
+      if (li.tagName.toLowerCase() !== "li") return;
+      var marker = ordered ? (i++) + ". " : "- ";
+      var clone = li.cloneNode(true);
+      Array.prototype.forEach.call(clone.querySelectorAll("ul,ol"), function (x) { x.remove(); });
+      md += indent + marker + mdInline(clone).trim().replace(/\s*\n\s*/g, " ") + "\n";
+      Array.prototype.forEach.call(li.children, function (c) {
+        var t = c.tagName.toLowerCase();
+        if (t === "ul" || t === "ol") md += mdList(c, t === "ol", indent + "  ");
+      });
+    });
+    return md + "\n";
+  }
+
+  function mdPre(pre) {
+    var code = pre.querySelector("code") || pre;
+    var lang = pre.getAttribute("data-lang") || "";
+    return "```" + lang + "\n" + code.innerText.replace(/\s+$/, "") + "\n```\n\n";
+  }
+
+  // Escape a table cell for Markdown: backslash first (so we don't double-process
+  // our own escapes), then the cell delimiter, then flatten any line breaks.
+  function mdCell(el) {
+    return mdInline(el).trim().replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n+/g, " ");
+  }
+
+  function mdTable(t) {
+    var head = [], rows = [];
+    var headRow = t.querySelector("thead tr");
+    if (headRow) Array.prototype.forEach.call(headRow.children, function (c) { head.push(mdCell(c)); });
+    var bodyRows = t.querySelectorAll("tbody tr");
+    if (!bodyRows.length) bodyRows = t.querySelectorAll("tr");
+    Array.prototype.forEach.call(bodyRows, function (tr) {
+      if (tr.parentNode.tagName.toLowerCase() === "thead") return;
+      var cells = [];
+      Array.prototype.forEach.call(tr.children, function (c) { cells.push(mdCell(c)); });
+      if (cells.length) rows.push(cells);
+    });
+    if (!head.length && rows.length) head = rows.shift();
+    if (!head.length) return "";
+    var md = "| " + head.join(" | ") + " |\n| " + head.map(function () { return "---"; }).join(" | ") + " |\n";
+    rows.forEach(function (r) { md += "| " + r.join(" | ") + " |\n"; });
+    return md + "\n";
+  }
+
+  function mdXrefGrid(div) {
+    var md = "";
+    Array.prototype.forEach.call(div.querySelectorAll("a"), function (a) {
+      var title = a.querySelector(".xref-title"), desc = a.querySelector(".xref-desc");
+      var href = a.getAttribute("href") || "";
+      var t = title ? title.textContent.trim() : mdInline(a).trim();
+      md += "- [" + t + "](" + href + ")" + (desc ? " — " + desc.textContent.trim() : "") + "\n";
+    });
+    return md + "\n";
+  }
+
+  function mdCallout(div) {
+    var md = "";
+    Array.prototype.forEach.call(div.children, function (c) {
+      if (c.classList && c.classList.contains("callout-title")) md += "**" + c.textContent.trim() + "**\n";
+      else md += mdInline(c).trim() + "\n";
+    });
+    return "> " + md.trim().replace(/\n/g, "\n> ") + "\n\n";
+  }
+
+  function mdChildren(el) {
+    var md = "";
+    Array.prototype.forEach.call(el.childNodes, function (n) { if (n.nodeType === 1) md += mdBlock(n); });
+    return md;
+  }
+
+  function mdBlock(n) {
+    if (mdSkip(n)) return "";
+    switch (n.tagName.toLowerCase()) {
+      case "h1": return "# " + mdHeadingText(n) + "\n\n";
+      case "h2": return "## " + mdHeadingText(n) + "\n\n";
+      case "h3": return "### " + mdHeadingText(n) + "\n\n";
+      case "h4": return "#### " + mdHeadingText(n) + "\n\n";
+      case "h5": case "h6": return "##### " + mdHeadingText(n) + "\n\n";
+      case "p": var p = mdInline(n).trim(); return p ? p + "\n\n" : "";
+      case "pre": return mdPre(n);
+      case "ul": return mdList(n, false, "");
+      case "ol": return mdList(n, true, "");
+      case "blockquote": return "> " + mdInline(n).trim().replace(/\n/g, "\n> ") + "\n\n";
+      case "table": return mdTable(n);
+      case "hr": return "---\n\n";
+      default:
+        if (n.classList && n.classList.contains("callout")) return mdCallout(n);
+        if (n.classList && n.classList.contains("xref-grid")) return mdXrefGrid(n);
+        return mdChildren(n);
+    }
+  }
+
+  function pageToMarkdown(art) {
+    var md = mdChildren(art).replace(/\n{3,}/g, "\n\n").trim();
+    return md + "\n\n---\n\nSource: " + location.href.split("#")[0] + "\n";
+  }
 
   // ---- Mobile (left section) nav toggle ----
   var navToggle = document.querySelector(".nav-toggle");
