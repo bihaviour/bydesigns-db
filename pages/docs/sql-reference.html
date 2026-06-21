@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SQL reference · Twill DB docs</title>
-<meta name="description" content="The exact SQL surface Twill DB supports: DDL, DML, queries, transactions, types, parameters, and what is out of scope in Phase 1.">
+<meta name="description" content="The exact SQL surface Twill DB supports: DDL, DML, queries, transactions, types, parameters, and what is out of scope.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -34,8 +34,8 @@
 <tbody>
 <tr><td><code>CREATE TABLE</code></td><td>Define a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
 <tr><td><code>DROP TABLE</code></td><td>Remove a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
-<tr><td><code>CREATE INDEX … USING hnsw</code></td><td>Build a vector index (Phase 5)</td><td>Autocommit only — see <a href="#vector-search">Vector search</a></td></tr>
-<tr><td><code>DROP INDEX</code></td><td>Remove a vector index (Phase 5)</td><td>Autocommit only</td></tr>
+<tr><td><code>CREATE INDEX … USING hnsw</code></td><td>Build a vector index</td><td>Autocommit only — see <a href="#vector-search">Vector search</a></td></tr>
+<tr><td><code>DROP INDEX</code></td><td>Remove a vector index</td><td>Autocommit only</td></tr>
 <tr><td><code>INSERT</code></td><td>Add rows</td><td>Fully transactional</td></tr>
 <tr><td><code>UPDATE</code></td><td>Modify rows</td><td>Fully transactional</td></tr>
 <tr><td><code>DELETE</code></td><td>Remove rows</td><td>Fully transactional</td></tr>
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT);</code></p
 <li><span class="req-tag must">MUST</span> declare at least one column; an empty column list is a parse error.</li>
 <li><span class="req-tag may">MAY</span> omit a column's type name — an untyped column defaults to <code>TEXT</code> affinity.</li>
 <li><span class="req-tag may">MAY</span> write a parenthesised size such as <code>VARCHAR(64)</code> or <code>DECIMAL(10,2)</code> — the size is parsed and ignored; only the storage class matters.</li>
-<li><span class="req-tag may">MAY</span> mark a column <code>UNIQUE</code> or explicitly <code>NULL</code> — these are accepted as constraint markers (uniqueness is enforced for the primary key in Phase 1).</li>
+<li><span class="req-tag may">MAY</span> mark a column <code>UNIQUE</code> or explicitly <code>NULL</code> — these are accepted as constraint markers (uniqueness is enforced for the primary key).</li>
 </ul>
 <div class="callout note">
 <p class="callout-title">PRIMARY KEY implies NOT NULL</p>
@@ -132,7 +132,7 @@ SELECT COUNT(*), AVG(score), MAX(score) FROM notes;
 SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <div class="callout warning">
 <p class="callout-title">Aggregates are whole-table only</p>
-<p><code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, and <code>AVG</code> compute over the entire (filtered) table. There is no <code>GROUP BY</code> in Phase 1, so you cannot mix a bare aggregate with per-row columns to mean grouped output.</p>
+<p><code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, and <code>AVG</code> compute over the entire (filtered) table. There is no <code>GROUP BY</code>, so you cannot mix a bare aggregate with per-row columns to mean grouped output.</p>
 </div>
 
 <h3>ORDER BY and LIMIT</h3>
@@ -173,7 +173,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>Comparison</td><td><code>=</code>, <code>&lt;&gt;</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td><code>&lt;&gt;</code> and <code>!=</code> are both inequality</td></tr>
 <tr><td>Null test</td><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td></td></tr>
 <tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code></td><td>Pattern match against a string expression</td></tr>
-<tr><td>Vector distance</td><td><code>&lt;-&gt;</code>, <code>&lt;=&gt;</code>, <code>&lt;#&gt;</code></td><td>L2 / cosine / inner-product distance (Phase 5) — see <a href="#vector-search">Vector search</a></td></tr>
+<tr><td>Vector distance</td><td><code>&lt;-&gt;</code>, <code>&lt;=&gt;</code>, <code>&lt;#&gt;</code></td><td>L2 / cosine / inner-product distance — see <a href="#vector-search">Vector search</a></td></tr>
 <tr><td>Additive</td><td><code>+</code>, <code>-</code></td><td></td></tr>
 <tr><td>Multiplicative</td><td><code>*</code>, <code>/</code>, <code>%</code></td><td>Multiply, divide, modulo</td></tr>
 <tr><td>Unary</td><td><code>-</code>, <code>+</code></td><td>Negation / identity prefix</td></tr>
@@ -202,7 +202,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td><code>REAL</code></td><td>64-bit floating point</td><td><code>REAL</code>, <code>FLOA…</code>, <code>DOUB…</code>, <code>NUMERIC</code>, <code>DEC…</code></td></tr>
 <tr><td><code>TEXT</code></td><td>UTF-8 string</td><td><code>CHAR…</code>, <code>TEXT</code>, <code>CLOB</code>, <code>STRING</code>; also the default for an unknown or omitted type</td></tr>
 <tr><td><code>BLOB</code></td><td>Raw bytes</td><td><code>BLOB</code>, <code>BYTEA</code></td></tr>
-<tr><td><code>VECTOR</code></td><td>Fixed-length <code>f32</code> array (Phase 5)</td><td><code>VECTOR(N)</code> — dimension <code>N</code> required and validated on insert</td></tr>
+<tr><td><code>VECTOR</code></td><td>Fixed-length <code>f32</code> array</td><td><code>VECTOR(N)</code> — dimension <code>N</code> required and validated on insert</td></tr>
 </tbody>
 </table>
 </div>
@@ -213,7 +213,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 </section>
 
 <section id="vector-search">
-<h2>Vector search (Phase 5)</h2>
+<h2>Vector search</h2>
 <p>Vector search is built into the engine. A <code>VECTOR(N)</code> column stores a fixed-length array of <code>f32</code>, an HNSW index answers top-k nearest-neighbour queries, and three distance operators are available in projections, <code>WHERE</code>, and <code>ORDER BY</code>. Because the index rides the same WAL/replay path as the rows, it branches and scales-to-zero with the database.</p>
 
 <h3>The vector type and literals</h3>
@@ -263,7 +263,7 @@ SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
 <tr><td><code>s</code></td><td>Text</td><td><code>shello</code></td></tr>
 <tr><td><code>b</code></td><td>Bytes (base64)</td><td><code>b&lt;base64&gt;</code></td></tr>
 <tr><td><code>n</code></td><td>NULL</td><td><code>n</code></td></tr>
-<tr><td><code>v</code></td><td>Vector (Phase 5)</td><td><code>v[1,2,3]</code> or <code>v1,2,3</code></td></tr>
+<tr><td><code>v</code></td><td>Vector</td><td><code>v[1,2,3]</code> or <code>v1,2,3</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -297,14 +297,14 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 </section>
 
 <section>
-<h2>Out of scope (Phase 1)</h2>
+<h2>Out of scope</h2>
 <p>These are deliberate boundaries, not bugs. Each parses to a clear <code>ENGINE_ERR_SQL</code> rather than a wrong result.</p>
 <ul class="reqs">
 <li><span class="req-tag must-not">MUST NOT</span> use <code>JOIN</code> — queries read from a single table.</li>
 <li><span class="req-tag must-not">MUST NOT</span> use <code>GROUP BY</code> / <code>HAVING</code> — aggregates are whole-table only.</li>
 <li><span class="req-tag must-not">MUST NOT</span> use subqueries.</li>
 <li><span class="req-tag must-not">MUST NOT</span> use <code>SELECT DISTINCT</code>.</li>
-<li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>, Phase 5); general secondary/B-tree indexes are not exposed as SQL.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>); general secondary/B-tree indexes are not exposed as SQL.</li>
 </ul>
 <div class="callout note">
 <p class="callout-title">Unsupported syntax fails fast</p>

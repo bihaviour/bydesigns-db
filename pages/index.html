@@ -13,7 +13,7 @@
 
 <div class="hero-wrap">
   <div class="hero">
-    <span class="eyebrow"><span class="dot"></span>Phases 1–5 implemented · Rust · Postgres-wire compatible</span>
+    <span class="eyebrow"><span class="dot"></span>Embeddable &amp; disaggregated · Rust · Postgres-wire compatible</span>
     <h1>The database that is <span class="grad">embeddable</span> and <span class="grad">disaggregated</span> at once.</h1>
     <p class="sub">Twill DB is a serverless OLTP engine — a SQLite-style Rust library at function-call latency, whose storage backend is pluggable. Point it at a local file to run purely embedded, or at object storage to run storage-disaggregated and scale-to-zero. Same engine, same C ABI; the only difference is a connection string.</p>
     <div class="cta-row">
@@ -73,6 +73,16 @@
         <div class="ic">🧭</div>
         <h3>Vector search in-core</h3>
         <p>A <code>vector(N)</code> type and an HNSW index live behind the same storage seam as the rows — so vector search <strong>branches and scales-to-zero with the database</strong>. An agent can fork its memory.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">🧊</div>
+        <h3>Snapshot isolation</h3>
+        <p>MVCC throughout: every reader sees a stable snapshot and never blocks a writer, while a first-committer-wins check keeps concurrent transactions correct. One writer per database, lock-free reads.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">🛡️</div>
+        <h3>Crash-safe durability</h3>
+        <p>Commits are WAL-centric: every acked write is <code>fsync</code>-durable before the call returns — never acked from a buffer. Recovery replays the log deterministically and discards a torn trailing frame.</p>
       </div>
     </div>
   </section>
@@ -136,8 +146,8 @@ psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
   <section>
     <div class="sec-head">
       <span class="kicker">Where to go next</span>
-      <h2>Three doors into the project</h2>
-      <p>Use the database, follow the design intent, or track what shipped and what's next.</p>
+      <h2>Four doors into the project</h2>
+      <p>Use the database, follow the design intent, track what shipped and what's next, or meet the person behind it.</p>
     </div>
     <div class="doc-card-grid">
       <a class="doc-card" href="docs/index.html">
@@ -149,14 +159,20 @@ psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
       <a class="doc-card" href="specs/index.html">
         <div class="ic">📐</div>
         <h3>Development guidelines</h3>
-        <p>The fourteen design specifications and per-phase implementation maps — the source of truth for design intent.</p>
+        <p>The fourteen design specifications and implementation maps — the source of truth for design intent.</p>
         <div class="links"><span>Architecture · Storage seam · Validation</span></div>
       </a>
       <a class="doc-card" href="release/index.html">
         <div class="ic">🚀</div>
         <h3>Releases &amp; roadmap</h3>
-        <p>What's shipped (Phases 1–5) and what's coming next — the additive build sequence and milestones.</p>
+        <p>What's shipped and what's coming next — the capability milestones and what's planned.</p>
         <div class="links"><span>Release notes · Roadmap · Milestones</span></div>
+      </a>
+      <a class="doc-card" href="author/index.html">
+        <div class="ic">✍️</div>
+        <h3>The author</h3>
+        <p>Who is building Twill DB and why — the philosophy and the quest behind the project.</p>
+        <div class="links"><span>About · Philosophy · Contact</span></div>
       </a>
     </div>
   </section>
