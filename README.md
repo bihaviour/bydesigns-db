@@ -13,6 +13,9 @@ a **scale-to-zero lifecycle controller**, and **in-core vector search** (a
 database). See the [roadmap](#roadmap) and the [documentation](#documentation)
 entry points below.
 
+> [!WARNING]
+> **Pre-1.0 — active development.** Twill DB is under active development (currently `0.x`). Interfaces, the SQL surface, on-disk and storage formats, and behaviour may change between releases — **backward compatibility is not guaranteed until the `1.0.0` release**. Pin an exact version and review the release notes before upgrading.
+
 ## What this is
 
 **Twill DB** is an OLTP database engine that is, at the same time:

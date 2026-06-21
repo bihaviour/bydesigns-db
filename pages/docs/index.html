@@ -25,6 +25,11 @@
 <p class="lede">Everything you need to use Twill DB — open a database with a connection string, embed it in your app or run it as a Postgres-wire server, branch your data copy-on-write, and let it scale to zero. New here? Start with the <a href="getting-started.html">Quickstart</a>.</p>
 </header>
 
+<div class="callout warning">
+<p class="callout-title">Pre-1.0 — active development</p>
+<p>Twill DB is under active development (currently <code>0.x</code>). Interfaces, the SQL surface, on-disk and storage formats, and behaviour may change between releases — <strong>backward compatibility is not guaranteed until the <code>1.0.0</code> release</strong>. Pin an exact version and review the release notes before upgrading.</p>
+</div>
+
 <section>
 <h2>How Twill DB is delivered</h2>
 <p>There is <strong>one engine</strong> and you reach it through one of two front doors. The backend it durably writes to is chosen by the <em>connection string</em>, not by a rebuild.</p>
