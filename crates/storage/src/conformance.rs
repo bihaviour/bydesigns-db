@@ -126,6 +126,28 @@ pub fn fencing_rejects_stale_writer(make: &Factory) {
         "C4: stale writer must be Fenced, got {stale:?}"
     );
     block_on(s.append_wal(&token_b, &[rec("from-B")])).expect("C4: current writer succeeds");
+
+    // Renew (heartbeat) keeps the current writer's token valid for commits.
+    let token_b = block_on(s.renew_fence(&token_b)).expect("C4: renew the live token");
+    block_on(s.append_wal(&token_b, &[rec("after-renew")]))
+        .expect("C4: holder still commits after renewing its lease");
+
+    // Clean handoff: after a release, a fresh acquire takes over (higher epoch)
+    // and the released token can never commit again.
+    block_on(s.release_fence(token_b.clone())).expect("C4: release is clean");
+    let token_c = block_on(s.acquire_fence(WriterId(0xC))).unwrap();
+    assert!(
+        token_c.epoch > token_b.epoch,
+        "C4: a fresh acquire after release strictly bumps the epoch"
+    );
+    assert!(
+        matches!(
+            block_on(s.append_wal(&token_b, &[rec("released")])),
+            Err(StorageError::Fenced { .. })
+        ),
+        "C4: a released token is fenced"
+    );
+    block_on(s.append_wal(&token_c, &[rec("from-C")])).expect("C4: new holder commits");
 }
 
 /// C5 · crash-consistency hooks — deterministic recovery, monotone durable LSN.

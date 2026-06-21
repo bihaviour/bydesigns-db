@@ -59,6 +59,26 @@ use std::time::{Duration, Instant};
 
 const FENCE_LEASE: Duration = Duration::from_secs(10);
 
+/// Wall-clock milliseconds since the Unix epoch (lease expiry stamp). Lease
+/// liveness is advisory: fencing correctness rests on the monotonic CAS epoch,
+/// not the clock. The stamp lets a peer observe whether a writer is still alive.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Lease object payload: `epoch:u64 | owner:u128 | expires_at_ms:u64`. The epoch
+/// stays first so the legacy 8-byte reader (`durable_epoch`) keeps working.
+fn encode_lease(epoch: u64, owner: u128, expires_ms: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(32);
+    b.extend_from_slice(&epoch.to_le_bytes());
+    b.extend_from_slice(&owner.to_le_bytes());
+    b.extend_from_slice(&expires_ms.to_le_bytes());
+    b
+}
+
 /// Tunables for the LSM page store and the CAS commit log (spec 04 §Configuration).
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -767,11 +787,14 @@ impl Storage for ObjectStorage {
     }
 
     async fn acquire_fence(&self, owner: WriterId) -> Result<FenceToken, StorageError> {
+        let ttl = FENCE_LEASE.as_millis() as u64;
         let mut attempt = 0u32;
         loop {
             let (cur_epoch, etag) = self.durable_epoch()?;
             let new_epoch = cur_epoch + 1;
-            let bytes = new_epoch.to_le_bytes();
+            // A new holder strictly increases the epoch, fencing every prior
+            // token (take-over model). The lease stamp is advisory liveness.
+            let bytes = encode_lease(new_epoch, owner.0, now_ms() + ttl);
             let res = match &etag {
                 Some(e) => crate::block_on(self.store.put_if_match(&self.lease_key(), &bytes, e)),
                 None => crate::block_on(self.store.put_if_absent(&self.lease_key(), &bytes)),
@@ -798,18 +821,57 @@ impl Storage for ObjectStorage {
     }
 
     async fn renew_fence(&self, token: &FenceToken) -> Result<FenceToken, StorageError> {
-        self.check_fence(token)?;
-        Ok(FenceToken {
-            epoch: token.epoch,
-            owner: token.owner,
-            lease_until: Instant::now() + FENCE_LEASE,
-        })
+        // Durably re-stamp the lease under the *same* epoch: heartbeat. Fails
+        // `Fenced` if a newer writer has taken over (epoch advanced). This is the
+        // liveness signal a peer reads before deciding the writer is dead.
+        let ttl = FENCE_LEASE.as_millis() as u64;
+        let mut attempt = 0u32;
+        loop {
+            let (current, etag) = self.durable_epoch()?;
+            if token.epoch != current {
+                return Err(StorageError::Fenced {
+                    held: token.epoch,
+                    current,
+                });
+            }
+            let bytes = encode_lease(token.epoch, token.owner.0, now_ms() + ttl);
+            let res = match &etag {
+                Some(e) => crate::block_on(self.store.put_if_match(&self.lease_key(), &bytes, e)),
+                None => crate::block_on(self.store.put_if_absent(&self.lease_key(), &bytes)),
+            };
+            match res {
+                Ok(_) => {
+                    return Ok(FenceToken {
+                        epoch: token.epoch,
+                        owner: token.owner,
+                        lease_until: Instant::now() + FENCE_LEASE,
+                    })
+                }
+                Err(ObjectError::Precondition(_)) => {
+                    attempt += 1;
+                    if attempt > self.config.cas_max_retries {
+                        return Err(StorageError::Contended);
+                    }
+                    continue; // raced a concurrent lease write; re-read and retry
+                }
+                Err(e) => return Err(map_obj_err(e)),
+            }
+        }
     }
 
-    async fn release_fence(&self, _token: FenceToken) -> Result<(), StorageError> {
-        // The next acquire bumps the epoch via CAS regardless, so release is a
-        // no-op. Deleting the lease would reset the epoch and let a stale token
-        // re-pass the fence check, so we deliberately leave it in place.
+    async fn release_fence(&self, token: FenceToken) -> Result<(), StorageError> {
+        // Clean handoff: durably mark the lease expired (expires_at = 0) while
+        // KEEPING the epoch, so a peer sees the slot is free immediately yet the
+        // released token can never re-pass the fence (a fresh acquire still bumps
+        // the epoch). Best-effort: if we've already been fenced, nothing to do.
+        let (current, etag) = self.durable_epoch()?;
+        if token.epoch != current {
+            return Ok(());
+        }
+        let bytes = encode_lease(token.epoch, token.owner.0, 0);
+        if let Some(e) = &etag {
+            let _ = crate::block_on(self.store.put_if_match(&self.lease_key(), &bytes, e));
+        }
         Ok(())
     }
 
