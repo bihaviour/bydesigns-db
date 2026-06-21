@@ -275,16 +275,22 @@
     return "```" + lang + "\n" + code.innerText.replace(/\s+$/, "") + "\n```\n\n";
   }
 
+  // Escape a table cell for Markdown: backslash first (so we don't double-process
+  // our own escapes), then the cell delimiter, then flatten any line breaks.
+  function mdCell(el) {
+    return mdInline(el).trim().replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n+/g, " ");
+  }
+
   function mdTable(t) {
     var head = [], rows = [];
     var headRow = t.querySelector("thead tr");
-    if (headRow) Array.prototype.forEach.call(headRow.children, function (c) { head.push(mdInline(c).trim()); });
+    if (headRow) Array.prototype.forEach.call(headRow.children, function (c) { head.push(mdCell(c)); });
     var bodyRows = t.querySelectorAll("tbody tr");
     if (!bodyRows.length) bodyRows = t.querySelectorAll("tr");
     Array.prototype.forEach.call(bodyRows, function (tr) {
       if (tr.parentNode.tagName.toLowerCase() === "thead") return;
       var cells = [];
-      Array.prototype.forEach.call(tr.children, function (c) { cells.push(mdInline(c).trim().replace(/\|/g, "\\|")); });
+      Array.prototype.forEach.call(tr.children, function (c) { cells.push(mdCell(c)); });
       if (cells.length) rows.push(cells);
     });
     if (!head.length && rows.length) head = rows.shift();
