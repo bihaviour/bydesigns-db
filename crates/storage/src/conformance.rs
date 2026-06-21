@@ -126,6 +126,28 @@ pub fn fencing_rejects_stale_writer(make: &Factory) {
         "C4: stale writer must be Fenced, got {stale:?}"
     );
     block_on(s.append_wal(&token_b, &[rec("from-B")])).expect("C4: current writer succeeds");
+
+    // Renew (heartbeat) keeps the current writer's token valid for commits.
+    let token_b = block_on(s.renew_fence(&token_b)).expect("C4: renew the live token");
+    block_on(s.append_wal(&token_b, &[rec("after-renew")]))
+        .expect("C4: holder still commits after renewing its lease");
+
+    // Clean handoff: after a release, a fresh acquire takes over (higher epoch)
+    // and the released token can never commit again.
+    block_on(s.release_fence(token_b.clone())).expect("C4: release is clean");
+    let token_c = block_on(s.acquire_fence(WriterId(0xC))).unwrap();
+    assert!(
+        token_c.epoch > token_b.epoch,
+        "C4: a fresh acquire after release strictly bumps the epoch"
+    );
+    assert!(
+        matches!(
+            block_on(s.append_wal(&token_b, &[rec("released")])),
+            Err(StorageError::Fenced { .. })
+        ),
+        "C4: a released token is fenced"
+    );
+    block_on(s.append_wal(&token_c, &[rec("from-C")])).expect("C4: new holder commits");
 }
 
 /// C5 · crash-consistency hooks — deterministic recovery, monotone durable LSN.
@@ -195,6 +217,7 @@ pub fn branch_isolation(make: &Factory) {
     let r = block_on(s.resolve_branch(b)).unwrap();
     assert_eq!(r.base_lsn, base, "C7: branch base == fork point");
     assert_eq!(r.head_lsn, base, "C7: fresh branch head == base");
+    assert_eq!(r.parent, BranchId::ROOT, "C7: forked off the main line");
 
     assert_eq!(
         block_on(s.get_commit_lsn()).unwrap(),
@@ -203,8 +226,32 @@ pub fn branch_isolation(make: &Factory) {
     );
     assert_eq!(block_on(s.durable_lsn()).unwrap(), durable_before);
 
+    // The branch is listed in the namespace it was created in.
+    let listed = block_on(s.list_branches()).unwrap();
+    assert!(
+        listed.iter().any(|x| x.id == b),
+        "C7: created branch appears in list_branches"
+    );
+
     let unknown = block_on(s.resolve_branch(BranchId(424242)));
     assert!(matches!(unknown, Err(StorageError::NotFound(_))));
+
+    // Delete reclaims only the branch; resolving it afterwards is NotFound, and
+    // the base commit/durable marks are still untouched.
+    block_on(s.delete_branch(b)).expect("C7: delete the branch");
+    assert!(matches!(
+        block_on(s.resolve_branch(b)),
+        Err(StorageError::NotFound(_))
+    ));
+    assert!(
+        matches!(
+            block_on(s.delete_branch(BranchId(424242))),
+            Err(StorageError::NotFound(_))
+        ),
+        "C7: deleting an unknown branch is NotFound"
+    );
+    assert_eq!(block_on(s.get_commit_lsn()).unwrap(), commit_before);
+    assert_eq!(block_on(s.durable_lsn()).unwrap(), durable_before);
 }
 
 /// C8 · retention safety — floor moves forward; reads below it are snapshot-too-old.

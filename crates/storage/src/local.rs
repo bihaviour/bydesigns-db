@@ -46,6 +46,7 @@ const T_PAGE: u8 = 2;
 const T_FENCE: u8 = 3;
 const T_RETENTION: u8 = 4;
 const T_BRANCH: u8 = 5;
+const T_BRANCH_DEL: u8 = 6;
 
 /// A parsed frame with its replay-assigned LSN(s).
 enum Frame {
@@ -67,6 +68,10 @@ enum Frame {
     Branch {
         id: u64,
         base_lsn: u64,
+        parent: u64,
+    },
+    BranchDel {
+        id: u64,
     },
 }
 
@@ -347,13 +352,16 @@ impl Storage for LocalFileStorage {
             )));
         }
         let id = g.next_branch_id;
-        let mut payload = Vec::with_capacity(16);
+        // Pointer frame: id | base_lsn | parent (ROOT for branches off this line).
+        let mut payload = Vec::with_capacity(24);
         payload.extend_from_slice(&id.to_le_bytes());
         payload.extend_from_slice(&base_lsn.0.to_le_bytes());
+        payload.extend_from_slice(&BranchId::ROOT.0.to_le_bytes());
         g.append_frame(T_BRANCH, &payload)?;
         g.next_branch_id += 1;
         let bref = BranchRef {
             id: BranchId(id),
+            parent: BranchId::ROOT,
             base_lsn,
             head_lsn: base_lsn,
         };
@@ -369,6 +377,42 @@ impl Storage for LocalFileStorage {
             .get(&branch.0)
             .copied()
             .ok_or_else(|| StorageError::NotFound(format!("branch {}", branch.0)))
+    }
+
+    async fn list_branches(&self) -> Result<Vec<BranchRef>, StorageError> {
+        let mut v: Vec<BranchRef> = self
+            .inner
+            .lock()
+            .unwrap()
+            .branches
+            .values()
+            .copied()
+            .collect();
+        v.sort_by_key(|b| b.id.0);
+        Ok(v)
+    }
+
+    async fn delete_branch(&self, branch: BranchId) -> Result<(), StorageError> {
+        {
+            let mut g = self.inner.lock().unwrap();
+            if !g.branches.contains_key(&branch.0) {
+                return Err(StorageError::NotFound(format!("branch {}", branch.0)));
+            }
+            if g.branches.values().any(|b| b.parent == branch) {
+                return Err(StorageError::Invalid(format!(
+                    "branch {} has live children; delete them first",
+                    branch.0
+                )));
+            }
+            // Append a tombstone (the log is append-only) and drop from the map.
+            g.append_frame(T_BRANCH_DEL, &branch.0.to_le_bytes())?;
+            g.branches.remove(&branch.0);
+        }
+        // Reclaim the branch's diverged data: its single sibling overlay file.
+        let mut p = self.path.clone().into_os_string();
+        p.push(format!(".branch-{}", branch.0));
+        let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        Ok(())
     }
 
     async fn set_retention_floor(&self, lsn: Lsn) -> Result<(), StorageError> {
@@ -534,12 +578,24 @@ fn read_log(file: &mut File) -> Result<(Vec<Frame>, u64, u64), StorageError> {
                 frames.push(Frame::Retention { floor });
             }
             T_BRANCH => {
-                if payload.len() < 16 {
+                if payload.len() < 24 {
                     break;
                 }
                 let id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
                 let base_lsn = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-                frames.push(Frame::Branch { id, base_lsn });
+                let parent = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+                frames.push(Frame::Branch {
+                    id,
+                    base_lsn,
+                    parent,
+                });
+            }
+            T_BRANCH_DEL => {
+                if payload.len() < 8 {
+                    break;
+                }
+                let id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                frames.push(Frame::BranchDel { id });
             }
             _ => break, // unknown tag: treat as torn boundary
         }
@@ -579,16 +635,24 @@ fn recover(mut file: File) -> Result<Inner, StorageError> {
             }
             Frame::Fence { epoch: e } => epoch = epoch.max(e),
             Frame::Retention { floor } => retention_floor = retention_floor.max(floor),
-            Frame::Branch { id, base_lsn } => {
+            Frame::Branch {
+                id,
+                base_lsn,
+                parent,
+            } => {
                 branches.insert(
                     id,
                     BranchRef {
                         id: BranchId(id),
+                        parent: BranchId(parent),
                         base_lsn: Lsn(base_lsn),
                         head_lsn: Lsn(base_lsn),
                     },
                 );
                 next_branch_id = next_branch_id.max(id + 1);
+            }
+            Frame::BranchDel { id } => {
+                branches.remove(&id);
             }
         }
     }

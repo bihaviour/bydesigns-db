@@ -93,6 +93,48 @@ fn two_writers_resolve_to_one_survivor_via_cas() {
 }
 
 #[test]
+fn lease_lifecycle_is_durable_on_object_store() {
+    // The writer lease is a durable object: acquire stamps a live expiry, renew
+    // (heartbeat) re-stamps it under the same epoch, and release frees it
+    // (expiry 0) while keeping the epoch so the released token stays fenced.
+    let store: Arc<MemObjectStore> = Arc::new(MemObjectStore::new());
+    let s = ObjectStorage::with_store(store.clone(), PREFIX, ObjectConfig::default()).unwrap();
+    let lease_key = "db/test/lease";
+    let read = |store: &Arc<MemObjectStore>| -> (u64, u64) {
+        let b = block_on(store.get(lease_key)).unwrap().unwrap().bytes;
+        let epoch = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let expires = u64::from_le_bytes(b[24..32].try_into().unwrap());
+        (epoch, expires)
+    };
+
+    let t = block_on(s.acquire_fence(WriterId(1))).unwrap();
+    let (e0, exp0) = read(&store);
+    assert_eq!(e0, t.epoch, "lease records the acquired epoch");
+    assert!(exp0 > 0, "acquire stamps a live lease expiry");
+
+    let t = block_on(s.renew_fence(&t)).unwrap();
+    let (e1, exp1) = read(&store);
+    assert_eq!(e1, t.epoch, "renew keeps the same epoch");
+    assert!(exp1 > 0, "renew re-stamps a live expiry durably");
+
+    block_on(s.release_fence(t.clone())).unwrap();
+    let (e2, exp2) = read(&store);
+    assert_eq!(
+        e2, t.epoch,
+        "release keeps the epoch (so stale tokens stay fenced)"
+    );
+    assert_eq!(exp2, 0, "release frees the lease for a fast handoff");
+
+    // A fresh acquire still takes over (higher epoch); the released token is fenced.
+    let t2 = block_on(s.acquire_fence(WriterId(2))).unwrap();
+    assert!(t2.epoch > t.epoch);
+    assert!(matches!(
+        block_on(s.append_wal(&t, &[rec("released")])),
+        Err(StorageError::Fenced { .. })
+    ));
+}
+
+#[test]
 fn lost_cas_slot_is_retried_then_fenced() {
     // Directly exercise the put-if-absent CAS primitive the commit log rests on.
     let store = MemObjectStore::new();

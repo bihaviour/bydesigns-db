@@ -97,11 +97,46 @@ fn c_abi_roundtrip() {
     assert_eq!(done, 1, "no more rows");
     assert_eq!(engine_finalize(st), 0);
 
-    // Branching is deferred to Phase 4: NULL + a message on the handle.
-    assert!(engine_branch(h, cs("b").as_ptr()).is_null());
-    assert!(rd(engine_last_error(h))
-        .unwrap_or_default()
-        .contains("Phase 4"));
+    // Branching (Phase 4): fork a copy-on-write branch, diverge it, and prove
+    // isolation — the branch sees the base's rows plus its own; the base does not.
+    let bh = engine_branch(h, cs("feature").as_ptr());
+    assert!(!bh.is_null(), "engine_branch returns a live branch handle");
+
+    // The branch inherits the base's committed rows.
+    let mut bq: *mut EngineResult = ptr::null_mut();
+    assert_eq!(
+        engine_query(bh, cs("SELECT id FROM t ORDER BY id").as_ptr(), &mut bq),
+        0
+    );
+    assert_eq!(engine_result_rows(bq), 2, "branch inherits base rows");
+    engine_result_free(bq);
+
+    // Diverge the branch with a row of its own.
+    assert_eq!(
+        engine_exec(bh, cs("INSERT INTO t VALUES (3, 'branch-only')").as_ptr()),
+        0
+    );
+    let mut bq2: *mut EngineResult = ptr::null_mut();
+    assert_eq!(
+        engine_query(bh, cs("SELECT id FROM t ORDER BY id").as_ptr(), &mut bq2),
+        0
+    );
+    assert_eq!(engine_result_rows(bq2), 3, "branch sees its diverged row");
+    engine_result_free(bq2);
+
+    // The base is untouched by the branch's write.
+    let mut hq: *mut EngineResult = ptr::null_mut();
+    assert_eq!(
+        engine_query(h, cs("SELECT id FROM t ORDER BY id").as_ptr(), &mut hq),
+        0
+    );
+    assert_eq!(
+        engine_result_rows(hq),
+        2,
+        "base never sees the branch's write"
+    );
+    engine_result_free(hq);
+    engine_close(bh);
 
     engine_close(h);
     engine_close(ptr::null_mut()); // idempotent on NULL

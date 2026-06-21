@@ -34,9 +34,14 @@ pub mod conn;
 pub mod ffi;
 
 pub use conn::{Connection, Statement};
+pub use db::Database;
 pub use error::{EngineError, EngineStatus, Result};
 pub use exec::ResultSet;
 pub use value::{ColumnType, Value};
 
 /// ABI version embedded in `engine.h`; bindings verify it at load time.
-pub const ENGINE_ABI_VERSION: u32 = 1;
+///
+/// v2 (Phase 4): `engine_branch` goes from a reserved stub to a working
+/// copy-on-write branch — same signature, but it now returns a live branch
+/// handle instead of always NULL. No symbols were added or removed.
+pub const ENGINE_ABI_VERSION: u32 = 2;

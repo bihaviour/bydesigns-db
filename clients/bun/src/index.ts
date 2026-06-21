@@ -106,7 +106,12 @@ export class Database {
     return result;
   }
 
-  /** Copy-on-write branch (Phase 4). Throws in Phase 1. */
+  /**
+   * Create a copy-on-write branch off this database at its current committed
+   * LSN, returning a new {@link Database} bound to the branch. The branch sees
+   * the base's committed data but writes in isolation — neither the base nor a
+   * sibling observes a branch's writes. Close the returned handle when done.
+   */
   branch(name: string): Database {
     const h = this.#h;
     const child = lib.engine_branch(h, cstr(name));

@@ -14,6 +14,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bydesigns-controller"
+version = "0.2.0"
+dependencies = [
+ "bydesigns-engine",
+]
+
+[[package]]
 name = "bydesigns-engine"
 version = "0.2.0"
 dependencies = [

@@ -9,7 +9,7 @@ use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet};
 use crate::sql::{self, Stmt};
 use crate::value::Value;
 use crate::wal::WalOp;
-use bydesigns_storage::{block_on, WalRecord};
+use bydesigns_storage::{block_on, Lsn, WalRecord};
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Arc;
@@ -45,6 +45,34 @@ impl Connection {
 
     pub fn in_transaction(&self) -> bool {
         self.txn.is_some()
+    }
+
+    /// Create a copy-on-write branch off this connection's database at its
+    /// current committed LSN, returning a new connection bound to the branch.
+    /// The branch forks from committed state (not this connection's uncommitted
+    /// changes), so it must not be called inside an active transaction. Writes
+    /// to the returned connection are isolated from the base and any siblings.
+    pub fn branch(&self, name: &str) -> Result<Connection> {
+        if self.txn.is_some() {
+            return Err(EngineError::txn(
+                "cannot branch inside an active transaction",
+            ));
+        }
+        if self.db.is_branch() {
+            return Err(EngineError::misuse(
+                "branch-of-branch is not supported yet; branch from the base database",
+            ));
+        }
+        let base = self.db.committed_lsn();
+        let id = block_on(self.db.storage.create_branch(name, Lsn(base))).map_err(commit_error)?;
+        let db = Database::open_branch(self.db.url(), id)?;
+        Ok(Connection {
+            db,
+            txn: None,
+            last_error: CString::default(),
+            last_changes: 0,
+            last_lsn: 0,
+        })
     }
 
     /// Record the last error for retrieval via `engine_last_error`.

@@ -17,5 +17,9 @@
   its SQL parser, WAL codec, and base64; don't add a crate to replace them
   without a clear reason.
 - The C ABI in `include/engine.h` is hand-maintained to mirror `ffi.rs`. If you
-  change a signature or the status enum, update the header and bump
-  `ENGINE_ABI_VERSION` in both the header and `lib.rs`.
+  change a signature, the status enum, or an exported symbol's behavioural
+  contract, update the header and bump `ENGINE_ABI_VERSION` in both the header and
+  `lib.rs` (currently `2`) — and the Bun wrapper's pinned `EXPECTED_ABI_VERSION`
+  in `clients/bun/src/ffi.ts`.
+- Keep the embedded engine core thread-free: background loops (e.g. the lifecycle
+  heartbeat/reaper) belong in `crates/controller`, not in `crates/engine`.
