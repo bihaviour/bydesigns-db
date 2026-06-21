@@ -37,7 +37,8 @@ pub use types::{
 };
 
 pub use object::{
-    Config as ObjectConfig, FsObjectStore, MemObjectStore, ObjectError, ObjectStorage, ObjectStore,
+    Config as ObjectConfig, FaultKind, FaultMode, FaultObjectStore, FaultPlan, FsObjectStore,
+    MemObjectStore, ObjectError, ObjectStorage, ObjectStore,
 };
 
 use async_trait::async_trait;

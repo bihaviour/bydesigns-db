@@ -12,6 +12,10 @@
   `cargo build -p twill-engine --release && (cd clients/bun && bun test)`.
 - Durability is non-negotiable: changes to the commit/recovery path must keep the
   crash-safety tests green (C1 durability-after-ack, C5 deterministic recovery,
-  and the torn-trailing-frame test in `crates/storage/tests/conformance.rs`).
+  and the torn-trailing-frame test in `crates/storage/tests/conformance.rs`) **and
+  the seeded Experiment-4 crash gate** (`crates/storage/tests/crash_safety.rs`):
+  a [`FaultObjectStore`] fires at a chosen CAS-append, then the reopened store must
+  show zero acked-write loss and zero torn/half state across the seed sweep. This
+  gate runs as an explicit named step in CI before any tool stores real data.
 - Report results faithfully — if a test fails or a step was skipped, say so with
   the output; don't claim green without running it.
