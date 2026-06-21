@@ -1,0 +1,37 @@
+# Reference transaction-mode pgcat config for Twill DB engine-server (issue #20).
+#
+# pgcat is the alternative to PgBouncer when you also want load-balancing or
+# sharding across backend nodes; it offers the same transaction-mode pooling
+# plus query routing. As with PgBouncer, the pooler is a separate process in
+# front of engine-server — never bundled into it.
+#
+# Run:
+#   cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db
+#   pgcat deploy/pooler/pgcat.toml
+#   psql "host=127.0.0.1 port=6432 user=postgres dbname=srv sslmode=disable"
+
+[general]
+host = "127.0.0.1"
+port = 6432
+# Absorb the client-edge burst; the backend pool below stays small.
+max_client_conn = 5000
+
+[pools.srv]
+# transaction mode: return a backend to the pool at each transaction boundary,
+# which is what lets a burst of short-lived clients share a few backends.
+pool_mode = "transaction"
+default_role = "primary"
+query_parser_enabled = false
+
+[pools.srv.users.0]
+username = "postgres"
+password = ""
+# Keep the backend pool small and able to drain to zero so the engine idle-stops.
+pool_size = 20
+min_pool_size = 0
+
+# engine-server is a single backend (no replicas); transaction-mode pooling and
+# burst absorption do not require sharding.
+[pools.srv.shards.0]
+servers = [["127.0.0.1", 5433, "primary"]]
+database = "srv"
