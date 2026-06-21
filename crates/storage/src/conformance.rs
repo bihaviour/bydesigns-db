@@ -195,6 +195,7 @@ pub fn branch_isolation(make: &Factory) {
     let r = block_on(s.resolve_branch(b)).unwrap();
     assert_eq!(r.base_lsn, base, "C7: branch base == fork point");
     assert_eq!(r.head_lsn, base, "C7: fresh branch head == base");
+    assert_eq!(r.parent, BranchId::ROOT, "C7: forked off the main line");
 
     assert_eq!(
         block_on(s.get_commit_lsn()).unwrap(),
@@ -203,8 +204,32 @@ pub fn branch_isolation(make: &Factory) {
     );
     assert_eq!(block_on(s.durable_lsn()).unwrap(), durable_before);
 
+    // The branch is listed in the namespace it was created in.
+    let listed = block_on(s.list_branches()).unwrap();
+    assert!(
+        listed.iter().any(|x| x.id == b),
+        "C7: created branch appears in list_branches"
+    );
+
     let unknown = block_on(s.resolve_branch(BranchId(424242)));
     assert!(matches!(unknown, Err(StorageError::NotFound(_))));
+
+    // Delete reclaims only the branch; resolving it afterwards is NotFound, and
+    // the base commit/durable marks are still untouched.
+    block_on(s.delete_branch(b)).expect("C7: delete the branch");
+    assert!(matches!(
+        block_on(s.resolve_branch(b)),
+        Err(StorageError::NotFound(_))
+    ));
+    assert!(
+        matches!(
+            block_on(s.delete_branch(BranchId(424242))),
+            Err(StorageError::NotFound(_))
+        ),
+        "C7: deleting an unknown branch is NotFound"
+    );
+    assert_eq!(block_on(s.get_commit_lsn()).unwrap(), commit_before);
+    assert_eq!(block_on(s.durable_lsn()).unwrap(), durable_before);
 }
 
 /// C8 · retention safety — floor moves forward; reads below it are snapshot-too-old.

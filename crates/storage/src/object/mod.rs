@@ -182,6 +182,22 @@ impl ObjectStorage {
         ObjectStorage::with_store(Arc::new(store), &format!("db/{db_id}/"), Config::default())
     }
 
+    /// Open a branch's private write overlay: a second `ObjectStorage` rooted at
+    /// the parent's `branches/<id>/` sub-prefix over the *same* durable floor, so
+    /// the branch's diverged log/layers persist beside (but isolated from) the
+    /// base. Used by [`crate::open_branch`] for `s3://`/`r2://`/`gs://`.
+    pub fn open_branch_overlay(url: &str, branch: BranchId) -> Result<ObjectStorage, StorageError> {
+        let (bucket, db_id) = parse_object_url(url)?;
+        let base = std::env::var_os("BYDESIGNS_OBJECT_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("bydesigns-object"));
+        let root = base.join(&bucket);
+        let store = fs::FsObjectStore::open(&root)
+            .map_err(|e| StorageError::Invalid(format!("object root {root:?}: {e}")))?;
+        let prefix = format!("db/{db_id}/branches/{:020}/", branch.0);
+        ObjectStorage::with_store(Arc::new(store), &prefix, Config::default())
+    }
+
     // ---- key helpers -----------------------------------------------------
     fn lease_key(&self) -> String {
         format!("{}lease", self.prefix)
@@ -201,8 +217,10 @@ impl ObjectStorage {
     fn image_key(&self, lsn: u64) -> String {
         format!("{}image/img-L{lsn:020}.image", self.prefix)
     }
+    /// Branch pointer object. Suffixed `.ptr` so it never collides with the
+    /// branch's private overlay objects under `branches/<id>/`.
     fn branch_key(&self, id: u64) -> String {
-        format!("{}branches/{id:020}", self.prefix)
+        format!("{}branches/{id:020}.ptr", self.prefix)
     }
 
     // ---- synchronous object-store bridges (no .await held across the lock) -
@@ -571,16 +589,22 @@ impl ObjectStorage {
         let mut branches = HashMap::new();
         let mut next_branch_id = 1u64;
         for key in self.obj_list(&format!("{}branches/", self.prefix))? {
+            // Only pointer objects; skip each branch's private overlay objects.
+            if !key.ends_with(".ptr") {
+                continue;
+            }
             let Some(got) = self.obj_get(&key)? else {
                 continue;
             };
-            if got.bytes.len() >= 16 {
+            if got.bytes.len() >= 24 {
                 let id = u64::from_le_bytes(got.bytes[0..8].try_into().unwrap());
                 let base = u64::from_le_bytes(got.bytes[8..16].try_into().unwrap());
+                let parent = u64::from_le_bytes(got.bytes[16..24].try_into().unwrap());
                 branches.insert(
                     id,
                     BranchRef {
                         id: BranchId(id),
+                        parent: BranchId(parent),
                         base_lsn: Lsn(base),
                         head_lsn: Lsn(base),
                     },
@@ -798,14 +822,19 @@ impl Storage for ObjectStorage {
             )));
         }
         let id = g.next_branch_id;
-        let mut payload = Vec::with_capacity(16);
+        // Pointer payload: id | base_lsn | parent. Branches created off this
+        // line have parent ROOT; branch-of-branch is tracked in the overlay's
+        // own namespace (see BranchStorage).
+        let mut payload = Vec::with_capacity(24);
         payload.extend_from_slice(&id.to_le_bytes());
         payload.extend_from_slice(&base_lsn.0.to_le_bytes());
+        payload.extend_from_slice(&BranchId::ROOT.0.to_le_bytes());
         self.obj_put_if_absent(&self.branch_key(id), &payload)
             .map_err(map_obj_err)?;
         g.next_branch_id += 1;
         let bref = BranchRef {
             id: BranchId(id),
+            parent: BranchId::ROOT,
             base_lsn,
             head_lsn: base_lsn,
         };
@@ -821,6 +850,45 @@ impl Storage for ObjectStorage {
             .get(&branch.0)
             .copied()
             .ok_or_else(|| StorageError::NotFound(format!("branch {}", branch.0)))
+    }
+
+    async fn list_branches(&self) -> Result<Vec<BranchRef>, StorageError> {
+        let mut v: Vec<BranchRef> = self
+            .inner
+            .lock()
+            .unwrap()
+            .branches
+            .values()
+            .copied()
+            .collect();
+        v.sort_by_key(|b| b.id.0);
+        Ok(v)
+    }
+
+    async fn delete_branch(&self, branch: BranchId) -> Result<(), StorageError> {
+        {
+            let g = self.inner.lock().unwrap();
+            if !g.branches.contains_key(&branch.0) {
+                return Err(StorageError::NotFound(format!("branch {}", branch.0)));
+            }
+            if g.branches.values().any(|b| b.parent == branch) {
+                return Err(StorageError::Invalid(format!(
+                    "branch {} has live children; delete them first",
+                    branch.0
+                )));
+            }
+        }
+        // Drop the pointer, then reclaim only the branch's diverged objects
+        // under its private `branches/<id>/` sub-prefix. Shared base layers,
+        // which live directly under the database prefix, are never touched.
+        self.obj_delete(&self.branch_key(branch.0))?;
+        let overlay_prefix = format!("{}branches/{:020}/", self.prefix, branch.0);
+        for key in self.obj_list(&overlay_prefix)? {
+            self.obj_delete(&key)?;
+            self.cache.lock().unwrap().remove(&key);
+        }
+        self.inner.lock().unwrap().branches.remove(&branch.0);
+        Ok(())
     }
 
     async fn set_retention_floor(&self, lsn: Lsn) -> Result<(), StorageError> {

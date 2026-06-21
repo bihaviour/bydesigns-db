@@ -100,13 +100,21 @@ pub struct FenceToken {
     pub lease_until: Instant,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct BranchId(pub u64);
 
-/// Resolution of a branch to its fork point and current head.
+impl BranchId {
+    /// The root line every database starts on. Branches fork off it (or off
+    /// another branch); `parent == ROOT` means "forked from the main line".
+    pub const ROOT: BranchId = BranchId(0);
+}
+
+/// Resolution of a branch to its fork point, parent, and current head.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BranchRef {
     pub id: BranchId,
+    /// The branch this one forked from (`ROOT` = the main line).
+    pub parent: BranchId,
     /// Fork point on the parent.
     pub base_lsn: Lsn,
     /// Current head of this branch (`head == base` for a fresh branch).

@@ -23,12 +23,14 @@
 //!   page images. `ObjectStorage` realizes it as an LSM layer write. It shares a
 //!   single monotonic LSN counter with `append_wal`, so LSN order is total.
 
+mod branch;
 mod types;
 
 pub mod conformance;
 pub mod local;
 pub mod object;
 
+pub use branch::BranchStorage;
 pub use types::{
     BranchId, BranchRef, FenceToken, LogEntry, Lsn, Page, PageId, StorageError, WalRecord,
     WriterId, PAGE_SIZE,
@@ -43,7 +45,11 @@ use async_trait::async_trait;
 /// Bumped (major) for any signature change, associated-type byte-layout change,
 /// or contract weakening. The engine refuses to open a backend reporting an
 /// incompatible major version.
-pub const STORAGE_TRAIT_VERSION: u32 = 1;
+///
+/// v2 (Phase 4): branching gains a write path — `BranchRef` carries `parent`,
+/// and the trait gains [`Storage::list_branches`] / [`Storage::delete_branch`].
+/// All additive; the v1 read/commit/fence surface is unchanged.
+pub const STORAGE_TRAIT_VERSION: u32 = 2;
 
 /// The one seam. The engine calls this; it never touches disk directly.
 ///
@@ -128,8 +134,18 @@ pub trait Storage: Send + Sync + 'static {
     /// Create a branch as a new LSN pointer over shared immutable layers.
     async fn create_branch(&self, name: &str, base_lsn: Lsn) -> Result<BranchId, StorageError>;
 
-    /// Resolve a branch to `{base_lsn, head_lsn}`.
+    /// Resolve a branch to `{parent, base_lsn, head_lsn}`.
     async fn resolve_branch(&self, branch: BranchId) -> Result<BranchRef, StorageError>;
+
+    /// List all branches forked off this storage (the branch namespace it owns),
+    /// in ascending id order. Does not include the root line itself.
+    async fn list_branches(&self) -> Result<Vec<BranchRef>, StorageError>;
+
+    /// Delete a branch pointer and reclaim only its diverged (branch-private)
+    /// data. MUST refuse with `Invalid` if the branch still has live children
+    /// (delete them first); MUST be `NotFound` for an unknown branch. Shared
+    /// immutable base layers are never touched.
+    async fn delete_branch(&self, branch: BranchId) -> Result<(), StorageError>;
 
     // ---- GC / PITR hooks -------------------------------------------------
     /// Declare the retention floor: the oldest LSN any live reader or branch
@@ -160,6 +176,41 @@ pub fn open_storage(url: &str) -> Result<Box<dyn Storage>, StorageError> {
         "s3" | "r2" | "gs" => Ok(Box::new(ObjectStorage::open(url)?)),
         other => Err(StorageError::Invalid(format!("unknown scheme: {other}"))),
     }
+}
+
+/// Open an existing `branch` of the database at `url` as a copy-on-write view.
+///
+/// The returned [`BranchStorage`] reads the parent's shared immutable history
+/// at-or-below the branch's fork point and writes only to a branch-private
+/// overlay (a sibling file for `file://`, a child key-prefix for object stores).
+/// The branch must already exist (created via [`Storage::create_branch`]); an
+/// unknown branch is `NotFound`.
+pub fn open_branch(url: &str, branch: BranchId) -> Result<Box<dyn Storage>, StorageError> {
+    let scheme = url
+        .split_once("://")
+        .map(|(s, _)| s)
+        .ok_or_else(|| StorageError::Invalid(format!("missing scheme in url: {url}")))?;
+    let parent: Box<dyn Storage> = match scheme {
+        "file" => Box::new(LocalFileStorage::open(url)?),
+        "s3" | "r2" | "gs" => Box::new(ObjectStorage::open(url)?),
+        other => return Err(StorageError::Invalid(format!("unknown scheme: {other}"))),
+    };
+    let bref = block_on(parent.resolve_branch(branch))?;
+    let overlay: Box<dyn Storage> = match scheme {
+        "file" => Box::new(LocalFileStorage::open(&branch_overlay_url(url, branch))?),
+        _ => Box::new(ObjectStorage::open_branch_overlay(url, branch)?),
+    };
+    Ok(Box::new(BranchStorage::new(
+        std::sync::Arc::from(parent),
+        overlay,
+        bref,
+    )))
+}
+
+/// The `file://` sibling URL holding a branch's diverged data.
+fn branch_overlay_url(url: &str, branch: BranchId) -> String {
+    let base = url.split('?').next().unwrap_or(url);
+    format!("{base}.branch-{}", branch.0)
 }
 
 /// Drive a future to completion on the current thread, parking between polls.
