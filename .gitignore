@@ -27,3 +27,6 @@ node_modules/
 
 # Local manual end-to-end test kit (not for CI; developer-run)
 /local-e2e/
+
+# Claude Code session memory (agent-local, not project source)
+/.claude/projects/
