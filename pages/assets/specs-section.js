@@ -23,6 +23,7 @@ window.SECTION = {
     { label: "Validation", items: [
       { file: "09-benchmark-plan.html",      id: "BENCH", title: "Benchmark & Validation Plan" },
       { file: "10-hot-row-contention.html",  id: "HOT",   title: "Hot-Row Contention Strategy" },
+      { file: "15-twill-bench.html",         id: "TBENCH", title: "Twill Bench CLI" },
     ]},
     { label: "Operations & Planning", items: [
       { file: "11-deployment-targets.html", id: "DEPLOY", title: "Deployment Targets" },
