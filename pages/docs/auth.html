@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auth (better-auth) · Twill DB docs</title>
+<meta name="description" content="Compose better-auth in-process over the embedded Twill DB engine: a database adapter that stores users, sessions, and accounts as ordinary rows, so auth state branches and scales-to-zero with the database — no external auth service.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">AUTH</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Guide</span>
+</div>
+<h1>Auth (better-auth)</h1>
+<p class="lede">Authentication is <em>composed</em>, not built in. <a href="https://www.better-auth.com/">better-auth</a> is an ordinary in-process library; Twill DB ships a database adapter so the users, sessions, and accounts it manages are stored as plain rows in the embedded engine. Because they are plain rows, auth state inherits everything rows already get — it syncs to object storage, it branches copy-on-write, and it re-warms after scale-to-zero. There is no auth service to run.</p>
+</header>
+
+<section>
+<h2>The idea</h2>
+<p>The deciding rule (<a href="../specs/12-capabilities.html">spec 12</a>): storage and execution capabilities go <strong>into</strong> the engine; interfaces and services are <strong>composed around</strong> it and stay optional. Auth is a service capability, so it composes — better-auth runs in your process and writes through an adapter, rather than being welded into the engine core.</p>
+<p>The adapter (<code>@twilldb/bun/better-auth</code>) translates better-auth's CRUD contract onto the engine's SQL subset. A session check is then a local function call against an in-process database — no network hop, no separate auth server to deploy or scale.</p>
+
+<div class="callout note">
+<p class="callout-title">A library, not a bundled service</p>
+<p>better-auth is a dependency you add to your app, not part of <code>libengine</code>. The engine has no notion of users or sessions; it only sees rows. Swap better-auth for another library and the engine is unchanged.</p>
+</div>
+</section>
+
+<section>
+<h2>Wire it up</h2>
+<p>Pass the Twill adapter straight to <code>betterAuth({ database })</code>. The adapter creates its tables on first use (one <code>CREATE TABLE</code> per better-auth model, in autocommit), so no migration step is required for the embedded path.</p>
+<pre><code>import { betterAuth } from "better-auth";
+import { open } from "@twilldb/bun";
+import { twillAdapter } from "@twilldb/bun/better-auth";
+
+using db = open("file://./app.db"); // or s3://bucket/app for disaggregated
+
+const auth = betterAuth({
+  database: twillAdapter(db),
+  emailAndPassword: { enabled: true },
+  secret: process.env.BETTER_AUTH_SECRET!,
+});
+
+// Sign-up writes the user, account, and session rows into the engine.
+await auth.api.signUpEmail({
+  body: { email: "ada@example.com", password: "correct-horse-battery", name: "Ada" },
+});
+
+// Sign-in verifies the hash and mints a session token.
+const { token } = await auth.api.signInEmail({
+  body: { email: "ada@example.com", password: "correct-horse-battery" },
+});</code></pre>
+<p>The auth state is just rows — you can read it with ordinary SQL. Resolving a session token is the two-step lookup an in-process check performs:</p>
+<pre><code>const [{ userId }] = db.query("SELECT userId FROM session WHERE token = ?", [token]);
+const [{ name }]   = db.query("SELECT name FROM user WHERE id = ?", [userId]);</code></pre>
+<p>A runnable version of this is <code>clients/bun/examples/auth-app.ts</code> (<code>bun run examples/auth-app.ts</code>).</p>
+</section>
+
+<section>
+<h2>Auth state branches with the database</h2>
+<p>Because users and sessions are ordinary rows, branching the database branches the auth state. A branch sees the base's committed users (read-through below the fork LSN) but writes in isolation — a sign-up on a branch never leaks back to the base.</p>
+<pre><code>using staging = db.branch("staging");
+const stagingAuth = betterAuth({ database: twillAdapter(staging), /* …same config… */ });
+
+// A user created on the branch is invisible to the base.
+await stagingAuth.api.signUpEmail({
+  body: { email: "bel@example.com", password: "staging-only", name: "Bel" },
+});
+// db (base) still shows only ada@example.com; staging shows both.</code></pre>
+<p>This is the property the composition test asserts (<code>clients/bun/test/better-auth.test.ts</code>): the same database guarantees that protect your rows protect your auth state for free.</p>
+</section>
+
+<section>
+<h2>How the adapter maps to the SQL subset</h2>
+<p>Twill DB's <a href="sql-reference.html">SQL surface</a> is a focused subset, and the adapter translates better-auth's query contract onto it. better-auth handles id generation, password hashing, and date/boolean field transforms; the adapter only translates queries and coerces row values back from the engine's text representation.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>better-auth needs</th><th>Engine reality</th><th>Adapter strategy</th></tr></thead>
+<tbody>
+<tr><td><code>in</code> / <code>not_in</code></td><td>No native <code>IN</code></td><td>Expand to an <code>OR</code> / <code>AND</code> chain of equalities</td></tr>
+<tr><td><code>contains</code> / <code>starts_with</code> / <code>ends_with</code></td><td><code>LIKE</code></td><td>Bind a <code>%</code>-wrapped pattern</td></tr>
+<tr><td><code>offset</code></td><td>No <code>OFFSET</code></td><td>Over-fetch by the offset, slice client-side</td></tr>
+<tr><td><code>limit</code> (dynamic)</td><td><code>LIMIT</code> needs an integer literal</td><td>Emit the integer directly, never a parameter</td></tr>
+<tr><td>Dates, booleans, JSON</td><td>Six storage classes (text/int/real/blob/null/vector)</td><td><code>supports*: false</code> — better-auth serializes them; the adapter maps types to affinity</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout warning">
+<p class="callout-title">Scope follows the engine</p>
+<p>The adapter is as capable as the engine's SQL subset. Joins, group-by, and subqueries are out of scope by design, so plugins that depend on database-side joins are not supported through this adapter. The core email/password and session flows — and anything expressible as single-table CRUD — work.</p>
+</div>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="branching.html"><span class="xref-id">BR</span><span class="xref-title">Branching</span><span class="xref-desc">Why a sign-up on a branch never touches the base.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-id">BUN</span><span class="xref-title">Connect from Bun (embedded)</span><span class="xref-desc">The in-process path better-auth composes over.</span></a>
+<a class="xref" href="sql-reference.html"><span class="xref-id">SQL</span><span class="xref-title">SQL reference</span><span class="xref-desc">The subset the adapter maps onto.</span></a>
+<a class="xref" href="../specs/12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities (spec)</span><span class="xref-desc">The built-in-vs-composed rule that puts auth outside the core.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -20,6 +20,9 @@ window.SECTION = {
       { file: "scale-to-zero.html", id: "S0", title: "Scale-to-zero & lifecycle" },
       { file: "hot-row.html",       id: "HOT", title: "Hot-row contention" },
     ]},
+    { label: "Compose", items: [
+      { file: "auth.html",     id: "AUTH", title: "Auth (better-auth)" },
+    ]},
     { label: "Reference", items: [
       { file: "sql-reference.html", id: "SQL", title: "SQL reference" },
       { file: "c-abi.html",         id: "ABI", title: "C ABI reference" },
