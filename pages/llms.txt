@@ -25,6 +25,7 @@ Notes for agents:
 - [Connection pooling](https://bihaviour.github.io/twill-db/docs/connection-pooling.html): Place a transaction-mode pooler (PgBouncer or pgcat) in front of engine-server to absorb serverless connection bursts, with the single-writer caveats.
 - [Branching](https://bihaviour.github.io/twill-db/docs/branching.html): Copy-on-write branches — an instant LSN pointer over shared immutable layers, write isolation, the embedded API, and the limits.
 - [Scale-to-zero & lifecycle](https://bihaviour.github.io/twill-db/docs/scale-to-zero.html): How stateless compute idles to nothing on object storage — the controller state machine, cold-start budget, lease heartbeat, keep-warm, cost trade-off.
+- [Hot-row contention](https://bihaviour.github.io/twill-db/docs/hot-row.html): Keeping concurrent same-row writes correct, and the three levers — retry the conflict, shard the hot row, route the irreducible outlier to Postgres.
 - [SQL reference](https://bihaviour.github.io/twill-db/docs/sql-reference.html): The exact SQL surface — DDL, DML, queries, transactions, types, parameters, and what is out of scope.
 - [C ABI reference](https://bihaviour.github.io/twill-db/docs/c-abi.html): The frozen C ABI (version 3) — handles, status codes, every exported function, typed-literal parameter encoding, and the safety contract.
 
