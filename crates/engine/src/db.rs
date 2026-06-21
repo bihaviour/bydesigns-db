@@ -16,7 +16,7 @@ use bydesigns_storage::{
     WriterId,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
 /// A simple counting write lane: at most one writer holds it at a time. Held
@@ -58,6 +58,9 @@ pub struct Database {
     url: String,
     /// `Some(id)` if this handle is a copy-on-write branch view, else the root.
     branch: Option<BranchId>,
+    /// Set once a lease renewal observes that a newer writer fenced us; commits
+    /// then fail fast (the storage append would reject them anyway).
+    fenced: AtomicBool,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Weak<Database>>> {
@@ -117,6 +120,7 @@ impl Database {
             key: key.clone(),
             url: url.to_string(),
             branch: None,
+            fenced: AtomicBool::new(false),
         });
 
         let mut reg = registry().lock().unwrap();
@@ -157,6 +161,7 @@ impl Database {
             key: key.clone(),
             url: url.to_string(),
             branch: Some(branch),
+            fenced: AtomicBool::new(false),
         });
 
         let mut reg = registry().lock().unwrap();
@@ -179,6 +184,27 @@ impl Database {
     /// Whether this handle is a branch view (branch-of-branch is rejected).
     pub fn is_branch(&self) -> bool {
         self.branch.is_some()
+    }
+
+    /// Durably renew this database's single-writer lease (the lifecycle
+    /// controller's heartbeat). On `Fenced` — a newer writer took over — mark
+    /// the database fenced so subsequent commits fail fast, and surface the
+    /// error so the controller can step the instance down.
+    pub fn renew_lease(&self) -> Result<()> {
+        match block_on(self.storage.renew_fence(&self.token)) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if matches!(e, bydesigns_storage::StorageError::Fenced { .. }) {
+                    self.fenced.store(true, Ordering::SeqCst);
+                }
+                Err(commit_error(e))
+            }
+        }
+    }
+
+    /// True once a lease renewal observed this writer was fenced by a newer one.
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
     }
 }
 

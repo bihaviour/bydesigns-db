@@ -34,6 +34,7 @@ pub mod conn;
 pub mod ffi;
 
 pub use conn::{Connection, Statement};
+pub use db::Database;
 pub use error::{EngineError, EngineStatus, Result};
 pub use exec::ResultSet;
 pub use value::{ColumnType, Value};
