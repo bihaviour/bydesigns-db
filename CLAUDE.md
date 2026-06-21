@@ -181,8 +181,12 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
   inside an explicit transaction it returns `ENGINE_ERR_TXN`. Row DML is fully
   transactional.
 - The SQL surface is a focused subset; unsupported syntax returns `ENGINE_ERR_SQL`
-  (joins, GROUP BY, subqueries, DISTINCT are out of scope). Phase 5 adds the
+  (joins, subqueries, CTEs, DISTINCT remain out of scope). Phase 5 adds the
   `vector(N)` type, the `<->`/`<=>`/`<#>` distance operators, and HNSW indexes.
+  The PostgREST-compat work (#27) additionally grows the *engine* surface with
+  `::` casts, `GROUP BY`/`HAVING`, `LIMIT … OFFSET`, scalar functions, and
+  `json_agg`/`json_build_object` (single-table); the PostgREST-specific glue
+  (version probe, catalog reflection) stays in `crates/server`, never the engine.
 
 ## When changing things
 

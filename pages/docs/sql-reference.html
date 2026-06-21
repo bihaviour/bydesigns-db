@@ -110,9 +110,11 @@ DELETE FROM notes;</code></pre>
 <pre data-lang="sql"><code>SELECT items
   FROM table
  WHERE predicate
+ GROUP BY expr, ...
+HAVING predicate
  ORDER BY expr [ASC | DESC], ...
- LIMIT n</code></pre>
-<p>Clauses are optional and parsed in this order. <code>SELECT ALL</code> is accepted (it is the default); <code>SELECT DISTINCT</code> is rejected.</p>
+ LIMIT n OFFSET m</code></pre>
+<p>Clauses are optional and parsed in this order. <code>SELECT ALL</code> is accepted (it is the default); <code>SELECT DISTINCT</code> is rejected. Queries still read from a single table — there is no <code>JOIN</code> or subquery.</p>
 
 <h3>Select items</h3>
 <div class="table-wrap">
@@ -120,25 +122,25 @@ DELETE FROM notes;</code></pre>
 <thead><tr><th>Item</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td><code>*</code></td><td>All columns of the table, in declared order</td></tr>
-<tr><td><code>expr</code></td><td>Any expression — a column, literal, or computed value</td></tr>
+<tr><td><code>expr</code></td><td>Any expression — a column, literal, function call, or computed value</td></tr>
 <tr><td><code>expr AS alias</code></td><td>Name the output column (the <code>AS</code> keyword is optional)</td></tr>
-<tr><td><code>COUNT</code> / <code>SUM</code> / <code>MIN</code> / <code>MAX</code> / <code>AVG</code></td><td>Whole-table aggregate over <code>*</code> or an expression</td></tr>
+<tr><td><code>COUNT</code> / <code>SUM</code> / <code>MIN</code> / <code>MAX</code> / <code>AVG</code> / <code>JSON_AGG</code></td><td>Aggregate over <code>*</code> or an expression (whole-table, or per group with <code>GROUP BY</code>)</td></tr>
 </tbody>
 </table>
 </div>
 <pre data-lang="sql"><code>SELECT * FROM notes;
-SELECT id, title AS heading FROM notes WHERE score >= 5 ORDER BY score DESC LIMIT 10;
+SELECT id, title AS heading FROM notes WHERE score >= 5 ORDER BY score DESC LIMIT 10 OFFSET 20;
 SELECT COUNT(*), AVG(score), MAX(score) FROM notes;
+SELECT author, COUNT(*) AS n FROM notes GROUP BY author HAVING COUNT(*) > 1 ORDER BY n DESC;
 SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
-<div class="callout warning">
-<p class="callout-title">Aggregates are whole-table only</p>
-<p><code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, and <code>AVG</code> compute over the entire (filtered) table. There is no <code>GROUP BY</code>, so you cannot mix a bare aggregate with per-row columns to mean grouped output.</p>
-</div>
 
-<h3>ORDER BY and LIMIT</h3>
+<h3>Aggregates and GROUP BY</h3>
+<p><code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, <code>AVG</code>, and <code>JSON_AGG</code> compute over the filtered rows. Without <code>GROUP BY</code> they fold the whole (filtered) table into one row; with <code>GROUP BY</code> they fold each group, and you may project the grouped expressions alongside the aggregates. <code>HAVING</code> filters whole groups. Aggregates nest inside scalar expressions, so result-wrapping shapes like <code>coalesce(json_agg(title), '[]')</code> work.</p>
+
+<h3>ORDER BY, LIMIT and OFFSET</h3>
 <ul class="reqs">
-<li><span class="req-tag may">MAY</span> sort by one or more expressions, each independently <code>ASC</code> (default) or <code>DESC</code>.</li>
-<li><span class="req-tag must">MUST</span> give <code>LIMIT</code> an integer literal — a non-integer (including a parameter) is a parse error.</li>
+<li><span class="req-tag may">MAY</span> sort by one or more expressions, each independently <code>ASC</code> (default) or <code>DESC</code>; an <code>ORDER BY</code> key may name a select-list alias.</li>
+<li><span class="req-tag must">MUST</span> give <code>LIMIT</code> / <code>OFFSET</code> an integer literal (<code>LIMIT ALL</code> means no limit) — a non-integer is a parse error.</li>
 </ul>
 </section>
 
@@ -157,8 +159,28 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>Column reference</td><td><code>title</code>, <code>notes.title</code> (table qualifier accepted, only the column part is used)</td></tr>
 <tr><td>Parameter</td><td><code>?</code> (positional, bound 1-based)</td></tr>
 <tr><td>Parenthesised</td><td><code>(score + 1) * 2</code></td></tr>
+<tr><td>Function call</td><td><code>lower(title)</code>, <code>coalesce(x, 0)</code></td></tr>
+<tr><td>Type cast</td><td><code>x::int</code>, <code>'42'::integer</code>, <code>count(*)::int</code> (Postgres <code>::</code>)</td></tr>
 </tbody>
 </table>
+</div>
+
+<h3>Functions</h3>
+<p>A focused set of standard scalar functions, plus the JSON builders client tooling (PostgREST, Bun.sql) leans on. An unknown function is a parse-time <code>ENGINE_ERR_SQL</code>, never a silent <code>NULL</code>.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Group</th><th>Functions</th></tr></thead>
+<tbody>
+<tr><td>Null handling</td><td><code>coalesce(...)</code>, <code>nullif(a, b)</code></td></tr>
+<tr><td>String</td><td><code>lower</code>, <code>upper</code>, <code>trim</code>/<code>btrim</code>, <code>ltrim</code>, <code>rtrim</code>, <code>length</code>/<code>char_length</code>, <code>concat</code></td></tr>
+<tr><td>Numeric</td><td><code>abs</code>, <code>round</code></td></tr>
+<tr><td>JSON</td><td><code>to_json</code>, <code>json_build_object(k, v, ...)</code>, and the <code>json_agg</code> aggregate</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout note">
+<p class="callout-title">JSON is best-effort text</p>
+<p>The engine has no native <code>json</code> type, so JSON functions produce JSON-encoded <em>text</em>. This covers result-wrapping shapes such as <code>coalesce(json_agg(title), '[]')</code>; faithful nested/record JSON (e.g. <code>row_to_json</code> over a join) is part of the in-progress PostgREST embedding work.</p>
 </div>
 
 <h3>Operators</h3>
@@ -301,8 +323,7 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 <p>These are deliberate boundaries, not bugs. Each parses to a clear <code>ENGINE_ERR_SQL</code> rather than a wrong result.</p>
 <ul class="reqs">
 <li><span class="req-tag must-not">MUST NOT</span> use <code>JOIN</code> — queries read from a single table.</li>
-<li><span class="req-tag must-not">MUST NOT</span> use <code>GROUP BY</code> / <code>HAVING</code> — aggregates are whole-table only.</li>
-<li><span class="req-tag must-not">MUST NOT</span> use subqueries.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use subqueries or CTEs (<code>WITH</code>).</li>
 <li><span class="req-tag must-not">MUST NOT</span> use <code>SELECT DISTINCT</code>.</li>
 <li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>); general secondary/B-tree indexes are not exposed as SQL.</li>
 </ul>
