@@ -65,23 +65,17 @@ pub struct SelectStmt {
     pub items: Vec<SelItem>,
     pub from: Option<String>,
     pub filter: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
     pub order_by: Vec<(Expr, bool)>, // (expr, ascending)
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug)]
 pub enum SelItem {
     Star,
-    Expr {
-        expr: Expr,
-        alias: Option<String>,
-    },
-    Aggregate {
-        func: AggFunc,
-        arg: AggArg,
-        cast: Option<CastTarget>,
-        alias: Option<String>,
-    },
+    Expr { expr: Expr, alias: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,12 +85,15 @@ pub enum AggFunc {
     Min,
     Max,
     Avg,
+    /// `json_agg(expr)` — aggregate the group's values into a JSON array. The
+    /// data-path shape PostgREST wraps result sets in.
+    JsonAgg,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AggArg {
     Star,
-    Expr(Expr),
+    Expr(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +127,19 @@ pub enum Expr {
     Cast {
         e: Box<Expr>,
         target: CastTarget,
+    },
+    /// A scalar function call, e.g. `coalesce(a, 0)`, `lower(name)`. Aggregate
+    /// functions parse to [`Expr::Aggregate`] instead.
+    Func {
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// An aggregate over the current group (or the whole table when there is no
+    /// `GROUP BY`). Parses anywhere an expression may appear, so it nests inside
+    /// scalars — e.g. `coalesce(json_agg(x), '[]')`.
+    Aggregate {
+        func: AggFunc,
+        arg: AggArg,
     },
 }
 
@@ -855,6 +865,22 @@ impl Parser {
         } else {
             None
         };
+        let mut group_by = Vec::new();
+        if self.eat_kw("group") {
+            self.expect_kw("by")?;
+            loop {
+                group_by.push(self.expr()?);
+                if self.skip(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        let having = if self.eat_kw("having") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
         let mut order_by = Vec::new();
         if self.eat_kw("order") {
             self.expect_kw("by")?;
@@ -873,25 +899,43 @@ impl Parser {
                 break;
             }
         }
-        let limit = if self.eat_kw("limit") {
-            match self.bump() {
-                Tok::Int(n) => Some(n),
-                other => {
-                    return Err(EngineError::sql(format!(
-                        "LIMIT expects an integer, found {other:?}"
-                    )))
+        // LIMIT / OFFSET in either order (Postgres accepts both orderings).
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            if limit.is_none() && self.eat_kw("limit") {
+                if self.eat_kw("all") {
+                    continue; // LIMIT ALL == no limit
                 }
+                limit = Some(self.signed_int("LIMIT")?);
+            } else if offset.is_none() && self.eat_kw("offset") {
+                offset = Some(self.signed_int("OFFSET")?);
+                let _ = self.eat_kw("row") || self.eat_kw("rows");
+            } else {
+                break;
             }
-        } else {
-            None
-        };
+        }
         Ok(SelectStmt {
             items,
             from,
             filter,
+            group_by,
+            having,
             order_by,
             limit,
+            offset,
         })
+    }
+
+    /// An integer literal for LIMIT / OFFSET, allowing a leading unary minus.
+    fn signed_int(&mut self, what: &str) -> Result<i64> {
+        let neg = self.skip(Tok::Minus);
+        match self.bump() {
+            Tok::Int(n) => Ok(if neg { -n } else { n }),
+            other => Err(EngineError::sql(format!(
+                "{what} expects an integer, found {other:?}"
+            ))),
+        }
     }
 
     fn select_item(&mut self) -> Result<SelItem> {
@@ -899,36 +943,8 @@ impl Parser {
             self.bump();
             return Ok(SelItem::Star);
         }
-        // Aggregate function?
-        if let Some(w) = self.peek_word() {
-            if let Some(func) = agg_func(w) {
-                // lookahead: must be followed by '('
-                if self.toks.get(self.pos + 1) == Some(&Tok::LParen) {
-                    self.bump(); // func name
-                    self.expect(Tok::LParen)?;
-                    let arg = if self.peek() == &Tok::Star {
-                        self.bump();
-                        AggArg::Star
-                    } else {
-                        AggArg::Expr(self.expr()?)
-                    };
-                    self.expect(Tok::RParen)?;
-                    // an aggregate may carry trailing `::type` casts, e.g.
-                    // `count(*)::int` (common from Bun.sql and PostgREST)
-                    let mut cast = None;
-                    while self.skip(Tok::DColon) {
-                        cast = Some(self.parse_cast_type()?);
-                    }
-                    let alias = self.opt_alias()?;
-                    return Ok(SelItem::Aggregate {
-                        func,
-                        arg,
-                        cast,
-                        alias,
-                    });
-                }
-            }
-        }
+        // Aggregates (and trailing `::type` casts on them, e.g. `count(*)::int`)
+        // parse through the ordinary expression grammar now, so this is uniform.
         let expr = self.expr()?;
         let alias = self.opt_alias()?;
         Ok(SelItem::Expr { expr, alias })
@@ -1216,6 +1232,61 @@ impl Parser {
         }
     }
 
+    /// Parse the argument list of a call; the function name `name` has been
+    /// consumed and the cursor sits on `(`. Aggregate names produce
+    /// [`Expr::Aggregate`]; everything else a scalar [`Expr::Func`].
+    fn func_call(&mut self, name: String) -> Result<Expr> {
+        if let Some(func) = agg_func(&name) {
+            return self.aggregate_call(func);
+        }
+        self.expect(Tok::LParen)?;
+        let mut args = Vec::new();
+        if self.peek() != &Tok::RParen {
+            // A bare `*` argument is only meaningful to `count(*)` (an aggregate,
+            // handled above); tolerate it here so a stray one fails at eval.
+            if self.peek() == &Tok::Star {
+                self.bump();
+            } else {
+                loop {
+                    args.push(self.expr()?);
+                    if self.skip(Tok::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Expr::Func { name, args })
+    }
+
+    /// Parse `(* | expr)` for an aggregate; cursor sits on `(`. `DISTINCT` and
+    /// `ORDER BY` inside the call are accepted and ignored (Phase-5 subset).
+    fn aggregate_call(&mut self, func: AggFunc) -> Result<Expr> {
+        self.expect(Tok::LParen)?;
+        let _ = self.eat_kw("distinct") || self.eat_kw("all");
+        let arg = if self.peek() == &Tok::Star {
+            self.bump();
+            AggArg::Star
+        } else {
+            AggArg::Expr(Box::new(self.expr()?))
+        };
+        // Tolerate a trailing `ORDER BY ...` inside the aggregate (ignored).
+        if self.eat_kw("order") {
+            self.expect_kw("by")?;
+            loop {
+                let _ = self.expr()?;
+                let _ = self.eat_kw("asc") || self.eat_kw("desc");
+                if self.skip(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Expr::Aggregate { func, arg })
+    }
+
     fn primary(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             Tok::Int(n) => {
@@ -1255,10 +1326,19 @@ impl Parser {
                     Ok(Expr::Int(0))
                 } else {
                     self.bump();
-                    // table.column -> use column part (single-table queries in P1)
-                    if self.skip(Tok::Dot) {
-                        let col = self.ident()?;
-                        Ok(Expr::Column(col))
+                    if self.peek() == &Tok::LParen {
+                        self.func_call(w)
+                    } else if self.skip(Tok::Dot) {
+                        // table.column -> use column part (single-table in P1).
+                        // `table.*` projects all columns; only meaningful at the
+                        // select-item level, where Star is handled separately.
+                        if self.peek() == &Tok::Star {
+                            self.bump();
+                            Ok(Expr::Column("*".to_string()))
+                        } else {
+                            let col = self.ident()?;
+                            Ok(Expr::Column(col))
+                        }
                     } else {
                         Ok(Expr::Column(w))
                     }
@@ -1323,6 +1403,8 @@ fn agg_func(w: &str) -> Option<AggFunc> {
         _ if w.eq_ignore_ascii_case("min") => Some(AggFunc::Min),
         _ if w.eq_ignore_ascii_case("max") => Some(AggFunc::Max),
         _ if w.eq_ignore_ascii_case("avg") => Some(AggFunc::Avg),
+        _ if w.eq_ignore_ascii_case("json_agg") => Some(AggFunc::JsonAgg),
+        _ if w.eq_ignore_ascii_case("jsonb_agg") => Some(AggFunc::JsonAgg),
         _ => None,
     }
 }
@@ -1335,8 +1417,8 @@ fn is_constraint_kw(w: &str) -> bool {
 
 fn is_clause_kw(w: &str) -> bool {
     [
-        "from", "where", "order", "limit", "group", "having", "as", "and", "or", "is", "like",
-        "asc", "desc",
+        "from", "where", "order", "limit", "offset", "group", "having", "as", "and", "or", "is",
+        "like", "asc", "desc",
     ]
     .iter()
     .any(|k| w.eq_ignore_ascii_case(k))

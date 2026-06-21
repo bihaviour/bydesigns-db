@@ -294,3 +294,113 @@ fn type_casts_coerce_values() {
 
     let _ = fs::remove_file(&p);
 }
+
+#[test]
+fn group_by_having_and_order() {
+    let p = db_path("groupby");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+    db.exec("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)")
+        .unwrap();
+    db.exec(
+        "INSERT INTO sales VALUES (1,'west',10),(2,'west',30),(3,'east',5),(4,'east',5),(5,'north',100)",
+    )
+    .unwrap();
+
+    // GROUP BY with aggregate + grouped column, ordered by the aggregate.
+    let rs = db
+        .query(
+            "SELECT region, sum(amount) AS total, count(*) AS n \
+             FROM sales GROUP BY region ORDER BY total DESC",
+        )
+        .unwrap();
+    assert_eq!(rs.columns, vec!["region", "total", "n"]);
+    assert_eq!(rs.rows.len(), 3);
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("north"));
+    assert_eq!(cell(&rs, 0, 1).as_deref(), Some("100"));
+    assert_eq!(cell(&rs, 1, 0).as_deref(), Some("west"));
+    assert_eq!(cell(&rs, 1, 1).as_deref(), Some("40"));
+
+    // HAVING filters whole groups.
+    let rs = db
+        .query("SELECT region FROM sales GROUP BY region HAVING sum(amount) > 20 ORDER BY region")
+        .unwrap();
+    assert_eq!(rs.rows.len(), 2);
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("north"));
+    assert_eq!(cell(&rs, 1, 0).as_deref(), Some("west"));
+
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn limit_offset_paginates() {
+    let p = db_path("offset");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    db.exec("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+
+    // OFFSET then LIMIT, in PostgREST's pagination shape.
+    let rs = db
+        .query("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1")
+        .unwrap();
+    assert_eq!(rs.rows.len(), 2);
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("2"));
+    assert_eq!(cell(&rs, 1, 0).as_deref(), Some("3"));
+
+    // OFFSET past the end yields nothing; LIMIT ALL keeps everything.
+    let rs = db.query("SELECT id FROM t ORDER BY id OFFSET 10").unwrap();
+    assert_eq!(rs.rows.len(), 0);
+    let rs = db
+        .query("SELECT id FROM t ORDER BY id LIMIT ALL OFFSET 3")
+        .unwrap();
+    assert_eq!(rs.rows.len(), 2);
+
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn scalar_functions_and_json() {
+    let p = db_path("funcs");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+
+    // coalesce / nullif / string + numeric helpers (no FROM).
+    let rs = db
+        .query(
+            "SELECT coalesce(NULL, 'x') AS a, nullif(1, 1) AS b, upper('hi') AS c, \
+             length('abc') AS d, abs(-4) AS e, round(2.6) AS f, concat('a', 'b', 'c') AS g",
+        )
+        .unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("x"));
+    assert_eq!(cell(&rs, 0, 1), None); // nullif(1,1) -> NULL
+    assert_eq!(cell(&rs, 0, 2).as_deref(), Some("HI"));
+    assert_eq!(cell(&rs, 0, 3).as_deref(), Some("3"));
+    assert_eq!(cell(&rs, 0, 4).as_deref(), Some("4"));
+    assert_eq!(cell(&rs, 0, 5).as_deref(), Some("3"));
+    assert_eq!(cell(&rs, 0, 6).as_deref(), Some("abc"));
+
+    // json_build_object produces JSON text.
+    let rs = db
+        .query("SELECT json_build_object('k', 1, 'name', 'Ada') AS j")
+        .unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some(r#"{"k":1,"name":"Ada"}"#));
+
+    // json_agg aggregates a column into a JSON array; coalesce covers the empty
+    // set (the PostgREST result-wrapping shape).
+    db.exec("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)")
+        .unwrap();
+    db.exec("INSERT INTO books VALUES (1,'A'),(2,'B')").unwrap();
+    let rs = db
+        .query("SELECT coalesce(json_agg(title), '[]') AS titles FROM books")
+        .unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some(r#"["A","B"]"#));
+
+    let rs = db
+        .query("SELECT coalesce(json_agg(title), '[]') AS titles FROM books WHERE id > 99")
+        .unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("[]"));
+
+    // unknown function is a SQL error, not a silent NULL.
+    let err = db.query("SELECT bogus_fn(1)").unwrap_err();
+    assert_eq!(err.status, EngineStatus::ErrSql);
+
+    let _ = fs::remove_file(&p);
+}
