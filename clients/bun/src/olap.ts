@@ -22,8 +22,7 @@
 // falls back to CSV, which DuckDB also reads via read_csv_auto — so the snapshot
 // is always publishable, only the encoding changes.
 
-import { randomBytes } from "node:crypto";
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Database } from "./index";
 
@@ -77,19 +76,22 @@ function csvCell(v: string | null): string {
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 
-// An unguessable token for intermediate filenames. The final snapshot paths are
-// deterministic (a known location to read from), but the staging/.tmp files we
-// write-then-rename must not be predictable: a predictable name in a shared
-// directory invites a symlink/race attack (CodeQL js/insecure-temporary-file).
-function tmpToken(): string {
-  return randomBytes(8).toString("hex");
+// Create a private, exclusively-owned staging directory under `parent`.
+// `mkdtempSync` makes a 0700 directory with an unguessable suffix in one atomic
+// syscall — the secure-temp-file pattern. We do every intermediate write inside
+// it, then atomically rename only the finished artifact into `parent`; this is
+// why the snapshot path stays deterministic (a known location to read from)
+// while no intermediate is ever at a predictable shared path (which would invite
+// a symlink/race attack — CodeQL js/insecure-temporary-file).
+function stagingDir(parent: string): string {
+  return mkdtempSync(join(parent, ".twill-stage-"));
 }
 
 function writeCsv(rows: Record<string, string | null>[], columns: string[], path: string): void {
   const header = columns.join(",");
   const body = rows.map((r) => columns.map((c) => csvCell(r[c])).join(",")).join("\n");
-  // Exclusive create ("wx"): never follow/overwrite a pre-existing file or
-  // symlink at this (randomized) staging path — fail instead.
+  // Exclusive create ("wx") inside the private staging dir: never follow or
+  // overwrite a pre-existing file/symlink — fail instead.
   writeFileSync(path, rows.length ? `${header}\n${body}\n` : `${header}\n`, { flag: "wx" });
 }
 
@@ -100,16 +102,15 @@ function sqlLit(path: string): string {
   return path.replace(/'/g, "''");
 }
 
-// Convert a staged CSV to Parquet with DuckDB, publishing atomically (write to a
-// .tmp then rename) so a reader only ever sees a whole snapshot.
+// Convert a staged CSV to Parquet with DuckDB. Both paths live inside the
+// caller's private staging dir, so we write straight to `outPath`; the caller
+// renames the finished file into place atomically.
 function csvToParquet(csvPath: string, outPath: string): void {
-  const tmp = `${outPath}.${tmpToken()}.tmp`;
-  const sql = `COPY (SELECT * FROM read_csv_auto('${sqlLit(csvPath)}', header=true)) TO '${sqlLit(tmp)}' (FORMAT PARQUET)`;
+  const sql = `COPY (SELECT * FROM read_csv_auto('${sqlLit(csvPath)}', header=true)) TO '${sqlLit(outPath)}' (FORMAT PARQUET)`;
   const r = Bun.spawnSync(["duckdb", "-c", sql]);
   if (!r.success) {
     throw new Error(`duckdb parquet COPY failed: ${r.stderr.toString()}`);
   }
-  renameSync(tmp, outPath); // atomic publish
 }
 
 /**
@@ -133,24 +134,29 @@ export function materialize(db: Database, opts: MaterializeOptions): SnapshotRes
   const wantParquet = (opts.format ?? "parquet") === "parquet";
   const useParquet = wantParquet && duckdbAvailable();
 
-  if (!useParquet) {
-    const path = join(opts.dir, `${opts.table}.csv`);
-    const tmp = `${path}.${tmpToken()}.tmp`;
-    writeCsv(rows, columns, tmp);
-    renameSync(tmp, path); // atomic publish
-    return { path, rows: rows.length, format: "csv" };
-  }
-
-  // Stage to CSV next to the output, convert to Parquet, drop the stage.
-  const staging = join(opts.dir, `.${opts.table}.${tmpToken()}.staging.csv`);
-  writeCsv(rows, columns, staging);
-  const path = join(opts.dir, `${opts.table}.parquet`);
+  // Everything intermediate is written inside a private staging dir, then the
+  // finished artifact is renamed into `opts.dir` (atomic publish — a reader only
+  // ever sees a whole snapshot).
+  const stage = stagingDir(opts.dir);
   try {
-    csvToParquet(staging, path);
+    if (!useParquet) {
+      const path = join(opts.dir, `${opts.table}.csv`);
+      const staged = join(stage, `${opts.table}.csv`);
+      writeCsv(rows, columns, staged);
+      renameSync(staged, path);
+      return { path, rows: rows.length, format: "csv" };
+    }
+    // Stage to CSV, convert to Parquet (both inside the private dir), publish.
+    const stagedCsv = join(stage, `${opts.table}.csv`);
+    writeCsv(rows, columns, stagedCsv);
+    const stagedParquet = join(stage, `${opts.table}.parquet`);
+    csvToParquet(stagedCsv, stagedParquet);
+    const path = join(opts.dir, `${opts.table}.parquet`);
+    renameSync(stagedParquet, path);
+    return { path, rows: rows.length, format: "parquet" };
   } finally {
-    rmSync(staging, { force: true });
+    rmSync(stage, { recursive: true, force: true });
   }
-  return { path, rows: rows.length, format: "parquet" };
 }
 
 /**
