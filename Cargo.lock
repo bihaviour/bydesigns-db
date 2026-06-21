@@ -63,6 +63,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "twill-bench"
+version = "0.3.2"
+dependencies = [
+ "twill-engine",
+]
+
+[[package]]
 name = "twill-controller"
 version = "0.3.2"
 dependencies = [

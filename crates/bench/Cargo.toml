@@ -1,0 +1,15 @@
+[package]
+name = "twill-bench"
+description = "Embedded benchmark driver for the twill-db validation plan (spec 09): HDR-style percentile capture for the latency-floor, group-commit, and contention experiments."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "twill-bench"
+path = "src/main.rs"
+
+[dependencies]
+engine = { package = "twill-engine", path = "../engine" }
