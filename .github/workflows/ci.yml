@@ -122,12 +122,15 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: true
+      # One starved/flaky leg must not cancel the others (and with it the release).
+      fail-fast: false
       matrix:
         include:
           - { pkg: linux-x64,    runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  bin: libengine.so,    artifact: libengine-linux-x64.so }
           - { pkg: linux-arm64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, bin: libengine.so,    artifact: libengine-linux-arm64.so }
-          - { pkg: darwin-x64,   runner: macos-13,         target: x86_64-apple-darwin,       bin: libengine.dylib, artifact: libengine-darwin-x64.dylib }
+          # Both macOS targets build on Apple-Silicon runners (macos-13 Intel hosts
+          # are scarce/deprecated); x86_64 is a cross-compile via the universal SDK.
+          - { pkg: darwin-x64,   runner: macos-14,         target: x86_64-apple-darwin,       bin: libengine.dylib, artifact: libengine-darwin-x64.dylib }
           - { pkg: darwin-arm64, runner: macos-14,         target: aarch64-apple-darwin,      bin: libengine.dylib, artifact: libengine-darwin-arm64.dylib }
           - { pkg: win32-x64,    runner: windows-latest,   target: x86_64-pc-windows-msvc,    bin: engine.dll,      artifact: engine-win32-x64.dll }
     steps:
