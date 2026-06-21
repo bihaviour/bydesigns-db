@@ -16,7 +16,7 @@
   // GA4 Measurement ID. Replace the placeholder with the real "G-XXXXXXXXXX"
   // id from the GA4 property (Admin → Data Streams). Until it starts with "G-",
   // analytics stays inert: no Google script loads and no banner is shown.
-  var GA4_MEASUREMENT_ID = "G-XXXXXXXXXX";
+  var GA4_MEASUREMENT_ID = "G-84B7FR998L";
 
   // ---- Top site header (Home / Docs / Specs / Release) ----------------------
   var NAV = [
