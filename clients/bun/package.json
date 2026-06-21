@@ -1,7 +1,7 @@
 {
   "name": "@twilldb/bun",
-  "version": "0.1.0",
-  "description": "Embed the Twill DB engine in-process via bun:ffi (Phase 1, file:// backend).",
+  "version": "0.3.2",
+  "description": "Embed the Twill DB engine in-process via bun:ffi.",
   "type": "module",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -20,6 +20,13 @@
   ],
   "engines": {
     "bun": ">=1.1.0"
+  },
+  "optionalDependencies": {
+    "@twilldb/engine-linux-x64": "0.3.2",
+    "@twilldb/engine-linux-arm64": "0.3.2",
+    "@twilldb/engine-darwin-x64": "0.3.2",
+    "@twilldb/engine-darwin-arm64": "0.3.2",
+    "@twilldb/engine-win32-x64": "0.3.2"
   },
   "scripts": {
     "test": "bun test",
