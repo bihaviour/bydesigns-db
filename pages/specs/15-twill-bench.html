@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Twill Bench CLI · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">15 · TBENCH</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-21</span>
+</div>
+<h1>Twill Bench CLI</h1>
+<p class="lede">The official benchmarking, correctness, and serverless-efficiency CLI for Twill DB — a single driver that knows the engine's internals, so it measures not just request latency but commit durability, lifecycle behaviour, and data correctness under load. This page captures the product vision and <strong>verifies it against what ships today</strong>, separating what already exists from what is aligned-but-unbuilt and what would strain the architecture's rules.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; relationship to the validation plan</h2>
+<p>Unlike a generic load generator (k6, Locust, Vegeta), Twill Bench understands the engine: it can attribute latency to the commit round-trip, watch a database scale to zero and back, and assert ACID invariants over the result set. It exists to answer three questions on every run — <em>is the database fast, is the data still correct under stress, and how efficiently did the serverless architecture use compute and storage?</em></p>
+<div class="callout note">
+<p class="callout-title">15 is the CLI; 09 is the falsifiable plan it operationalizes</p>
+<p>The <a href="09-benchmark-plan.html">Benchmark &amp; Validation Plan</a> defines the five adversarial experiments (latency floor, group-commit curve, contention wall, crash safety, cold read), the measurement methodology (percentiles via HDR histogram, never means), and the ship/route/block decision rule. <strong>This page does not replace those — it wraps them in an ergonomic CLI</strong> and adds scenario-oriented workloads, correctness profiles, and reporting on top. Where the two meet, spec 09 is authoritative on methodology; any number Twill Bench reports for a placement decision MUST still satisfy 09 (real object store for W1, the Experiment-4 durability gate before real data).</p>
+</div>
+</section>
+
+<section>
+<h2>Goals &amp; design principles</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> capture all latency as a distribution (p50/p90/p95/p99/p999 via an HDR-style histogram); mean-only reporting is prohibited (inherited from spec 09).</li>
+<li><span class="req-tag must">MUST</span> validate data correctness alongside performance — a fast run that loses an acked write or an update is a <em>failure</em>, not a fast success.</li>
+<li><span class="req-tag must">MUST</span> emit both human-friendly terminal output and a machine-readable JSON record for archiving, plotting, and CI gating.</li>
+<li><span class="req-tag should">SHOULD</span> be zero-config for the common scenarios and reproducible (pinned engine + storage SHA, region, instance type, seed — per spec 09).</li>
+<li><span class="req-tag should">SHOULD</span> be safe to run against production for read-only scenarios, and refuse to mutate unless explicitly opted in.</li>
+<li><span class="req-tag should">SHOULD</span> be extensible via benchmark profiles without recompiling the driver.</li>
+<li><span class="req-tag must-not">MUST NOT</span> pull heavyweight or non-auditable dependencies into the engine core to satisfy a reporting feature; CLI-only concerns (YAML profiles, Prometheus export) stay in the <code>twill-bench</code> crate, feature-gated, and never cross the <a href="03-storage-interface.html">storage seam</a> or the thread-free engine boundary.</li>
+</ul>
+</section>
+
+<section>
+<h2>Command structure</h2>
+<p>The brief proposes a <code>twill bench &lt;scenario&gt; [options]</code> surface. Today the binary is invoked as <code>twill-bench &lt;expN&gt; --url … [flags]</code>. Both are sub-command driven; the work below is to grow the scenario vocabulary and a profile loader, not to re-architect the entry point.</p>
+<div class="code-block"><pre><code>twill bench read-heavy
+twill bench write-heavy
+twill bench burst
+twill bench scale-to-zero
+twill bench bank-transfer        # correctness workload profile
+twill bench compare --baseline v0.5.0 --candidate v0.5.1
+twill bench custom --profile workload.yaml</code></pre></div>
+</section>
+
+<section>
+<h2>Benchmark scenarios</h2>
+<p>Scenarios are named workload shapes. The three implemented experiments map onto the request-mix scenarios; the lifecycle scenarios (burst, scale-to-zero, long-run) are new and depend on the <a href="06-lifecycle-controller.html">controller</a> being in the loop.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Scenario</th><th>Shape</th><th>Verification status</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>read-heavy</strong></td><td>90% SELECT / 10% INSERT — analytical-leaning mix</td><td><span class="req-tag should">PLANNED</span> mix engine exists (writer loop); needs read path + ratio control</td></tr>
+<tr><td><strong>write-heavy</strong></td><td>20% SELECT / 80% INSERT — ingestion</td><td><span class="req-tag should">PLANNED</span> close to today's <code>exp2</code> independent-row insert loop</td></tr>
+<tr><td><strong>mixed-oltp</strong></td><td>70% SELECT / 20% INSERT / 8% UPDATE / 2% DELETE — SaaS</td><td><span class="req-tag should">PLANNED</span> needs UPDATE/DELETE/SELECT in the driver loop</td></tr>
+<tr><td><strong>burst</strong></td><td>idle → 500 → 5k → 20k rps → idle, repeat; measures cold/warm starts + scaling latency</td><td><span class="req-tag may">NEEDS DESIGN</span> requires the controller's lifecycle signals, not just the engine</td></tr>
+<tr><td><strong>scale-to-zero</strong></td><td>query → idle 10m → query; measures cold boot, compute reuse, cache restore</td><td><span class="req-tag may">NEEDS DESIGN</span> this is spec 09 <strong>Exp 5</strong> (cold read) — SHOULD, not yet a subcommand</td></tr>
+<tr><td><strong>long-run</strong></td><td>hours/days; detects memory/resource/connection leaks, scheduler drift</td><td><span class="req-tag may">NEEDS DESIGN</span> soak harness + resource sampling</td></tr>
+<tr><td><strong>custom</strong></td><td>user-supplied YAML profile (duration, connections, mix)</td><td><span class="req-tag may">NEEDS DESIGN</span> profile loader; keep the YAML dep CLI-only + feature-gated</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">Lifecycle scenarios need the controller, not the embedded engine</p>
+<p>Burst, scale-to-zero, and long-run measure cold start, worker reuse, and scheduling — signals the embedded library deliberately does not own (the engine core is thread-free; lifecycle lives in <a href="06-lifecycle-controller.html"><code>twill-controller</code></a>). These scenarios are meaningful over the <a href="07-server-mode.html">server / pgwire</a> path against a controller-driven deployment, and degrade to a single warm process when run purely embedded.</p>
+</div>
+</section>
+
+<section>
+<h2>Metrics</h2>
+<p>The brief groups metrics into five families. The query family ships today; the compute and scheduler families are the new, lifecycle-dependent surface and must be sourced from the controller/server, never invented inside the engine.</p>
+
+<h3>Query metrics <span class="req-tag must">IMPLEMENTED</span></h3>
+<p>Total / successful / failed requests, requests/sec, and the latency distribution (median, p90, p95, p99, max). Today's driver records per-commit latency into an HDR-style histogram and prints p50/p99/p999; widening to p90/p95 and a success/failure split is additive.</p>
+
+<h3>Storage metrics <span class="req-tag should">PARTIAL</span></h3>
+<p>Commit latency is measured today (it is the experiment). Snapshot/WAL read &amp; write counts, storage-fetch latency, and cache hit/miss ratio require the engine/storage to expose counters through a read-only stats surface — additive, but a new seam-respecting introspection path (no backend internals leak into the <code>Storage</code> trait).</p>
+
+<h3>Compute &amp; scheduler metrics <span class="req-tag may">NEEDS DESIGN</span></h3>
+<p>Cold/warm starts, average start time, worker-reuse rate, compute active/idle duration, scale-to-zero events, peak workers; queue depth, scheduling delay, allocation/placement time. These come from <a href="06-lifecycle-controller.html"><code>twill-controller</code></a> and the server, and overlap directly with a future observability/OTLP export. Twill Bench consumes them; it does not generate them.</p>
+
+<h3>Network metrics <span class="req-tag may">NEEDS DESIGN</span></h3>
+<p>Client RTT, TLS handshake, request/response transfer — meaningful only on the pgwire transport; measured client-side in the bench driver.</p>
+</section>
+
+<section>
+<h2>Data-correctness validation</h2>
+<p>Performance is only valid if correctness is preserved. Twill Bench asserts, over the workload it just drove, that none of the classic anomalies occurred.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> detect: missing rows, duplicate rows, lost updates, dirty reads, non-repeatable reads, phantom reads, serializable violations, and transaction-consistency breaks.</li>
+<li><span class="req-tag must">MUST</span> exit non-zero (code 2) when any invariant is violated, regardless of latency.</li>
+</ul>
+<p>Today's <code>exp3</code> already counts first-committer-wins conflicts and retries them, proving no-lost-update on a contended counter (over pgwire the conflict surfaces as SQLSTATE <code>40001</code>); the conformance and group-commit suites prove durability and isolation at the crate level. The new work is to lift those assertions into named, result-checking <em>workload profiles</em>.</p>
+
+<h3>Workload profiles</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Profile</th><th>Drives</th><th>Asserts</th></tr></thead>
+<tbody>
+<tr><td><strong>bank-transfer</strong></td><td>concurrent transfers between two accounts</td><td>ACID, balance invariant (sum conserved), transaction correctness</td></tr>
+<tr><td><strong>inventory</strong></td><td>concurrent stock decrements</td><td>no negative inventory, optimistic-lock conflict handling</td></tr>
+<tr><td><strong>counter</strong></td><td>thousands of concurrent increments</td><td>atomicity, zero lost updates (generalizes <code>exp3</code>)</td></tr>
+<tr><td><strong>document-editing</strong></td><td>concurrent updates to one document</td><td>conflict rate, merge/retry latency, retry behaviour</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Reporting</h2>
+<h3>Latency breakdown <span class="req-tag may">NEEDS DESIGN</span></h3>
+<p>Rather than a single total, attribute time across the request path — receive, auth, scheduler, compute spin-up, metadata load, storage read, execution, commit, response. The spin-up / metadata / storage segments require the same controller + storage introspection as the compute/storage metrics above; until those land, the breakdown is partial (client-side + commit only).</p>
+
+<h3>Serverless-efficiency report <span class="req-tag may">NEEDS DESIGN</span></h3>
+<p>Unique to Twill DB: compute-active vs idle time, scale-to-zero count, average worker lifetime, compute-seconds/query, storage-reads/query, average compute utilization. This reframes a run around <em>operational cost</em>, not just latency — the most differentiated piece of the brief, and entirely controller-sourced.</p>
+
+<h3>Release comparison <span class="req-tag should">PLANNED</span></h3>
+<p><code>twill bench compare --baseline vX --candidate vY</code> diffs two runs (read/write latency, cold start, memory, throughput) into a PASS/regression verdict. The JSON record already carries the git SHA and all percentiles; comparison is a post-processing layer over two archived records, naturally CI-friendly.</p>
+
+<h3>Output formats</h3>
+<ul class="reqs">
+<li><span class="req-tag must">IMPLEMENTED</span> — terminal summary + one-line JSON record (experiment, transport, backend, SHA, throughput, percentiles).</li>
+<li><span class="req-tag should">PLANNED</span> — <code>--json</code> as the sole stdout payload for scripting (today the JSON line accompanies the human summary).</li>
+<li><span class="req-tag may">NEEDS DESIGN</span> — <code>--prometheus</code> export for Grafana/CI. Keep the exporter dependency CLI-only and feature-gated; it must never reach the engine.</li>
+</ul>
+
+<h3>Exit codes</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>success</td></tr>
+<tr><td>1</td><td>benchmark failed</td></tr>
+<tr><td>2</td><td>correctness validation failed</td></tr>
+<tr><td>3</td><td>configuration error</td></tr>
+<tr><td>4</td><td>connection error</td></tr>
+</tbody>
+</table>
+</div>
+<p>Today the binary uses <code>2</code> for a usage/parse error and <code>1</code> for a run failure. Adopting the brief's table (notably <code>2</code> = correctness failure, <code>3</code> = config) is a small, behaviour-defining change worth pinning in a test.</p>
+</section>
+
+<section>
+<h2>Verification summary — brief vs. what ships</h2>
+<p>Where each brief capability stands against the current <code>crates/bench</code> driver and the project's architecture rules.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Capability</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>p50/p99/p999 via HDR histogram, JSON record, git SHA</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>exp1/exp2/exp3</code>, embedded + pgwire, <code>file://</code> + <code>s3://</code></td></tr>
+<tr><td>Group-commit + contention experiments</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>maps to spec 09 Exp 1–3; conflict retry proven</td></tr>
+<tr><td>Crash-safety gate</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>spec 09 Exp 4, in <code>crates/storage</code> (CI gate), not yet a bench subcommand</td></tr>
+<tr><td>Request-mix scenarios (read/write/mixed)</td><td><span class="req-tag should">PLANNED</span></td><td>needs SELECT/UPDATE/DELETE in the driver loop + ratio control</td></tr>
+<tr><td>Correctness workload profiles</td><td><span class="req-tag should">PLANNED</span></td><td>generalize <code>exp3</code>; assert invariants, exit code 2 on violation</td></tr>
+<tr><td>Release comparison</td><td><span class="req-tag should">PLANNED</span></td><td>post-process two archived JSON records</td></tr>
+<tr><td>Cold-read / scale-to-zero scenario (Exp 5)</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>spec 09 SHOULD; needs controller in the loop</td></tr>
+<tr><td>Compute / scheduler / serverless-efficiency metrics</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>controller-sourced; overlaps a future OTLP export — bench consumes, engine never generates</td></tr>
+<tr><td>Storage counters, latency breakdown</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>read-only introspection surface that respects the storage seam</td></tr>
+<tr><td>YAML custom profiles, Prometheus export</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>CLI-only, feature-gated deps; keep out of engine core</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Constraints &amp; open questions</h2>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> let any reporting feature (YAML, Prometheus, OTLP) add a dependency to <code>crates/engine</code> or move a backend concept into the <code>Storage</code> trait — these live in the bench/server/controller crates only.</li>
+<li><span class="req-tag must-not">MUST NOT</span> generate lifecycle/compute metrics inside the thread-free engine; consume them from <a href="06-lifecycle-controller.html"><code>twill-controller</code></a> and the server.</li>
+<li><span class="req-tag should">SHOULD</span> resolve: do the new compute/efficiency metrics share one signal vocabulary with a future observability/OTLP exporter? They should — settle the metric set in the bench first, then emit the same set live.</li>
+<li><span class="req-tag should">SHOULD</span> resolve: what is the safe-against-production guard? Read-only scenarios run anywhere; any mutating scenario requires an explicit opt-in flag and a non-production URL by default.</li>
+<li><span class="req-tag may">MAY</span> defer (future enhancements per the brief): multi-region runs, fault injection, network-latency simulation, storage-backend comparison, flamegraphs, continuous mode, a historical benchmark DB, HTML reports, and an interactive TUI.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">The five falsifiable experiments + methodology this CLI operationalizes; authoritative on placement.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention</span><span class="xref-desc">The red-quadrant the counter/contention profiles probe and route around.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Source of cold-start, worker-reuse, and scale-to-zero signals the lifecycle scenarios report.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode</span><span class="xref-desc">The pgwire path the network metrics and deployed-server runs drive against.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam reporting features must not cross; storage counters need a seam-respecting stats surface.</span></a>
+<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-id">RISK</span><span class="xref-title">Tradeoffs &amp; Risks</span><span class="xref-desc">The honest costs (write latency, single writer, cold start) these runs quantify.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-21. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
