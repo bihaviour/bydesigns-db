@@ -1208,11 +1208,9 @@ impl Parser {
             "character" | "bit" => {
                 self.eat_kw("varying");
             }
-            "timestamp" | "time" => {
-                if self.eat_kw("with") || self.eat_kw("without") {
-                    self.eat_kw("time");
-                    self.eat_kw("zone");
-                }
+            "timestamp" | "time" if self.eat_kw("with") || self.eat_kw("without") => {
+                self.eat_kw("time");
+                self.eat_kw("zone");
             }
             _ => {}
         }
