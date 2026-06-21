@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect with a Postgres client · bydesigns-db docs</title>
+<title>Connect with a Postgres client · Twill DB docs</title>
 <meta name="description" content="Start engine-server and connect with psql, Bun's SQL client, generic Postgres drivers, or PostgREST over the supported pgwire subset.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
@@ -27,12 +27,12 @@
 
 <section>
 <h2>Start the server</h2>
-<p>Run <code>bydesigns-server</code> with two arguments: <code>--listen HOST:PORT</code> for the bind address and <code>--db URL</code> for the storage backend. The <code>--db</code> URL scheme selects the backend exactly as the embedded path does — <code>file://</code> for pure-embedded, <code>s3://</code>/<code>r2://</code>/<code>gs://</code> for disaggregated.</p>
+<p>Run <code>twill-server</code> with two arguments: <code>--listen HOST:PORT</code> for the bind address and <code>--db URL</code> for the storage backend. The <code>--db</code> URL scheme selects the backend exactly as the embedded path does — <code>file://</code> for pure-embedded, <code>s3://</code>/<code>r2://</code>/<code>gs://</code> for disaggregated.</p>
 <pre data-lang="bash"><code># Embedded backend (local file)
-cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db file://./srv.db
+cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db
 
 # Disaggregated backend (object storage; credentials from the environment)
-cargo run -p bydesigns-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/app</code></pre>
+cargo run -p twill-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/app</code></pre>
 <p>With no flags it defaults to <code>--listen 127.0.0.1:5433</code> and <code>--db file://./engine-server.db</code>. The short forms <code>-l</code> and <code>-d</code> are accepted.</p>
 <div class="callout tip">
 <p class="callout-title">Same engine, just behind a listener</p>
@@ -144,7 +144,7 @@ db-anon-role = "postgres"</code></pre>
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0.</footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

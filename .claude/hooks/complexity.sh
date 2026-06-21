@@ -15,7 +15,7 @@ case "$f" in
   *) exit 0 ;;
 esac
 
-threshold="${BYDESIGNS_CCN_THRESHOLD:-15}"
+threshold="${TWILL_CCN_THRESHOLD:-15}"
 command -v lizard >/dev/null 2>&1 || exit 0
 
 report=$(lizard -C "$threshold" -w "$f" 2>/dev/null || true)

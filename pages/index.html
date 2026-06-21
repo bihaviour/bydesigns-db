@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bydesigns-db — A serverless OLTP engine that's embeddable and disaggregated</title>
-<meta name="description" content="bydesigns-db is a serverless OLTP database engine: an embeddable Rust library at function-call latency whose storage backend is pluggable — run it purely embedded on a local file, or storage-disaggregated on S3/R2. Scale-to-zero, true embeddability, and instant copy-on-write branching at once.">
+<title>Twill DB — A serverless OLTP engine that's embeddable and disaggregated</title>
+<meta name="description" content="Twill DB is a serverless OLTP database engine: an embeddable Rust library at function-call latency whose storage backend is pluggable — run it purely embedded on a local file, or storage-disaggregated on S3/R2. Scale-to-zero, true embeddability, and instant copy-on-write branching at once.">
 <link rel="stylesheet" href="assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 <script>window.SITE_SECTION="home";</script>
@@ -15,11 +15,11 @@
   <div class="hero">
     <span class="eyebrow"><span class="dot"></span>Phases 1–5 implemented · Rust · Postgres-wire compatible</span>
     <h1>The database that is <span class="grad">embeddable</span> and <span class="grad">disaggregated</span> at once.</h1>
-    <p class="sub">bydesigns-db is a serverless OLTP engine — a SQLite-style Rust library at function-call latency, whose storage backend is pluggable. Point it at a local file to run purely embedded, or at object storage to run storage-disaggregated and scale-to-zero. Same engine, same C ABI; the only difference is a connection string.</p>
+    <p class="sub">Twill DB is a serverless OLTP engine — a SQLite-style Rust library at function-call latency, whose storage backend is pluggable. Point it at a local file to run purely embedded, or at object storage to run storage-disaggregated and scale-to-zero. Same engine, same C ABI; the only difference is a connection string.</p>
     <div class="cta-row">
       <a class="btn btn-primary" href="docs/getting-started.html">Get started →</a>
       <a class="btn btn-ghost" href="docs/index.html">Read the docs</a>
-      <a class="btn btn-ghost" href="https://github.com/bihaviour/bydesigns-db" target="_blank" rel="noopener">View on GitHub</a>
+      <a class="btn btn-ghost" href="https://github.com/bihaviour/twill-db" target="_blank" rel="noopener">View on GitHub</a>
     </div>
     <div class="stat-strip">
       <div class="stat"><div class="v">1</div><div class="l">engine, two delivery modes</div></div>
@@ -36,7 +36,7 @@
     <div class="sec-head">
       <span class="kicker">Why it exists</span>
       <h2>Two properties that usually exclude each other</h2>
-      <p>Embeddability wants the engine to <em>be</em> your application's address space. Disaggregated storage wants durable state to live over the network so compute is stateless. bydesigns-db resolves the tension by moving the seam inward.</p>
+      <p>Embeddability wants the engine to <em>be</em> your application's address space. Disaggregated storage wants durable state to live over the network so compute is stateless. Twill DB resolves the tension by moving the seam inward.</p>
     </div>
     <div class="feature-grid">
       <div class="feature">
@@ -91,7 +91,7 @@
       </div>
       <div class="code-window">
         <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="fname">notes.ts</span></div>
-<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
 
 using db = open("file://./local.db");   // or "s3://bucket/db"
 db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
@@ -113,7 +113,7 @@ preview.exec("INSERT INTO notes VALUES (2, 'branch-only')");
       <div class="code-window">
         <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="fname">server.sh</span></div>
 <pre data-lang="bash"><code># The same engine, behind a Postgres-wire listener
-cargo run -p bydesigns-server -- \
+cargo run -p twill-server -- \
   --listen 127.0.0.1:5433 \
   --db file://./srv.db          # or s3://bucket/db
 
@@ -167,7 +167,7 @@ psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
       <p>Keep the in-process, link-it-anywhere ergonomics; point the storage backend at the network instead of a local file. Embeddable and disaggregated stop being contradictory the moment the seam is a pluggable backend rather than a server you connect to.</p>
       <div class="cta-row" style="justify-content:center;">
         <a class="btn btn-primary" href="docs/getting-started.html">Start the quickstart →</a>
-        <a class="btn btn-ghost" href="https://github.com/bihaviour/bydesigns-db" target="_blank" rel="noopener">Star on GitHub</a>
+        <a class="btn btn-ghost" href="https://github.com/bihaviour/twill-db" target="_blank" rel="noopener">Star on GitHub</a>
       </div>
     </div>
   </section>
@@ -176,12 +176,12 @@ psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
 
 <footer class="site-footer">
   <div class="inner">
-    <div>bydesigns-db — a serverless OLTP engine. Licensed under AGPL-3.0.</div>
+    <div>Twill DB — a serverless OLTP engine. Licensed under AGPL-3.0.</div>
     <div class="foot-links">
       <a href="docs/index.html">Docs</a>
       <a href="specs/index.html">Specs</a>
       <a href="release/index.html">Release</a>
-      <a href="https://github.com/bihaviour/bydesigns-db" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/bihaviour/twill-db" target="_blank" rel="noopener">GitHub</a>
     </div>
   </div>
 </footer>

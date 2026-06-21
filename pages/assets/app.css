@@ -1,5 +1,5 @@
 /* =============================================================================
-   bydesigns-db — Site & Documentation Design System
+   twill-db — Site & Documentation Design System
    A self-contained stylesheet for the whole site (home, docs, specs, release).
    No external dependencies. Light + dark themes via [data-theme]. A sticky
    top site-header sits above an optional 3-column layout (nav | content | toc).

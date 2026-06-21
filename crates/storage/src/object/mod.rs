@@ -189,13 +189,13 @@ impl ObjectStorage {
 
     /// Open the database named by an object-storage URL, backed by a durable
     /// [`FsObjectStore`] floor (the MinIO/self-hosted tier). The bucket maps to a
-    /// directory under `$BYDESIGNS_OBJECT_ROOT` (default: a temp dir), so the
+    /// directory under `$TWILL_OBJECT_ROOT` (default: a temp dir), so the
     /// same URL reopens the same durable data across process restarts.
     pub fn open(url: &str) -> Result<ObjectStorage, StorageError> {
         let (bucket, db_id) = parse_object_url(url)?;
-        let base = std::env::var_os("BYDESIGNS_OBJECT_ROOT")
+        let base = std::env::var_os("TWILL_OBJECT_ROOT")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("bydesigns-object"));
+            .unwrap_or_else(|| std::env::temp_dir().join("twill-object"));
         let root = base.join(&bucket);
         let store = fs::FsObjectStore::open(&root)
             .map_err(|e| StorageError::Invalid(format!("object root {root:?}: {e}")))?;
@@ -208,9 +208,9 @@ impl ObjectStorage {
     /// base. Used by [`crate::open_branch`] for `s3://`/`r2://`/`gs://`.
     pub fn open_branch_overlay(url: &str, branch: BranchId) -> Result<ObjectStorage, StorageError> {
         let (bucket, db_id) = parse_object_url(url)?;
-        let base = std::env::var_os("BYDESIGNS_OBJECT_ROOT")
+        let base = std::env::var_os("TWILL_OBJECT_ROOT")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("bydesigns-object"));
+            .unwrap_or_else(|| std::env::temp_dir().join("twill-object"));
         let root = base.join(&bucket);
         let store = fs::FsObjectStore::open(&root)
             .map_err(|e| StorageError::Invalid(format!("object root {root:?}: {e}")))?;

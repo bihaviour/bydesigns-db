@@ -49,7 +49,7 @@
 </tbody>
 </table>
 </div>
-<p>The server adds <strong>zero</strong> dependencies (it links only <code>bydesigns-engine</code>) and the only engine-side change is additive and Rust-API-only: <code>ResultSet</code> gained a <code>types</code> field and <code>Statement</code> a <code>column_type</code> accessor, so the server can report accurate type OIDs. The C ABI (<code>engine.h</code>) and <code>ENGINE_ABI_VERSION</code> are unchanged.</p>
+<p>The server adds <strong>zero</strong> dependencies (it links only <code>twill-engine</code>) and the only engine-side change is additive and Rust-API-only: <code>ResultSet</code> gained a <code>types</code> field and <code>Statement</code> a <code>column_type</code> accessor, so the server can report accurate type OIDs. The C ABI (<code>engine.h</code>) and <code>ENGINE_ABI_VERSION</code> are unchanged.</p>
 </section>
 
 <section>
@@ -92,7 +92,7 @@
 
 <section>
 <h2>Running</h2>
-<pre data-lang="bash"><code>cargo build -p bydesigns-server --release      # target/release/engine-server
+<pre data-lang="bash"><code>cargo build -p twill-server --release      # target/release/engine-server
 engine-server --listen 127.0.0.1:5433 --db file://./srv.db        # embedded
 engine-server --listen 127.0.0.1:5433 --db s3://bucket/mydb       # disaggregated
 
@@ -101,8 +101,8 @@ psql "host=127.0.0.1 port=5433 user=app dbname=app sslmode=disable"
 #  Bun:  new SQL("postgres://app@127.0.0.1:5433/app?sslmode=disable")
 #  pgbench -n -f script.sql -T 5 -c 8 "host=127.0.0.1 port=5433 user=app dbname=app sslmode=disable"
 
-cargo test -p bydesigns-server                 # in-process wire protocol tests</code></pre>
-<p>Set <code>BYDESIGNS_WIRE_DEBUG=1</code> to trace startup parameters and each frontend message (off by default).</p>
+cargo test -p twill-server                 # in-process wire protocol tests</code></pre>
+<p>Set <code>TWILL_WIRE_DEBUG=1</code> to trace startup parameters and each frontend message (off by default).</p>
 </section>
 
 <section>
@@ -117,7 +117,7 @@ cargo test -p bydesigns-server                 # in-process wire protocol tests<
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db — internal development specification. Implementation map.</footer>
+<footer class="doc-footer">Twill DB — internal development specification. Implementation map.</footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

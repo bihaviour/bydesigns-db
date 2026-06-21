@@ -1,5 +1,5 @@
 //! Engine-owned WAL encoding. Each [`WalOp`] serializes to one opaque
-//! [`bydesigns_storage::WalRecord`]; the storage backend stores and orders them
+//! [`twill_storage::WalRecord`]; the storage backend stores and orders them
 //! but never interprets the bytes (spec 02 / 03).
 //!
 //! A committing transaction emits its data ops followed by a single `Commit`
@@ -11,7 +11,7 @@ use crate::catalog::{Column, TableSchema};
 use crate::error::{EngineError, Result};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexDef, IndexParams, Metric};
-use bydesigns_storage::WalRecord;
+use twill_storage::WalRecord;
 
 #[derive(Clone, Debug)]
 pub enum WalOp {

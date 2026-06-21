@@ -63,7 +63,7 @@ struct Session {
 /// Serve one client connection to completion. Drives startup/auth, then the
 /// command loop, until the client disconnects or sends `Terminate`.
 pub fn serve(mut stream: impl Read + Write, db_url: &str) -> io::Result<()> {
-    let debug = std::env::var_os("BYDESIGNS_WIRE_DEBUG").is_some();
+    let debug = std::env::var_os("TWILL_WIRE_DEBUG").is_some();
     // Startup: handle an optional SSL/GSS probe (declined), then read params.
     let params = loop {
         match read_startup(&mut stream)? {

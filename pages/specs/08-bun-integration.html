@@ -32,7 +32,7 @@
 <dt>Path 2 — Server mode (Bun as client)</dt>
 <dd>Run <code>engine-server</code> (Postgres wire protocol, <a href="07-server-mode.html">07</a>). Bun connects with its built-in <code>Bun.sql</code> Postgres client — zero extra dependencies — for multi-client access and tools that expect Postgres.</dd>
 </dl>
-<p>It also specifies the <code>@yourdb/bun</code> wrapper package over the raw FFI symbols, the NAPI alternative for one package across Bun and Node, prebuilt-binary packaging and distribution, the normative requirements, failure modes, acceptance criteria, and open questions. The C ABI itself is owned by <a href="02-engine-core.html">02 — Engine Core</a>; this page binds to it and MUST NOT redefine it.</p>
+<p>It also specifies the <code>@twilldb/bun</code> wrapper package over the raw FFI symbols, the NAPI alternative for one package across Bun and Node, prebuilt-binary packaging and distribution, the normative requirements, failure modes, acceptance criteria, and open questions. The C ABI itself is owned by <a href="02-engine-core.html">02 — Engine Core</a>; this page binds to it and MUST NOT redefine it.</p>
 <div class="callout note">
 <p class="callout-title">Note — storage choice is config, not a rebuild</p>
 <p>In both paths the storage backend is selected by the connection-string scheme passed to <code>engine_open</code> (or to the server): <code>file://</code> → <code>LocalFileStorage</code> (pure-embedded, no network egress), <code>s3://</code> / <code>r2://</code> → the disaggregated <code>ObjectStorage</code> backend (<a href="04-object-storage-backend.html">04</a>). The Bun-facing code is identical regardless of backend; only the URL changes.</p>
@@ -69,7 +69,7 @@
 <li><span class="req-tag must">MUST</span> marshal JS strings to NUL-terminated C strings for every <code>const char*</code> argument and copy out every <strong>borrowed</strong> <code>const char*</code> return before the owning object advances or is freed.</li>
 <li><span class="req-tag must">MUST</span> map engine status codes and <code>engine_last_error</code> into typed JS errors, distinguishing retryable from terminal failures.</li>
 <li><span class="req-tag must">MUST</span> free every engine-owned resource exactly once — handles via <code>engine_close</code>, results via <code>engine_result_free</code>, statements via <code>engine_finalize</code>.</li>
-<li><span class="req-tag should">SHOULD</span> expose an ergonomic, typed wrapper (<code>@yourdb/bun</code>) so application code never touches raw pointers.</li>
+<li><span class="req-tag should">SHOULD</span> expose an ergonomic, typed wrapper (<code>@twilldb/bun</code>) so application code never touches raw pointers.</li>
 <li><span class="req-tag may">MAY</span> ship a NAPI addon as an alternative distribution so one package serves Bun and Node.</li>
 </ul>
 <h3>Non-goals</h3>
@@ -109,7 +109,7 @@
     <text x="530" y="186">engine-server (pgwire)</text>
   </g>
   <g fill="currentColor" font-family="sans-serif" font-size="11" opacity="0.75">
-    <text x="36" y="76">app → @yourdb/bun → bun:ffi → libengine</text>
+    <text x="36" y="76">app → @twilldb/bun → bun:ffi → libengine</text>
     <text x="36" y="90">storage trait → file:// or s3://</text>
     <text x="448" y="80">or a local .db file (file://)</text>
     <text x="36" y="204">app → Bun.sql (pg client)</text>
@@ -126,7 +126,7 @@
 <tr><th></th><th>Path 1 — Embedded</th><th>Path 2 — Server</th></tr>
 </thead>
 <tbody>
-<tr><td>Bun mechanism</td><td><code>bun:ffi</code> + <code>@yourdb/bun</code></td><td>built-in <code>Bun.sql</code></td></tr>
+<tr><td>Bun mechanism</td><td><code>bun:ffi</code> + <code>@twilldb/bun</code></td><td>built-in <code>Bun.sql</code></td></tr>
 <tr><td>Transport</td><td>direct function calls (no protocol)</td><td>Postgres wire protocol</td></tr>
 <tr><td>Extra deps</td><td>prebuilt native lib for the platform</td><td>none (client is built into Bun)</td></tr>
 <tr><td>Latency on hot path</td><td>function-call (µs over cache hits)</td><td>network round-trip + parse</td></tr>
@@ -274,11 +274,11 @@ function query(h: Pointer, sql: string): Record&lt;string, string&gt;[] {
 </section>
 
 <section>
-<h2>TS wrapper package — @yourdb/bun</h2>
-<p>Application code SHOULD never touch raw pointers. <code>@yourdb/bun</code> wraps the FFI symbols in an ergonomic, typed API with structured errors and deterministic resource disposal. It maps one-to-one onto the ABI subset above.</p>
+<h2>TS wrapper package — @twilldb/bun</h2>
+<p>Application code SHOULD never touch raw pointers. <code>@twilldb/bun</code> wraps the FFI symbols in an ergonomic, typed API with structured errors and deterministic resource disposal. It maps one-to-one onto the ABI subset above.</p>
 
 <h3>Public API surface</h3>
-<pre data-lang="ts"><code>// @yourdb/bun
+<pre data-lang="ts"><code>// @twilldb/bun
 export function open(url: string): Database;
 
 export interface Database extends Disposable {
@@ -308,7 +308,7 @@ export class EngineError extends Error {
 }</code></pre>
 
 <h3>Intended usage</h3>
-<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
 
 // `using` ⇒ db.close() runs deterministically at scope exit (Symbol.dispose)
 using db = open("s3://bucket/mydb?region=us-east-1");
@@ -434,11 +434,11 @@ await sql.begin(async (tx) =&gt; {
 <tr><th>Target</th><th>Library file</th><th>Bun <code>suffix</code></th><th>Distribution package</th></tr>
 </thead>
 <tbody>
-<tr><td><code>darwin-arm64</code></td><td><code>libengine.dylib</code></td><td><code>dylib</code></td><td><code>@yourdb/bun-darwin-arm64</code></td></tr>
-<tr><td><code>darwin-x64</code></td><td><code>libengine.dylib</code></td><td><code>dylib</code></td><td><code>@yourdb/bun-darwin-x64</code></td></tr>
-<tr><td><code>linux-x64</code></td><td><code>libengine.so</code></td><td><code>so</code></td><td><code>@yourdb/bun-linux-x64</code></td></tr>
-<tr><td><code>linux-arm64</code></td><td><code>libengine.so</code></td><td><code>so</code></td><td><code>@yourdb/bun-linux-arm64</code></td></tr>
-<tr><td><code>win32-x64</code></td><td><code>engine.dll</code></td><td><code>dll</code></td><td><code>@yourdb/bun-win32-x64</code></td></tr>
+<tr><td><code>darwin-arm64</code></td><td><code>libengine.dylib</code></td><td><code>dylib</code></td><td><code>@twilldb/bun-darwin-arm64</code></td></tr>
+<tr><td><code>darwin-x64</code></td><td><code>libengine.dylib</code></td><td><code>dylib</code></td><td><code>@twilldb/bun-darwin-x64</code></td></tr>
+<tr><td><code>linux-x64</code></td><td><code>libengine.so</code></td><td><code>so</code></td><td><code>@twilldb/bun-linux-x64</code></td></tr>
+<tr><td><code>linux-arm64</code></td><td><code>libengine.so</code></td><td><code>so</code></td><td><code>@twilldb/bun-linux-arm64</code></td></tr>
+<tr><td><code>win32-x64</code></td><td><code>engine.dll</code></td><td><code>dll</code></td><td><code>@twilldb/bun-win32-x64</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -449,23 +449,23 @@ await sql.begin(async (tx) =&gt; {
 <li><span class="req-tag must">MUST</span> resolve the binary from the installed per-platform subpackage for the current <code>process.platform</code> + <code>process.arch</code>, and fail with a clear, actionable error when none matches (naming the missing <code>platform-arch</code> package).</li>
 <li><span class="req-tag should">SHOULD</span> publish each platform binary as an <code>optionalDependencies</code> entry keyed by <code>os</code>/<code>cpu</code> so the package manager installs only the matching one.</li>
 <li><span class="req-tag should">SHOULD</span> embed an ABI version constant in both <code>engine.h</code> and the wrapper and verify it at <code>dlopen</code> time, failing fast on mismatch rather than calling a stale symbol.</li>
-<li><span class="req-tag may">MAY</span> support an <code>YOURDB_ENGINE_PATH</code> environment override for local builds and unusual deployment layouts.</li>
+<li><span class="req-tag may">MAY</span> support an <code>TWILLDB_ENGINE_PATH</code> environment override for local builds and unusual deployment layouts.</li>
 </ul>
 
 <h3>Install flow</h3>
 <div class="diagram">
 <pre>
-  bun add @yourdb/bun
+  bun add @twilldb/bun
         │
         ▼
   resolves optionalDependencies by { os, cpu }
         │
-        ├─ darwin-arm64  → @yourdb/bun-darwin-arm64 (libengine.dylib)
-        ├─ linux-x64     → @yourdb/bun-linux-x64    (libengine.so)
+        ├─ darwin-arm64  → @twilldb/bun-darwin-arm64 (libengine.dylib)
+        ├─ linux-x64     → @twilldb/bun-linux-x64    (libengine.so)
         └─ ...           → (exactly one matches; others skipped)
         │
         ▼
-  import { open } from "@yourdb/bun"
+  import { open } from "@twilldb/bun"
         │
         ▼
   dlopen(`libengine.${suffix}`) from the resolved subpackage
@@ -490,7 +490,7 @@ await sql.begin(async (tx) =&gt; {
 </thead>
 <tbody>
 <tr><td>connection URL scheme</td><td>both</td><td><code>file://</code> → local, no egress; <code>s3://</code>/<code>r2://</code> → disaggregated. Selects the storage backend; same call path.</td></tr>
-<tr><td><code>YOURDB_ENGINE_PATH</code></td><td>embedded</td><td>Override the resolved library path (local builds, custom layouts).</td></tr>
+<tr><td><code>TWILLDB_ENGINE_PATH</code></td><td>embedded</td><td>Override the resolved library path (local builds, custom layouts).</td></tr>
 <tr><td><code>binding</code> (<code>ffi</code> / <code>napi</code>)</td><td>embedded</td><td>Which binding mechanism the package uses; <code>napi</code> for Bun+Node single package.</td></tr>
 <tr><td>pooler endpoint</td><td>server</td><td><code>Bun.sql</code> connection string points at the pooler (transaction mode), not the engine.</td></tr>
 <tr><td><code>maxConnections</code> (<code>Bun.sql</code>)</td><td>server</td><td>Client-side pool size; coordinate with the upstream pooler limits (<a href="07-server-mode.html">07</a>).</td></tr>
@@ -508,8 +508,8 @@ await sql.begin(async (tx) =&gt; {
 <tr><th>Failure</th><th>Mechanism</th><th>Handling</th></tr>
 </thead>
 <tbody>
-<tr><td>ABI mismatch</td><td>Installed <code>libengine</code> predates/postdates the wrapper's expected symbol set or struct layout.</td><td>Verify an embedded ABI version constant at <code>dlopen</code>; fail fast with a clear "engine ABI vX, wrapper expects vY — upgrade <code>@yourdb/bun</code> or the binary" error. Never call a stale symbol — that is undefined behaviour.</td></tr>
-<tr><td>Missing native library</td><td>No per-platform subpackage matched <code>os</code>/<code>cpu</code> (unsupported arch, pruned optional dep, manual copy).</td><td>Surface an actionable error naming the expected <code>@yourdb/bun-&lt;platform&gt;-&lt;arch&gt;</code> package and the <code>YOURDB_ENGINE_PATH</code> override; do not attempt to load a wrong-arch binary.</td></tr>
+<tr><td>ABI mismatch</td><td>Installed <code>libengine</code> predates/postdates the wrapper's expected symbol set or struct layout.</td><td>Verify an embedded ABI version constant at <code>dlopen</code>; fail fast with a clear "engine ABI vX, wrapper expects vY — upgrade <code>@twilldb/bun</code> or the binary" error. Never call a stale symbol — that is undefined behaviour.</td></tr>
+<tr><td>Missing native library</td><td>No per-platform subpackage matched <code>os</code>/<code>cpu</code> (unsupported arch, pruned optional dep, manual copy).</td><td>Surface an actionable error naming the expected <code>@twilldb/bun-&lt;platform&gt;-&lt;arch&gt;</code> package and the <code>TWILLDB_ENGINE_PATH</code> override; do not attempt to load a wrong-arch binary.</td></tr>
 <tr><td><code>engine_open</code> returns NULL</td><td>Unknown URL scheme (engine rejects rather than defaulting) or storage init failure.</td><td>Throw an open error; no handle exists to query, so the message is generic but states the URL scheme. Validate the scheme client-side first for a better message.</td></tr>
 <tr><td>Use-after-free of borrowed value</td><td>JS keeps a value/colname pointer after the result/statement advanced or was freed.</td><td>Wrapper copies all borrowed cstrings into JS before freeing; never exposes raw pointers. Reading after dispose returns a misuse error, not a crash.</td></tr>
 <tr><td>Double free / use-after-dispose</td><td><code>close()</code>/<code>finalize()</code> called twice, or method on a disposed object.</td><td><code>engine_close</code>/<code>engine_result_free</code> are idempotent on NULL; the wrapper marks disposed and returns a misuse error rather than re-freeing.</td></tr>
@@ -559,7 +559,7 @@ await sql.begin(async (tx) =&gt; {
 <li><strong>GC vs determinism.</strong> How aggressively to lean on <code>FinalizationRegistry</code> as a backstop without letting callers treat GC timing as resource management — durability and lifetime must stay explicit.</li>
 <li><strong>NAPI vs FFI as the default.</strong> Ship FFI-only first (Bun-native, simplest) and add NAPI later, or lead with NAPI for cross-runtime reach from day one? Affects the packaging story.</li>
 <li><strong>Worker thread safety.</strong> Is one engine handle usable across Bun Worker threads, or strictly one handle per thread? The single-writer-per-DB ceiling suggests per-thread handles; confirm against the engine's threading model.</li>
-<li><strong>WASM binding shape.</strong> The Workers build cannot use <code>bun:ffi</code> or a <code>.node</code> addon; what is the JS↔WASM call shape and does the <code>@yourdb/bun</code> surface survive unchanged? See <a href="11-deployment-targets.html">11</a>.</li>
+<li><strong>WASM binding shape.</strong> The Workers build cannot use <code>bun:ffi</code> or a <code>.node</code> addon; what is the JS↔WASM call shape and does the <code>@twilldb/bun</code> surface survive unchanged? See <a href="11-deployment-targets.html">11</a>.</li>
 </ul>
 </section>
 

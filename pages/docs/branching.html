@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Branching · bydesigns-db docs</title>
-<meta name="description" content="Copy-on-write branches in bydesigns-db: an instant LSN pointer over shared immutable layers, write isolation, the embedded API, and the rules and limits.">
+<title>Branching · Twill DB docs</title>
+<meta name="description" content="Copy-on-write branches in Twill DB: an instant LSN pointer over shared immutable layers, write isolation, the embedded API, and the rules and limits.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -63,7 +63,7 @@
 <section>
 <h2>Create a branch (embedded)</h2>
 <p>From the embedded Bun client, <code>db.branch(name)</code> forks the database at its current committed LSN and returns a <strong>new <code>Database</code></strong> bound to the branch. The returned handle is independent — close it when you are done (or let <code>using</code> dispose it).</p>
-<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
 
 using db = open("file://./app.db");
 db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
@@ -133,7 +133,7 @@ db.query("SELECT id, body FROM notes");        // sees only row 1 — the base n
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0.</footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

@@ -1,11 +1,11 @@
 // A runnable sample of the embedded path — the Phase 1 payoff: a working,
 // persistent, in-process database in a Bun app with zero infrastructure.
 //
-//   cargo build -p bydesigns-engine --release
+//   cargo build -p twill-engine --release
 //   cd clients/bun && bun run examples/notes.ts
 //
 // (The library is auto-discovered from ../../../target/{release,debug}; or set
-//  YOURDB_ENGINE_PATH to a built libengine.*)
+//  TWILLDB_ENGINE_PATH to a built libengine.*)
 
 import { open } from "../src/index";
 

@@ -1,6 +1,6 @@
 [package]
-name = "bydesigns-engine"
-description = "The bydesigns-db engine core: SQL frontend, MVCC, WAL, and the stable C ABI (libengine)."
+name = "twill-engine"
+description = "The twill-db engine core: SQL frontend, MVCC, WAL, and the stable C ABI (libengine)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,7 +14,7 @@ name = "engine"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-bydesigns-storage = { path = "../storage" }
+twill-storage = { path = "../storage" }
 async-trait.workspace = true
 thiserror.workspace = true
 

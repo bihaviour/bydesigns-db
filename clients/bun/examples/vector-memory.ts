@@ -1,6 +1,6 @@
 // Phase 5 example — vector search as agent memory, and branching it.
 //
-// Run: cargo build -p bydesigns-engine --release
+// Run: cargo build -p twill-engine --release
 //      bun run examples/vector-memory.ts
 //
 // Shows the in-core vector capability (spec 12): a vector(N) column, an HNSW

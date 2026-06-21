@@ -10,7 +10,7 @@ use crate::sql::{self, Stmt};
 use crate::value::Value;
 use crate::vector::{IndexDef, IndexParams};
 use crate::wal::WalOp;
-use bydesigns_storage::{block_on, Lsn, WalRecord};
+use twill_storage::{block_on, Lsn, WalRecord};
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Arc;

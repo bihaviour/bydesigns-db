@@ -11,7 +11,7 @@
 use crate::error::{EngineError, EngineStatus, Result};
 use crate::store::Store;
 use crate::wal::WalOp;
-use bydesigns_storage::{
+use twill_storage::{
     block_on, open_branch as storage_open_branch, open_storage, BranchId, FenceToken, Lsn, Storage,
     WriterId,
 };
@@ -134,7 +134,7 @@ impl Database {
 
     /// Open (or share) a copy-on-write branch of the database at `url`. The
     /// branch must already exist (created via `storage.create_branch`); its
-    /// diverged state lives in a private overlay (see `bydesigns_storage::
+    /// diverged state lives in a private overlay (see `twill_storage::
     /// open_branch`), so a branch writer never touches the base or siblings.
     pub fn open_branch(url: &str, branch: BranchId) -> Result<Arc<Database>> {
         let key = format!("{}#branch={}", registry_key(url), branch.0);
@@ -194,7 +194,7 @@ impl Database {
         match block_on(self.storage.renew_fence(&self.token)) {
             Ok(_) => Ok(()),
             Err(e) => {
-                if matches!(e, bydesigns_storage::StorageError::Fenced { .. }) {
+                if matches!(e, twill_storage::StorageError::Fenced { .. }) {
                     self.fenced.store(true, Ordering::SeqCst);
                 }
                 Err(commit_error(e))
@@ -268,8 +268,8 @@ fn apply_replay(store: &mut Store, op: WalOp, commit_lsn: u64) {
 }
 
 /// Map a storage error during commit to the engine's conflict/storage codes.
-pub fn commit_error(e: bydesigns_storage::StorageError) -> EngineError {
-    use bydesigns_storage::StorageError::*;
+pub fn commit_error(e: twill_storage::StorageError) -> EngineError {
+    use twill_storage::StorageError::*;
     let status = match &e {
         Fenced { .. } | Contended => EngineStatus::ErrConflict,
         _ => EngineStatus::ErrStorage,

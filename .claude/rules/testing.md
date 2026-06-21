@@ -9,7 +9,7 @@
 - The Bun client loads the native library through `bun:ffi`. After any change to
   the C ABI or engine behaviour, **rebuild `libengine` in release and re-run
   `bun test`** — otherwise Bun silently runs against a stale binary:
-  `cargo build -p bydesigns-engine --release && (cd clients/bun && bun test)`.
+  `cargo build -p twill-engine --release && (cd clients/bun && bun test)`.
 - Durability is non-negotiable: changes to the commit/recovery path must keep the
   crash-safety tests green (C1 durability-after-ack, C5 deterministic recovery,
   and the torn-trailing-frame test in `crates/storage/tests/conformance.rs`).

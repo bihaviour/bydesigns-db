@@ -1,4 +1,4 @@
-//! # bydesigns-db · Pluggable Storage Interface (spec 03)
+//! # twill-db · Pluggable Storage Interface (spec 03)
 //!
 //! A single narrow trait the engine calls instead of touching disk — the seam
 //! that makes *embeddable* and *storage-disaggregated* stop contradicting each

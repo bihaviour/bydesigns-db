@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SQL reference · bydesigns-db docs</title>
-<meta name="description" content="The exact SQL surface bydesigns-db supports: DDL, DML, queries, transactions, types, parameters, and what is out of scope in Phase 1.">
+<title>SQL reference · Twill DB docs</title>
+<meta name="description" content="The exact SQL surface Twill DB supports: DDL, DML, queries, transactions, types, parameters, and what is out of scope in Phase 1.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -22,7 +22,7 @@
 <span class="spec-date">Reference</span>
 </div>
 <h1>SQL reference</h1>
-<p class="lede">bydesigns-db speaks a deliberately small, hand-parsed SQL subset: DDL, row DML, single-table queries with aggregates, and transaction control. Everything on this page is what the parser actually accepts — anything outside it is rejected with <code>ENGINE_ERR_SQL</code> rather than silently mis-parsed.</p>
+<p class="lede">Twill DB speaks a deliberately small, hand-parsed SQL subset: DDL, row DML, single-table queries with aggregates, and transaction control. Everything on this page is what the parser actually accepts — anything outside it is rejected with <code>ENGINE_ERR_SQL</code> rather than silently mis-parsed.</p>
 </header>
 
 <section>
@@ -269,7 +269,7 @@ SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
 </div>
 <div class="callout tip">
 <p class="callout-title">The wrapper does the tagging for you</p>
-<p>The <code>@yourdb/bun</code> client encodes these typed literals from native JS/TS values, so you bind ordinary numbers, strings, and <code>Uint8Array</code>. The raw tags matter only when calling <a href="c-abi.html">the C ABI</a> directly. See <a href="connect-bun.html">Connect from Bun</a>.</p>
+<p>The <code>@twilldb/bun</code> client encodes these typed literals from native JS/TS values, so you bind ordinary numbers, strings, and <code>Uint8Array</code>. The raw tags matter only when calling <a href="c-abi.html">the C ABI</a> directly. See <a href="connect-bun.html">Connect from Bun</a>.</p>
 </div>
 </section>
 
@@ -324,7 +324,7 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0.</footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

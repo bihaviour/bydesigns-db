@@ -4,8 +4,8 @@
 //! spec 04 — CAS single-writer fencing, crash-safety (§8 Exp 4 a/b), layer
 //! resolution across memtable/delta/image, and flush → compaction → GC.
 
-use bydesigns_storage::conformance::run_conformance;
-use bydesigns_storage::{
+use twill_storage::conformance::run_conformance;
+use twill_storage::{
     block_on, FsObjectStore, MemObjectStore, ObjectConfig, ObjectError, ObjectStorage, ObjectStore,
     PageId, Storage, StorageError, WalRecord, WriterId,
 };
@@ -16,7 +16,7 @@ fn unique_root(tag: &str) -> std::path::PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("bydesigns-obj-{tag}-{}-{n}", std::process::id()));
+    p.push(format!("twill-obj-{tag}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     p
 }
@@ -164,7 +164,7 @@ fn exp4a_durable_after_cas_before_ack() {
         block_on(s2.get_commit_lsn()).unwrap() >= acked,
         "acked commit survives crash-after-CAS"
     );
-    let entries = block_on(s2.scan_wal(bydesigns_storage::Lsn::ZERO)).unwrap();
+    let entries = block_on(s2.scan_wal(twill_storage::Lsn::ZERO)).unwrap();
     let payloads: Vec<_> = entries.iter().map(|e| e.record.bytes.clone()).collect();
     assert!(payloads.iter().any(|p| p == b"a") && payloads.iter().any(|p| p == b"b"));
     let _ = std::fs::remove_dir_all(&root);
@@ -250,7 +250,7 @@ fn flush_compaction_gc_reduces_live_layers_and_respects_pitr() {
     let t = block_on(s.acquire_fence(WriterId(1))).unwrap();
 
     // Three flushes => three delta layer objects.
-    let mut last = bydesigns_storage::Lsn::ZERO;
+    let mut last = twill_storage::Lsn::ZERO;
     for round in 0..3u8 {
         last = block_on(s.put_page(&t, PageId(round as u64), &[round; 16])).unwrap();
         block_on(s.flush()).unwrap();

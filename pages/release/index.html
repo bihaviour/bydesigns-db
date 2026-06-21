@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Releases &amp; Roadmap · bydesigns-db</title>
-<meta name="description" content="What shipped in bydesigns-db (Phases 1–4) and what's coming next — the additive build sequence, milestones, and exit criteria.">
+<title>Releases &amp; Roadmap · Twill DB</title>
+<meta name="description" content="What shipped in Twill DB (Phases 1–4) and what's coming next — the additive build sequence, milestones, and exit criteria.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 <script>window.SITE_BASE="../";window.SITE_SECTION="release";</script>
@@ -15,9 +15,9 @@
   <div class="hero">
     <span class="eyebrow"><span class="dot"></span>Current: v0.2.0 · Phases 1–5 implemented</span>
     <h1>Releases &amp; roadmap</h1>
-    <p class="sub">bydesigns-db ships in strictly additive phases: the smallest embeddable thing first, then disaggregation, then server mode, then the lifecycle controller — each one a working, demonstrable product. This page records what has shipped and what is planned next.</p>
+    <p class="sub">Twill DB ships in strictly additive phases: the smallest embeddable thing first, then disaggregation, then server mode, then the lifecycle controller — each one a working, demonstrable product. This page records what has shipped and what is planned next.</p>
     <div class="cta-row">
-      <a class="btn btn-primary" href="https://github.com/bihaviour/bydesigns-db/releases" target="_blank" rel="noopener">GitHub releases →</a>
+      <a class="btn btn-primary" href="https://github.com/bihaviour/twill-db/releases" target="_blank" rel="noopener">GitHub releases →</a>
       <a class="btn btn-ghost" href="../specs/13-roadmap.html">Full build sequence</a>
     </div>
   </div>
@@ -45,7 +45,7 @@
 
       <div class="tl-item done">
         <h3>Phase 1 — Embedded library <span class="chip shipped">✓ Shipped</span></h3>
-        <p><span class="ver">libengine + engine.h + @yourdb/bun + LocalFileStorage</span></p>
+        <p><span class="ver">libengine + engine.h + @twilldb/bun + LocalFileStorage</span></p>
         <p>The engine as an in-process library bound into Bun via <code>bun:ffi</code>, backed by <code>LocalFileStorage</code> (a plain <code>file://</code> database, no network). SQL → MVCC snapshot isolation → crash-safe WAL durability with deterministic replay. The C ABI is frozen here and reused unchanged by every later phase.</p>
         <p><strong>Gate:</strong> basic SQL correctness + MVCC snapshot isolation; durable-after-ack with torn-frame recovery. <a href="../specs/phase-1-embedded.html">Implementation map →</a> · <a href="../specs/02-engine-core.html">Engine Core spec</a></p>
       </div>
@@ -66,7 +66,7 @@
 
       <div class="tl-item done">
         <h3>Phase 4 — Branching &amp; lifecycle <span class="chip shipped">✓ Shipped</span></h3>
-        <p><span class="ver">BranchStorage + durable single-writer lease + bydesigns-controller</span></p>
+        <p><span class="ver">BranchStorage + durable single-writer lease + twill-controller</span></p>
         <p>Copy-on-write branching as a storage-seam concern (a parent read-through below the fork LSN plus a private write overlay), a durable single-writer lease fenced by a monotonic CAS epoch, and a scale-to-zero lifecycle controller (cold-start, idle reaper, lease heartbeat, thundering-herd admission). All additive: <code>STORAGE_TRAIT_VERSION</code> and <code>ENGINE_ABI_VERSION</code> bumped to 2.</p>
         <p><strong>Gate:</strong> scale-to-zero + cold-start with the fence re-acquired by exactly one writer; O(1) branch creation with write isolation. <a href="../specs/phase-4-branching-lifecycle.html">Implementation map →</a> · <a href="../specs/06-lifecycle-controller.html">Lifecycle spec</a></p>
       </div>
@@ -119,7 +119,7 @@
       <table>
         <thead><tr><th>Milestone</th><th>Headline deliverable</th><th>Gate(s)</th><th>State after</th></tr></thead>
         <tbody>
-          <tr><td><strong>M1 — Embedded</strong> <span class="chip shipped">✓</span></td><td>libengine + engine.h + @yourdb/bun + LocalFileStorage</td><td>Basic correctness + MVCC snapshot</td><td>In-process persistent DB, zero infra</td></tr>
+          <tr><td><strong>M1 — Embedded</strong> <span class="chip shipped">✓</span></td><td>libengine + engine.h + @twilldb/bun + LocalFileStorage</td><td>Basic correctness + MVCC snapshot</td><td>In-process persistent DB, zero infra</td></tr>
           <tr><td><strong>M2 — Disaggregated</strong> <span class="chip shipped">✓</span></td><td>ObjectStorage (LSM page store + S3-CAS log)</td><td>Commit latency, group commit, durability</td><td>Disaggregated + scale-to-zero, still embedded</td></tr>
           <tr><td><strong>M3 — Server</strong> <span class="chip shipped">✓</span></td><td>engine-server + pgwire subset + pooler guidance</td><td>Group-commit + contention in server mode</td><td>Multi-client; PostgREST + Bun.sql for free</td></tr>
           <tr><td><strong>M4 — Controller</strong> <span class="chip shipped">✓</span></td><td>Lifecycle state machine + branch-on-LSN + CAS fencing</td><td>Cold read + thundering-herd</td><td>True scale-to-zero + instant clones</td></tr>
@@ -140,12 +140,12 @@
 
 <footer class="site-footer">
   <div class="inner">
-    <div>bydesigns-db — a serverless OLTP engine. Licensed under AGPL-3.0.</div>
+    <div>Twill DB — a serverless OLTP engine. Licensed under AGPL-3.0.</div>
     <div class="foot-links">
       <a href="../docs/index.html">Docs</a>
       <a href="../specs/index.html">Specs</a>
       <a href="../release/index.html">Release</a>
-      <a href="https://github.com/bihaviour/bydesigns-db" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/bihaviour/twill-db" target="_blank" rel="noopener">GitHub</a>
     </div>
   </div>
 </footer>

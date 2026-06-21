@@ -1,6 +1,6 @@
 //! Engine error type, mapped 1:1 onto the `EngineStatus` codes in `engine.h`.
 
-use bydesigns_storage::StorageError;
+use twill_storage::StorageError;
 
 /// `EngineStatus` (see `include/engine.h`). The numeric values are part of the
 /// stable C ABI and MUST NOT change.

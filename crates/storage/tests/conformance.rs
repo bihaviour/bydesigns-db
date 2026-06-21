@@ -2,8 +2,8 @@
 //! backend-specific torn-trailing-frame recovery test (the in-process analog of
 //! a `kill -9` mid-append).
 
-use bydesigns_storage::conformance::run_conformance;
-use bydesigns_storage::{block_on, open_storage, Lsn, WriterId};
+use twill_storage::conformance::run_conformance;
+use twill_storage::{block_on, open_storage, Lsn, WriterId};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ fn unique_db_path(tag: &str) -> PathBuf {
     let n = N.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let mut p = std::env::temp_dir();
-    p.push(format!("bydesigns-{tag}-{pid}-{n}.db"));
+    p.push(format!("twill-{tag}-{pid}-{n}.db"));
     let _ = fs::remove_file(&p);
     p
 }
@@ -40,7 +40,7 @@ fn recovers_from_torn_trailing_frame() {
     let acked = {
         let s = open_storage(&url).unwrap();
         let t = block_on(s.acquire_fence(WriterId(1))).unwrap();
-        block_on(s.append_wal(&t, &[bydesigns_storage::WalRecord::new(b"good".to_vec())])).unwrap()
+        block_on(s.append_wal(&t, &[twill_storage::WalRecord::new(b"good".to_vec())])).unwrap()
     };
 
     // Simulate a partially-written trailing frame: a length prefix promising
@@ -61,7 +61,7 @@ fn recovers_from_torn_trailing_frame() {
 
     // And new appends after recovery are clean and durable.
     let t = block_on(s2.acquire_fence(WriterId(2))).unwrap();
-    let next = block_on(s2.append_wal(&t, &[bydesigns_storage::WalRecord::new(b"after".to_vec())]))
+    let next = block_on(s2.append_wal(&t, &[twill_storage::WalRecord::new(b"after".to_vec())]))
         .unwrap();
     assert!(next > acked);
     drop(s2);

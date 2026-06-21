@@ -11,7 +11,7 @@ fn db_path(tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("bydesigns-eng-{tag}-{}-{n}.db", std::process::id()));
+    p.push(format!("twill-eng-{tag}-{}-{n}.db", std::process::id()));
     let _ = fs::remove_file(&p);
     p
 }

@@ -24,7 +24,7 @@ fn db_path() -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("bydesigns-ffi-{}-{n}.db", std::process::id()));
+    p.push(format!("twill-ffi-{}-{n}.db", std::process::id()));
     let _ = std::fs::remove_file(&p);
     p
 }
@@ -230,9 +230,9 @@ fn s3_scheme_opens_the_object_backend() {
     // Phase 2: the *same* engine binary opens an object-storage database with no
     // recompile — the connection string is the only thing that changed (the seam
     // never moved). The object floor is rooted under a temp dir for the test.
-    let root = std::env::temp_dir().join(format!("bydesigns-ffi-obj-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("twill-ffi-obj-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    std::env::set_var("BYDESIGNS_OBJECT_ROOT", &root);
+    std::env::set_var("TWILL_OBJECT_ROOT", &root);
 
     let bucket = format!("s3://buck/{}", std::process::id());
     let url = cs(&bucket);

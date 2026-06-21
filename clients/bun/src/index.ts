@@ -1,8 +1,8 @@
-// @yourdb/bun — ergonomic, typed embedding of the bydesigns-db engine via
+// @twilldb/bun — ergonomic, typed embedding of the twill-db engine via
 // bun:ffi (Phase 1, embedded path). Application code never touches raw pointers;
 // resources are released deterministically with `using` / explicit close.
 //
-//   import { open } from "@yourdb/bun";
+//   import { open } from "@twilldb/bun";
 //   using db = open("file://./local.db");
 //   db.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
 //   db.query("INSERT INTO notes VALUES (?, ?)", [1, "hello"]);

@@ -6,7 +6,7 @@ argument-hint: "[version] [--draft] [--notes \"…\"]"
 
 # /release — publish a version release
 
-Tag and publish a release for `bihaviour/bydesigns-db`. CI also auto-tags on
+Tag and publish a release for `bihaviour/twill-db`. CI also auto-tags on
 `main` when all gates are green; this skill is the manual / curated path and is
 where you write good notes.
 
@@ -14,7 +14,7 @@ where you write good notes.
 - The working tree is clean and you're on the intended commit (normally `main`,
   or the commit the user names). `git status --porcelain` should be empty.
 - The gates pass locally or in CI: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test --workspace`, and the Bun e2e (`cargo build -p bydesigns-engine --release`
+  `cargo test --workspace`, and the Bun e2e (`cargo build -p twill-engine --release`
   then `cd clients/bun && bun test`). Do not release on red.
 
 ## Resolve the version
@@ -34,7 +34,7 @@ subjects. Seed from `git log <prev-tag>..HEAD --no-merges --pretty='- %s'` (or
 
 ## Publish (outward-facing — confirm before running)
 Pick a backend like the `/gh` skill: GitHub MCP tools if available, else `gh` CLI.
-- Build attachable artifacts: `cargo build -p bydesigns-engine --release` →
+- Build attachable artifacts: `cargo build -p twill-engine --release` →
   attach `target/release/libengine.so` and `crates/engine/include/engine.h`.
 - CLI: `gh release create v<version> --target <sha> --title "v<version>" --notes "<curated notes>" <assets…>`
   (add `--draft` if the user wants to review first).

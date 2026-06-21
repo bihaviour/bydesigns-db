@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>C ABI reference · bydesigns-db docs</title>
-<meta name="description" content="The frozen bydesigns-db C ABI (version 3): handles, status codes, every exported function, the typed-literal parameter encoding, and the safety contract.">
+<title>C ABI reference · Twill DB docs</title>
+<meta name="description" content="The frozen Twill DB C ABI (version 3): handles, status codes, every exported function, the typed-literal parameter encoding, and the safety contract.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -229,7 +229,7 @@ int main(void) {
 }</code></pre>
 <div class="callout tip">
 <p class="callout-title">From Bun you rarely touch this directly</p>
-<p>The <code>@yourdb/bun</code> client wraps every function here over <code>bun:ffi</code>, encodes the typed-literal parameters, and pins <code>EXPECTED_ABI_VERSION</code> to catch a stale binary. See <a href="connect-bun.html">Connect from Bun</a> for the ergonomic typed API.</p>
+<p>The <code>@twilldb/bun</code> client wraps every function here over <code>bun:ffi</code>, encodes the typed-literal parameters, and pins <code>EXPECTED_ABI_VERSION</code> to catch a stale binary. See <a href="connect-bun.html">Connect from Bun</a> for the ergonomic typed API.</p>
 </div>
 </section>
 
@@ -245,7 +245,7 @@ int main(void) {
 
 <nav class="page-nav" id="page-nav"></nav>
 </article>
-<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0.</footer>
 </main>
 <aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
 </div>

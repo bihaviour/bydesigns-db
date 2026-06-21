@@ -1,12 +1,12 @@
 {
-  "name": "@yourdb/bun",
+  "name": "@twilldb/bun",
   "version": "0.1.0",
-  "description": "Embed the bydesigns-db engine in-process via bun:ffi (Phase 1, file:// backend).",
+  "description": "Embed the Twill DB engine in-process via bun:ffi (Phase 1, file:// backend).",
   "type": "module",
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bihaviour/bydesigns-db"
+    "url": "https://github.com/bihaviour/twill-db"
   },
   "module": "src/index.ts",
   "main": "src/index.ts",

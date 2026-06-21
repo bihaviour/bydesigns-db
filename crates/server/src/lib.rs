@@ -1,4 +1,4 @@
-//! # bydesigns-db · engine-server (spec 07, Phase 3)
+//! # twill-db · engine-server (spec 07, Phase 3)
 //!
 //! The embedded engine wrapped in a Postgres-wire listener. The listener is the
 //! *only* new thing on the inbound edge: it frames protocol messages and turns

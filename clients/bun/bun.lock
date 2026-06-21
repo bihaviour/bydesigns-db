@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@yourdb/bun",
+      "name": "@twilldb/bun",
       "devDependencies": {
         "bun-types": "^1.3.14",
         "typescript": "^6.0.3",
