@@ -64,14 +64,14 @@ dependencies = [
 
 [[package]]
 name = "twill-controller"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "twill-engine",
 ]
 
 [[package]]
 name = "twill-engine"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "thiserror",
@@ -80,14 +80,14 @@ dependencies = [
 
 [[package]]
 name = "twill-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "twill-engine",
 ]
 
 [[package]]
 name = "twill-storage"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "thiserror",
