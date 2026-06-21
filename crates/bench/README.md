@@ -1,10 +1,17 @@
 # twill-bench
 
-The embedded (in-process) benchmark driver for the validation plan
-(`pages/specs/09-benchmark-plan.html`; issue #6 / #29). It drives the engine
-directly through the Rust/FFI API and reports latency as **percentiles**
-(p50/p99/p999) via a compact HDR-style histogram — never mean-only, as spec 09
-requires.
+The benchmark driver for the validation plan
+(`pages/specs/09-benchmark-plan.html`; issue #6 / #29). It reports latency as
+**percentiles** (p50/p99/p999) via a compact HDR-style histogram — never
+mean-only, as spec 09 requires — and drives the *same* experiments over two
+transports, so the embedded and server paths are measured identically:
+
+- **embedded** (default) — the engine in-process through the Rust/FFI API.
+- **pgwire** (`--transport pgwire`) — the engine through the Postgres wire
+  protocol. With no `--server` it spins up an in-process `engine-server`
+  listener (so the wire path is offline-testable); with `--server host:port` it
+  drives a deployed `engine-server`, the form a real-host run (or `pgbench`)
+  takes.
 
 ## Run
 
@@ -20,13 +27,22 @@ $BIN exp2 --url file:///tmp/bench.db --writers 8 --duration-ms 5000
 
 # Exp 3 — write-contention wall (N writers on the same row)
 $BIN exp3 --url file:///tmp/bench.db --writers 8 --duration-ms 5000
+
+# Server path (pgwire): same experiments through the Postgres wire protocol.
+# No --server → an in-process listener is spun up on the given --url backend.
+$BIN exp2 --transport pgwire --url file:///tmp/bench.db --writers 8 --duration-ms 5000
+
+# …or drive an already-running engine-server (implies pgwire):
+$BIN exp2 --server 127.0.0.1:5433 --url file:///srv.db --writers 8 --duration-ms 5000
 ```
 
 Each run prints a human summary plus a one-line JSON record (experiment, backend,
 git SHA, writers, throughput, p50/p99/p999) for archiving and plotting.
 
-Flags: `--url` (required), `--writers`, `--warmup-ms` (default 200),
-`--duration-ms` (default 1000), `--label`.
+Flags: `--url` (required), `--transport embedded|pgwire`, `--server HOST:PORT`
+(implies pgwire), `--writers`, `--warmup-ms` (default 200), `--duration-ms`
+(default 1000), `--label`. The JSON record carries the `transport` so embedded
+and server runs are distinguishable when archived together.
 
 ## What runs here vs on a real host
 
@@ -54,5 +70,13 @@ Set `TWILL_BENCH_GIT_SHA` to pin the recorded commit in CI/automation.
   that batching amortizes across the group.
 - **Exp 3** counts the first-committer-wins conflicts it retries; the retry loop
   is what keeps a contended counter correct (see `pages/docs/hot-row.html`).
-- Server-mode drivers (`pgbench`, TPC-C via `go-tpc`/BenchBase) cover the same
-  experiments over the pgwire path and live outside this crate.
+  Over `--transport pgwire` the conflict arrives as SQLSTATE `40001`
+  (serialization_failure) and the driver retries it, exactly as `pgbench
+  --max-tries` would.
+- **Server-mode (`--transport pgwire`)** drives the experiments through the
+  Postgres wire path via a small in-crate client (`src/pgclient.rs`) — no
+  external Postgres tooling, so the wire path is exercised in `cargo test`
+  (`tests/pgwire.rs`) against an in-process listener. `pgbench` and TPC-C (via
+  `go-tpc`/BenchBase) remain the off-the-shelf drivers for real-host runs and a
+  realistic OLTP mix (spec 09); point `--server` at the same `engine-server`
+  they target to compare.

@@ -67,6 +67,7 @@ name = "twill-bench"
 version = "0.3.2"
 dependencies = [
  "twill-engine",
+ "twill-server",
 ]
 
 [[package]]

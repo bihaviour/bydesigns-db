@@ -7,9 +7,14 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "twill_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "twill-bench"
 path = "src/main.rs"
 
 [dependencies]
 engine = { package = "twill-engine", path = "../engine" }
+twill-server = { path = "../server" }
