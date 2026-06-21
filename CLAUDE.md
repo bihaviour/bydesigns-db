@@ -10,24 +10,28 @@ the *same* engine runs either purely embedded (`file://`) or storage-disaggregat
 on object storage (`s3://`/`r2://`/`gs://`). The full design lives as an HTML spec
 site under `specs/` (start at `specs/13-roadmap.html` for the phased plan).
 
-**Phases 1, 2, and 3 are implemented.** Phase 1 is the embedded library
+**Phases 1, 2, 3, and 4 are implemented.** Phase 1 is the embedded library
 (`file://`); Phase 2 adds the disaggregated `ObjectStorage` backend
 (`s3://`/`r2://`/`gs://`) — an LSM page store + CAS commit log over a pluggable
 object-client seam — selected purely by connection string, with the engine and C
 ABI unchanged. Phase 3 adds `engine-server`: the same engine behind a Postgres-wire
 listener (a defined pgwire subset), serving either backend by connection string.
-A later phase adds the lifecycle controller; it is *additive* because the storage
-seam never moves. See `docs/PHASE1.md`, `docs/PHASE2.md`, and `docs/PHASE3.md` for
-the implementation maps and the deliberate scope decisions.
+Phase 4 adds copy-on-write branching (the `engine_branch` stub is now a working
+branch — `STORAGE_TRAIT_VERSION` 2, `ENGINE_ABI_VERSION` 2), a durable
+single-writer lease (acquire/renew/release), and the `bydesigns-controller`
+lifecycle controller (scale-to-zero + keep-warm); all *additive* because the
+storage seam never moves. See `docs/PHASE1.md`–`docs/PHASE4.md` for the
+implementation maps and the deliberate scope decisions.
 
 ## Layout
 
 ```
-crates/storage   # the pluggable `Storage` trait (the seam) + LocalFileStorage + ObjectStorage (LSM+CAS over the object/ client seam) + C1–C8 conformance suite
-crates/engine    # libengine: SQL → MVCC → WAL, plus the stable C ABI (include/engine.h)
-crates/server    # engine-server: the engine behind a Postgres-wire listener (pgwire subset); links the engine unchanged
-clients/bun      # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
-specs/           # the development specification (HTML); the source of truth for design intent
+crates/storage    # the pluggable `Storage` trait (the seam) + LocalFileStorage + ObjectStorage (LSM+CAS over the object/ client seam) + BranchStorage (copy-on-write) + C1–C8 conformance suite
+crates/engine     # libengine: SQL → MVCC → WAL, plus the stable C ABI (include/engine.h)
+crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset); links the engine unchanged
+crates/controller # lifecycle controller: scale-to-zero instances, lease heartbeat, keep-warm + thundering-herd admission (Phase 4)
+clients/bun       # @yourdb/bun: bun:ffi bindings + ergonomic typed wrapper + example
+specs/            # the development specification (HTML); the source of truth for design intent
 ```
 
 ## Commands
@@ -107,8 +111,9 @@ versions + visibility), `wal.rs` (engine-owned WAL op encoding), `db.rs` (shared
 
 These are deliberate, not omissions — don't "fix" them without checking the roadmap:
 
-- `engine_branch` is reserved (returns NULL + a message); copy-on-write branching
-  is Phase 4. Do not implement branching in earlier phases.
+- `engine_branch` is implemented as of Phase 4: it forks a copy-on-write branch
+  at the connection's committed LSN and returns a new branch-bound handle.
+  Branch-of-branch and branching inside a transaction are rejected (NULL + error).
 - DDL (`CREATE`/`DROP TABLE`) runs in autocommit only; inside an explicit
   transaction it returns `ENGINE_ERR_TXN`. Row DML is fully transactional.
 - The SQL surface is a focused subset; unsupported syntax returns `ENGINE_ERR_SQL`
