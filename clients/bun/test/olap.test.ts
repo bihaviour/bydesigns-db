@@ -78,6 +78,17 @@ test("Materializer.materializeOnce publishes a snapshot on demand", () => {
   m.stop(); // no-op when not started — must not throw
 });
 
+test("rejects unsafe table/column identifiers (SQL/CLI/path injection guard)", () => {
+  using db = open(url);
+  seed(db);
+  for (const bad of ["events; DROP TABLE events", "../escape", "ev'ents", "a b", ".hidden"]) {
+    expect(() => materialize(db, { table: bad, dir, format: "csv" })).toThrow(/invalid table/);
+  }
+  expect(() =>
+    materialize(db, { table: "events", dir, columns: ["id", "amount); --"], format: "csv" }),
+  ).toThrow(/invalid column/);
+});
+
 test.skipIf(!duckdbAvailable())(
   "DuckDB aggregates over the Parquet snapshot the row engine wrote",
   () => {

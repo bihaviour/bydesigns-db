@@ -48,6 +48,19 @@ export interface SnapshotResult {
   format: SnapshotFormat;
 }
 
+// Table/column names are interpolated into SQL, into a DuckDB CLI SQL string,
+// and into snapshot file paths. Restrict them to a plain SQL identifier so none
+// of those sinks can be injected (no quotes, semicolons, whitespace, path
+// separators, `..`, or leading dots). Callers pass schema identifiers, not user
+// input, but validating here keeps every sink safe regardless.
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function checkIdent(kind: string, name: string): void {
+  if (!IDENT.test(name)) {
+    throw new Error(`invalid ${kind} identifier ${JSON.stringify(name)}: must match ${IDENT}`);
+  }
+}
+
 /** Whether the DuckDB CLI is on PATH (used as the Parquet writer and reader). */
 export function duckdbAvailable(): boolean {
   try {
@@ -69,11 +82,18 @@ function writeCsv(rows: Record<string, string | null>[], columns: string[], path
   writeFileSync(path, rows.length ? `${header}\n${body}\n` : `${header}\n`);
 }
 
+// Escape a path for embedding as a single-quoted DuckDB SQL literal. The table
+// name in the path is already an allowlisted identifier; this also neutralizes a
+// quote in the caller-provided `dir`.
+function sqlLit(path: string): string {
+  return path.replace(/'/g, "''");
+}
+
 // Convert a staged CSV to Parquet with DuckDB, publishing atomically (write to a
 // .tmp then rename) so a reader only ever sees a whole snapshot.
 function csvToParquet(csvPath: string, outPath: string): void {
   const tmp = `${outPath}.tmp`;
-  const sql = `COPY (SELECT * FROM read_csv_auto('${csvPath}', header=true)) TO '${tmp}' (FORMAT PARQUET)`;
+  const sql = `COPY (SELECT * FROM read_csv_auto('${sqlLit(csvPath)}', header=true)) TO '${sqlLit(tmp)}' (FORMAT PARQUET)`;
   const r = Bun.spawnSync(["duckdb", "-c", sql]);
   if (!r.success) {
     throw new Error(`duckdb parquet COPY failed: ${r.stderr.toString()}`);
@@ -86,6 +106,11 @@ function csvToParquet(csvPath: string, outPath: string): void {
  * Returns the published path, row count, and the format actually written.
  */
 export function materialize(db: Database, opts: MaterializeOptions): SnapshotResult {
+  // Validate identifiers before they reach any SQL / CLI / path sink.
+  checkIdent("table", opts.table);
+  for (const c of opts.columns ?? []) {
+    if (c !== "*") checkIdent("column", c);
+  }
   mkdirSync(opts.dir, { recursive: true });
   const cols = opts.columns ?? ["*"];
   const rows = db.query<Record<string, string | null>>(
