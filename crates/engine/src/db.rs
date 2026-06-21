@@ -243,6 +243,9 @@ fn replay(storage: &dyn Storage, store: &mut Store) -> Result<()> {
         }
     }
     // `group` non-empty here would be an incomplete trailing txn: discard.
+    // Build every vector index from the recovered rows — this is the index's
+    // cold-start "warm" (spec 12): no graph is stored, it is replayed.
+    store.rebuild_indexes();
     Ok(())
 }
 
@@ -254,6 +257,12 @@ fn apply_replay(store: &mut Store, op: WalOp, commit_lsn: u64) {
             store.replay_insert(&table, vid, values, commit_lsn)
         }
         WalOp::Delete { table, vid } => store.replay_delete(&table, vid, commit_lsn),
+        // Index definitions are registered empty here; the graph is populated by
+        // `rebuild_indexes` once all rows are present (order-independent).
+        WalOp::CreateIndex { def } => store.register_index(def),
+        WalOp::DropIndex { name } => {
+            store.drop_index(&name);
+        }
         WalOp::Commit => {}
     }
 }

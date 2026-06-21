@@ -6,8 +6,11 @@
  * see Rust layout. No Rust panic crosses this boundary: a caught panic becomes
  * ENGINE_ERR_INTERNAL and the handle stays defined and queryable.
  *
- * Frozen in Phase 1. Later phases ADD backends/listeners behind the same
- * symbols; they do not change these signatures.
+ * Frozen in Phase 1. Later phases ADD backends/listeners/capabilities behind the
+ * same symbols; they do not change these signatures. Phase 5 adds the in-core
+ * vector capability (the vector(N) type, an HNSW index via CREATE INDEX ... USING
+ * hnsw, the distance operators <-> / <=> / <#>, and the "v…" bind encoding) — all
+ * over these unchanged symbols; vectors are carried as their "[1,2,3]" text form.
  */
 #ifndef BYDESIGNS_ENGINE_H
 #define BYDESIGNS_ENGINE_H
@@ -18,7 +21,7 @@ extern "C" {
 
 #include <stdint.h>
 
-#define ENGINE_ABI_VERSION 2
+#define ENGINE_ABI_VERSION 3
 
 typedef struct EngineHandle EngineHandle; /* a connection */
 typedef struct EngineResult EngineResult; /* a buffered query result */
@@ -53,7 +56,8 @@ EngineStatus  engine_query(EngineHandle* h, const char* sql, EngineResult** out)
 /* ---- prepared statements ------------------------------------------- */
 EngineStatus  engine_prepare(EngineHandle* h, const char* sql, EngineStmt** out);
 /* bind by 1-based positional index; value is a NUL-terminated typed literal:
-   "i42" int, "f3.5" float, "shello" text, "b<base64>" bytes, "n" NULL. */
+   "i42" int, "f3.5" float, "shello" text, "b<base64>" bytes, "n" NULL,
+   "v[1,2,3]" (or "v1,2,3") vector (Phase 5). */
 EngineStatus  engine_bind(EngineStmt* s, int idx, const char* value);
 /* step: ENGINE_OK with *done = 0 means a row is current; *done = 1 means no
    more rows. Column values for the current row via engine_column_value. */

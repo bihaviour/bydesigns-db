@@ -28,6 +28,7 @@ mod exec;
 mod sql;
 mod store;
 mod value;
+mod vector;
 mod wal;
 
 pub mod conn;
@@ -38,10 +39,16 @@ pub use db::Database;
 pub use error::{EngineError, EngineStatus, Result};
 pub use exec::ResultSet;
 pub use value::{ColumnType, Value};
+pub use vector::{IndexParams, Metric};
 
 /// ABI version embedded in `engine.h`; bindings verify it at load time.
 ///
-/// v2 (Phase 4): `engine_branch` goes from a reserved stub to a working
-/// copy-on-write branch — same signature, but it now returns a live branch
-/// handle instead of always NULL. No symbols were added or removed.
-pub const ENGINE_ABI_VERSION: u32 = 2;
+/// v3 (Phase 5): adds the in-core vector capability — the `vector(N)` type, the
+/// HNSW access method (`CREATE INDEX … USING hnsw`), the distance operators
+/// (`<->` / `<=>` / `<#>`), and the `'v…'` bind-parameter encoding for vectors.
+/// No C symbols were added or removed; the bump signals the new behaviour so a
+/// binding can refuse a stale engine.
+///
+/// v2 (Phase 4): `engine_branch` went from a reserved stub to a working
+/// copy-on-write branch — same signature, returning a live branch handle.
+pub const ENGINE_ABI_VERSION: u32 = 3;

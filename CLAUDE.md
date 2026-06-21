@@ -8,20 +8,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 (SQLite-style, function-call latency) whose **storage backend is pluggable**, so
 the *same* engine runs either purely embedded (`file://`) or storage-disaggregated
 on object storage (`s3://`/`r2://`/`gs://`). The full design lives as an HTML spec
-site under `specs/` (start at `specs/13-roadmap.html` for the phased plan).
+site under `pages/specs/` (start at `pages/specs/13-roadmap.html` for the phased plan).
 
-**Phases 1, 2, 3, and 4 are implemented.** Phase 1 is the embedded library
+**Phases 1, 2, 3, 4, and 5 are implemented.** Phase 1 is the embedded library
 (`file://`); Phase 2 adds the disaggregated `ObjectStorage` backend
 (`s3://`/`r2://`/`gs://`) — an LSM page store + CAS commit log over a pluggable
 object-client seam — selected purely by connection string, with the engine and C
 ABI unchanged. Phase 3 adds `engine-server`: the same engine behind a Postgres-wire
 listener (a defined pgwire subset), serving either backend by connection string.
 Phase 4 adds copy-on-write branching (the `engine_branch` stub is now a working
-branch — `STORAGE_TRAIT_VERSION` 2, `ENGINE_ABI_VERSION` 2), a durable
+branch — `STORAGE_TRAIT_VERSION` 2, `ENGINE_ABI_VERSION` 2 at Phase 4), a durable
 single-writer lease (acquire/renew/release), and the `bydesigns-controller`
-lifecycle controller (scale-to-zero + keep-warm); all *additive* because the
-storage seam never moves. See the per-phase implementation maps under
-`pages/specs/phase-1-embedded.html`–`pages/specs/phase-4-branching-lifecycle.html`
+lifecycle controller (scale-to-zero + keep-warm). Phase 5 adds the in-core
+**vector capability** — a `vector(N)` type, an HNSW access method
+(`CREATE INDEX … USING hnsw`), the distance operators `<->`/`<=>`/`<#>`, and a
+top-k nearest-neighbour query — riding the *same* WAL/replay path the rows do, so
+it branches and scales-to-zero with the database (`ENGINE_ABI_VERSION` 3;
+`STORAGE_TRAIT_VERSION` stays 2, the storage seam is untouched). Everything stays
+*additive* because the storage seam never moves. See the per-phase implementation
+maps under `pages/specs/phase-1-embedded.html`–`pages/specs/phase-5-capabilities.html`
 for the implementation maps and the deliberate scope decisions.
 
 ## Layout
@@ -103,8 +108,9 @@ intact, because every later phase depends on them:
 A statement flows `sql.rs` (hand-written lexer + recursive-descent parser →
 `Stmt` AST) → `exec.rs` (evaluate against the MVCC store) → `conn.rs` (transaction
 state machine + commit durability). Supporting modules: `store.rs` (MVCC row
-versions + visibility), `wal.rs` (engine-owned WAL op encoding), `db.rs` (shared
-`Database` + cross-handle registry + WAL replay), `catalog.rs`, `value.rs`.
+versions + visibility, plus the vector-index registry), `wal.rs` (engine-owned WAL
+op encoding), `db.rs` (shared `Database` + cross-handle registry + WAL replay),
+`catalog.rs`, `value.rs`, `vector.rs` (Phase 5: the HNSW access method).
 
 - **MVCC / snapshot isolation.** Every row version is stamped `create_lsn` /
   `delete_lsn`; readers capture a snapshot LSN and filter by visibility
@@ -137,6 +143,23 @@ versions + visibility), `wal.rs` (engine-owned WAL op encoding), `db.rs` (shared
   thundering-herd admission. Don't move lifecycle/heartbeat threads into the
   embedded engine core — embedders must stay thread-free.
 
+## Phase 5: vector search (in-core)
+
+- **The vector index rides the WAL, not a side file.** A `VectorIndex`
+  (`crates/engine/src/vector.rs`, HNSW) is a *derived* structure over a table's
+  `vector(N)` column — registered by a `CreateIndex` WAL op and rebuilt from the
+  rows by `Store::rebuild_indexes` after replay, exactly like the in-memory row
+  store. That is why branching branches the index and scale-to-zero re-warms it
+  for free; do not add a separate durable graph or move the index off the WAL path.
+- **Built-in vs composed (spec 12).** Vector search is the one capability built
+  *into* the engine; better-auth/PostgREST/DuckDB are composed *around* it and must
+  not enter the core (no interface/service/OLAP code in `crates/engine`). The
+  composition glue lives in `clients/bun/examples/` (`vector-memory.ts`,
+  `compose.ts`).
+- **KNN planner.** `exec.rs::knn_select` recognizes `ORDER BY <col> <dist-op> <q>
+  ASC LIMIT k`, uses the matching HNSW index, over-fetches, then MVCC-filters; with
+  no index the distance operator still works as a brute-force scan + sort.
+
 ## Phase-1 scope boundaries (intentional)
 
 These are deliberate, not omissions — don't "fix" them without checking the roadmap:
@@ -144,10 +167,12 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
 - `engine_branch` is implemented as of Phase 4: it forks a copy-on-write branch
   at the connection's committed LSN and returns a new branch-bound handle.
   Branch-of-branch and branching inside a transaction are rejected (NULL + error).
-- DDL (`CREATE`/`DROP TABLE`) runs in autocommit only; inside an explicit
-  transaction it returns `ENGINE_ERR_TXN`. Row DML is fully transactional.
+- DDL (`CREATE`/`DROP TABLE`, `CREATE`/`DROP INDEX`) runs in autocommit only;
+  inside an explicit transaction it returns `ENGINE_ERR_TXN`. Row DML is fully
+  transactional.
 - The SQL surface is a focused subset; unsupported syntax returns `ENGINE_ERR_SQL`
-  (joins, GROUP BY, subqueries, DISTINCT are out of scope for Phase 1).
+  (joins, GROUP BY, subqueries, DISTINCT are out of scope). Phase 5 adds the
+  `vector(N)` type, the `<->`/`<=>`/`<#>` distance operators, and HNSW indexes.
 
 ## When changing things
 

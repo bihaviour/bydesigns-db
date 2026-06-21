@@ -13,7 +13,7 @@
 
 <div class="hero-wrap">
   <div class="hero">
-    <span class="eyebrow"><span class="dot"></span>Current: v0.2.0 · Phases 1–4 implemented</span>
+    <span class="eyebrow"><span class="dot"></span>Current: v0.2.0 · Phases 1–5 implemented</span>
     <h1>Releases &amp; roadmap</h1>
     <p class="sub">bydesigns-db ships in strictly additive phases: the smallest embeddable thing first, then disaggregation, then server mode, then the lifecycle controller — each one a working, demonstrable product. This page records what has shipped and what is planned next.</p>
     <div class="cta-row">
@@ -33,9 +33,9 @@
     </div>
     <div class="stat-strip">
       <div class="stat"><div class="v">v0.2.0</div><div class="l">current workspace version</div></div>
-      <div class="stat"><div class="v">ABI 2</div><div class="l">frozen C embedding contract</div></div>
+      <div class="stat"><div class="v">ABI 3</div><div class="l">frozen C embedding contract</div></div>
       <div class="stat"><div class="v">Trait 2</div><div class="l">storage seam version</div></div>
-      <div class="stat"><div class="v">4 / 5</div><div class="l">phases shipped</div></div>
+      <div class="stat"><div class="v">5 / 5</div><div class="l">phases shipped</div></div>
     </div>
   </section>
 
@@ -71,6 +71,13 @@
         <p><strong>Gate:</strong> scale-to-zero + cold-start with the fence re-acquired by exactly one writer; O(1) branch creation with write isolation. <a href="../specs/phase-4-branching-lifecycle.html">Implementation map →</a> · <a href="../specs/06-lifecycle-controller.html">Lifecycle spec</a></p>
       </div>
 
+      <div class="tl-item done">
+        <h3>Phase 5 — Capabilities: vector search <span class="chip shipped">✓ Shipped</span></h3>
+        <p><span class="ver">in-core vector(N) type + HNSW + distance operators + KNN · composition</span></p>
+        <p>Vector search built <em>into</em> the engine: a <code>vector(N)</code> type, an HNSW access method (<code>CREATE INDEX … USING hnsw</code>), the distance operators <code>&lt;-&gt;</code> / <code>&lt;=&gt;</code> / <code>&lt;#&gt;</code>, and top-k nearest-neighbour answered by the index. Because the index rides the <em>same</em> WAL/replay path as the rows, it <strong>branches and scales-to-zero with the database</strong> — an agent can fork its memory. Interface/service capabilities (better-auth, PostgREST, DuckDB) are composed <em>around</em> the core, never welded in. Additive: <code>ENGINE_ABI_VERSION</code> → 3, <code>STORAGE_TRAIT_VERSION</code> stays 2.</p>
+        <p><strong>Gate:</strong> HNSW top-k matches brute force; WHERE-filtered + MVCC-correct KNN; the index branches and rebuilds from the WAL on restart. <a href="../specs/phase-5-capabilities.html">Implementation map →</a> · <a href="../specs/12-capabilities.html">Capabilities spec</a></p>
+      </div>
+
     </div>
   </section>
 
@@ -79,15 +86,14 @@
     <div class="timeline">
 
       <div class="tl-item next">
-        <h3>Phase 5 — Capabilities <span class="chip planned">Planned</span></h3>
-        <p><span class="ver">vector search in-core · compose better-auth / PostgREST / DuckDB</span></p>
-        <p>With the core platform shipped, capability grows by the build-in vs compose rule: storage/execution capabilities go <em>into</em> the engine, interface/service capabilities are <em>composed around</em> it.</p>
+        <h3>Beyond Phase 5 — vector hardening <span class="chip planned">Planned</span></h3>
+        <p><span class="ver">deferred items from the Phase 5 scope boundaries</span></p>
         <ul class="reqs">
-          <li><span class="req-tag may">MAY</span> build <strong>vector search in-core</strong>: a vector type plus an HNSW access method behind the same <code>Storage</code> trait the B-trees use — so it inherits scale-to-zero, branching, and S3-backing for free (an agent can branch its memory).</li>
-          <li><span class="req-tag may">MAY</span> compose <strong>better-auth</strong> (in-process, writing to the embedded DB), <strong>PostgREST</strong> (REST in front of server mode), and <strong>DuckDB</strong> (OLAP over shared S3 Parquet/Iceberg) — none welded into the core.</li>
-          <li><span class="req-tag should">SHOULD</span> treat HNSW cold traversal as the nastiest cache scenario: keep the working-set graph resident, S3 as the cold floor only.</li>
+          <li><span class="req-tag may">MAY</span> add a <strong>page-laid-out vector index</strong> as a Phase-2-style cold-read optimization (the current index is WAL-derived in-memory state, rebuilt on open — correct and branch-safe, but warms on every cold start).</li>
+          <li><span class="req-tag may">MAY</span> support <strong>incremental index maintenance</strong> under heavy delete churn (deletes are tombstoned today; full-vs-incremental rebuild is an open question).</li>
+          <li><span class="req-tag should">SHOULD</span> expose richer <strong>recall tuning</strong> — HNSW is approximate by design, governed by <code>ef_search</code>; surface and document the recall/latency trade-off.</li>
         </ul>
-        <p>Detail in <a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a>.</p>
+        <p>Detail in <a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a> and the <a href="../specs/phase-5-capabilities.html">Phase 5 map</a>.</p>
       </div>
 
       <div class="tl-item next">

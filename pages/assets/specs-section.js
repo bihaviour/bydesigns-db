@@ -35,6 +35,7 @@ window.SECTION = {
       { file: "phase-2-object-storage.html",      id: "P2", title: "Phase 2 — Object Storage" },
       { file: "phase-3-server.html",              id: "P3", title: "Phase 3 — Server + pgwire" },
       { file: "phase-4-branching-lifecycle.html", id: "P4", title: "Phase 4 — Branching & Lifecycle" },
+      { file: "phase-5-capabilities.html",        id: "P5", title: "Phase 5 — Capabilities: Vector Search" },
     ]},
   ],
 };

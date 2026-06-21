@@ -24,7 +24,9 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "example": "bun run examples/notes.ts"
+    "example": "bun run examples/notes.ts",
+    "example:vectors": "bun run examples/vector-memory.ts",
+    "example:compose": "bun run examples/compose.ts"
   },
   "devDependencies": {
     "bun-types": "^1.3.14",

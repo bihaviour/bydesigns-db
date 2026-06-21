@@ -116,7 +116,7 @@ db.query("SELECT id, body FROM notes");        // sees only row 1 — the base n
 <h2>Use cases</h2>
 <ul class="reqs">
 <li><span class="req-tag may">MAY</span> <strong>many tools, one base.</strong> Provision one seed database and branch it once per tool; each tool diverges only as it writes, so storage stays near the seed size until tools actually mutate data — branching is the lever that makes "many small databases" affordable.</li>
-<li><span class="req-tag may">MAY</span> <strong>agent memory.</strong> An agent branches its memory to explore a line of work in isolation, then keeps or discards the branch without touching the base.</li>
+<li><span class="req-tag may">MAY</span> <strong>agent memory.</strong> An agent branches its memory to explore a line of work in isolation, then keeps or discards the branch without touching the base. Because the in-core <a href="sql-reference.html#vector-search">vector index</a> rides the same WAL as the rows, <strong>branching the database branches the vector index too</strong> — the agent forks its embeddings at near-zero cost.</li>
 <li><span class="req-tag may">MAY</span> <strong>preview &amp; test.</strong> Fork the live data, run a migration or a risky change against the branch, verify, and throw the branch away — the base is never at risk.</li>
 </ul>
 </section>

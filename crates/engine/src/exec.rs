@@ -10,10 +10,15 @@ use crate::catalog::TableSchema;
 use crate::error::{EngineError, Result};
 use crate::sql::{AggArg, AggFunc, BinOp, Expr, SelItem, SelectStmt, UnOp};
 use crate::store::{RowVersion, Store, PENDING};
-use crate::value::{ColumnType, Value};
+use crate::value::{parse_vector, ColumnType, Value};
+use crate::vector::{distance, Metric};
 use crate::wal::WalOp;
 use std::cmp::Ordering;
 use std::collections::HashSet;
+
+/// How many candidates the HNSW scan over-fetches per requested result, to
+/// absorb hits that are MVCC-invisible or filtered out by a `WHERE` clause.
+const KNN_OVERFETCH: usize = 4;
 
 /// A buffered query result. Cells render to the string-only C ABI on demand.
 #[derive(Debug, Default)]
@@ -41,6 +46,7 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::Int(i) => Ok(Value::Int(*i)),
         Expr::Real(r) => Ok(Value::Real(*r)),
         Expr::Str(s) => Ok(Value::Text(s.clone())),
+        Expr::Vector(v) => Ok(Value::Vector(v.clone())),
         Expr::Param(idx) => ctx
             .params
             .get(idx - 1)
@@ -127,6 +133,41 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
         And => Ok(three_valued_and(l.as_bool(), r.as_bool())),
         Or => Ok(three_valued_or(l.as_bool(), r.as_bool())),
         Add | Sub | Mul | Div | Mod => arith(op, l, r),
+        VecL2 | VecCosine | VecIp => vec_distance(op, &l, &r),
+    }
+}
+
+/// Evaluate a vector distance operator to a REAL distance. NULL operands yield
+/// NULL; a `'[1,2,3]'` text operand is accepted (parsed) for ergonomics, so the
+/// same query works whether the query vector arrives as a literal, a `?`
+/// parameter, or a string.
+fn vec_distance(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
+    if l.is_null() || r.is_null() {
+        return Ok(Value::Null);
+    }
+    let metric = op.vec_metric().expect("vector distance op");
+    let (Some(a), Some(b)) = (to_vec_operand(l), to_vec_operand(r)) else {
+        return Err(EngineError::sql(
+            "vector distance operators require vector operands",
+        ));
+    };
+    if a.len() != b.len() {
+        return Err(EngineError::sql(format!(
+            "vector dimension mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    Ok(Value::Real(distance(metric, &a, &b) as f64))
+}
+
+/// Coerce a value usable as a vector operand: a real vector, or a `'[...]'`
+/// text literal that parses as one.
+fn to_vec_operand(v: &Value) -> Option<Vec<f32>> {
+    match v {
+        Value::Vector(x) => Some(x.clone()),
+        Value::Text(s) => parse_vector(s),
+        _ => None,
     }
 }
 
@@ -272,6 +313,13 @@ pub fn run_select(
         .ok_or_else(|| EngineError::sql(format!("no such table: {table_name}")))?;
     let schema = &table.schema;
 
+    // Index-accelerated top-k nearest-neighbour, when the query shape allows it
+    // (an HNSW index exists for the ordered-by distance) — answered by the access
+    // method, not a full scan plus sort (spec 12).
+    if let Some(rs) = knn_select(store, sel, table_name, snapshot, as_writer, params)? {
+        return Ok(rs);
+    }
+
     // Visible rows passing WHERE.
     let mut matched: Vec<&Vec<Value>> = Vec::new();
     for v in &table.rows {
@@ -301,61 +349,89 @@ pub fn run_select(
         return aggregate_select(sel, schema, &matched, params);
     }
 
-    // ORDER BY (evaluated on the matched rows).
-    if !sel.order_by.is_empty() {
-        let keys = &sel.order_by;
-        let mut indexed: Vec<usize> = (0..matched.len()).collect();
-        let mut err: Option<EngineError> = None;
-        indexed.sort_by(|&a, &b| {
-            if err.is_some() {
+    order_matched(sel, schema, &mut matched, params)?;
+    if let Some(limit) = sel.limit {
+        matched.truncate(limit.max(0) as usize);
+    }
+    project(sel, schema, &matched, params)
+}
+
+enum ProjItem {
+    Column(usize),
+    Expr(Expr),
+}
+
+/// Sort `matched` in place by the `ORDER BY` keys (brute-force, evaluated per
+/// row). The first evaluation error aborts the sort and is returned.
+fn order_matched(
+    sel: &SelectStmt,
+    schema: &TableSchema,
+    matched: &mut Vec<&Vec<Value>>,
+    params: &[Value],
+) -> Result<()> {
+    if sel.order_by.is_empty() {
+        return Ok(());
+    }
+    let keys = &sel.order_by;
+    let mut indexed: Vec<usize> = (0..matched.len()).collect();
+    let mut err: Option<EngineError> = None;
+    indexed.sort_by(|&a, &b| {
+        if err.is_some() {
+            return Ordering::Equal;
+        }
+        order_key_cmp(keys, schema, matched[a], matched[b], params, &mut err)
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    *matched = indexed.into_iter().map(|i| matched[i]).collect();
+    Ok(())
+}
+
+/// Compare two rows by the ordered key list, recording the first eval error.
+fn order_key_cmp(
+    keys: &[(Expr, bool)],
+    schema: &TableSchema,
+    ra: &[Value],
+    rb: &[Value],
+    params: &[Value],
+    err: &mut Option<EngineError>,
+) -> Ordering {
+    for (expr, asc) in keys {
+        let ca = EvalCtx {
+            row: Some(ra),
+            schema: Some(schema),
+            params,
+        };
+        let cb = EvalCtx {
+            row: Some(rb),
+            schema: Some(schema),
+            params,
+        };
+        let (va, vb) = match (eval(expr, &ca), eval(expr, &cb)) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => {
+                *err = Some(e);
                 return Ordering::Equal;
             }
-            for (expr, asc) in keys {
-                let ca = EvalCtx {
-                    row: Some(matched[a]),
-                    schema: Some(schema),
-                    params,
-                };
-                let cb = EvalCtx {
-                    row: Some(matched[b]),
-                    schema: Some(schema),
-                    params,
-                };
-                let va = match eval(expr, &ca) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        err = Some(e);
-                        return Ordering::Equal;
-                    }
-                };
-                let vb = match eval(expr, &cb) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        err = Some(e);
-                        return Ordering::Equal;
-                    }
-                };
-                let ord = null_aware_cmp(&va, &vb);
-                let ord = if *asc { ord } else { ord.reverse() };
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            Ordering::Equal
-        });
-        if let Some(e) = err {
-            return Err(e);
+        };
+        let ord = null_aware_cmp(&va, &vb);
+        let ord = if *asc { ord } else { ord.reverse() };
+        if ord != Ordering::Equal {
+            return ord;
         }
-        let reordered: Vec<&Vec<Value>> = indexed.into_iter().map(|i| matched[i]).collect();
-        matched = reordered;
     }
+    Ordering::Equal
+}
 
-    if let Some(limit) = sel.limit {
-        let n = limit.max(0) as usize;
-        matched.truncate(n);
-    }
-
-    // Projection + column names + best-effort column types.
+/// Project the `matched` rows through the SELECT list, producing column names,
+/// best-effort types, and rendered rows. Shared by the scan and KNN paths.
+fn project(
+    sel: &SelectStmt,
+    schema: &TableSchema,
+    matched: &[&Vec<Value>],
+    params: &[Value],
+) -> Result<ResultSet> {
     let mut columns = Vec::new();
     let mut types: Vec<ColumnType> = Vec::new();
     let mut plan: Vec<ProjItem> = Vec::new();
@@ -373,12 +449,14 @@ pub fn run_select(
                 types.push(expr_type(expr, Some(schema)));
                 plan.push(ProjItem::Expr(expr.clone()));
             }
-            SelItem::Aggregate { .. } => unreachable!("aggregate handled above"),
+            SelItem::Aggregate { .. } => {
+                return Err(EngineError::sql("aggregate not allowed in this position"))
+            }
         }
     }
 
     let mut rows = Vec::with_capacity(matched.len());
-    for vals in &matched {
+    for vals in matched {
         let mut out = Vec::with_capacity(plan.len());
         for p in &plan {
             match p {
@@ -395,7 +473,6 @@ pub fn run_select(
         }
         rows.push(out);
     }
-
     Ok(ResultSet {
         columns,
         types,
@@ -403,9 +480,117 @@ pub fn run_select(
     })
 }
 
-enum ProjItem {
-    Column(usize),
-    Expr(Expr),
+/// The recognized shape of an index-answerable nearest-neighbour query:
+/// `ORDER BY <col> <dist-op> <query> ASC LIMIT k`, no aggregates.
+struct KnnPlan<'a> {
+    column: String,
+    metric: Metric,
+    query: &'a Expr,
+    limit: usize,
+}
+
+/// Recognize a top-k nearest-neighbour query, independent of whether an index
+/// exists (the executor checks that next).
+fn knn_plan(sel: &SelectStmt) -> Option<KnnPlan<'_>> {
+    let limit = sel.limit?;
+    if limit < 0 || sel.order_by.len() != 1 {
+        return None;
+    }
+    let (order_expr, asc) = &sel.order_by[0];
+    if !asc
+        || sel
+            .items
+            .iter()
+            .any(|i| matches!(i, SelItem::Aggregate { .. }))
+    {
+        return None;
+    }
+    let Expr::Binary { op, l, r } = order_expr else {
+        return None;
+    };
+    let metric = op.vec_metric()?;
+    let Expr::Column(col) = l.as_ref() else {
+        return None;
+    };
+    Some(KnnPlan {
+        column: col.clone(),
+        metric,
+        query: r.as_ref(),
+        limit: limit as usize,
+    })
+}
+
+/// Answer a top-k nearest-neighbour `SELECT` via the HNSW index, or `None` if the
+/// query is not of that shape or no matching index exists (caller falls back to a
+/// brute-force scan + sort, which the distance operator already supports).
+fn knn_select(
+    store: &Store,
+    sel: &SelectStmt,
+    table_name: &str,
+    snapshot: u64,
+    as_writer: bool,
+    params: &[Value],
+) -> Result<Option<ResultSet>> {
+    let Some(plan) = knn_plan(sel) else {
+        return Ok(None);
+    };
+    if plan.limit == 0 {
+        return Ok(None);
+    }
+    let Some(index) = store.index_for(table_name, &plan.column) else {
+        return Ok(None);
+    };
+    if index.metric() != plan.metric || index.is_empty() {
+        return Ok(None);
+    }
+    // Evaluate the (constant) query vector; bail to the scan path if it is not one.
+    let cctx = EvalCtx {
+        row: None,
+        schema: None,
+        params,
+    };
+    let Some(query) = to_vec_operand(&eval(plan.query, &cctx)?) else {
+        return Ok(None);
+    };
+
+    let Some(table) = store.table(table_name) else {
+        return Ok(None);
+    };
+    let schema = &table.schema;
+    // Over-fetch to absorb MVCC-invisible / filtered hits, but never beyond the
+    // number of live vectors in the index.
+    let fetch = plan
+        .limit
+        .saturating_mul(KNN_OVERFETCH)
+        .max(index.def.params.ef_search)
+        .min(index.len());
+
+    let mut matched: Vec<&Vec<Value>> = Vec::new();
+    for (vid, _dist) in index.search(&query, fetch) {
+        let Some(v) = table.version(vid) else {
+            continue;
+        };
+        let visible = if as_writer {
+            v.visible_to_writer(snapshot)
+        } else {
+            v.visible_to_reader(snapshot)
+        };
+        if !visible {
+            continue;
+        }
+        let ctx = EvalCtx {
+            row: Some(&v.values),
+            schema: Some(schema),
+            params,
+        };
+        if predicate(&sel.filter, &ctx)? {
+            matched.push(&v.values);
+            if matched.len() >= plan.limit {
+                break;
+            }
+        }
+    }
+    Ok(Some(project(sel, schema, &matched, params)?))
 }
 
 /// Best-effort static type of a projected expression. A bare column resolves to
@@ -416,6 +601,9 @@ fn expr_type(expr: &Expr, schema: Option<&TableSchema>) -> ColumnType {
         Expr::Int(_) => ColumnType::Integer,
         Expr::Real(_) => ColumnType::Real,
         Expr::Str(_) => ColumnType::Text,
+        Expr::Vector(v) => ColumnType::Vector(v.len() as u32),
+        // A distance operator yields a REAL distance.
+        Expr::Binary { op, .. } if op.vec_metric().is_some() => ColumnType::Real,
         Expr::Column(name) => schema
             .and_then(|s| s.column_index(name).map(|i| s.columns[i].ty))
             .unwrap_or(ColumnType::Text),
@@ -653,7 +841,7 @@ pub fn run_insert(
                 }
             }
         }
-        // NOT NULL.
+        // NOT NULL + vector dimension.
         for (i, c) in schema.columns.iter().enumerate() {
             if c.not_null && vals[i].is_null() {
                 return Err(EngineError::constraint(format!(
@@ -662,6 +850,7 @@ pub fn run_insert(
                 )));
             }
         }
+        check_vector_dims(&schema, &vals, table)?;
         staged.push(vals);
     }
 
@@ -679,25 +868,68 @@ pub fn run_insert(
         }
     }
 
-    // Apply.
-    let t = store.table_mut(table).unwrap();
-    let mut wal = Vec::with_capacity(staged.len());
+    // Apply, then maintain any vector index on the table (spec 12).
+    let maintain = store.table_has_index(table);
     let n = staged.len() as i64;
-    for vals in staged {
-        let vid = t.alloc_vid();
-        wal.push(WalOp::Insert {
-            table: table.to_string(),
-            vid,
-            values: vals.clone(),
-        });
-        t.rows.push(RowVersion {
-            vid,
-            values: vals,
-            create_lsn: PENDING,
-            delete_lsn: 0,
-        });
+    let mut wal = Vec::with_capacity(staged.len());
+    let mut inserted: Vec<(u64, Vec<Value>)> = Vec::new();
+    {
+        let t = store.table_mut(table).unwrap();
+        for vals in staged {
+            let vid = t.alloc_vid();
+            wal.push(WalOp::Insert {
+                table: table.to_string(),
+                vid,
+                values: vals.clone(),
+            });
+            if maintain {
+                inserted.push((vid, vals.clone()));
+            }
+            t.rows.push(RowVersion {
+                vid,
+                values: vals,
+                create_lsn: PENDING,
+                delete_lsn: 0,
+            });
+        }
+    }
+    for (vid, vals) in &inserted {
+        store.index_row_inserted(table, *vid, vals);
     }
     Ok((wal, n))
+}
+
+/// Enforce the declared dimension of every `vector(n)` column (spec 12 — vectors
+/// are validated on insert). NULL is permitted unless a NOT NULL says otherwise.
+fn check_vector_dims(schema: &TableSchema, vals: &[Value], table: &str) -> Result<()> {
+    for (i, c) in schema.columns.iter().enumerate() {
+        let ColumnType::Vector(dim) = c.ty else {
+            continue;
+        };
+        match &vals[i] {
+            Value::Null => {}
+            Value::Vector(v) if v.len() == dim as usize => {}
+            Value::Vector(v) => {
+                return Err(EngineError::constraint(format!(
+                    "vector dimension mismatch on {}.{}: expected {}, got {}",
+                    table,
+                    c.name,
+                    dim,
+                    v.len()
+                )))
+            }
+            other => {
+                return Err(EngineError::constraint(format!(
+                    "column {}.{} is vector({}) but value is {}",
+                    table,
+                    c.name,
+                    dim,
+                    other.type_name()
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn run_delete(
@@ -793,6 +1025,7 @@ pub fn run_update(
                 )));
             }
         }
+        check_vector_dims(&schema, &nv, table)?;
         updates.push((v.vid, nv));
     }
 
@@ -812,29 +1045,39 @@ pub fn run_update(
     }
 
     // Apply: supersede each old version, append the new one.
+    let maintain = store.table_has_index(table);
     let n = updates.len() as i64;
-    let t = store.table_mut(table).unwrap();
     let mut wal = Vec::new();
-    for (old_vid, nv) in updates {
-        if let Some(rv) = t.version_mut(old_vid) {
-            rv.delete_lsn = PENDING;
+    let mut inserted: Vec<(u64, Vec<Value>)> = Vec::new();
+    {
+        let t = store.table_mut(table).unwrap();
+        for (old_vid, nv) in updates {
+            if let Some(rv) = t.version_mut(old_vid) {
+                rv.delete_lsn = PENDING;
+            }
+            let new_vid = t.alloc_vid();
+            wal.push(WalOp::Delete {
+                table: table.to_string(),
+                vid: old_vid,
+            });
+            wal.push(WalOp::Insert {
+                table: table.to_string(),
+                vid: new_vid,
+                values: nv.clone(),
+            });
+            if maintain {
+                inserted.push((new_vid, nv.clone()));
+            }
+            t.rows.push(RowVersion {
+                vid: new_vid,
+                values: nv,
+                create_lsn: PENDING,
+                delete_lsn: 0,
+            });
         }
-        let new_vid = t.alloc_vid();
-        wal.push(WalOp::Delete {
-            table: table.to_string(),
-            vid: old_vid,
-        });
-        wal.push(WalOp::Insert {
-            table: table.to_string(),
-            vid: new_vid,
-            values: nv.clone(),
-        });
-        t.rows.push(RowVersion {
-            vid: new_vid,
-            values: nv,
-            create_lsn: PENDING,
-            delete_lsn: 0,
-        });
+    }
+    for (vid, vals) in &inserted {
+        store.index_row_inserted(table, *vid, vals);
     }
     Ok((wal, n))
 }
@@ -877,5 +1120,6 @@ fn value_key(v: &Value) -> String {
         Value::Real(r) => format!("r{}", r.to_bits()),
         Value::Text(s) => format!("t{s}"),
         Value::Blob(b) => format!("b{}", crate::value::base64_encode(b)),
+        Value::Vector(_) => format!("v{}", crate::value::format_vector(v.as_vector().unwrap())),
     }
 }

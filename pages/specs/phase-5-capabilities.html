@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 5 — Capabilities: Vector Search · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">P5 · MAP</span>
+<span class="badge badge-status status-approved">Implemented</span>
+<span class="spec-date">Phase 5</span>
+</div>
+<h1>Phase 5 — Capabilities: Vector Search</h1>
+<p class="lede">Phase 5 adds in-core vector search — a <code>vector(N)</code> type, an HNSW access method, the <code>&lt;-&gt;</code>/<code>&lt;=&gt;</code>/<code>&lt;#&gt;</code> distance operators, and top-k KNN — that branches and scales-to-zero with the database, additive (<code>ENGINE_ABI_VERSION</code> 3, <code>STORAGE_TRAIT_VERSION</code> stays 2), plus composition (better-auth / PostgREST / DuckDB) around the core.</p>
+</header>
+
+<section>
+<h2>Overview</h2>
+<p>Phase 5 grows the platform by the Capabilities deciding rule (spec <a href="12-capabilities.html">12</a>, roadmap §Phase 5): <strong>storage/execution capabilities go INTO the engine; interface/service capabilities are COMPOSED AROUND it.</strong> The one capability that is <em>built in</em> is <strong>vector search</strong>; the three that are <em>composed around</em> (better-auth, PostgREST, DuckDB) are adopted unmodified and demonstrated as glue, never welded into the core.</p>
+<p>Everything is additive and the storage seam never moves: <code>ENGINE_ABI_VERSION</code> goes to <strong>3</strong> (the vector type, HNSW, distance operators, and the <code>v…</code> bind encoding — no C symbols added or removed), while <strong><code>STORAGE_TRAIT_VERSION</code> stays <code>2</code></strong>. The vector index needs no new storage capability: it rides the existing <code>append_wal</code>/replay path exactly like the rows do.</p>
+</section>
+
+<section>
+<h2>Built IN — vector search (the headline)</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Deliverable (spec 12)</th><th>Where</th></tr>
+</thead>
+<tbody>
+<tr><td><code>vector(N)</code> type — fixed-length <code>f32</code>, dimension declared at column time, validated on insert</td><td><code>crates/engine/src/value.rs</code> (<code>Value::Vector</code>, <code>ColumnType::Vector(u32)</code>, <code>parse_vector</code>/<code>format_vector</code>), enforced in <code>exec.rs::check_vector_dims</code></td></tr>
+<tr><td>HNSW access method behind the <strong>same <code>Storage</code> trait</strong> the rows use</td><td><code>crates/engine/src/vector.rs</code> (<code>VectorIndex</code> — multi-layer navigable small world, <code>hnswlib</code>/<code>usearch</code> lineage, dependency-free)</td></tr>
+<tr><td>Distance operators the planner pushes into the index scan</td><td><code>&lt;-&gt;</code> L2, <code>&lt;=&gt;</code> cosine, <code>&lt;#&gt;</code> inner product (<code>sql.rs</code> lexer/parser + <code>exec.rs::vec_distance</code>)</td></tr>
+<tr><td>Top-k nearest-neighbour answered by the access method, not a full scan + sort</td><td><code>exec.rs::knn_select</code> (+ <code>knn_plan</code>): detects <code>ORDER BY &lt;col&gt; &lt;dist-op&gt; &lt;q&gt; ASC LIMIT k</code>, searches the index, MVCC-filters the candidates</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h3>Why it branches / scales-to-zero / S3-backs for free</h3>
+<p>The engine is WAL-centric: rows are not stored as pages, they are replayed from the durable WAL into the in-memory MVCC store on open (<code>db.rs::replay</code>). The vector index is built the same way — it is a <strong>derived structure over the column's vectors</strong>, not a side file. The only durable artifacts are the <code>CreateIndex</code>/<code>DropIndex</code> WAL ops (<code>wal.rs</code>) and the vector values themselves; the graph is rebuilt by <code>Store::rebuild_indexes</code> after replay (the index's cold-start "warm"). Three properties fall straight out, with no special-casing:</p>
+<ul>
+<li><strong>Branching branches the index</strong> (spec 12's differentiator, gated by <code>tests/vector.rs::branch_branches_the_vector_index</code> and the Bun <code>branching forks the vector index</code> test). A branch is a <code>BranchStorage</code> whose replay includes the parent's <code>CreateIndex</code> + the in-window inserts, so the branch rebuilds its <em>own</em> graph; its diverged writes never touch the base.</li>
+<li><strong>Scale-to-zero</strong>: idle compute drops, the next open replays the WAL and rebuilds the graph — the warm is the replay.</li>
+<li><strong>S3-backing / PITR</strong>: the vectors and the index definition are LSN-versioned WAL records like everything else, so the object backend and point-in-time window cover them unchanged (<code>s3://</code> works with no recompile, same as rows).</li>
+</ul>
+</section>
+
+<section>
+<h3>MVCC + index maintenance</h3>
+<p>The index maps <code>vid -&gt; vector</code> for every row version that has one; <strong>visibility is resolved at query time</strong> against the row version the vid identifies, so the index stays MVCC-agnostic. Inserts/updates add the new vid (<code>Store::index_row_inserted</code>); deletes need no index change (the row version's <code>delete_lsn</code> filters it out); a rolled-back pending insert is tombstoned out (<code>Store::rollback_pending</code>). The KNN scan over-fetches (<code>KNN_OVERFETCH</code>) to absorb invisible/filtered hits, then takes the first <code>k</code> that pass <code>WHERE</code> and snapshot visibility.</p>
+</section>
+
+<section>
+<h3>SQL surface added</h3>
+<ul>
+<li><code>embedding VECTOR(768)</code> column type (dimension required, validated).</li>
+<li>Vector literals <code>[1, 2, 3]</code> and <code>'[1,2,3]'</code> text coercion (pgvector-style).</li>
+<li><code>CREATE INDEX name ON table USING hnsw (col [vector_cosine_ops]) [WITH (m=…, ef_construction=…, ef_search=…, metric='cosine'|'l2'|'inner_product')]</code> and <code>DROP INDEX [IF EXISTS] name</code> (autocommit DDL, like <code>CREATE TABLE</code>).</li>
+<li>Distance operators usable in projection, <code>WHERE</code>, and <code>ORDER BY</code>. Without a matching index the query still works as a brute-force scan + sort (the operator evaluates per row); with one it is answered by the access method — same results, proven by <code>tests/vector.rs::hnsw_index_answers_top_k_and_matches_brute_force</code>.</li>
+</ul>
+</section>
+
+<section>
+<h2>Composed AROUND — placement, not core code</h2>
+<p>Per the rule, none of these enter the engine binary; the core stays "rows + vectors + the storage trait". They are demonstrated as the thin glue we own:</p>
+<ul>
+<li><strong>better-auth (service, in-process).</strong> Auth state is ordinary rows in the embedded engine — no external auth service, and because it is rows it <strong>branches and recovers with the database</strong>. Shown in <code>clients/bun/examples/compose.ts</code> (<code>users</code>/<code>sessions</code>, a staging-branch with its own users).</li>
+<li><strong>PostgREST (interface, in front).</strong> Attaches over <strong>server mode</strong> (pgwire, Phase 3) with zero engine changes — wire-compatibility is the contract. Absent in embedded deployments; nothing to build here.</li>
+<li><strong>DuckDB (OLAP, over shared storage).</strong> A second engine over the same floor. The only code we own is the <strong>materialization job</strong>: publish an open columnar snapshot DuckDB reads directly, atomically (temp + rename). Shown in <code>compose.ts</code> (CSV via <code>read_csv_auto</code>; Parquet/Iceberg is the production format, the writer being an off-the-shelf piece, not built in-house).</li>
+</ul>
+</section>
+
+<section>
+<h2>Tests</h2>
+<ul>
+<li><code>crates/engine/tests/vector.rs</code> — type round-trip + dimension validation, the three distance operators (brute force), HNSW top-k vs brute-force parity, <code>WHERE</code>-filtered + MVCC-correct KNN, branch isolation of the index, rebuild from WAL on restart, rollback tombstoning, exact nearest over a larger set, and the <code>CREATE INDEX</code> guards.</li>
+<li><code>crates/engine/tests/ffi.rs::vector_search_via_c_abi</code> — the vector type, an HNSW index, and a <code>v…</code>-bound query through the same C ABI <code>bun:ffi</code> binds.</li>
+<li><code>clients/bun/test/vector.test.ts</code> — the embedded path end-to-end, including the branch-the-memory payoff. Examples: <code>vector-memory.ts</code>, <code>compose.ts</code>.</li>
+</ul>
+</section>
+
+<section>
+<h2>Deliberate scope boundaries (documented, not accidental)</h2>
+<ul>
+<li><strong>The index is derived, not paged.</strong> Spec 12 says "store the graph as pages, not a side file"; the engine's rows are themselves WAL-derived in-memory state, not pages, so the <em>consistent</em> realization is a WAL-derived index — same durability path, same branch/scale-to-zero semantics, never a side file. The literal page layout is a Phase-2-style cold-read optimization, not a Phase-5 requirement.</li>
+<li><strong>Deletes are tombstones.</strong> A removed vid is filtered from results but its node stays in the graph (navigation is unaffected; it is a valid point in space). Incremental-vs-full rebuild under heavy delete churn is a spec "MAY" / open question, deferred.</li>
+<li><strong>HNSW is approximate by design.</strong> Recall is governed by <code>ef_search</code>; for the test-scale data the search is effectively exhaustive, so results are exact.</li>
+<li><strong>Composed engines are adopted, not vendored.</strong> better-auth/PostgREST/DuckDB are external; Phase 5 builds only the glue (the vector capability and the materialization job), per spec 12's "build only thin glue".</li>
+<li><strong>SQL subset unchanged otherwise.</strong> Joins, GROUP BY, subqueries, and <code>DISTINCT</code> remain out of scope; <code>ORDER BY</code> ranks by expressions, not output aliases.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities</span><span class="xref-desc">The deciding rule — vector search built INTO the engine; better-auth/PostgREST/DuckDB composed AROUND it.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam that stays put: the HNSW index rides the existing <code>append_wal</code>/replay path, no new storage capability.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Scale-to-zero and branching the index follow for free — the warm is the WAL replay that rebuilds the graph.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The phased plan whose Phase 5 capabilities gate this map implements.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db — internal development specification. Implementation map.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

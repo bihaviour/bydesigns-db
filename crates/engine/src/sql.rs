@@ -6,6 +6,7 @@
 
 use crate::error::{EngineError, Result};
 use crate::value::ColumnType;
+use crate::vector::{IndexParams, Metric};
 
 // ---- AST ------------------------------------------------------------------
 
@@ -17,6 +18,17 @@ pub enum Stmt {
         if_not_exists: bool,
     },
     DropTable {
+        name: String,
+        if_exists: bool,
+    },
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
+        params: IndexParams,
+        if_not_exists: bool,
+    },
+    DropIndex {
         name: String,
         if_exists: bool,
     },
@@ -92,6 +104,7 @@ pub enum Expr {
     Int(i64),
     Real(f64),
     Str(String),
+    Vector(Vec<f32>),
     Param(usize), // 1-based
     Column(String),
     Binary {
@@ -129,6 +142,24 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    /// Vector distance operators (spec 12): `<->` L2, `<=>` cosine, `<#>` inner
+    /// product. Each evaluates to a REAL distance and selects the matching
+    /// HNSW metric when pushed into an index scan.
+    VecL2,
+    VecCosine,
+    VecIp,
+}
+
+impl BinOp {
+    /// The HNSW metric a distance operator queries under, if it is one.
+    pub fn vec_metric(self) -> Option<Metric> {
+        match self {
+            BinOp::VecL2 => Some(Metric::L2),
+            BinOp::VecCosine => Some(Metric::Cosine),
+            BinOp::VecIp => Some(Metric::InnerProduct),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +179,8 @@ enum Tok {
     Param,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     Semi,
     Dot,
@@ -162,6 +195,9 @@ enum Tok {
     Minus,
     Slash,
     Percent,
+    VecL2,     // <->
+    VecCosine, // <=>
+    VecIp,     // <#>
     Eof,
 }
 
@@ -212,6 +248,8 @@ fn simple_token(c: u8) -> Option<Tok> {
     Some(match c {
         b'(' => Tok::LParen,
         b')' => Tok::RParen,
+        b'[' => Tok::LBracket,
+        b']' => Tok::RBracket,
         b',' => Tok::Comma,
         b';' => Tok::Semi,
         b'.' => Tok::Dot,
@@ -226,15 +264,12 @@ fn simple_token(c: u8) -> Option<Tok> {
     })
 }
 
-/// Comparison operators with optional second character (`<=`, `<>`, `>=`, `!=`).
+/// Comparison operators with optional second character (`<=`, `<>`, `>=`, `!=`)
+/// plus the three-character vector distance operators (`<->`, `<=>`, `<#>`).
 fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize)> {
     let two = b.get(i + 1).copied();
     Ok(match b[i] {
-        b'<' => match two {
-            Some(b'=') => (Tok::Le, i + 2),
-            Some(b'>') => (Tok::Ne, i + 2),
-            _ => (Tok::Lt, i + 1),
-        },
+        b'<' => lex_lt(b, i),
         b'>' => match two {
             Some(b'=') => (Tok::Ge, i + 2),
             _ => (Tok::Gt, i + 1),
@@ -245,6 +280,21 @@ fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize)> {
             _ => return Err(EngineError::sql("unexpected '!'")),
         },
     })
+}
+
+/// Disambiguate `<`: the three-char distance operators bind first, then `<=` /
+/// `<>`, then bare `<`.
+fn lex_lt(b: &[u8], i: usize) -> (Tok, usize) {
+    let two = b.get(i + 1).copied();
+    let three = b.get(i + 2).copied();
+    match (two, three) {
+        (Some(b'-'), Some(b'>')) => (Tok::VecL2, i + 3),
+        (Some(b'='), Some(b'>')) => (Tok::VecCosine, i + 3),
+        (Some(b'#'), Some(b'>')) => (Tok::VecIp, i + 3),
+        (Some(b'='), _) => (Tok::Le, i + 2),
+        (Some(b'>'), _) => (Tok::Ne, i + 2),
+        _ => (Tok::Lt, i + 1),
+    }
 }
 
 /// String literal; `''` escapes a single quote. `i` points at the opening quote.
@@ -420,11 +470,23 @@ impl Parser {
         }
     }
 
+    fn next_is_kw(&self, kw: &str) -> bool {
+        matches!(self.toks.get(self.pos + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case(kw))
+    }
+
     fn statement(&mut self) -> Result<Stmt> {
         if self.is_kw("create") {
-            self.create_table()
+            if self.next_is_kw("index") {
+                self.create_index()
+            } else {
+                self.create_table()
+            }
         } else if self.is_kw("drop") {
-            self.drop_table()
+            if self.next_is_kw("index") {
+                self.drop_index()
+            } else {
+                self.drop_table()
+            }
         } else if self.is_kw("insert") {
             self.insert()
         } else if self.is_kw("select") {
@@ -493,13 +555,7 @@ impl Parser {
             if !is_constraint_kw(w) {
                 let tyname = self.ident()?;
                 ty = ColumnType::from_sql(&tyname);
-                // optional (size) or (p,s)
-                if self.skip(Tok::LParen) {
-                    while self.peek() != &Tok::RParen && self.peek() != &Tok::Eof {
-                        self.bump();
-                    }
-                    self.expect(Tok::RParen)?;
-                }
+                ty = self.parse_type_size(ty)?;
             }
         }
         let mut primary_key = false;
@@ -526,6 +582,141 @@ impl Parser {
             primary_key,
             not_null,
         })
+    }
+
+    /// Parse an optional `(n)` / `(p,s)` type suffix. For a vector type the first
+    /// integer is the declared dimension; for any other type the suffix is parsed
+    /// and ignored (affinity is name-based).
+    fn parse_type_size(&mut self, ty: ColumnType) -> Result<ColumnType> {
+        if !self.skip(Tok::LParen) {
+            return Ok(ty);
+        }
+        let mut first_int: Option<i64> = None;
+        while self.peek() != &Tok::RParen && self.peek() != &Tok::Eof {
+            if first_int.is_none() {
+                if let Tok::Int(n) = self.peek() {
+                    first_int = Some(*n);
+                }
+            }
+            self.bump();
+        }
+        self.expect(Tok::RParen)?;
+        if matches!(ty, ColumnType::Vector(_)) {
+            let d = first_int.unwrap_or(0);
+            if d <= 0 {
+                return Err(EngineError::sql("vector(N) requires a positive dimension"));
+            }
+            return Ok(ColumnType::Vector(d as u32));
+        }
+        Ok(ty)
+    }
+
+    /// `CREATE INDEX [IF NOT EXISTS] name ON table USING hnsw (col [opclass])
+    /// [WITH (m=.., ef_construction=.., ef_search=.., metric='cosine')]`.
+    fn create_index(&mut self) -> Result<Stmt> {
+        self.expect_kw("create")?;
+        self.expect_kw("index")?;
+        let if_not_exists = if self.eat_kw("if") {
+            self.expect_kw("not")?;
+            self.expect_kw("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        self.expect_kw("on")?;
+        let table = self.ident()?;
+        self.expect_kw("using")?;
+        let method = self.ident()?;
+        if !method.eq_ignore_ascii_case("hnsw") {
+            return Err(EngineError::sql(format!(
+                "unsupported index method '{method}'; only HNSW is supported"
+            )));
+        }
+        self.expect(Tok::LParen)?;
+        let column = self.ident()?;
+        let mut params = IndexParams::default();
+        // Optional pgvector-style opclass (e.g. vector_cosine_ops).
+        if let Some(w) = self.peek_word() {
+            if let Some(m) = opclass_metric(w) {
+                params.metric = m;
+                self.bump();
+            }
+        }
+        self.expect(Tok::RParen)?;
+        if self.eat_kw("with") {
+            self.parse_index_options(&mut params)?;
+        }
+        Ok(Stmt::CreateIndex {
+            name,
+            table,
+            column,
+            params,
+            if_not_exists,
+        })
+    }
+
+    fn parse_index_options(&mut self, params: &mut IndexParams) -> Result<()> {
+        self.expect(Tok::LParen)?;
+        loop {
+            let key = self.ident()?;
+            self.expect(Tok::Eq)?;
+            self.apply_index_option(&key, params)?;
+            if self.skip(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(Tok::RParen)
+    }
+
+    fn apply_index_option(&mut self, key: &str, params: &mut IndexParams) -> Result<()> {
+        if key.eq_ignore_ascii_case("metric") {
+            let name = self.string_or_ident()?;
+            params.metric = Metric::from_name(&name)
+                .ok_or_else(|| EngineError::sql(format!("unknown vector metric '{name}'")))?;
+            return Ok(());
+        }
+        let n = self.int_value()?;
+        match key.to_ascii_lowercase().as_str() {
+            "m" => params.m = (n.max(2)) as usize,
+            "ef_construction" => params.ef_construction = (n.max(1)) as usize,
+            "ef_search" => params.ef_search = (n.max(1)) as usize,
+            other => return Err(EngineError::sql(format!("unknown index option '{other}'"))),
+        }
+        Ok(())
+    }
+
+    fn string_or_ident(&mut self) -> Result<String> {
+        match self.bump() {
+            Tok::Str(s) => Ok(s),
+            Tok::Word(w) => Ok(w),
+            other => Err(EngineError::sql(format!(
+                "expected a name, found {other:?}"
+            ))),
+        }
+    }
+
+    fn int_value(&mut self) -> Result<i64> {
+        match self.bump() {
+            Tok::Int(n) => Ok(n),
+            other => Err(EngineError::sql(format!(
+                "expected an integer, found {other:?}"
+            ))),
+        }
+    }
+
+    fn drop_index(&mut self) -> Result<Stmt> {
+        self.expect_kw("drop")?;
+        self.expect_kw("index")?;
+        let if_exists = if self.eat_kw("if") {
+            self.expect_kw("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        Ok(Stmt::DropIndex { name, if_exists })
     }
 
     fn drop_table(&mut self) -> Result<Stmt> {
@@ -783,7 +974,7 @@ impl Parser {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr> {
-        let left = self.add_expr()?;
+        let left = self.vecdist_expr()?;
         // IS [NOT] NULL
         if self.eat_kw("is") {
             let negated = self.eat_kw("not");
@@ -807,7 +998,7 @@ impl Parser {
             false
         };
         if self.eat_kw("like") {
-            let pattern = self.add_expr()?;
+            let pattern = self.vecdist_expr()?;
             return Ok(Expr::Like {
                 e: Box::new(left),
                 pattern: Box::new(pattern),
@@ -825,7 +1016,7 @@ impl Parser {
         };
         if let Some(op) = op {
             self.bump();
-            let right = self.add_expr()?;
+            let right = self.vecdist_expr()?;
             Ok(Expr::Binary {
                 op,
                 l: Box::new(left),
@@ -834,6 +1025,29 @@ impl Parser {
         } else {
             Ok(left)
         }
+    }
+
+    /// Vector distance operators bind tighter than comparison but looser than
+    /// arithmetic, so `embedding <-> ? < 0.5` parses as `(embedding <-> ?) < 0.5`
+    /// and `a + 1 <-> b` as `(a + 1) <-> b`.
+    fn vecdist_expr(&mut self) -> Result<Expr> {
+        let mut left = self.add_expr()?;
+        loop {
+            let op = match self.peek() {
+                Tok::VecL2 => BinOp::VecL2,
+                Tok::VecCosine => BinOp::VecCosine,
+                Tok::VecIp => BinOp::VecIp,
+                _ => break,
+            };
+            self.bump();
+            let right = self.add_expr()?;
+            left = Expr::Binary {
+                op,
+                l: Box::new(left),
+                r: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     fn add_expr(&mut self) -> Result<Expr> {
@@ -915,6 +1129,7 @@ impl Parser {
                 self.expect(Tok::RParen)?;
                 Ok(e)
             }
+            Tok::LBracket => self.vector_literal(),
             Tok::Word(w) => {
                 if w.eq_ignore_ascii_case("null") {
                     self.bump();
@@ -940,6 +1155,51 @@ impl Parser {
                 "unexpected token in expression: {other:?}"
             ))),
         }
+    }
+
+    /// A `[a, b, c]` vector literal of numeric (optionally signed) components.
+    fn vector_literal(&mut self) -> Result<Expr> {
+        self.expect(Tok::LBracket)?;
+        let mut comps = Vec::new();
+        if self.peek() != &Tok::RBracket {
+            loop {
+                comps.push(self.number_component()?);
+                if self.skip(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Tok::RBracket)?;
+        Ok(Expr::Vector(comps))
+    }
+
+    fn number_component(&mut self) -> Result<f32> {
+        let neg = self.skip(Tok::Minus);
+        let v = match self.bump() {
+            Tok::Int(n) => n as f32,
+            Tok::Real(r) => r as f32,
+            other => {
+                return Err(EngineError::sql(format!(
+                    "vector literal expects numbers, found {other:?}"
+                )))
+            }
+        };
+        Ok(if neg { -v } else { v })
+    }
+}
+
+/// Map a pgvector-style opclass keyword to its metric (e.g. `vector_cosine_ops`).
+fn opclass_metric(w: &str) -> Option<Metric> {
+    let w = w.to_ascii_lowercase();
+    if !w.starts_with("vector_") || !w.ends_with("_ops") {
+        return None;
+    }
+    match w.trim_start_matches("vector_").trim_end_matches("_ops") {
+        "cosine" => Some(Metric::Cosine),
+        "l2" => Some(Metric::L2),
+        "ip" => Some(Metric::InnerProduct),
+        _ => None,
     }
 }
 

@@ -34,6 +34,8 @@
 <tbody>
 <tr><td><code>CREATE TABLE</code></td><td>Define a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
 <tr><td><code>DROP TABLE</code></td><td>Remove a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
+<tr><td><code>CREATE INDEX … USING hnsw</code></td><td>Build a vector index (Phase 5)</td><td>Autocommit only — see <a href="#vector-search">Vector search</a></td></tr>
+<tr><td><code>DROP INDEX</code></td><td>Remove a vector index (Phase 5)</td><td>Autocommit only</td></tr>
 <tr><td><code>INSERT</code></td><td>Add rows</td><td>Fully transactional</td></tr>
 <tr><td><code>UPDATE</code></td><td>Modify rows</td><td>Fully transactional</td></tr>
 <tr><td><code>DELETE</code></td><td>Remove rows</td><td>Fully transactional</td></tr>
@@ -171,6 +173,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>Comparison</td><td><code>=</code>, <code>&lt;&gt;</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td><code>&lt;&gt;</code> and <code>!=</code> are both inequality</td></tr>
 <tr><td>Null test</td><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td></td></tr>
 <tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code></td><td>Pattern match against a string expression</td></tr>
+<tr><td>Vector distance</td><td><code>&lt;-&gt;</code>, <code>&lt;=&gt;</code>, <code>&lt;#&gt;</code></td><td>L2 / cosine / inner-product distance (Phase 5) — see <a href="#vector-search">Vector search</a></td></tr>
 <tr><td>Additive</td><td><code>+</code>, <code>-</code></td><td></td></tr>
 <tr><td>Multiplicative</td><td><code>*</code>, <code>/</code>, <code>%</code></td><td>Multiply, divide, modulo</td></tr>
 <tr><td>Unary</td><td><code>-</code>, <code>+</code></td><td>Negation / identity prefix</td></tr>
@@ -189,7 +192,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 
 <section>
 <h2>Types and storage classes</h2>
-<p>Every value belongs to one of five storage classes. A declared column type maps to a storage class by affinity (the same keyword rules SQLite uses), and values are lightly coerced toward the column's class where lossless.</p>
+<p>Every value belongs to one of six storage classes. A declared column type maps to a storage class by affinity (the same keyword rules SQLite uses), and values are lightly coerced toward the column's class where lossless.</p>
 <div class="table-wrap">
 <table>
 <thead><tr><th>Storage class</th><th>Holds</th><th>Declared types that map to it</th></tr></thead>
@@ -199,6 +202,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td><code>REAL</code></td><td>64-bit floating point</td><td><code>REAL</code>, <code>FLOA…</code>, <code>DOUB…</code>, <code>NUMERIC</code>, <code>DEC…</code></td></tr>
 <tr><td><code>TEXT</code></td><td>UTF-8 string</td><td><code>CHAR…</code>, <code>TEXT</code>, <code>CLOB</code>, <code>STRING</code>; also the default for an unknown or omitted type</td></tr>
 <tr><td><code>BLOB</code></td><td>Raw bytes</td><td><code>BLOB</code>, <code>BYTEA</code></td></tr>
+<tr><td><code>VECTOR</code></td><td>Fixed-length <code>f32</code> array (Phase 5)</td><td><code>VECTOR(N)</code> — dimension <code>N</code> required and validated on insert</td></tr>
 </tbody>
 </table>
 </div>
@@ -206,6 +210,42 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <li><span class="req-tag may">MAY</span> rely on light affinity: an <code>INTEGER</code> inserted into a <code>REAL</code> column becomes a real; a whole-number <code>REAL</code> in an <code>INTEGER</code> column becomes an integer.</li>
 <li><span class="req-tag must">MUST</span> read all values back as text across the C ABI — a <code>BLOB</code> renders as standard padded base64, and a SQL <code>NULL</code> comes back as a null pointer.</li>
 </ul>
+</section>
+
+<section id="vector-search">
+<h2>Vector search (Phase 5)</h2>
+<p>Vector search is built into the engine. A <code>VECTOR(N)</code> column stores a fixed-length array of <code>f32</code>, an HNSW index answers top-k nearest-neighbour queries, and three distance operators are available in projections, <code>WHERE</code>, and <code>ORDER BY</code>. Because the index rides the same WAL/replay path as the rows, it branches and scales-to-zero with the database.</p>
+
+<h3>The vector type and literals</h3>
+<p>Declare the dimension at column time; it is validated on insert. Vector literals are written <code>[1, 2, 3]</code> (or the pgvector-style text form <code>'[1,2,3]'</code>).</p>
+<pre data-lang="sql"><code>CREATE TABLE memories (
+  id        INTEGER PRIMARY KEY,
+  note      TEXT,
+  embedding VECTOR(3)
+);
+
+INSERT INTO memories VALUES
+  (1, 'apples',  [1, 0, 0]),
+  (2, 'oranges', [0, 1, 0]);</code></pre>
+
+<h3>HNSW index</h3>
+<p>Create an HNSW access method over a vector column. Like <code>CREATE TABLE</code>, index DDL runs in autocommit only. <code>WITH</code> options tune the graph and the search.</p>
+<pre data-lang="sql"><code>CREATE INDEX mem_e ON memories USING hnsw (embedding)
+  WITH (metric = 'cosine');           -- 'cosine' | 'l2' | 'inner_product'
+  -- also: m, ef_construction, ef_search
+
+DROP INDEX IF EXISTS mem_e;</code></pre>
+
+<h3>Distance operators &amp; nearest-neighbour queries</h3>
+<p>The three operators compute a distance between two vectors: <code>&lt;-&gt;</code> (L2), <code>&lt;=&gt;</code> (cosine), and <code>&lt;#&gt;</code> (inner product). Pass the query vector as a parameter and order by distance:</p>
+<pre data-lang="sql"><code>SELECT note
+  FROM memories
+ ORDER BY embedding &lt;=&gt; ?      -- bind the query vector, e.g. [0.9, 0.1, 0]
+ LIMIT 1;                       -- → 'apples'</code></pre>
+<div class="callout note">
+<p class="callout-title">Index or brute force — same answers</p>
+<p>An <code>ORDER BY &lt;col&gt; &lt;dist-op&gt; &lt;query&gt; ASC LIMIT k</code> query is answered by the HNSW index when one exists, and falls back to a brute-force scan-and-sort when it does not — the results match. HNSW is approximate by design (recall governed by <code>ef_search</code>); results are MVCC-filtered against your snapshot and any <code>WHERE</code> clause.</p>
+</div>
 </section>
 
 <section>
@@ -223,6 +263,7 @@ SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
 <tr><td><code>s</code></td><td>Text</td><td><code>shello</code></td></tr>
 <tr><td><code>b</code></td><td>Bytes (base64)</td><td><code>b&lt;base64&gt;</code></td></tr>
 <tr><td><code>n</code></td><td>NULL</td><td><code>n</code></td></tr>
+<tr><td><code>v</code></td><td>Vector (Phase 5)</td><td><code>v[1,2,3]</code> or <code>v1,2,3</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -263,7 +304,7 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 <li><span class="req-tag must-not">MUST NOT</span> use <code>GROUP BY</code> / <code>HAVING</code> — aggregates are whole-table only.</li>
 <li><span class="req-tag must-not">MUST NOT</span> use subqueries.</li>
 <li><span class="req-tag must-not">MUST NOT</span> use <code>SELECT DISTINCT</code>.</li>
-<li><span class="req-tag must-not">MUST NOT</span> use views, <code>CREATE INDEX</code> as SQL, or <code>ALTER TABLE</code>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>, Phase 5); general secondary/B-tree indexes are not exposed as SQL.</li>
 </ul>
 <div class="callout note">
 <p class="callout-title">Unsupported syntax fails fast</p>

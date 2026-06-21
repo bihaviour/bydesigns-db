@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>C ABI reference · bydesigns-db docs</title>
-<meta name="description" content="The frozen bydesigns-db C ABI (version 2): handles, status codes, every exported function, the typed-literal parameter encoding, and the safety contract.">
+<meta name="description" content="The frozen bydesigns-db C ABI (version 3): handles, status codes, every exported function, the typed-literal parameter encoding, and the safety contract.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -22,7 +22,7 @@
 <span class="spec-date">Reference</span>
 </div>
 <h1>C ABI reference</h1>
-<p class="lede">The C ABI (<code>engine.h</code>, <code>ENGINE_ABI_VERSION</code> 2) is the single boundary every runtime binds to — <code>bun:ffi</code>, NAPI, or a static link. It is frozen: later phases add backends and listeners behind the same symbols without changing these signatures. Opaque handles only; no Rust panic ever crosses this line.</p>
+<p class="lede">The C ABI (<code>engine.h</code>, <code>ENGINE_ABI_VERSION</code> 3) is the single boundary every runtime binds to — <code>bun:ffi</code>, NAPI, or a static link. It is frozen: later phases add backends and capabilities behind the same symbols without changing these signatures (Phase 5's vector type added only a new bind tag, no new symbols). Opaque handles only; no Rust panic ever crosses this line.</p>
 </header>
 
 <section>
@@ -154,7 +154,7 @@
 <dt><code>long long engine_last_lsn(EngineHandle* h)</code></dt>
 <dd>Commit LSN of the last commit.</dd>
 <dt><code>int engine_abi_version(void)</code></dt>
-<dd>The ABI version this library exports — currently <code>2</code>. Check it against <code>ENGINE_ABI_VERSION</code> at load time.</dd>
+<dd>The ABI version this library exports — currently <code>3</code>. Check it against <code>ENGINE_ABI_VERSION</code> at load time.</dd>
 </dl>
 </section>
 
@@ -179,6 +179,7 @@
 <tr><td><code>s</code></td><td>Text</td><td><code>shello</code></td></tr>
 <tr><td><code>b</code></td><td>Bytes (base64)</td><td><code>b&lt;base64&gt;</code></td></tr>
 <tr><td><code>n</code></td><td>NULL</td><td><code>n</code></td></tr>
+<tr><td><code>v</code></td><td>Vector (Phase 5)</td><td><code>v[1,2,3]</code> or <code>v1,2,3</code></td></tr>
 </tbody>
 </table>
 </div>

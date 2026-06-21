@@ -13,7 +13,7 @@
 
 <div class="hero-wrap">
   <div class="hero">
-    <span class="eyebrow"><span class="dot"></span>Phases 1–4 implemented · Rust · Postgres-wire compatible</span>
+    <span class="eyebrow"><span class="dot"></span>Phases 1–5 implemented · Rust · Postgres-wire compatible</span>
     <h1>The database that is <span class="grad">embeddable</span> and <span class="grad">disaggregated</span> at once.</h1>
     <p class="sub">bydesigns-db is a serverless OLTP engine — a SQLite-style Rust library at function-call latency, whose storage backend is pluggable. Point it at a local file to run purely embedded, or at object storage to run storage-disaggregated and scale-to-zero. Same engine, same C ABI; the only difference is a connection string.</p>
     <div class="cta-row">
@@ -68,6 +68,11 @@
         <div class="ic">🐘</div>
         <h3>Postgres-wire compatible</h3>
         <p>The same engine runs behind a Postgres-wire listener. <code>psql</code>, <code>Bun.sql</code>, <code>pgbench</code>, and PostgREST connect unchanged — no bespoke driver, no bespoke REST layer.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">🧭</div>
+        <h3>Vector search in-core</h3>
+        <p>A <code>vector(N)</code> type and an HNSW index live behind the same storage seam as the rows — so vector search <strong>branches and scales-to-zero with the database</strong>. An agent can fork its memory.</p>
       </div>
     </div>
   </section>
