@@ -4,12 +4,12 @@
 //! sibling are untouched by a branch's writes — and creating a branch copies no
 //! pages (near-zero marginal storage until divergence).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use twill_storage::{
     block_on, open_branch, open_storage, BranchStorage, FenceToken, Lsn, MemObjectStore,
     ObjectConfig, ObjectStorage, ObjectStore, PageId, Storage, StorageError, WalRecord, WriterId,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);

@@ -4,13 +4,13 @@
 //! spec 04 — CAS single-writer fencing, crash-safety (§8 Exp 4 a/b), layer
 //! resolution across memtable/delta/image, and flush → compaction → GC.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use twill_storage::conformance::run_conformance;
 use twill_storage::{
     block_on, FsObjectStore, MemObjectStore, ObjectConfig, ObjectError, ObjectStorage, ObjectStore,
     PageId, Storage, StorageError, WalRecord, WriterId,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 fn unique_root(tag: &str) -> std::path::PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);

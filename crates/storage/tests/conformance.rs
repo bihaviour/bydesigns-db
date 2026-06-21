@@ -2,12 +2,12 @@
 //! backend-specific torn-trailing-frame recovery test (the in-process analog of
 //! a `kill -9` mid-append).
 
-use twill_storage::conformance::run_conformance;
-use twill_storage::{block_on, open_storage, Lsn, WriterId};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use twill_storage::conformance::run_conformance;
+use twill_storage::{block_on, open_storage, Lsn, WriterId};
 
 fn unique_db_path(tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -61,8 +61,8 @@ fn recovers_from_torn_trailing_frame() {
 
     // And new appends after recovery are clean and durable.
     let t = block_on(s2.acquire_fence(WriterId(2))).unwrap();
-    let next = block_on(s2.append_wal(&t, &[twill_storage::WalRecord::new(b"after".to_vec())]))
-        .unwrap();
+    let next =
+        block_on(s2.append_wal(&t, &[twill_storage::WalRecord::new(b"after".to_vec())])).unwrap();
     assert!(next > acked);
     drop(s2);
 
