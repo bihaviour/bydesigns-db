@@ -10,6 +10,7 @@
 use crate::catalog::{Column, TableSchema};
 use crate::error::{EngineError, Result};
 use crate::value::{ColumnType, Value};
+use crate::vector::{IndexDef, IndexParams, Metric};
 use bydesigns_storage::WalRecord;
 
 #[derive(Clone, Debug)]
@@ -29,6 +30,12 @@ pub enum WalOp {
         table: String,
         vid: u64,
     },
+    CreateIndex {
+        def: IndexDef,
+    },
+    DropIndex {
+        name: String,
+    },
     Commit,
 }
 
@@ -37,6 +44,8 @@ const OP_DROP: u8 = 2;
 const OP_INSERT: u8 = 3;
 const OP_DELETE: u8 = 4;
 const OP_COMMIT: u8 = 5;
+const OP_CREATE_INDEX: u8 = 6;
+const OP_DROP_INDEX: u8 = 7;
 
 impl WalOp {
     pub fn encode(&self) -> WalRecord {
@@ -48,7 +57,7 @@ impl WalOp {
                 put_u32(&mut b, schema.columns.len() as u32);
                 for c in &schema.columns {
                     put_str(&mut b, &c.name);
-                    b.push(c.ty.tag());
+                    put_coltype(&mut b, c.ty);
                     let mut flags = 0u8;
                     if c.primary_key {
                         flags |= 1;
@@ -61,6 +70,20 @@ impl WalOp {
             }
             WalOp::DropTable { name } => {
                 b.push(OP_DROP);
+                put_str(&mut b, name);
+            }
+            WalOp::CreateIndex { def } => {
+                b.push(OP_CREATE_INDEX);
+                put_str(&mut b, &def.name);
+                put_str(&mut b, &def.table);
+                put_str(&mut b, &def.column);
+                put_u32(&mut b, def.params.m as u32);
+                put_u32(&mut b, def.params.ef_construction as u32);
+                put_u32(&mut b, def.params.ef_search as u32);
+                b.push(def.params.metric.tag());
+            }
+            WalOp::DropIndex { name } => {
+                b.push(OP_DROP_INDEX);
                 put_str(&mut b, name);
             }
             WalOp::Insert { table, vid, values } => {
@@ -92,7 +115,7 @@ impl WalOp {
                 let mut columns = Vec::with_capacity(n);
                 for _ in 0..n {
                     let cname = c.str()?;
-                    let ty = ColumnType::from_tag(c.u8()?);
+                    let ty = c.coltype()?;
                     let flags = c.u8()?;
                     columns.push(Column {
                         name: cname,
@@ -106,6 +129,29 @@ impl WalOp {
                 }
             }
             OP_DROP => WalOp::DropTable { name: c.str()? },
+            OP_CREATE_INDEX => {
+                let name = c.str()?;
+                let table = c.str()?;
+                let column = c.str()?;
+                let m = c.u32()? as usize;
+                let ef_construction = c.u32()? as usize;
+                let ef_search = c.u32()? as usize;
+                let metric = Metric::from_tag(c.u8()?);
+                WalOp::CreateIndex {
+                    def: IndexDef {
+                        name,
+                        table,
+                        column,
+                        params: IndexParams {
+                            m,
+                            ef_construction,
+                            ef_search,
+                            metric,
+                        },
+                    },
+                }
+            }
+            OP_DROP_INDEX => WalOp::DropIndex { name: c.str()? },
             OP_INSERT => {
                 let table = c.str()?;
                 let vid = c.u64()?;
@@ -137,6 +183,13 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
     put_u32(b, s.len() as u32);
     b.extend_from_slice(s.as_bytes());
 }
+/// Column type codec: the affinity tag, plus the dimension for `vector(n)`.
+fn put_coltype(b: &mut Vec<u8>, ty: ColumnType) {
+    b.push(ty.tag());
+    if let ColumnType::Vector(d) = ty {
+        put_u32(b, d);
+    }
+}
 fn put_value(b: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => b.push(0),
@@ -156,6 +209,13 @@ fn put_value(b: &mut Vec<u8>, v: &Value) {
             b.push(4);
             put_u32(b, bytes.len() as u32);
             b.extend_from_slice(bytes);
+        }
+        Value::Vector(vec) => {
+            b.push(5);
+            put_u32(b, vec.len() as u32);
+            for x in vec {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
         }
     }
 }
@@ -199,7 +259,25 @@ impl<'a> Cursor<'a> {
                 let n = self.u32()? as usize;
                 Value::Blob(self.take(n)?.to_vec())
             }
+            5 => {
+                let n = self.u32()? as usize;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(f32::from_le_bytes(self.take(4)?.try_into().unwrap()));
+                }
+                Value::Vector(v)
+            }
             other => return Err(EngineError::internal(format!("bad value tag {other}"))),
         })
+    }
+
+    /// Decode a column type written by [`put_coltype`].
+    fn coltype(&mut self) -> Result<ColumnType> {
+        let tag = self.u8()?;
+        if tag == 4 {
+            Ok(ColumnType::Vector(self.u32()?))
+        } else {
+            Ok(ColumnType::from_tag(tag))
+        }
     }
 }

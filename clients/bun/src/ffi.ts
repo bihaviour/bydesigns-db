@@ -84,7 +84,7 @@ export const lib = opened.symbols;
 export const libPath = LIB_PATH;
 
 /** The ABI version the wrapper was written against. */
-export const EXPECTED_ABI_VERSION = 2;
+export const EXPECTED_ABI_VERSION = 3;
 
 // Verify the loaded library matches the wrapper's expected ABI, failing fast
 // rather than calling a stale symbol (undefined behaviour).

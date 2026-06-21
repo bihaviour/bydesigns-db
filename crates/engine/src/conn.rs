@@ -8,6 +8,7 @@ use crate::error::{EngineError, Result};
 use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet};
 use crate::sql::{self, Stmt};
 use crate::value::Value;
+use crate::vector::{IndexDef, IndexParams};
 use crate::wal::WalOp;
 use bydesigns_storage::{block_on, Lsn, WalRecord};
 use std::ffi::CString;
@@ -128,7 +129,10 @@ impl Connection {
                 self.last_changes = 0;
                 Ok(rs)
             }
-            Stmt::CreateTable { .. } | Stmt::DropTable { .. } => {
+            Stmt::CreateTable { .. }
+            | Stmt::DropTable { .. }
+            | Stmt::CreateIndex { .. }
+            | Stmt::DropIndex { .. } => {
                 self.exec_ddl(stmt)?;
                 Ok(ResultSet::default())
             }
@@ -348,8 +352,88 @@ impl Connection {
                 store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
                 Ok(Some(commit_lsn.0))
             }
+            Stmt::CreateIndex {
+                name,
+                table,
+                column,
+                params,
+                if_not_exists,
+            } => self.do_create_index(name, table, column, *params, *if_not_exists),
+            Stmt::DropIndex { name, if_exists } => self.do_drop_index(name, *if_exists),
             _ => unreachable!(),
         }
+    }
+
+    /// `CREATE INDEX … USING hnsw`: validate the target column is a vector,
+    /// durably log the definition, then build the in-memory graph from the
+    /// column's current rows (autocommit, like `CREATE TABLE`).
+    fn do_create_index(
+        &self,
+        name: &str,
+        table: &str,
+        column: &str,
+        params: IndexParams,
+        if_not_exists: bool,
+    ) -> Result<Option<u64>> {
+        {
+            let store = self.db.store.read().unwrap();
+            if store.has_index(name) {
+                if if_not_exists {
+                    return Ok(None);
+                }
+                return Err(EngineError::sql(format!("index {name} already exists")));
+            }
+            let t = store
+                .table(table)
+                .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?;
+            let col = t
+                .schema
+                .column_index(column)
+                .ok_or_else(|| EngineError::sql(format!("no such column: {table}.{column}")))?;
+            if !t.schema.columns[col].ty.is_vector() {
+                return Err(EngineError::sql(format!(
+                    "HNSW index requires a vector column; {table}.{column} is not a vector"
+                )));
+            }
+        }
+        let def = IndexDef {
+            name: name.to_string(),
+            table: table.to_string(),
+            column: column.to_string(),
+            params,
+        };
+        let records = vec![
+            WalOp::CreateIndex { def: def.clone() }.encode(),
+            WalOp::Commit.encode(),
+        ];
+        let commit_lsn =
+            block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
+        let mut store = self.db.store.write().unwrap();
+        store.create_index(def);
+        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        Ok(Some(commit_lsn.0))
+    }
+
+    fn do_drop_index(&self, name: &str, if_exists: bool) -> Result<Option<u64>> {
+        if !self.db.store.read().unwrap().has_index(name) {
+            if if_exists {
+                return Ok(None);
+            }
+            return Err(EngineError::sql(format!("no such index: {name}")));
+        }
+        let records = vec![
+            WalOp::DropIndex {
+                name: name.to_string(),
+            }
+            .encode(),
+            WalOp::Commit.encode(),
+        ];
+        let commit_lsn =
+            block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
+        let mut store = self.db.store.write().unwrap();
+        store.drop_index(name);
+        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        Ok(Some(commit_lsn.0))
     }
 
     // ---- prepared statements --------------------------------------------
