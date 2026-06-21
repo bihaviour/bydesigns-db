@@ -198,6 +198,7 @@ impl Session {
     // ---- simple query protocol ------------------------------------------
 
     fn simple_query(&mut self, out: &mut Out, sql: &str) {
+        log_sql("simple", sql);
         let stmts = split_statements(sql);
         if stmts.is_empty() {
             out.empty_query_response();
@@ -255,6 +256,7 @@ impl Session {
         if self.skip_until_sync {
             return;
         }
+        log_sql("parse", &sql);
         // Intercepted (introspection) statements never reach the engine parser.
         let prepared = if matches!(
             introspect::intercept(&sql, &self.user, &self.database),
@@ -549,6 +551,60 @@ impl Session {
                 .map(|(c, v)| encode_value(v, fmt_at(formats, c)))
                 .collect();
             out.data_row(&cols);
+        }
+    }
+}
+
+// ---- SQL capture (corpus collection) --------------------------------------
+
+/// Where captured SQL is written. Configured once from `TWILL_LOG_SQL`:
+/// unset/empty → off; `1`/`true`/`stderr`/`-` → stderr; anything else → a file
+/// path appended to. This is a debugging/diagnostic aid for building a
+/// wire-client SQL corpus (e.g. PostgREST); it logs statement *text* only,
+/// never bound parameter values.
+enum SqlSink {
+    Off,
+    Stderr,
+    File(std::sync::Mutex<std::fs::File>),
+}
+
+fn sql_sink() -> &'static SqlSink {
+    static SINK: std::sync::OnceLock<SqlSink> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| match std::env::var("TWILL_LOG_SQL") {
+        Ok(v) if !v.trim().is_empty() => {
+            let v = v.trim();
+            if matches!(v, "1" | "true" | "stderr" | "-") {
+                SqlSink::Stderr
+            } else {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(v)
+                {
+                    Ok(f) => SqlSink::File(std::sync::Mutex::new(f)),
+                    Err(e) => {
+                        eprintln!("[twill] TWILL_LOG_SQL: cannot open {v:?}: {e}; using stderr");
+                        SqlSink::Stderr
+                    }
+                }
+            }
+        }
+        _ => SqlSink::Off,
+    })
+}
+
+/// Record one received statement (preserving its formatting) with a record
+/// separator so multi-line client SQL stays readable and greppable.
+fn log_sql(tag: &str, sql: &str) {
+    let record = format!("-- [{tag}]\n{}\n", sql.trim_end());
+    match sql_sink() {
+        SqlSink::Off => {}
+        SqlSink::Stderr => eprint!("{record}"),
+        SqlSink::File(m) => {
+            if let Ok(mut f) = m.lock() {
+                let _ = f.write_all(record.as_bytes());
+                let _ = f.flush();
+            }
         }
     }
 }
