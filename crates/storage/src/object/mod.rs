@@ -455,10 +455,40 @@ impl ObjectStorage {
     }
 
     /// Rebuild in-memory state from the durable objects (open / after a crash).
+    /// Composes three independent scans: layer discovery (sets the flushed
+    /// high-water), commit-log replay (the LSN stream + unflushed memtable), and
+    /// branch loading; then reads the lease epoch and retention floor.
     fn recover(&self) -> Result<(), StorageError> {
-        let mut g = self.inner.lock().unwrap();
+        let (deltas, image, flushed_hw) = self.discover_layers()?;
+        let replay = self.replay_log(flushed_hw)?;
+        let (branches, next_branch_id) = self.load_branches()?;
+        let (epoch, _) = self.durable_epoch()?;
+        let retention_floor = match self.obj_get(&self.retention_key())? {
+            Some(g) if g.bytes.len() >= 8 => u64::from_le_bytes(g.bytes[..8].try_into().unwrap()),
+            _ => 0,
+        };
 
-        // Layers first: they set the flushed high-water that bounds log replay.
+        let mut g = self.inner.lock().unwrap();
+        g.next_seq = replay.max_seq + 1;
+        g.next_lsn = replay.next_lsn;
+        g.durable_lsn = replay.durable_lsn;
+        g.commit_lsn = replay.commit_lsn;
+        g.epoch = epoch;
+        g.retention_floor = retention_floor;
+        g.memtable = replay.memtable;
+        g.memtable_bytes = replay.memtable_bytes;
+        g.flushed_hw = flushed_hw;
+        g.deltas = deltas;
+        g.image = image;
+        g.branches = branches;
+        g.next_branch_id = next_branch_id;
+        Ok(())
+    }
+
+    /// Discover live delta/image layers from the bucket. Returns the deltas
+    /// (ascending by `hi`), the covering image (greatest `image_lsn`), and the
+    /// flushed high-water LSN that bounds log replay into the memtable.
+    fn discover_layers(&self) -> Result<(Vec<DeltaMeta>, Option<ImageMeta>, u64), StorageError> {
         let mut deltas = Vec::new();
         for key in self.obj_list(&format!("{}delta/", self.prefix))? {
             if let Some((lo, hi)) = parse_delta_name(&key) {
@@ -466,6 +496,7 @@ impl ObjectStorage {
             }
         }
         deltas.sort_by_key(|d| d.hi);
+
         let mut image: Option<ImageMeta> = None;
         for key in self.obj_list(&format!("{}image/", self.prefix))? {
             if let Some(image_lsn) = parse_image_name(&key) {
@@ -478,21 +509,26 @@ impl ObjectStorage {
                 }
             }
         }
+
         let flushed_hw = deltas
             .iter()
             .map(|d| d.hi)
             .chain(image.iter().map(|i| i.image_lsn))
             .max()
             .unwrap_or(0);
+        Ok((deltas, image, flushed_hw))
+    }
 
-        // Replay the durable commit log in slot order to rebuild the LSN stream,
-        // durable/commit marks, and the unflushed memtable tail.
+    /// Replay the durable commit log in slot order, rebuilding the gap-free LSN
+    /// stream, the durable/commit marks, and the unflushed memtable tail (page
+    /// items with `lsn > flushed_hw`).
+    fn replay_log(&self, flushed_hw: u64) -> Result<LogReplay, StorageError> {
         let mut log_keys = self.obj_list(&self.log_prefix())?;
         log_keys.sort();
+        let mut max_seq = 0u64;
         let mut next_lsn = 1u64;
         let mut durable_lsn = 0u64;
         let mut commit_lsn = 0u64;
-        let mut max_seq = 0u64;
         let mut memtable: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
         let mut memtable_bytes = 0usize;
         for key in &log_keys {
@@ -502,69 +538,68 @@ impl ObjectStorage {
             let got = self
                 .obj_get(key)?
                 .ok_or_else(|| StorageError::Corruption(format!("missing log segment {key}")))?;
-            let items = codec::decode_segment(&got.bytes)?;
             let mut has_wal = false;
-            for item in items {
+            for item in codec::decode_segment(&got.bytes)? {
                 let lsn = next_lsn;
                 next_lsn += 1;
                 durable_lsn = lsn;
                 match item {
                     LogItem::Wal(_) => has_wal = true,
-                    LogItem::Page { page_id, image } => {
-                        if lsn > flushed_hw {
-                            memtable_bytes += image.len();
-                            memtable.insert((page_id, lsn), image);
-                        }
+                    LogItem::Page { page_id, image } if lsn > flushed_hw => {
+                        memtable_bytes += image.len();
+                        memtable.insert((page_id, lsn), image);
                     }
+                    LogItem::Page { .. } => {}
                 }
             }
             if has_wal {
                 commit_lsn = durable_lsn;
             }
         }
+        Ok(LogReplay {
+            max_seq,
+            next_lsn,
+            durable_lsn,
+            commit_lsn,
+            memtable,
+            memtable_bytes,
+        })
+    }
 
-        // Branches.
+    /// Load branch pointers from the bucket; returns the map and the next id.
+    fn load_branches(&self) -> Result<(HashMap<u64, BranchRef>, u64), StorageError> {
         let mut branches = HashMap::new();
         let mut next_branch_id = 1u64;
         for key in self.obj_list(&format!("{}branches/", self.prefix))? {
-            if let Some(got) = self.obj_get(&key)? {
-                if got.bytes.len() >= 16 {
-                    let id = u64::from_le_bytes(got.bytes[0..8].try_into().unwrap());
-                    let base = u64::from_le_bytes(got.bytes[8..16].try_into().unwrap());
-                    branches.insert(
-                        id,
-                        BranchRef {
-                            id: BranchId(id),
-                            base_lsn: Lsn(base),
-                            head_lsn: Lsn(base),
-                        },
-                    );
-                    next_branch_id = next_branch_id.max(id + 1);
-                }
+            let Some(got) = self.obj_get(&key)? else {
+                continue;
+            };
+            if got.bytes.len() >= 16 {
+                let id = u64::from_le_bytes(got.bytes[0..8].try_into().unwrap());
+                let base = u64::from_le_bytes(got.bytes[8..16].try_into().unwrap());
+                branches.insert(
+                    id,
+                    BranchRef {
+                        id: BranchId(id),
+                        base_lsn: Lsn(base),
+                        head_lsn: Lsn(base),
+                    },
+                );
+                next_branch_id = next_branch_id.max(id + 1);
             }
         }
-
-        let (epoch, _) = self.durable_epoch()?;
-        let retention_floor = match self.obj_get(&self.retention_key())? {
-            Some(g) if g.bytes.len() >= 8 => u64::from_le_bytes(g.bytes[..8].try_into().unwrap()),
-            _ => 0,
-        };
-
-        g.next_seq = max_seq + 1;
-        g.next_lsn = next_lsn;
-        g.durable_lsn = durable_lsn;
-        g.commit_lsn = commit_lsn;
-        g.epoch = epoch;
-        g.retention_floor = retention_floor;
-        g.memtable = memtable;
-        g.memtable_bytes = memtable_bytes;
-        g.flushed_hw = flushed_hw;
-        g.deltas = deltas;
-        g.image = image;
-        g.branches = branches;
-        g.next_branch_id = next_branch_id;
-        Ok(())
+        Ok((branches, next_branch_id))
     }
+}
+
+/// Accumulator for [`ObjectStorage::replay_log`].
+struct LogReplay {
+    max_seq: u64,
+    next_lsn: u64,
+    durable_lsn: u64,
+    commit_lsn: u64,
+    memtable: BTreeMap<(u64, u64), Vec<u8>>,
+    memtable_bytes: usize,
 }
 
 /// Keep the greater-LSN version of a page when merging layers for compaction.
@@ -603,7 +638,7 @@ impl Storage for ObjectStorage {
         let mut deltas: Vec<DeltaMeta> = g.deltas.clone();
         let image = g.image.clone();
         drop(g);
-        deltas.sort_by(|a, b| b.hi.cmp(&a.hi));
+        deltas.sort_by_key(|d| std::cmp::Reverse(d.hi));
         for d in &deltas {
             if d.lo > query {
                 continue; // span starts after the snapshot; cannot match
