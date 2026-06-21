@@ -8,7 +8,7 @@
 
 use crate::catalog::TableSchema;
 use crate::error::{EngineError, Result};
-use crate::sql::{AggArg, AggFunc, BinOp, Expr, SelItem, SelectStmt, UnOp};
+use crate::sql::{AggArg, AggFunc, BinOp, CastTarget, Expr, SelItem, SelectStmt, UnOp};
 use crate::store::{RowVersion, Store, PENDING};
 use crate::value::{parse_vector, ColumnType, Value};
 use crate::vector::{distance, Metric};
@@ -108,7 +108,64 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let rv = eval(r, ctx)?;
             eval_binary(*op, lv, rv)
         }
+        Expr::Cast { e, target } => {
+            let v = eval(e, ctx)?;
+            cast_value(v, *target)
+        }
     }
+}
+
+/// Coerce a value to a `::type` cast target. NULL casts to NULL; unmodelled
+/// targets pass the value through unchanged. Bad numeric text errors, matching
+/// Postgres `invalid input syntax`.
+fn cast_value(v: Value, target: CastTarget) -> Result<Value> {
+    if v.is_null() || target == CastTarget::Passthrough {
+        return Ok(v);
+    }
+    match target {
+        CastTarget::Int => match v {
+            Value::Int(i) => Ok(Value::Int(i)),
+            Value::Real(r) => Ok(Value::Int(r.round() as i64)),
+            Value::Text(s) => parse_int_text(&s),
+            other => Err(cast_err(&other, "integer")),
+        },
+        CastTarget::Real => match v {
+            Value::Int(i) => Ok(Value::Real(i as f64)),
+            Value::Real(r) => Ok(Value::Real(r)),
+            Value::Text(s) => s.trim().parse::<f64>().map(Value::Real).map_err(|_| {
+                EngineError::sql(format!("invalid input syntax for type real: {s:?}"))
+            }),
+            other => Err(cast_err(&other, "real")),
+        },
+        CastTarget::Text => Ok(match v.render() {
+            Some(s) => Value::Text(s),
+            None => Value::Null,
+        }),
+        CastTarget::Bool => match v.as_bool() {
+            Some(b) => Ok(Value::Int(b as i64)),
+            None => Ok(Value::Null),
+        },
+        CastTarget::Passthrough => Ok(v),
+    }
+}
+
+/// Parse integer text the way Postgres `::int` does: accept an integer literal,
+/// or a real literal that it rounds.
+fn parse_int_text(s: &str) -> Result<Value> {
+    let t = s.trim();
+    if let Ok(i) = t.parse::<i64>() {
+        return Ok(Value::Int(i));
+    }
+    if let Ok(r) = t.parse::<f64>() {
+        return Ok(Value::Int(r.round() as i64));
+    }
+    Err(EngineError::sql(format!(
+        "invalid input syntax for type integer: {s:?}"
+    )))
+}
+
+fn cast_err(v: &Value, ty: &str) -> EngineError {
+    EngineError::sql(format!("cannot cast {} to {ty}", v.type_name()))
 }
 
 fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
@@ -607,7 +664,21 @@ fn expr_type(expr: &Expr, schema: Option<&TableSchema>) -> ColumnType {
         Expr::Column(name) => schema
             .and_then(|s| s.column_index(name).map(|i| s.columns[i].ty))
             .unwrap_or(ColumnType::Text),
+        // A cast reports its target type (a passthrough keeps the inner type).
+        Expr::Cast { e, target } => match target {
+            CastTarget::Passthrough => expr_type(e, schema),
+            other => cast_column_type(*other),
+        },
         _ => ColumnType::Text,
+    }
+}
+
+/// The result-set column type a non-passthrough cast target reports.
+fn cast_column_type(t: CastTarget) -> ColumnType {
+    match t {
+        CastTarget::Int | CastTarget::Bool => ColumnType::Integer,
+        CastTarget::Real => ColumnType::Real,
+        CastTarget::Text | CastTarget::Passthrough => ColumnType::Text,
     }
 }
 
@@ -676,10 +747,23 @@ fn aggregate_select(
     let mut types = Vec::new();
     let mut row = Vec::new();
     for item in &sel.items {
-        if let SelItem::Aggregate { func, arg, alias } = item {
+        if let SelItem::Aggregate {
+            func,
+            arg,
+            cast,
+            alias,
+        } = item
+        {
             columns.push(alias.clone().unwrap_or_else(|| agg_name(*func)));
-            types.push(agg_type(*func, arg, schema));
-            row.push(compute_aggregate(*func, arg, schema, matched, params)?);
+            types.push(match cast {
+                Some(t) => cast_column_type(*t),
+                None => agg_type(*func, arg, schema),
+            });
+            let v = compute_aggregate(*func, arg, schema, matched, params)?;
+            row.push(match cast {
+                Some(t) => cast_value(v, *t)?,
+                None => v,
+            });
         }
     }
     // LIMIT 0 suppresses the single aggregate row.

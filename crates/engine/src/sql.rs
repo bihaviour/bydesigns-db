@@ -79,6 +79,7 @@ pub enum SelItem {
     Aggregate {
         func: AggFunc,
         arg: AggArg,
+        cast: Option<CastTarget>,
         alias: Option<String>,
     },
 }
@@ -125,6 +126,40 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// Postgres `expr::type` cast — coerces the inner value to `target`.
+    Cast {
+        e: Box<Expr>,
+        target: CastTarget,
+    },
+}
+
+/// The storage class a `::type` cast coerces to. Types we don't specifically
+/// model (uuid, json, timestamp, regclass, …) map to [`CastTarget::Passthrough`]
+/// and leave the value unchanged — lenient by design, for wire compatibility.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CastTarget {
+    Int,
+    Real,
+    Text,
+    Bool,
+    Passthrough,
+}
+
+impl CastTarget {
+    /// Map a SQL type's leading word to a cast target.
+    fn from_word(w: &str) -> CastTarget {
+        match w.to_ascii_lowercase().as_str() {
+            "int" | "integer" | "int2" | "int4" | "int8" | "smallint" | "bigint" | "oid"
+            | "serial" | "bigserial" => CastTarget::Int,
+            "real" | "float" | "float4" | "float8" | "double" | "numeric" | "decimal" => {
+                CastTarget::Real
+            }
+            "text" | "varchar" | "character" | "char" | "name" | "json" | "jsonb" | "uuid"
+            | "citext" | "bytea" | "bpchar" => CastTarget::Text,
+            "bool" | "boolean" => CastTarget::Bool,
+            _ => CastTarget::Passthrough,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -183,6 +218,7 @@ enum Tok {
     RBracket,
     Comma,
     Semi,
+    DColon, // `::` type cast
     Dot,
     Star,
     Eq,
@@ -225,6 +261,7 @@ fn lex(sql: &str) -> Result<Vec<Tok>> {
         }
         let (tok, next) = match c {
             b'<' | b'>' | b'!' => lex_operator(b, i)?,
+            b':' => lex_colon(b, i)?,
             b'\'' => lex_string(b, i)?,
             b'"' => lex_quoted_ident(b, i)?,
             _ if c.is_ascii_digit() => lex_number(b, i)?,
@@ -280,6 +317,16 @@ fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize)> {
             _ => return Err(EngineError::sql("unexpected '!'")),
         },
     })
+}
+
+/// `::` is the only colon form the engine accepts (the Postgres type cast); a
+/// lone `:` is not valid SQL here.
+fn lex_colon(b: &[u8], i: usize) -> Result<(Tok, usize)> {
+    if b.get(i + 1) == Some(&b':') {
+        Ok((Tok::DColon, i + 2))
+    } else {
+        Err(EngineError::sql("unexpected ':'"))
+    }
 }
 
 /// Disambiguate `<`: the three-char distance operators bind first, then `<=` /
@@ -866,8 +913,19 @@ impl Parser {
                         AggArg::Expr(self.expr()?)
                     };
                     self.expect(Tok::RParen)?;
+                    // an aggregate may carry trailing `::type` casts, e.g.
+                    // `count(*)::int` (common from Bun.sql and PostgREST)
+                    let mut cast = None;
+                    while self.skip(Tok::DColon) {
+                        cast = Some(self.parse_cast_type()?);
+                    }
                     let alias = self.opt_alias()?;
-                    return Ok(SelItem::Aggregate { func, arg, alias });
+                    return Ok(SelItem::Aggregate {
+                        func,
+                        arg,
+                        cast,
+                        alias,
+                    });
                 }
             }
         }
@@ -1099,7 +1157,64 @@ impl Parser {
         } else if self.skip(Tok::Plus) {
             self.unary_expr()
         } else {
-            self.primary()
+            self.cast_expr()
+        }
+    }
+
+    /// Parse a primary then any trailing `::type` casts (left-associative; binds
+    /// tighter than unary minus, matching Postgres so `-1::int` == `-(1::int)`).
+    fn cast_expr(&mut self) -> Result<Expr> {
+        let mut e = self.primary()?;
+        while self.skip(Tok::DColon) {
+            let target = self.parse_cast_type()?;
+            e = Expr::Cast {
+                e: Box::new(e),
+                target,
+            };
+        }
+        Ok(e)
+    }
+
+    /// Consume a (possibly schema-qualified, multi-word, parameterized, array)
+    /// type name after `::`. Only the leading word picks the target; the rest is
+    /// consumed and ignored so any Postgres type spelling parses.
+    fn parse_cast_type(&mut self) -> Result<CastTarget> {
+        let mut word = self.ident()?;
+        if self.skip(Tok::Dot) {
+            word = self.ident()?; // schema-qualified: `pg_catalog.text`
+        }
+        let target = CastTarget::from_word(&word);
+        self.eat_type_modifiers(&word);
+        if self.skip(Tok::LParen) {
+            // precision/scale, e.g. `(255)` or `(10, 2)` — consume balanced
+            while self.peek() != &Tok::RParen && self.peek() != &Tok::Eof {
+                self.bump();
+            }
+            self.expect(Tok::RParen)?;
+        }
+        while self.skip(Tok::LBracket) {
+            self.expect(Tok::RBracket)?; // array marker `[]`
+        }
+        Ok(target)
+    }
+
+    /// Consume the trailing words of a multi-word type name (e.g. the
+    /// `precision` of `double precision`, the `with time zone` of `timestamp`).
+    fn eat_type_modifiers(&mut self, word: &str) {
+        match word.to_ascii_lowercase().as_str() {
+            "double" => {
+                self.eat_kw("precision");
+            }
+            "character" | "bit" => {
+                self.eat_kw("varying");
+            }
+            "timestamp" | "time" => {
+                if self.eat_kw("with") || self.eat_kw("without") {
+                    self.eat_kw("time");
+                    self.eat_kw("zone");
+                }
+            }
+            _ => {}
         }
     }
 

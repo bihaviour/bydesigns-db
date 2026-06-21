@@ -245,3 +245,52 @@ fn parse_errors_are_sql_status() {
     assert_eq!(err.status, EngineStatus::ErrSql);
     let _ = fs::remove_file(&p);
 }
+
+#[test]
+fn type_casts_coerce_values() {
+    let p = db_path("cast");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+
+    // text -> int, real -> int (rounds), int -> text
+    let rs = db
+        .query("SELECT '42'::int AS a, 1.7::integer AS b, 5::text AS c")
+        .unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("42"));
+    assert_eq!(cell(&rs, 0, 1).as_deref(), Some("2"));
+    assert_eq!(cell(&rs, 0, 2).as_deref(), Some("5"));
+
+    // multi-word / parameterized / schema-qualified / array type spellings parse
+    let rs = db
+        .query("SELECT 3::double precision AS a, '7'::varchar(10) AS b, 9::pg_catalog.int8 AS c")
+        .unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("3.0")); // real renders with a fraction
+
+    assert_eq!(cell(&rs, 0, 1).as_deref(), Some("7"));
+    assert_eq!(cell(&rs, 0, 2).as_deref(), Some("9"));
+
+    // cast binds tighter than unary minus: -1::int == -(1::int)
+    let rs = db.query("SELECT -1::int AS a").unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("-1"));
+
+    // NULL casts to NULL; bad numeric text is a SQL error
+    let rs = db.query("SELECT NULL::int AS a").unwrap();
+    assert_eq!(cell(&rs, 0, 0), None);
+    let err = db.query("SELECT 'nope'::int").unwrap_err();
+    assert_eq!(err.status, EngineStatus::ErrSql);
+
+    // cast applies in a WHERE filter against stored rows
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1, '10'), (2, '20')")
+        .unwrap();
+    let rs = db.query("SELECT id FROM t WHERE tag::int > 15").unwrap();
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("2"));
+
+    // aggregate with a trailing cast: `count(*)::int` (Bun.sql / PostgREST)
+    let rs = db.query("SELECT count(*)::int AS n FROM t").unwrap();
+    assert_eq!(rs.columns[0], "n");
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("2"));
+
+    let _ = fs::remove_file(&p);
+}
