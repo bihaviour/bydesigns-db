@@ -139,7 +139,25 @@
   <section>
     <div class="callout note">
       <p class="callout-title">How releases are versioned</p>
-      <p>Releases are versioned from the Cargo workspace version (<code>Cargo.toml</code> → <code>[workspace.package] version</code>). CI tags a release automatically on <code>main</code> once code quality, security, complexity, and unit tests are all green; the <code>/release</code> skill is the manual equivalent. Each release publishes the prebuilt <code>libengine</code> and the matching <code>engine.h</code>.</p>
+      <p>Releases are versioned from the Cargo workspace version (<code>Cargo.toml</code> → <code>[workspace.package] version</code>). CI tags a release automatically on <code>main</code> once code quality, security, complexity, and unit tests are all green; the <code>/release</code> skill is the manual equivalent. Everything ships at one version, in lockstep.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Distribution</span>
+      <h2>How each release ships</h2>
+      <p>One tag, three channels — matched to how you embed the engine. All travel at the same version, so the wrapper and the native binary it loads are always an ABI-matched pair.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Channel</th><th>What ships</th><th>For</th></tr></thead>
+        <tbody>
+          <tr><td><strong>npm</strong></td><td><code>@twilldb/bun</code> + per-platform binary packages (<code>@twilldb/engine-&lt;os&gt;-&lt;cpu&gt;</code>) as optional dependencies</td><td>TypeScript / Bun apps — <code>bun add @twilldb/bun</code>, no build step</td></tr>
+          <tr><td><strong>GitHub Releases</strong></td><td>Prebuilt <code>libengine.{so,dylib,dll}</code> for each platform + the matching <code>engine.h</code></td><td>Native / C-ABI embedders and the delivery backend the npm + container channels consume</td></tr>
+          <tr><td><strong>GHCR</strong></td><td><code>ghcr.io/bihaviour/twill-db</code> — the <code>engine-server</code> (pgwire) container image, tagged per version and <code>latest</code></td><td>Self-host / managed-service deployments behind a Postgres-wire listener</td></tr>
+        </tbody>
+      </table>
     </div>
   </section>
 

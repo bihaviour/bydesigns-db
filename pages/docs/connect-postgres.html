@@ -34,6 +34,14 @@ cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db
 # Disaggregated backend (object storage; credentials from the environment)
 cargo run -p twill-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/app</code></pre>
 <p>With no flags it defaults to <code>--listen 127.0.0.1:5433</code> and <code>--db file://./engine-server.db</code>. The short forms <code>-l</code> and <code>-d</code> are accepted.</p>
+<h3>Run as a container</h3>
+<p>For deployment, pull the prebuilt image instead of building from source. It runs <code>engine-server</code> bound to <code>0.0.0.0:5433</code> with a durable data volume at <code>/data</code>; append flags to override either default.</p>
+<pre data-lang="bash"><code># Embedded backend, persisted to a named volume
+docker run -p 5433:5433 -v twilldata:/data ghcr.io/bihaviour/twill-db:latest
+
+# Disaggregated backend (bucket credentials from the environment)
+docker run -p 5433:5433 -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  ghcr.io/bihaviour/twill-db:latest --db s3://my-bucket/app</code></pre>
 <div class="callout tip">
 <p class="callout-title">Same engine, just behind a listener</p>
 <p>The SQL parser, MVCC, WAL, local cache, and <code>Storage</code> trait are byte-for-byte the embedded build. The only thing server mode adds is a protocol listener that turns wire messages into the same engine calls <code>bun:ffi</code> makes in-process. Develop embedded and deploy as a server (or the reverse) without changing your SQL or your data.</p>

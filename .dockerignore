@@ -1,0 +1,12 @@
+# Keep the Docker build context lean — everything here is rebuilt or irrelevant.
+target/
+**/node_modules/
+**/dist/
+.git/
+.github/
+pages/
+clients/
+*.db
+.env
+.env.*
+.DS_Store

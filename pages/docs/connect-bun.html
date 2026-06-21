@@ -26,12 +26,22 @@
 </header>
 
 <section>
-<h2>Load the library</h2>
-<p>The wrapper auto-discovers the built native library from <code>target/release</code> then <code>target/debug</code>. Build it once before running anything that imports <code>@twilldb/bun</code>; the loader binds whatever it finds, so a stale binary runs silently if you forget to rebuild after an engine change.</p>
+<h2>Install</h2>
+<p>For an application, install the wrapper from npm. The native engine ships as a set of <strong>per-platform binary packages</strong> (<code>@twilldb/engine-linux-x64</code>, <code>@twilldb/engine-darwin-arm64</code>, …) declared as optional dependencies; your package manager downloads only the one matching your OS and CPU. There is no build step, no postinstall, and no network access at runtime — the prebuilt <code>libengine</code> is already on disk.</p>
+<pre data-lang="bash"><code>bun add @twilldb/bun</code></pre>
+<p>The wrapper and its binary packages are versioned together as an ABI pair, so they always resolve to a matching engine.</p>
+<h3>Load order</h3>
+<p>At load time the wrapper resolves the native library in this order:</p>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> <code>TWILLDB_ENGINE_PATH</code> — an absolute library path, if set, overrides everything (handy for a custom build or a CI path).</li>
+<li><span class="req-tag should">SHOULD</span> the installed per-platform package for your host (the npm path above).</li>
+<li><span class="req-tag may">MAY</span> a locally built <code>libengine</code> under <code>target/release</code> then <code>target/debug</code> (the source-checkout path below).</li>
+</ul>
+<pre data-lang="bash"><code>TWILLDB_ENGINE_PATH=/abs/path/libengine.so bun test</code></pre>
+<h3>From a source checkout</h3>
+<p>When working in the repo (no published package installed), build the engine once; the loader then picks it up from the cargo target dir. The loader binds whatever it finds, so a stale binary runs silently if you forget to rebuild after an engine change.</p>
 <pre data-lang="bash"><code>cargo build -p twill-engine --release   # → target/release/libengine.{a,so,dylib}
 cd clients/bun &amp;&amp; bun install</code></pre>
-<p>To point at a specific build (a non-standard target dir, a packaged artifact, or a CI path), set <code>TWILLDB_ENGINE_PATH</code> to the absolute library path; it overrides auto-discovery.</p>
-<pre data-lang="bash"><code>TWILLDB_ENGINE_PATH=/abs/path/libengine.so bun test</code></pre>
 <div class="callout note">
 <p class="callout-title">Rebuild after engine or ABI changes</p>
 <p>The wrapper pins an expected ABI version. After any change that touches the C ABI or engine behaviour, rebuild the release <code>libengine</code> before running Bun — otherwise you are testing a stale binary against the new wrapper.</p>
