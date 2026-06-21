@@ -177,6 +177,182 @@
     pre.appendChild(btn);
   });
 
+  // ---- "Copy as Markdown" — export the page for pasting into an AI agent ----
+  // Docs pages get a header button that serialises the article body to clean
+  // Markdown (headings, prose, code fences, lists, tables, callouts) so it can be
+  // dropped straight into an LLM chat. Pairs with /llms.txt for crawl-time access.
+  if (SECTION_KEY === "docs" && article) buildMarkdownCopy(article);
+
+  function buildMarkdownCopy(art) {
+    var header = art.querySelector(".page-header");
+    var meta = header && header.querySelector(".spec-meta");
+    var host = meta || header;
+    if (!host) return;
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "md-copy-btn";
+    btn.title = "Copy this page as Markdown to paste into an AI agent";
+    btn.setAttribute("aria-label", "Copy this page as Markdown");
+    btn.innerHTML = '<span class="md-copy-ico" aria-hidden="true">⧉</span>'
+      + '<span class="md-copy-label">Copy as Markdown</span>';
+    if (meta && !meta.querySelector(".spec-date")) btn.style.marginLeft = "auto";
+    host.appendChild(btn);
+
+    var label = btn.querySelector(".md-copy-label");
+    btn.addEventListener("click", function () {
+      var md = pageToMarkdown(art);
+      var done = function () {
+        btn.classList.add("copied");
+        if (label) label.textContent = "Copied";
+        setTimeout(function () {
+          btn.classList.remove("copied");
+          if (label) label.textContent = "Copy as Markdown";
+        }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(md).then(done, fallback);
+      } else { fallback(); }
+      function fallback() {
+        var ta = document.createElement("textarea"); ta.value = md;
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); done(); } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    });
+  }
+
+  // ---- HTML → Markdown (powers the "Copy as Markdown" button) ----------------
+  var MD_SKIP = ["page-nav", "doc-footer", "toc", "heading-anchor", "spec-meta", "md-copy-btn", "copy-btn", "nav-toggle"];
+  function mdSkip(el) {
+    if (el.classList) for (var i = 0; i < MD_SKIP.length; i++) { if (el.classList.contains(MD_SKIP[i])) return true; }
+    var tag = el.tagName ? el.tagName.toLowerCase() : "";
+    return tag === "script" || tag === "style" || tag === "button";
+  }
+
+  function mdInline(node) {
+    var out = "";
+    Array.prototype.forEach.call(node.childNodes, function (n) {
+      if (n.nodeType === 3) { out += n.nodeValue.replace(/\s+/g, " "); return; }
+      if (n.nodeType !== 1 || mdSkip(n)) return;
+      var tag = n.tagName.toLowerCase();
+      if (tag === "code") out += "`" + n.textContent + "`";
+      else if (tag === "strong" || tag === "b") out += "**" + mdInline(n).trim() + "**";
+      else if (tag === "em" || tag === "i") out += "*" + mdInline(n).trim() + "*";
+      else if (tag === "br") out += "  \n";
+      else if (tag === "a") {
+        var txt = mdInline(n).trim(), href = n.getAttribute("href") || "";
+        out += href ? "[" + txt + "](" + href + ")" : txt;
+      } else out += mdInline(n);
+    });
+    return out;
+  }
+
+  function mdHeadingText(h) {
+    var c = h.cloneNode(true), a = c.querySelector(".heading-anchor");
+    if (a) a.remove();
+    return c.textContent.trim();
+  }
+
+  function mdList(list, ordered, indent) {
+    var md = "", i = 1;
+    Array.prototype.forEach.call(list.children, function (li) {
+      if (li.tagName.toLowerCase() !== "li") return;
+      var marker = ordered ? (i++) + ". " : "- ";
+      var clone = li.cloneNode(true);
+      Array.prototype.forEach.call(clone.querySelectorAll("ul,ol"), function (x) { x.remove(); });
+      md += indent + marker + mdInline(clone).trim().replace(/\s*\n\s*/g, " ") + "\n";
+      Array.prototype.forEach.call(li.children, function (c) {
+        var t = c.tagName.toLowerCase();
+        if (t === "ul" || t === "ol") md += mdList(c, t === "ol", indent + "  ");
+      });
+    });
+    return md + "\n";
+  }
+
+  function mdPre(pre) {
+    var code = pre.querySelector("code") || pre;
+    var lang = pre.getAttribute("data-lang") || "";
+    return "```" + lang + "\n" + code.innerText.replace(/\s+$/, "") + "\n```\n\n";
+  }
+
+  // Escape a table cell for Markdown: backslash first (so we don't double-process
+  // our own escapes), then the cell delimiter, then flatten any line breaks.
+  function mdCell(el) {
+    return mdInline(el).trim().replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n+/g, " ");
+  }
+
+  function mdTable(t) {
+    var head = [], rows = [];
+    var headRow = t.querySelector("thead tr");
+    if (headRow) Array.prototype.forEach.call(headRow.children, function (c) { head.push(mdCell(c)); });
+    var bodyRows = t.querySelectorAll("tbody tr");
+    if (!bodyRows.length) bodyRows = t.querySelectorAll("tr");
+    Array.prototype.forEach.call(bodyRows, function (tr) {
+      if (tr.parentNode.tagName.toLowerCase() === "thead") return;
+      var cells = [];
+      Array.prototype.forEach.call(tr.children, function (c) { cells.push(mdCell(c)); });
+      if (cells.length) rows.push(cells);
+    });
+    if (!head.length && rows.length) head = rows.shift();
+    if (!head.length) return "";
+    var md = "| " + head.join(" | ") + " |\n| " + head.map(function () { return "---"; }).join(" | ") + " |\n";
+    rows.forEach(function (r) { md += "| " + r.join(" | ") + " |\n"; });
+    return md + "\n";
+  }
+
+  function mdXrefGrid(div) {
+    var md = "";
+    Array.prototype.forEach.call(div.querySelectorAll("a"), function (a) {
+      var title = a.querySelector(".xref-title"), desc = a.querySelector(".xref-desc");
+      var href = a.getAttribute("href") || "";
+      var t = title ? title.textContent.trim() : mdInline(a).trim();
+      md += "- [" + t + "](" + href + ")" + (desc ? " — " + desc.textContent.trim() : "") + "\n";
+    });
+    return md + "\n";
+  }
+
+  function mdCallout(div) {
+    var md = "";
+    Array.prototype.forEach.call(div.children, function (c) {
+      if (c.classList && c.classList.contains("callout-title")) md += "**" + c.textContent.trim() + "**\n";
+      else md += mdInline(c).trim() + "\n";
+    });
+    return "> " + md.trim().replace(/\n/g, "\n> ") + "\n\n";
+  }
+
+  function mdChildren(el) {
+    var md = "";
+    Array.prototype.forEach.call(el.childNodes, function (n) { if (n.nodeType === 1) md += mdBlock(n); });
+    return md;
+  }
+
+  function mdBlock(n) {
+    if (mdSkip(n)) return "";
+    switch (n.tagName.toLowerCase()) {
+      case "h1": return "# " + mdHeadingText(n) + "\n\n";
+      case "h2": return "## " + mdHeadingText(n) + "\n\n";
+      case "h3": return "### " + mdHeadingText(n) + "\n\n";
+      case "h4": return "#### " + mdHeadingText(n) + "\n\n";
+      case "h5": case "h6": return "##### " + mdHeadingText(n) + "\n\n";
+      case "p": var p = mdInline(n).trim(); return p ? p + "\n\n" : "";
+      case "pre": return mdPre(n);
+      case "ul": return mdList(n, false, "");
+      case "ol": return mdList(n, true, "");
+      case "blockquote": return "> " + mdInline(n).trim().replace(/\n/g, "\n> ") + "\n\n";
+      case "table": return mdTable(n);
+      case "hr": return "---\n\n";
+      default:
+        if (n.classList && n.classList.contains("callout")) return mdCallout(n);
+        if (n.classList && n.classList.contains("xref-grid")) return mdXrefGrid(n);
+        return mdChildren(n);
+    }
+  }
+
+  function pageToMarkdown(art) {
+    var md = mdChildren(art).replace(/\n{3,}/g, "\n\n").trim();
+    return md + "\n\n---\n\nSource: " + location.href.split("#")[0] + "\n";
+  }
+
   // ---- Mobile (left section) nav toggle ----
   var navToggle = document.querySelector(".nav-toggle");
   if (navToggle && sidebar) {
