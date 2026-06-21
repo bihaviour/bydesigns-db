@@ -11,7 +11,10 @@
 use crate::error::{EngineError, EngineStatus, Result};
 use crate::store::Store;
 use crate::wal::WalOp;
-use bydesigns_storage::{block_on, open_storage, FenceToken, Lsn, Storage, WriterId};
+use bydesigns_storage::{
+    block_on, open_branch as storage_open_branch, open_storage, BranchId, FenceToken, Lsn, Storage,
+    WriterId,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
@@ -51,6 +54,10 @@ pub struct Database {
     pub(crate) store: RwLock<Store>,
     pub(crate) lane: WriteLane,
     key: String,
+    /// The URL this database was opened from (the base URL for a branch).
+    url: String,
+    /// `Some(id)` if this handle is a copy-on-write branch view, else the root.
+    branch: Option<BranchId>,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Weak<Database>>> {
@@ -108,6 +115,8 @@ impl Database {
             store: RwLock::new(store),
             lane: WriteLane::new(),
             key: key.clone(),
+            url: url.to_string(),
+            branch: None,
         });
 
         let mut reg = registry().lock().unwrap();
@@ -119,8 +128,57 @@ impl Database {
         Ok(db)
     }
 
+    /// Open (or share) a copy-on-write branch of the database at `url`. The
+    /// branch must already exist (created via `storage.create_branch`); its
+    /// diverged state lives in a private overlay (see `bydesigns_storage::
+    /// open_branch`), so a branch writer never touches the base or siblings.
+    pub fn open_branch(url: &str, branch: BranchId) -> Result<Arc<Database>> {
+        let key = format!("{}#branch={}", registry_key(url), branch.0);
+        {
+            let reg = registry().lock().unwrap();
+            if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
+                return Ok(existing);
+            }
+        }
+
+        let storage = storage_open_branch(url, branch)?;
+        let token = block_on(storage.acquire_fence(next_writer_id()))?;
+
+        let mut store = Store::default();
+        replay(storage.as_ref(), &mut store)?;
+        let committed = block_on(storage.get_commit_lsn())?;
+        store.committed_lsn = store.committed_lsn.max(committed.0);
+
+        let db = Arc::new(Database {
+            storage,
+            token,
+            store: RwLock::new(store),
+            lane: WriteLane::new(),
+            key: key.clone(),
+            url: url.to_string(),
+            branch: Some(branch),
+        });
+
+        let mut reg = registry().lock().unwrap();
+        if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        reg.insert(key, Arc::downgrade(&db));
+        Ok(db)
+    }
+
     pub fn committed_lsn(&self) -> u64 {
         self.store.read().unwrap().committed_lsn
+    }
+
+    /// The URL this database (or its base, for a branch) was opened from.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Whether this handle is a branch view (branch-of-branch is rejected).
+    pub fn is_branch(&self) -> bool {
+        self.branch.is_some()
     }
 }
 

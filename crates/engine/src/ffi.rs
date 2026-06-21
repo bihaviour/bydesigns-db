@@ -334,17 +334,31 @@ pub extern "C" fn engine_rollback(h: *mut Connection) -> c_int {
 
 // ---- branching (Phase 4) --------------------------------------------------
 
-/// Reserved in the frozen ABI; copy-on-write branching lands in Phase 4. Sets
-/// the handle's last error and returns NULL.
+/// Create a copy-on-write branch off the database `h` is connected to (at its
+/// current committed LSN) and return a **new** connection handle bound to that
+/// branch. The branch shares the base's immutable history but writes in
+/// isolation — neither the base nor any sibling sees a branch's writes. The
+/// returned handle is owned by the caller and freed with `engine_close`.
+///
+/// Returns NULL on failure (e.g. inside an active transaction, branch-of-branch,
+/// or invalid name); the reason is retrievable via `engine_last_error(h)`.
 #[no_mangle]
-pub extern "C" fn engine_branch(h: *mut Connection, _name: *const c_char) -> *mut Connection {
+pub extern "C" fn engine_branch(h: *mut Connection, name: *const c_char) -> *mut Connection {
     catch_unwind(AssertUnwindSafe(|| {
-        if let Some(c) = unsafe { h.as_mut() } {
-            c.set_last_error(
-                "branching (engine_branch) is a Phase 4 feature; not available in Phase 1",
-            );
+        let Some(c) = (unsafe { h.as_mut() }) else {
+            return std::ptr::null_mut();
+        };
+        let Some(name) = (unsafe { as_str(name) }) else {
+            c.set_last_error("invalid UTF-8 in branch name");
+            return std::ptr::null_mut();
+        };
+        match c.branch(name) {
+            Ok(child) => Box::into_raw(Box::new(child)),
+            Err(e) => {
+                c.set_last_error(&e.message);
+                std::ptr::null_mut()
+            }
         }
-        std::ptr::null_mut()
     }))
     .unwrap_or(std::ptr::null_mut())
 }

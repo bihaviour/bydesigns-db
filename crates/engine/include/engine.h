@@ -18,7 +18,7 @@ extern "C" {
 
 #include <stdint.h>
 
-#define ENGINE_ABI_VERSION 1
+#define ENGINE_ABI_VERSION 2
 
 typedef struct EngineHandle EngineHandle; /* a connection */
 typedef struct EngineResult EngineResult; /* a buffered query result */
@@ -66,9 +66,14 @@ EngineStatus  engine_begin(EngineHandle* h);
 EngineStatus  engine_commit(EngineHandle* h);   /* blocks until WAL durable */
 EngineStatus  engine_rollback(EngineHandle* h);
 
-/* ---- branching (reserved; Phase 4) --------------------------------- */
-/* Copy-on-write branch at the current LSN. Phase 1 returns NULL and sets the
-   handle's last error; the symbol is frozen here for forward compatibility. */
+/* ---- branching (Phase 4) ------------------------------------------- */
+/* Create a copy-on-write branch off the database `h` is connected to, at its
+   current committed LSN, and return a NEW connection handle bound to that
+   branch. The branch shares the base's immutable history but writes in
+   isolation: neither the base nor any sibling sees a branch's writes. The
+   returned handle is owned by the caller and freed with engine_close().
+   Returns NULL on failure (e.g. inside an active transaction or branch-of-
+   branch); the reason is available via engine_last_error(h). */
 EngineHandle* engine_branch(EngineHandle* h, const char* name);
 
 /* ---- result / row access (borrowed pointers into the result) -------- */

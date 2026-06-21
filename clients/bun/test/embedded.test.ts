@@ -147,9 +147,19 @@ test("typed errors carry status and retryable flag", () => {
   expect(() => db.query("SELEKT 1")).toThrow(EngineError);
 });
 
-test("branch is reserved for Phase 4", () => {
+test("branch is copy-on-write isolated from the base", () => {
   using db = open(url);
-  expect(() => db.branch("preview")).toThrow(/Phase 4/);
+  db.exec("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)");
+  db.exec("INSERT INTO k VALUES (1, 'base')");
+
+  // Fork a branch: it inherits the base row, then diverges on its own.
+  using br = db.branch("preview");
+  expect(br.query("SELECT v FROM k ORDER BY id").length).toBe(1);
+  br.exec("INSERT INTO k VALUES (2, 'branch-only')");
+  expect(br.query("SELECT v FROM k ORDER BY id").length).toBe(2);
+
+  // The base never sees the branch's write.
+  expect(db.query("SELECT v FROM k ORDER BY id").length).toBe(1);
 });
 
 test("use-after-close is misuse, not a crash", () => {
