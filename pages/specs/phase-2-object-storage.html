@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 2 — Object-Storage Backend · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">P2 · MAP</span>
+<span class="badge badge-status status-approved">Implemented</span>
+<span class="spec-date">Phase 2</span>
+</div>
+<h1>Phase 2 — Object-Storage Backend</h1>
+<p class="lede">The implementation map for <code>ObjectStorage</code>: an LSM page store plus a CAS commit log over a pluggable object-client seam, dropped in behind the unchanged trait so the same <code>libengine</code> runs disaggregated by flipping the connection string.</p>
+</header>
+
+<section>
+<h2>Overview</h2>
+<p>This document maps the implemented code to the Phase 2 deliverables, exit criteria, and Definition of Done in <a href="13-roadmap.html">the roadmap</a> and the <a href="04-object-storage-backend.html">object-storage backend spec</a>, and records the deliberate scope decisions.</p>
+<p>The headline Phase-2 claim — <strong>flip the connection string, not the binary</strong> — is real: the engine and the C ABI are byte-for-byte unchanged. <code>open_storage</code> dispatches <code>s3://</code>/<code>r2://</code>/<code>gs://</code> to the new <code>ObjectStorage</code> backend, and the same compiled <code>libengine</code> runs disaggregated. (<code>crates/engine/tests/ffi.rs::s3_scheme_opens_the_object_backend</code> proves it end-to-end through the frozen ABI.)</p>
+</section>
+
+<section>
+<h2>What shipped</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Deliverable (spec 13 §Phase 2 / spec 04)</th><th>Where</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ObjectStorage</code> — second concrete <code>Storage</code> impl, disaggregated &amp; scale-to-zero</td><td><code>crates/storage/src/object/mod.rs</code></td></tr>
+<tr><td><strong>Commit log</strong> — ordered append on object-store CAS (put-if-absent), durable = commit, doubles as the fence</td><td><code>object/mod.rs</code> (<code>append_segment</code>, <code>acquire_fence</code>)</td></tr>
+<tr><td><strong>Page store</strong> — LSM: in-memory memtable → immutable <code>delta/</code> layers → <code>image/</code> layers, with compaction + GC past the PITR window</td><td><code>object/mod.rs</code> (<code>flush_locked</code>, <code>compact</code>, <code>gc</code>, <code>get_page</code>)</td></tr>
+<tr><td>Thin <strong>object-client seam</strong> so AWS S3 / R2 / MinIO swap by config, not rebuild</td><td><code>object/store.rs</code> (<code>trait ObjectStore</code>)</td></tr>
+<tr><td><code>MemObjectStore</code> (fast CAS/fencing tests) + <code>FsObjectStore</code> (durable, crash-safe, the MinIO/self-hosted floor)</td><td><code>object/mem.rs</code>, <code>object/fs.rs</code></td></tr>
+<tr><td>Local cache that keeps object-store latency off the read hot path</td><td><code>object/mod.rs</code> (<code>cache</code>, <code>load_layer</code> — immutable layer objects are cache-safe)</td></tr>
+<tr><td>Hand-rolled durable-object codecs (segment / delta / image), CRC-checked</td><td><code>object/codec.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The <code>Storage</code> trait signature is <strong>unchanged</strong>, so <code>STORAGE_TRAIT_VERSION</code> stays <code>1</code> — Phase 2 is purely additive (a new backend behind the existing seam), which is exactly the property the roadmap requires.</p>
+</section>
+
+<section>
+<h2>How the two sub-systems work</h2>
+<div class="diagram">
+<pre>
+            engine core (unchanged)
+                  │ Storage trait
+                  ▼
+            local cache (parsed immutable layers)
+            miss │            │ commit
+        ┌────────┴───┐   ┌────┴──────────┐
+        │ PAGE STORE │   │  COMMIT LOG   │
+        │  LSM/memtbl│   │ CAS append    │
+        │  delta/img │   │ put-if-absent │
+        └─────┬──────┘   └──────┬────────┘
+              ▼                  ▼
+        ObjectStore (Mem | Fs | …future S3/R2 client…)
+</pre>
+</div>
+<ul>
+<li><strong>Write path.</strong> <code>append_wal</code> / <code>put_page</code> serialize their items into one log segment and claim the next slot <code>log/&lt;seq&gt;</code> with <strong>put-if-absent</strong>. The CAS success is the commit point — the ack happens only after the object store confirms the object durable. Each log item consumes one LSN, keeping the LSN stream gap-free across both write paths (same model as <code>LocalFileStorage</code>'s frames, now on object slots). Page items are also applied into the memtable.</li>
+<li><strong>Read path.</strong> <code>get_page(id, lsn)</code> resolves the at-or-before version by scanning memtable → delta layers (newest→oldest, pruned by the LSN span in the object name) → the image floor. Parsed layers are cached (immutable ⇒ safe).</li>
+<li><strong>Flush / compaction / GC.</strong> A full memtable (or <code>flush()</code>) serializes to an immutable <code>delta/L&lt;lo&gt;-L&lt;hi&gt;.delta</code>. <code>compact()</code> folds every layer at-or-below the PITR floor into a fresh <code>image/img-L&lt;floor&gt;.image</code>, retaining layers above the floor so any snapshot inside the window stays reconstructable. <code>gc()</code> physically deletes the now-unreferenced objects.</li>
+<li><strong>Fencing.</strong> <code>acquire_fence</code> advances the durable writer epoch in <code>lease</code> via conditional write (put-if-match / put-if-absent); a write under a stale epoch is rejected <code>Fenced</code>, and a lost log-slot CAS re-validates the lease before retrying. Single-writer-per-DB with no consensus cluster — the bucket is the consensus surface.</li>
+</ul>
+</section>
+
+<section>
+<h2>Exit criteria → evidence</h2>
+<ul>
+<li><strong>Same binary opens an <code>s3://</code> DB with no recompile; correctness suite green on object storage.</strong> C1–C8 run against <code>ObjectStorage</code> over both stores (<code>crates/storage/tests/object_storage.rs::object_storage_passes_conformance_on_{fs,mem}</code>), and the engine opens <code>s3://</code> end-to-end through the unchanged C ABI (<code>crates/engine/tests/ffi.rs::s3_scheme_opens_the_object_backend</code>).</li>
+<li><strong>§8 Experiment 4 (crash safety), unconditional.</strong> <code>exp4a_durable_after_cas_before_ack</code> (a segment is durable the instant its conditional PUT returns; a crash before the ack still recovers it) and <code>exp4b_page_reconstructed_after_crash_before_flush</code> (a commit durable in the log but not yet flushed to a delta is rebuilt by replaying the log forward). The <code>FsObjectStore</code> makes every object all-or-nothing (temp write → fsync → atomic rename → fsync dir), so no torn object ever becomes visible.</li>
+<li><strong>Two concurrent writers resolve to exactly one survivor via CAS fencing, no split-brain.</strong> <code>two_writers_resolve_to_one_survivor_via_cas</code> (the loser is <code>Fenced</code>; exactly one log slot exists).</li>
+<li><strong><code>get_page</code> returns the correct at-or-before version across memtable, delta, and image layers.</strong> <code>resolves_versions_across_memtable_delta_and_image</code>.</li>
+<li><strong>Flush → compaction → GC reduces live layer count; GC never deletes a layer inside the PITR window.</strong> <code>flush_compaction_gc_reduces_live_layers_and_respects_pitr</code> (3 deltas → 1 image; folded deltas reclaimed; covering image retained; reads below the floor are snapshot-too-old).</li>
+<li><strong>Durability invariant (non-negotiable).</strong> A commit is acked only after the conditional PUT returns <code>Ok</code>; the <code>ObjectStore</code> contract guarantees a returned <code>Ok</code> is durable. Caching hides read latency only, never commit latency.</li>
+</ul>
+</section>
+
+<section>
+<h2>Architecture decisions (and why)</h2>
+<ul>
+<li><strong>A thin <code>ObjectStore</code> trait is the swappable durability floor</strong> (spec 04 "MAY abstract the store behind a thin object-client trait"). <code>ObjectStorage</code> is written entirely against the five primitives the design needs — GET, PUT, the two conditional writes (the CAS unlock), DELETE, LIST — so an AWS-SDK or R2 client drops in later with no change below the seam. <code>MemObjectStore</code> and <code>FsObjectStore</code> are two impls of it; the cloud tiers are a third.</li>
+<li><strong>The commit log is the only durability record; the LSM is a derived cache.</strong> Memtable/delta/image can be lost and fully rebuilt by replaying the durable log forward. This is what makes Experiment 4(b) pass and keeps recovery simple.</li>
+<li><strong>CAS does double duty</strong> (spec 04 §"What CAS buys us"): the put-if-absent that orders a log slot is the same primitive that fences a stale writer. No Raft/Paxos/ZooKeeper.</li>
+<li><strong>PITR-aware compaction.</strong> An image layer is a read <em>floor</em> at its <code>image_lsn</code>, so compacting everything to the high-water LSN would make in-window snapshots unreadable. Compaction targets <code>image_lsn = retention_floor</code> and keeps layers above it — the standard object-storage-LSM (Neon/SlateDB-style) discipline.</li>
+</ul>
+</section>
+
+<section>
+<h2>Deliberate Phase-2 boundaries (documented, not accidental)</h2>
+<ul>
+<li><strong>The object root for <code>s3://</code> URLs is a durable <code>FsObjectStore</code></strong> under <code>$BYDESIGNS_OBJECT_ROOT</code> (default: a temp dir), the MinIO/self-hosted tier — so the whole stack is testable and demonstrable offline with no cloud credentials or network. A real AWS-S3 / Cloudflare-R2 client is a future <code>ObjectStore</code> impl behind the same trait; nothing above it changes. No secrets ever live in the repo (<code>file://</code>-only in tests, per the security rule).</li>
+<li><strong><code>ObjectStore</code> futures are driven synchronously under the backend lock</strong> (via the crate <code>block_on</code>), mirroring the synchronous C-ABI commit path. The <em>signatures</em> are async, so a fully pipelined async path and group commit (spec 04 §Configuration <code>group_commit_window</code>) drop in without moving the seam; they are a throughput optimization (Experiment 2), not a Phase-2 gate for correctness.</li>
+<li><strong>Live layer membership is tracked in memory and rediscovered by <code>list</code> on open.</strong> Valid because the design is single-writer-per-DB and every object is immutably named; a single mutable <code>manifest</code> pointer is an optimization to cut LIST cost at scale, not a correctness requirement.</li>
+<li><strong>Branch creation only (copy-on-write branch <em>writes</em> are Phase 4).</strong> Same boundary as Phase 1: branch pointers persist as <code>branches/&lt;id&gt;</code> objects and resolve correctly; per-branch write isolation arrives with the controller.</li>
+<li><strong>Log segments are retained (not GC'd) in Phase 2</strong>, matching <code>LocalFileStorage</code> (which never truncates its file): the engine replays the WAL from the origin on open. Trimming the log below the PITR floor is a later refinement; delta/image GC is implemented and tested.</li>
+</ul>
+</section>
+
+<section>
+<h2>Running</h2>
+<pre data-lang="bash"><code>cargo test                                   # adds tests/object_storage.rs (C1–C8 on both stores + Exp 4 + LSM)
+cargo clippy --all-targets -- -D warnings    # clean
+cargo build -p bydesigns-engine --release    # same libengine; s3:// is a runtime flip
+cd clients/bun &amp;&amp; bun test                    # unchanged C ABI still green</code></pre>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">The LSM page store on S3/R2, delta/image layers, and the S3-CAS commit log this map implements.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam the new <code>ObjectStorage</code> impl satisfies without changing the signatures the engine calls.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">The page cache that keeps object-store latency off the read hot path — now load-bearing.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The phased plan whose Phase 2 deliverables and durability gate this map implements.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db — internal development specification. Implementation map.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

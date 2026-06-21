@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL reference · bydesigns-db docs</title>
+<meta name="description" content="The exact SQL surface bydesigns-db supports: DDL, DML, queries, transactions, types, parameters, and what is out of scope in Phase 1.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">SQL</span>
+<span class="badge badge-status status-review">Reference</span>
+<span class="spec-date">Reference</span>
+</div>
+<h1>SQL reference</h1>
+<p class="lede">bydesigns-db speaks a deliberately small, hand-parsed SQL subset: DDL, row DML, single-table queries with aggregates, and transaction control. Everything on this page is what the parser actually accepts — anything outside it is rejected with <code>ENGINE_ERR_SQL</code> rather than silently mis-parsed.</p>
+</header>
+
+<section>
+<h2>Statements at a glance</h2>
+<p>Every supported statement, with its transactional behaviour. Keywords are case-insensitive; a single statement per call, with an optional trailing semicolon.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Statement</th><th>Purpose</th><th>In a transaction?</th></tr></thead>
+<tbody>
+<tr><td><code>CREATE TABLE</code></td><td>Define a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
+<tr><td><code>DROP TABLE</code></td><td>Remove a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
+<tr><td><code>CREATE INDEX … USING hnsw</code></td><td>Build a vector index (Phase 5)</td><td>Autocommit only — see <a href="#vector-search">Vector search</a></td></tr>
+<tr><td><code>DROP INDEX</code></td><td>Remove a vector index (Phase 5)</td><td>Autocommit only</td></tr>
+<tr><td><code>INSERT</code></td><td>Add rows</td><td>Fully transactional</td></tr>
+<tr><td><code>UPDATE</code></td><td>Modify rows</td><td>Fully transactional</td></tr>
+<tr><td><code>DELETE</code></td><td>Remove rows</td><td>Fully transactional</td></tr>
+<tr><td><code>SELECT</code></td><td>Read rows</td><td>Reads a snapshot; never blocks writers</td></tr>
+<tr><td><code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code></td><td>Transaction control</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout note">
+<p class="callout-title">DDL is autocommit-only by design</p>
+<p>Schema changes (<code>CREATE TABLE</code>, <code>DROP TABLE</code>) run only in autocommit. Issuing one inside an explicit transaction returns <code>ENGINE_ERR_TXN</code>. Row DML — <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code> — is fully transactional and commits durably.</p>
+</div>
+</section>
+
+<section>
+<h2>Data definition (DDL)</h2>
+<h3>CREATE TABLE</h3>
+<p>Define a table with one or more columns. Each column may carry a type name and the constraints <code>PRIMARY KEY</code> and/or <code>NOT NULL</code>. <code>IF NOT EXISTS</code> makes creation idempotent.</p>
+<pre data-lang="sql"><code>CREATE TABLE notes (
+  id    INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  body  TEXT,
+  score REAL,
+  data  BLOB
+);
+
+CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT);</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> declare at least one column; an empty column list is a parse error.</li>
+<li><span class="req-tag may">MAY</span> omit a column's type name — an untyped column defaults to <code>TEXT</code> affinity.</li>
+<li><span class="req-tag may">MAY</span> write a parenthesised size such as <code>VARCHAR(64)</code> or <code>DECIMAL(10,2)</code> — the size is parsed and ignored; only the storage class matters.</li>
+<li><span class="req-tag may">MAY</span> mark a column <code>UNIQUE</code> or explicitly <code>NULL</code> — these are accepted as constraint markers (uniqueness is enforced for the primary key in Phase 1).</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">PRIMARY KEY implies NOT NULL</p>
+<p>Declaring a column <code>PRIMARY KEY</code> also makes it <code>NOT NULL</code>.</p>
+</div>
+
+<h3>DROP TABLE</h3>
+<p>Remove a table. <code>IF EXISTS</code> suppresses the error when the table is absent.</p>
+<pre data-lang="sql"><code>DROP TABLE notes;
+DROP TABLE IF EXISTS notes;</code></pre>
+</section>
+
+<section>
+<h2>Data manipulation (DML)</h2>
+<h3>INSERT</h3>
+<p>Insert one or more rows. The column list is optional; when given, values bind to those columns by position. Multiple parenthesised tuples insert several rows in one statement. <code>OR REPLACE</code> / <code>OR IGNORE</code> are accepted after <code>INSERT</code> and ignored.</p>
+<pre data-lang="sql"><code>INSERT INTO notes (id, title, body) VALUES (1, 'first', 'hello');
+
+INSERT INTO notes (id, title) VALUES (2, 'two'), (3, 'three');
+
+INSERT INTO notes VALUES (4, 'four', NULL, 9.5, NULL);
+
+-- with parameters
+INSERT INTO notes (id, title) VALUES (?, ?);</code></pre>
+
+<h3>UPDATE</h3>
+<p>Assign one or more columns, optionally filtered by a <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is updated. The number of rows changed is reported by <code>engine_changes()</code>.</p>
+<pre data-lang="sql"><code>UPDATE notes SET title = 'renamed', score = score + 1 WHERE id = 1;
+UPDATE notes SET body = NULL;</code></pre>
+
+<h3>DELETE</h3>
+<p>Remove rows matching an optional <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is deleted.</p>
+<pre data-lang="sql"><code>DELETE FROM notes WHERE score IS NULL;
+DELETE FROM notes;</code></pre>
+</section>
+
+<section>
+<h2>Queries (SELECT)</h2>
+<p>A query reads from a single table (or no table, for bare expressions) under snapshot isolation. The full shape is:</p>
+<pre data-lang="sql"><code>SELECT items
+  FROM table
+ WHERE predicate
+ ORDER BY expr [ASC | DESC], ...
+ LIMIT n</code></pre>
+<p>Clauses are optional and parsed in this order. <code>SELECT ALL</code> is accepted (it is the default); <code>SELECT DISTINCT</code> is rejected.</p>
+
+<h3>Select items</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Item</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>*</code></td><td>All columns of the table, in declared order</td></tr>
+<tr><td><code>expr</code></td><td>Any expression — a column, literal, or computed value</td></tr>
+<tr><td><code>expr AS alias</code></td><td>Name the output column (the <code>AS</code> keyword is optional)</td></tr>
+<tr><td><code>COUNT</code> / <code>SUM</code> / <code>MIN</code> / <code>MAX</code> / <code>AVG</code></td><td>Whole-table aggregate over <code>*</code> or an expression</td></tr>
+</tbody>
+</table>
+</div>
+<pre data-lang="sql"><code>SELECT * FROM notes;
+SELECT id, title AS heading FROM notes WHERE score >= 5 ORDER BY score DESC LIMIT 10;
+SELECT COUNT(*), AVG(score), MAX(score) FROM notes;
+SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
+<div class="callout warning">
+<p class="callout-title">Aggregates are whole-table only</p>
+<p><code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, and <code>AVG</code> compute over the entire (filtered) table. There is no <code>GROUP BY</code> in Phase 1, so you cannot mix a bare aggregate with per-row columns to mean grouped output.</p>
+</div>
+
+<h3>ORDER BY and LIMIT</h3>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> sort by one or more expressions, each independently <code>ASC</code> (default) or <code>DESC</code>.</li>
+<li><span class="req-tag must">MUST</span> give <code>LIMIT</code> an integer literal — a non-integer (including a parameter) is a parse error.</li>
+</ul>
+</section>
+
+<section>
+<h2>Expressions</h2>
+<p>Expressions appear in <code>WHERE</code>, <code>ORDER BY</code>, select items, <code>UPDATE</code> assignments, and <code>INSERT</code> values. The operand forms are:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Form</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td>Integer literal</td><td><code>42</code>, <code>-7</code></td></tr>
+<tr><td>Real literal</td><td><code>3.5</code>, <code>1e3</code>, <code>2.0</code></td></tr>
+<tr><td>String literal</td><td><code>'hello'</code> (use <code>''</code> for a literal quote)</td></tr>
+<tr><td><code>NULL</code></td><td><code>NULL</code></td></tr>
+<tr><td>Boolean keyword</td><td><code>TRUE</code> → <code>1</code>, <code>FALSE</code> → <code>0</code></td></tr>
+<tr><td>Column reference</td><td><code>title</code>, <code>notes.title</code> (table qualifier accepted, only the column part is used)</td></tr>
+<tr><td>Parameter</td><td><code>?</code> (positional, bound 1-based)</td></tr>
+<tr><td>Parenthesised</td><td><code>(score + 1) * 2</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Operators</h3>
+<p>Listed from lowest to highest binding precedence.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Category</th><th>Operators</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Logical OR</td><td><code>OR</code></td><td>Three-valued logic (a NULL operand yields unknown)</td></tr>
+<tr><td>Logical AND</td><td><code>AND</code></td><td></td></tr>
+<tr><td>Logical NOT</td><td><code>NOT</code></td><td>Prefix</td></tr>
+<tr><td>Comparison</td><td><code>=</code>, <code>&lt;&gt;</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td><code>&lt;&gt;</code> and <code>!=</code> are both inequality</td></tr>
+<tr><td>Null test</td><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td></td></tr>
+<tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code></td><td>Pattern match against a string expression</td></tr>
+<tr><td>Vector distance</td><td><code>&lt;-&gt;</code>, <code>&lt;=&gt;</code>, <code>&lt;#&gt;</code></td><td>L2 / cosine / inner-product distance (Phase 5) — see <a href="#vector-search">Vector search</a></td></tr>
+<tr><td>Additive</td><td><code>+</code>, <code>-</code></td><td></td></tr>
+<tr><td>Multiplicative</td><td><code>*</code>, <code>/</code>, <code>%</code></td><td>Multiply, divide, modulo</td></tr>
+<tr><td>Unary</td><td><code>-</code>, <code>+</code></td><td>Negation / identity prefix</td></tr>
+</tbody>
+</table>
+</div>
+<pre data-lang="sql"><code>SELECT * FROM notes
+ WHERE (score &gt; 5 OR title LIKE 'a%')
+   AND body IS NOT NULL
+ ORDER BY score DESC;</code></pre>
+<div class="callout note">
+<p class="callout-title">NULL comparisons are unknown</p>
+<p>Comparing anything to <code>NULL</code> with <code>=</code> / <code>&lt;&gt;</code> yields unknown, not true or false — a row whose predicate is unknown is not returned. Use <code>IS NULL</code> / <code>IS NOT NULL</code> to test for null explicitly.</p>
+</div>
+</section>
+
+<section>
+<h2>Types and storage classes</h2>
+<p>Every value belongs to one of six storage classes. A declared column type maps to a storage class by affinity (the same keyword rules SQLite uses), and values are lightly coerced toward the column's class where lossless.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Storage class</th><th>Holds</th><th>Declared types that map to it</th></tr></thead>
+<tbody>
+<tr><td><code>NULL</code></td><td>The absence of a value</td><td>—</td></tr>
+<tr><td><code>INTEGER</code></td><td>64-bit signed integer</td><td>Any type name containing <code>INT</code></td></tr>
+<tr><td><code>REAL</code></td><td>64-bit floating point</td><td><code>REAL</code>, <code>FLOA…</code>, <code>DOUB…</code>, <code>NUMERIC</code>, <code>DEC…</code></td></tr>
+<tr><td><code>TEXT</code></td><td>UTF-8 string</td><td><code>CHAR…</code>, <code>TEXT</code>, <code>CLOB</code>, <code>STRING</code>; also the default for an unknown or omitted type</td></tr>
+<tr><td><code>BLOB</code></td><td>Raw bytes</td><td><code>BLOB</code>, <code>BYTEA</code></td></tr>
+<tr><td><code>VECTOR</code></td><td>Fixed-length <code>f32</code> array (Phase 5)</td><td><code>VECTOR(N)</code> — dimension <code>N</code> required and validated on insert</td></tr>
+</tbody>
+</table>
+</div>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> rely on light affinity: an <code>INTEGER</code> inserted into a <code>REAL</code> column becomes a real; a whole-number <code>REAL</code> in an <code>INTEGER</code> column becomes an integer.</li>
+<li><span class="req-tag must">MUST</span> read all values back as text across the C ABI — a <code>BLOB</code> renders as standard padded base64, and a SQL <code>NULL</code> comes back as a null pointer.</li>
+</ul>
+</section>
+
+<section id="vector-search">
+<h2>Vector search (Phase 5)</h2>
+<p>Vector search is built into the engine. A <code>VECTOR(N)</code> column stores a fixed-length array of <code>f32</code>, an HNSW index answers top-k nearest-neighbour queries, and three distance operators are available in projections, <code>WHERE</code>, and <code>ORDER BY</code>. Because the index rides the same WAL/replay path as the rows, it branches and scales-to-zero with the database.</p>
+
+<h3>The vector type and literals</h3>
+<p>Declare the dimension at column time; it is validated on insert. Vector literals are written <code>[1, 2, 3]</code> (or the pgvector-style text form <code>'[1,2,3]'</code>).</p>
+<pre data-lang="sql"><code>CREATE TABLE memories (
+  id        INTEGER PRIMARY KEY,
+  note      TEXT,
+  embedding VECTOR(3)
+);
+
+INSERT INTO memories VALUES
+  (1, 'apples',  [1, 0, 0]),
+  (2, 'oranges', [0, 1, 0]);</code></pre>
+
+<h3>HNSW index</h3>
+<p>Create an HNSW access method over a vector column. Like <code>CREATE TABLE</code>, index DDL runs in autocommit only. <code>WITH</code> options tune the graph and the search.</p>
+<pre data-lang="sql"><code>CREATE INDEX mem_e ON memories USING hnsw (embedding)
+  WITH (metric = 'cosine');           -- 'cosine' | 'l2' | 'inner_product'
+  -- also: m, ef_construction, ef_search
+
+DROP INDEX IF EXISTS mem_e;</code></pre>
+
+<h3>Distance operators &amp; nearest-neighbour queries</h3>
+<p>The three operators compute a distance between two vectors: <code>&lt;-&gt;</code> (L2), <code>&lt;=&gt;</code> (cosine), and <code>&lt;#&gt;</code> (inner product). Pass the query vector as a parameter and order by distance:</p>
+<pre data-lang="sql"><code>SELECT note
+  FROM memories
+ ORDER BY embedding &lt;=&gt; ?      -- bind the query vector, e.g. [0.9, 0.1, 0]
+ LIMIT 1;                       -- → 'apples'</code></pre>
+<div class="callout note">
+<p class="callout-title">Index or brute force — same answers</p>
+<p>An <code>ORDER BY &lt;col&gt; &lt;dist-op&gt; &lt;query&gt; ASC LIMIT k</code> query is answered by the HNSW index when one exists, and falls back to a brute-force scan-and-sort when it does not — the results match. HNSW is approximate by design (recall governed by <code>ef_search</code>); results are MVCC-filtered against your snapshot and any <code>WHERE</code> clause.</p>
+</div>
+</section>
+
+<section>
+<h2>Parameters</h2>
+<p>Use a positional <code>?</code> placeholder anywhere an expression is allowed, then bind by 1-based index. Binding goes through the prepared-statement path of the C ABI.</p>
+<pre data-lang="sql"><code>INSERT INTO notes (id, title) VALUES (?, ?);
+SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
+<p>Each bound value is a NUL-terminated <em>typed literal</em>: a one-character tag followed by the encoded value. This is how the string-only ABI carries a typed argument.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Tag</th><th>Type</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td><code>i</code></td><td>Integer</td><td><code>i42</code></td></tr>
+<tr><td><code>f</code></td><td>Float</td><td><code>f3.5</code></td></tr>
+<tr><td><code>s</code></td><td>Text</td><td><code>shello</code></td></tr>
+<tr><td><code>b</code></td><td>Bytes (base64)</td><td><code>b&lt;base64&gt;</code></td></tr>
+<tr><td><code>n</code></td><td>NULL</td><td><code>n</code></td></tr>
+<tr><td><code>v</code></td><td>Vector (Phase 5)</td><td><code>v[1,2,3]</code> or <code>v1,2,3</code></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout tip">
+<p class="callout-title">The wrapper does the tagging for you</p>
+<p>The <code>@yourdb/bun</code> client encodes these typed literals from native JS/TS values, so you bind ordinary numbers, strings, and <code>Uint8Array</code>. The raw tags matter only when calling <a href="c-abi.html">the C ABI</a> directly. See <a href="connect-bun.html">Connect from Bun</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Transactions</h2>
+<p>Row DML is fully transactional under snapshot isolation. A single writer serializes through a write lane; readers capture a snapshot LSN and never block.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Statement</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>BEGIN</code></td><td>Start an explicit transaction (<code>BEGIN TRANSACTION</code> / <code>START TRANSACTION</code> also accepted)</td></tr>
+<tr><td><code>COMMIT</code></td><td>Publish the transaction — blocks until the WAL is durable</td></tr>
+<tr><td><code>ROLLBACK</code></td><td>Discard the transaction's pending changes</td></tr>
+</tbody>
+</table>
+</div>
+<pre data-lang="sql"><code>BEGIN;
+INSERT INTO notes (id, title) VALUES (10, 'draft');
+UPDATE notes SET score = 1 WHERE id = 10;
+COMMIT;   -- returns only once the records are durable on the backend</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> keep schema changes out of an explicit transaction — DDL inside <code>BEGIN</code> returns <code>ENGINE_ERR_TXN</code>.</li>
+<li><span class="req-tag should">SHOULD</span> retry a transaction that fails with <code>ENGINE_ERR_CONFLICT</code> — a first-committer-wins check rejects conflicting concurrent writers.</li>
+</ul>
+</section>
+
+<section>
+<h2>Out of scope (Phase 1)</h2>
+<p>These are deliberate boundaries, not bugs. Each parses to a clear <code>ENGINE_ERR_SQL</code> rather than a wrong result.</p>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> use <code>JOIN</code> — queries read from a single table.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use <code>GROUP BY</code> / <code>HAVING</code> — aggregates are whole-table only.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use subqueries.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use <code>SELECT DISTINCT</code>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>, Phase 5); general secondary/B-tree indexes are not exposed as SQL.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Unsupported syntax fails fast</p>
+<p>Anything outside the surface on this page is rejected at parse time with <code>ENGINE_ERR_SQL</code> — the engine never silently mis-parses or partially applies an unsupported statement.</p>
+</div>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="c-abi.html"><span class="xref-id">ABI</span><span class="xref-title">C ABI reference</span><span class="xref-desc">The frozen C interface: prepare, bind, step, and the typed-literal encoding.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-id">BUN</span><span class="xref-title">Connect from Bun</span><span class="xref-desc">The ergonomic typed wrapper that binds these parameters for you.</span></a>
+<a class="xref" href="getting-started.html"><span class="xref-id">QS</span><span class="xref-title">Quickstart</span><span class="xref-desc">Build the engine and run your first SQL.</span></a>
+<a class="xref" href="../specs/02-engine-core.html"><span class="xref-id">02</span><span class="xref-title">Engine core</span><span class="xref-desc">How the parser, MVCC store, and WAL fit together.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bydesigns-db — A serverless OLTP engine that's embeddable and disaggregated</title>
+<meta name="description" content="bydesigns-db is a serverless OLTP database engine: an embeddable Rust library at function-call latency whose storage backend is pluggable — run it purely embedded on a local file, or storage-disaggregated on S3/R2. Scale-to-zero, true embeddability, and instant copy-on-write branching at once.">
+<link rel="stylesheet" href="assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+<script>window.SITE_SECTION="home";</script>
+</head>
+<body>
+
+<div class="hero-wrap">
+  <div class="hero">
+    <span class="eyebrow"><span class="dot"></span>Phases 1–5 implemented · Rust · Postgres-wire compatible</span>
+    <h1>The database that is <span class="grad">embeddable</span> and <span class="grad">disaggregated</span> at once.</h1>
+    <p class="sub">bydesigns-db is a serverless OLTP engine — a SQLite-style Rust library at function-call latency, whose storage backend is pluggable. Point it at a local file to run purely embedded, or at object storage to run storage-disaggregated and scale-to-zero. Same engine, same C ABI; the only difference is a connection string.</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="docs/getting-started.html">Get started →</a>
+      <a class="btn btn-ghost" href="docs/index.html">Read the docs</a>
+      <a class="btn btn-ghost" href="https://github.com/bihaviour/bydesigns-db" target="_blank" rel="noopener">View on GitHub</a>
+    </div>
+    <div class="stat-strip">
+      <div class="stat"><div class="v">1</div><div class="l">engine, two delivery modes</div></div>
+      <div class="stat"><div class="v">in-proc</div><div class="l">embedded hot path (no socket)</div></div>
+      <div class="stat"><div class="v">→0</div><div class="l">idle compute cost</div></div>
+      <div class="stat"><div class="v">O(1)</div><div class="l">copy-on-write branch creation</div></div>
+    </div>
+  </div>
+</div>
+
+<main class="site-main">
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Why it exists</span>
+      <h2>Two properties that usually exclude each other</h2>
+      <p>Embeddability wants the engine to <em>be</em> your application's address space. Disaggregated storage wants durable state to live over the network so compute is stateless. bydesigns-db resolves the tension by moving the seam inward.</p>
+    </div>
+    <div class="feature-grid">
+      <div class="feature">
+        <div class="ic">📦</div>
+        <h3>Truly embeddable</h3>
+        <p>Links in-process as a native library over a frozen C ABI. The hot path is a function call, never a network round-trip — SQLite-style ergonomics, link it anywhere Bun, Node, or C can call.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">☁️</div>
+        <h3>Storage-disaggregated</h3>
+        <p>Durability bottoms out on object storage (S3 / Cloudflare R2 / MinIO) via an LSM page store and an S3-CAS commit log. Compute holds no durable state, so it is disposable.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">🔌</div>
+        <h3>One pluggable seam</h3>
+        <p>The engine never touches disk — it talks to a single narrow <code>Storage</code> trait. The backend is chosen by URL scheme: <code>file://</code> embeds, <code>s3://</code> disaggregates. No rebuild.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">🌿</div>
+        <h3>Instant branching</h3>
+        <p>A branch is a cheap LSN pointer over shared immutable layers (copy-on-write). Fork a database in O(1); writes diverge into a private overlay and never touch the base.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">💤</div>
+        <h3>Scale-to-zero</h3>
+        <p>The lifecycle controller cold-starts on first connection and tears down when idle. At rest you pay only for object-storage bytes — no idle compute bill.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">🐘</div>
+        <h3>Postgres-wire compatible</h3>
+        <p>The same engine runs behind a Postgres-wire listener. <code>psql</code>, <code>Bun.sql</code>, <code>pgbench</code>, and PostgREST connect unchanged — no bespoke driver, no bespoke REST layer.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">🧭</div>
+        <h3>Vector search in-core</h3>
+        <p>A <code>vector(N)</code> type and an HNSW index live behind the same storage seam as the rows — so vector search <strong>branches and scales-to-zero with the database</strong>. An agent can fork its memory.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="split">
+      <div class="prose">
+        <span class="kicker" style="color:var(--accent-text);font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:.76rem;">Embedded in seconds</span>
+        <h2>Open a database with a connection string</h2>
+        <p>Build the native library once, then use the typed Bun wrapper. The backend is selected purely by the URL scheme — flip <code>file://</code> to <code>s3://</code> and the same code path becomes disaggregated and scale-to-zero, with no recompile.</p>
+        <p>Branching is a first-class operation: a branch sees the base's data and writes in isolation.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="docs/connect-bun.html">Connect from Bun →</a>
+          <a class="btn btn-ghost" href="docs/connect.html">Connection model</a>
+        </div>
+      </div>
+      <div class="code-window">
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="fname">notes.ts</span></div>
+<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+
+using db = open("file://./local.db");   // or "s3://bucket/db"
+db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
+db.query("INSERT INTO notes VALUES (?, ?)", [1, "hello"]);
+
+const rows = db.query("SELECT id, body FROM notes");
+// [{ id: "1", body: "hello" }]
+
+// Instant copy-on-write branch: sees the base, writes in isolation.
+using preview = db.branch("preview");
+preview.exec("INSERT INTO notes VALUES (2, 'branch-only')");
+// the base never sees the branch's write</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="split">
+      <div class="code-window">
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="fname">server.sh</span></div>
+<pre data-lang="bash"><code># The same engine, behind a Postgres-wire listener
+cargo run -p bydesigns-server -- \
+  --listen 127.0.0.1:5433 \
+  --db file://./srv.db          # or s3://bucket/db
+
+# Any Postgres client connects (cleartext):
+psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
+      </div>
+      <div class="prose">
+        <span class="kicker" style="color:var(--accent-text);font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:.76rem;">Server mode falls out for free</span>
+        <h2>Wrap the library in a wire listener</h2>
+        <p>Server mode is the same library wrapped in a Postgres-wire listener — there is no second engine to maintain. Multi-client access, existing Postgres tooling, and connection pooling all come along for the ride.</p>
+        <p>Whether a caller reaches the engine through an FFI call or a network socket is the only thing that changes.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="docs/connect-postgres.html">Connect with psql →</a>
+          <a class="btn btn-ghost" href="docs/connection-pooling.html">Pooling guidance</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Where to go next</span>
+      <h2>Three doors into the project</h2>
+      <p>Use the database, follow the design intent, or track what shipped and what's next.</p>
+    </div>
+    <div class="doc-card-grid">
+      <a class="doc-card" href="docs/index.html">
+        <div class="ic">📘</div>
+        <h3>Documentation</h3>
+        <p>User guides: how to connect, branch, pool, and operate the engine. Start here to build something.</p>
+        <div class="links"><span>Quickstart · Connect · Guides · Reference</span></div>
+      </a>
+      <a class="doc-card" href="specs/index.html">
+        <div class="ic">📐</div>
+        <h3>Development guidelines</h3>
+        <p>The fourteen design specifications and per-phase implementation maps — the source of truth for design intent.</p>
+        <div class="links"><span>Architecture · Storage seam · Validation</span></div>
+      </a>
+      <a class="doc-card" href="release/index.html">
+        <div class="ic">🚀</div>
+        <h3>Releases &amp; roadmap</h3>
+        <p>What's shipped (Phases 1–4) and what's coming next — the additive build sequence and milestones.</p>
+        <div class="links"><span>Release notes · Roadmap · Milestones</span></div>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <div class="cta-band">
+      <h2>"SQLite that forgot where its file was — and found it on S3."</h2>
+      <p>Keep the in-process, link-it-anywhere ergonomics; point the storage backend at the network instead of a local file. Embeddable and disaggregated stop being contradictory the moment the seam is a pluggable backend rather than a server you connect to.</p>
+      <div class="cta-row" style="justify-content:center;">
+        <a class="btn btn-primary" href="docs/getting-started.html">Start the quickstart →</a>
+        <a class="btn btn-ghost" href="https://github.com/bihaviour/bydesigns-db" target="_blank" rel="noopener">Star on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="inner">
+    <div>bydesigns-db — a serverless OLTP engine. Licensed under AGPL-3.0.</div>
+    <div class="foot-links">
+      <a href="docs/index.html">Docs</a>
+      <a href="specs/index.html">Specs</a>
+      <a href="release/index.html">Release</a>
+      <a href="https://github.com/bihaviour/bydesigns-db" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Cache · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">05 · CACHE</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Local Cache</h1>
+<p class="lede">The two-tier local cache is the component that makes an object-storage-backed engine feel embedded: it keeps hot pages in-process so the common read is a memory access, not a hundreds-of-millisecond network round-trip — and it is forbidden, on pain of acked-write loss, from ever extending that same speedup to the commit path.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>The durability floor of this engine is object storage (S3 / R2 / GCS / MinIO), reached through the <a href="04-object-storage-backend.html">object-storage backend</a> via <code>get_page(page_id, lsn)</code>. A raw object-store GET costs tens-to-hundreds of milliseconds at the p99 tail. If every read paid that cost, the engine would not be embeddable in any meaningful sense — <code>engine_query()</code> over <code>bun:ffi</code> would block for the duration of a network call on the hot path, defeating the entire premise of an in-process library.</p>
+<p>The local cache exists to keep that latency <strong>off the hot path</strong>. It serves the overwhelming majority of reads from process-local memory or local NVMe, and falls through to object storage only on a genuine miss. The source design note states the dependency plainly, and this page treats it as the load-bearing claim:</p>
+<div class="callout danger">
+<p class="callout-title">Embeddability depends on this component</p>
+<p>Without a local cache, <em>every read is a network call</em>. The "hot path is in-process function calls" property that makes the engine embeddable (source §3, True embeddability) is produced <strong>entirely</strong> by this cache. The <code>LocalFileStorage</code> backend avoids the network by construction; the <code>ObjectStorage</code> backend only avoids it because of the cache described here. Treat a regression in hit ratio as a regression in embeddability, not a tuning nuisance.</p>
+</div>
+<p>Scope of this spec: the in-process page cache, the local file cache (LFC) on NVMe, the tiering and admission/eviction policy between them, version-correct serving against MVCC snapshots, the durability boundary the cache must respect, cold-start warming, configuration, failure modes, and acceptance criteria. It is the expansion of source §2.D (<em>Local cache</em>) and the embeddability point in source §3.</p>
+</section>
+
+<section>
+<h2>Responsibilities &amp; non-goals</h2>
+<h3>Responsibilities</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> serve reads for resident pages from memory (tier 1) or local NVMe (tier 2) without contacting object storage.</li>
+<li><span class="req-tag must">MUST</span> return the page version consistent with the requesting reader's snapshot LSN (see <a href="02-engine-core.html">Engine Core</a> MVCC).</li>
+<li><span class="req-tag must">MUST</span> treat cached page versions as immutable: a new committed version appends/invalidates, it never mutates a cached page in place.</li>
+<li><span class="req-tag must">MUST</span> emit per-tier hit-ratio and miss-to-object-storage counters for capacity planning and the benchmark plan.</li>
+<li><span class="req-tag should">SHOULD</span> warm proactively on cold start to bound the post-idle p99 (source §4, Cold start; <a href="09-benchmark-plan.html">Experiment 5</a>).</li>
+<li><span class="req-tag should">SHOULD</span> spill cleanly from memory to NVMe so working sets larger than RAM stay off the network.</li>
+</ul>
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> participate in the commit-acknowledgement path. The cache is a read accelerator only; durability is owned by the WAL / commit log (source §8, durability rule).</li>
+<li><span class="req-tag must-not">MUST NOT</span> be the source of truth for any page. The object-store floor is authoritative; the cache is reconstructable and disposable.</li>
+<li><span class="req-tag may">MAY</span> be empty at any time (after eviction, restart, or scale-to-zero) without affecting correctness — only performance.</li>
+<li>Replication, cross-node coherence, and distributed cache invalidation are out of scope: a single engine process owns its caches, and single-writer-per-DB (source §4) means there is no second writer to invalidate against.</li>
+</ul>
+</section>
+
+<section>
+<h2>Two-tier design</h2>
+<p>The cache is two tiers backed by one durability floor. Tier 1 is the in-process shared-buffer-style page cache; tier 2 is the local file cache (LFC) on NVMe. Tier 1 absorbs the genuinely hot working set at memory latency; the LFC extends the resident set far past RAM at NVMe latency, so the engine still avoids object storage for warm-but-not-hot pages.</p>
+<div class="diagram">
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two-tier cache hierarchy from in-process page cache to NVMe LFC to object storage floor">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-width="1.5" font-family="inherit" font-size="13">
+    <rect x="20" y="20" width="720" height="70" rx="6"/>
+    <text x="36" y="46" stroke="none" fill="currentColor" font-weight="600">Tier 1 — in-process page cache (shared-buffer style)</text>
+    <text x="36" y="68" stroke="none" fill="currentColor" font-size="12" opacity="0.8">RAM · ~ns–µs · pinned hot pages, MVCC version chains, dirty-on-WAL-flush only</text>
+
+    <rect x="20" y="120" width="720" height="70" rx="6"/>
+    <text x="36" y="146" stroke="none" fill="currentColor" font-weight="600">Tier 2 — local file cache (LFC) on NVMe</text>
+    <text x="36" y="168" stroke="none" fill="currentColor" font-size="12" opacity="0.8">local SSD · ~tens of µs · larger warm set, admission-gated, survives evictions from tier 1</text>
+
+    <rect x="20" y="220" width="720" height="60" rx="6" stroke-dasharray="5 4"/>
+    <text x="36" y="246" stroke="none" fill="currentColor" font-weight="600">Durability floor — object storage (S3 / R2 / GCS / MinIO)</text>
+    <text x="36" y="266" stroke="none" fill="currentColor" font-size="12" opacity="0.8">~tens–hundreds of ms · authoritative · reached only on a true miss · cache-miss = egress (except R2)</text>
+
+    <line x1="380" y1="90" x2="380" y2="120" marker-start="url(#arr)" marker-end="url(#arr)"/>
+    <line x1="380" y1="190" x2="380" y2="220" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  </g>
+</svg>
+<p class="diagram-caption">Read fall-through: tier 1 → tier 2 (LFC) → object-storage floor. Only the bottom hop crosses the network and bills egress.</p>
+</div>
+
+<h3>Tier 1 — in-process page cache (shared buffers)</h3>
+<p>A fixed-size, in-process array of page frames, modelled on PostgreSQL shared buffers / a buffer pool. Pages live in the engine's address space, so a hit is a pointer dereference plus a version-chain walk — no syscall, no copy across a process boundary, no network. This is precisely the property that preserves embeddability: an FFI <code>engine_query()</code> that hits tier 1 never yields the calling thread to I/O.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> store pages keyed by <code>(page_id, version)</code>, where version is the page's producing LSN (see <a href="04-object-storage-backend.html">layer format</a>).</li>
+<li><span class="req-tag must">MUST</span> support pinning during read/execute so an in-use frame cannot be evicted mid-operation.</li>
+<li><span class="req-tag should">SHOULD</span> hold the hot MVCC version chain for a page, not just the latest version, so concurrent snapshot readers at different LSNs hit tier 1.</li>
+<li><span class="req-tag should">SHOULD</span> be sized as a fraction of process RAM (typ. 25–50%), leaving headroom for executor working memory and the host runtime (Bun).</li>
+</ul>
+
+<h3>Tier 2 — local file cache (LFC) on NVMe</h3>
+<p>A larger, on-disk cache backed by a file (or a directory of slab files) on local NVMe. The LFC holds pages that have aged out of tier 1 but are still warm enough to be worth keeping off the network. A tier-2 hit is a local NVMe read (tens of microseconds) — three to four orders of magnitude faster than an object-store GET, and it bills no egress. The LFC is what lets a working set far larger than RAM still avoid the durability floor.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> be local, ephemeral storage (instance NVMe / scratch disk), never network-attached, never the durability floor.</li>
+<li><span class="req-tag must">MUST</span> store the same versioned pages as tier 1 and verify integrity on read (checksum) before serving.</li>
+<li><span class="req-tag should">SHOULD</span> be sized in the GB–tens-of-GB range, far larger than tier 1, bounded by available local disk.</li>
+<li><span class="req-tag may">MAY</span> be disabled entirely (<code>lfc.enabled = false</code>) for deployments with no usable local disk (e.g. Cloudflare Workers, see <a href="11-deployment-targets.html">Deployment Targets</a>), in which case tier 1 falls through directly to object storage.</li>
+</ul>
+
+<h3>Tiering policy between the tiers</h3>
+<p>The two tiers form an inclusive-by-default hierarchy with controlled promotion and demotion:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Transition</th><th>Trigger</th><th>Policy</th></tr></thead>
+<tbody>
+<tr><td>floor → tier 1</td><td>miss serviced by object storage</td><td>fetched page is installed in tier 1 and admitted to the LFC if it passes admission (below).</td></tr>
+<tr><td>tier 1 → tier 2 (demote)</td><td>eviction from tier 1</td><td>evicted page is written to the LFC if not already present and admission permits; otherwise dropped.</td></tr>
+<tr><td>tier 2 → tier 1 (promote)</td><td>tier-1 miss, tier-2 hit</td><td>page is read from NVMe into a tier-1 frame and pinned for the read; reference counters updated.</td></tr>
+<tr><td>tier 2 → drop</td><td>LFC eviction or full</td><td>page is discarded; next access falls to the floor. No write-back (pages are immutable and the floor is authoritative).</td></tr>
+</tbody>
+</table>
+</div>
+<p>Because every cached page version is immutable and reconstructable from the floor, there is never a dirty write-back from the LFC: demotion is a copy, eviction is a delete. The only "dirty" data in the system lives in the WAL until it is durable — and that data is governed by the <a href="#the-durability-boundary-critical-callout">durability boundary</a>, not the cache.</p>
+</section>
+
+<section>
+<h2>Eviction &amp; admission policy</h2>
+<h3>Tier 1 — replacement</h3>
+<p>Tier 1 replacement is a low-overhead scan-resistant policy. CLOCK (second-chance) is the default candidate for its near-zero per-access cost; 2Q or a CLOCK-Pro variant is the upgrade path if scan workloads (e.g. large sequential reads, the HNSW cold traversal in <a href="12-capabilities.html">Capabilities</a>) pollute a plain LRU.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Candidate</th><th>Strength</th><th>Cost / risk</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>LRU</td><td>simple, good recency</td><td>per-access list churn; one big scan evicts the hot set</td><td>baseline / reference only</td></tr>
+<tr><td>CLOCK</td><td>O(1)-ish, lock-light, approximates LRU</td><td>weaker than LRU under mixed recency/frequency</td><td><span class="pill green">default</span> tier 1</td></tr>
+<tr><td>2Q</td><td>scan-resistant (separates recent vs frequent)</td><td>two queues to tune</td><td>upgrade if scans pollute</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>LFC — admission</h3>
+<p>The LFC is admission-gated, not write-everything. Writing every evicted or fetched page to NVMe burns write endurance and lets one-shot pages (full-table scans, the analytics export path) evict the warm set. Admission policy decides whether a page <em>earns</em> a slot:</p>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> admit on second access (a one-touch page is not yet proven warm); track a lightweight frequency sketch / ghost queue to detect re-reference.</li>
+<li><span class="req-tag should">SHOULD</span> apply a frequency-based admission filter (TinyLFU-style) so a high-frequency incoming page can displace a low-frequency resident one, and a one-shot scan page is rejected.</li>
+<li><span class="req-tag may">MAY</span> bypass admission for pages explicitly fetched by a warming pass (they are admitted because warming chose them).</li>
+<li><span class="req-tag must-not">MUST NOT</span> let an admission decision block or slow a read: admission is asynchronous to the read path.</li>
+</ul>
+
+<h3>Metrics (mandatory)</h3>
+<p>These counters are not optional telemetry; they are the inputs to capacity planning and to <a href="09-benchmark-plan.html">benchmark</a> Experiment 5 (cold vs warm reads).</p>
+<dl class="fields">
+<dt>cache.t1.hit_ratio</dt><dd>tier-1 hits / total reads, rolling window. The headline embeddability indicator.</dd>
+<dt>cache.t2.hit_ratio</dt><dd>LFC hits / (reads that missed tier 1). Measures the LFC's contribution past RAM.</dd>
+<dt>cache.overall_hit_ratio</dt><dd>(t1 + t2 hits) / total reads. 1 − this = fraction of reads that became object-store GETs.</dd>
+<dt>cache.miss.object_reads</dt><dd>count of reads that fell through to object storage (each is a network round-trip and, except on R2, billable egress — see <a href="11-deployment-targets.html">Deployment Targets</a>).</dd>
+<dt>cache.miss.object_read_latency</dt><dd>p50/p99/p999 of the floor read, captured as a histogram (never mean-only).</dd>
+<dt>cache.t1.evictions / cache.t2.evictions</dt><dd>eviction rate per tier; a rising t1 eviction rate with flat hit ratio signals undersized tier 1.</dd>
+<dt>cache.t2.admit / cache.t2.reject</dt><dd>admission accept/reject counts; high reject is healthy (scan resistance working).</dd>
+</dl>
+</section>
+
+<section>
+<h2>Version correctness</h2>
+<p>The cache is not a key→bytes map; it is a versioned store, and correctness under MVCC is non-negotiable. Pages are versioned by LSN. A reader executes against a fixed <strong>snapshot LSN</strong> (see <a href="02-engine-core.html">Engine Core</a>, snapshot isolation via LSN-stamped versions). When that reader asks the cache for a page, the cache MUST return the version of that page that is visible at the reader's snapshot LSN — i.e. the newest version whose producing LSN is ≤ the snapshot LSN — not merely "the latest version present."</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> resolve <code>get_page(page_id, snapshot_lsn)</code> to the page version with the greatest producing LSN ≤ <code>snapshot_lsn</code>.</li>
+<li><span class="req-tag must">MUST</span> treat each cached page version as immutable. A newly committed version is <strong>appended</strong> to the page's version chain (or installed as a new keyed entry); it MUST NOT overwrite the bytes of an existing cached version.</li>
+<li><span class="req-tag must">MUST NOT</span> serve a version with producing LSN &gt; <code>snapshot_lsn</code> to that reader (that would expose a future write — a snapshot-isolation violation).</li>
+<li><span class="req-tag must">MUST</span>, on a chain miss (no resident version satisfies the snapshot), fall through to object storage with the snapshot LSN and let the layer format reconstruct the correct version.</li>
+<li><span class="req-tag should">SHOULD</span> retain older versions still referenced by live snapshots and release them once no snapshot ≤ their successor's LSN remains (cache version GC tracks the engine's oldest live snapshot, mirroring MVCC vacuum).</li>
+</ul>
+<p>This "append, never mutate" rule is the cache-level reflection of the storage format itself: the <a href="04-object-storage-backend.html">page store</a> is built from immutable delta and image layers keyed by <code>(key, LSN)</code>. The cache mirrors that immutability so a cache hit and a floor read are indistinguishable in result — same version selection, same bytes.</p>
+
+<h4>Invalidation on commit</h4>
+<p>Because there is a single writer per database (source §4), invalidation is local and simple: when the writer commits at LSN <em>L</em>, the pages it modified gain a new version <em>L</em>. The cache appends those versions; it does <em>not</em> evict the prior versions while live snapshots still reference them. There is no cross-process coherence problem to solve — no second writer can produce a version this cache does not already know about.</p>
+<div class="callout note">
+<p class="callout-title">Why append-not-mutate matters for correctness</p>
+<p>A long-running reader holding snapshot LSN <em>S</em> and a writer committing at LSN <em>L &gt; S</em> coexist. If the cache mutated the page in place at commit, the reader would suddenly see <em>L</em>'s bytes through its <em>S</em> snapshot — a torn, non-repeatable read. Appending a new version and selecting by snapshot LSN keeps both readers correct from the same cache.</p>
+</div>
+</section>
+
+<section>
+<h2>Interfaces / data formats</h2>
+<p>The cache sits between the engine's buffer-access layer and the <a href="03-storage-interface.html">Storage trait</a>. It implements the read path of that trait's <code>get_page</code> by consulting tiers before delegating the miss to the underlying <code>ObjectStorage</code> implementation.</p>
+<pre data-lang="rust"><code>/// Identity of a cached page version. The (page_id, lsn) pair is the cache key;
+/// `lsn` is the LSN at which this version of the page was produced.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PageKey { pub page_id: PageId, pub lsn: Lsn }
+
+pub trait PageCache: Send + Sync {
+    /// Return the page version visible at `snapshot_lsn`: the resident version
+    /// with the greatest producing LSN &lt;= snapshot_lsn. On miss, fetch from the
+    /// underlying Storage at snapshot_lsn, install, and return. Pins until dropped.
+    fn get(&amp;self, page_id: PageId, snapshot_lsn: Lsn) -&gt; Result&lt;PinnedPage&gt;;
+
+    /// Append a freshly committed version (producing LSN = `lsn`) into tier 1.
+    /// MUST NOT mutate any existing cached version of `page_id`.
+    fn put_committed(&amp;self, page_id: PageId, lsn: Lsn, page: Page);
+
+    /// Best-effort proactive load of `keys` into the cache (warming). Non-blocking
+    /// w.r.t. the read path; admission is bypassed (warming is the admission signal).
+    fn warm(&amp;self, keys: &amp;[PageKey]);
+
+    /// Release versions no live snapshot can observe (oldest_live_snapshot driven).
+    fn gc_versions(&amp;self, oldest_live_snapshot: Lsn);
+
+    /// Snapshot of per-tier counters for metrics export.
+    fn stats(&amp;self) -&gt; CacheStats;
+}
+
+pub struct CacheStats {
+    pub t1_hits: u64,  pub t2_hits: u64,  pub misses: u64,   // misses == object-store reads
+    pub t1_evictions: u64, pub t2_evictions: u64,
+    pub t2_admits: u64,    pub t2_rejects: u64,
+    pub object_read_latency_us: Histogram,                    // p50/p99/p999
+}</code></pre>
+<p>The on-NVMe LFC entry format is fixed-layout so an entry can be validated before it is trusted:</p>
+<pre data-lang="text"><code>LFC slab entry
+┌────────────┬────────────┬──────────────┬───────────────┬──────────────┐
+│ magic (4B) │ page_id(8B) │  lsn (8B)    │ crc32c (4B)   │ page bytes    │
+└────────────┴────────────┴──────────────┴───────────────┴──────────────┘
+  fixed                                    of page bytes    PAGE_SIZE (e.g. 8 KiB)
+- magic mismatch  -&gt; treat slot as empty
+- crc32c mismatch -&gt; corruption: drop slot, count as miss, re-fetch from floor</code></pre>
+</section>
+
+<section>
+<h2>Behaviour &amp; algorithms</h2>
+<h3>Read path (the hot path)</h3>
+<div class="diagram"><pre>
+get(page_id, snapshot_lsn):
+  1. TIER 1: walk version chain for page_id.
+       resident version v with max(v.lsn) &lt;= snapshot_lsn ?
+         -&gt; HIT: pin frame, bump CLOCK ref bit, t1_hits++, RETURN          (memory latency)
+  2. TIER 2 (LFC): look up satisfying (page_id, lsn) slot, verify crc32c.
+       valid ?
+         -&gt; HIT: read NVMe -&gt; install into tier 1 frame, pin, t2_hits++, RETURN  (NVMe latency)
+  3. MISS: storage.get_page(page_id, snapshot_lsn)   // network round-trip to floor
+       install version into tier 1; async-admit to LFC if admission passes
+       misses++ ; record object_read_latency ; RETURN                     (object-store latency)
+</pre><p class="diagram-caption">Three-stop fall-through. Steps 1–2 are local; only step 3 crosses the network and bills egress.</p></div>
+
+<h3>Commit / invalidation path (NOT the hot path)</h3>
+<p>On a successful commit at LSN <em>L</em> — and only <em>after</em> the WAL is durable (see below) — the writer calls <code>put_committed(page_id, L, page)</code> for each modified page. The cache appends version <em>L</em> to tier 1's chain. Prior versions remain for live snapshots; <code>gc_versions(oldest_live_snapshot)</code> reclaims them later. No NVMe write-back occurs at commit: the LFC learns the new version lazily, on demotion.</p>
+
+<h3>Version GC</h3>
+<p>The engine reports its oldest live snapshot LSN (the same value MVCC vacuum uses). The cache drops any version <em>v</em> of a page where a newer resident version <em>v′</em> exists with <code>v′.lsn ≤ oldest_live_snapshot</code> — i.e. no live reader can ever select <em>v</em> again. This keeps version chains bounded under a long-running-snapshot workload.</p>
+</section>
+
+<section>
+<h2>The durability boundary (critical callout)</h2>
+<div class="callout danger">
+<p class="callout-title">Cache READ latency, never COMMIT latency</p>
+<p>The cache hides <strong>read</strong> latency completely. It MUST NEVER hide <strong>commit</strong> latency. A commit MUST NOT be acknowledged to the client until its WAL records are durably stored on the commit-log floor (the S3 conditional-write / CAS append, source §2.C). Acknowledging a commit from an in-memory buffer before the WAL is durable produces <strong>acked-write loss</strong>: the client is told "committed," the process crashes, and the write is gone. This is disqualifying regardless of how good the latency numbers look (source §8, durability rule; <a href="09-benchmark-plan.html">Experiment 4</a>).</p>
+</div>
+<p>This is the single sharpest line in the whole component, and it follows directly from the W1/W2 distinction in the source:</p>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> source a commit acknowledgement from any cache tier. The ack is owned exclusively by the WAL/commit-log durability signal.</li>
+<li><span class="req-tag must-not">MUST NOT</span> reorder or shortcut the WAL-durable → ack → <code>put_committed</code> sequence. The page enters the cache <em>after</em> durability, never before.</li>
+<li><span class="req-tag must">MUST</span> tolerate a crash between WAL-durable and <code>put_committed</code>: on restart the page is simply re-fetched/re-materialized from the floor; the committed data is safe because it is in the durable WAL, not because it was in the cache.</li>
+<li><span class="req-tag must">MUST</span> keep the cache strictly off the W1 (commit-latency) axis — caching is a W1 <em>non</em>-mitigation. Source §8 is explicit: "cache cannot hide commit latency without breaking durability." Group commit beats W1; the cache only beats reads.</li>
+</ul>
+<div class="callout warning">
+<p class="callout-title">Restate the two levers, so nobody confuses them</p>
+<p>The cache addresses <strong>read</strong> latency. <strong>Group commit</strong> addresses commit latency (W1). <strong>Many-small-DBs / sharding</strong> addresses write serialization (W2). They are three different levers for three different problems; the cache is exactly one of them and stays in its lane.</p>
+</div>
+</section>
+
+<section>
+<h2>Cold start &amp; warming</h2>
+<p>Scale-to-zero (source §3) means the engine process is torn down when idle, so <strong>caches start cold after every idle period</strong>. The first request after idle pays process-start plus cache-warm, and a cold read goes all the way to the floor at object-storage latency (and, off R2, egress cost). The <a href="06-lifecycle-controller.html">lifecycle controller</a> drives the cold/idle transitions; <a href="11-deployment-targets.html">Deployment Targets</a> sets the substrate-specific cold-start cost (container spin-up vs Worker isolate).</p>
+<h3>Warming strategies</h3>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> warm on start (<code>warm.on_start = true</code>) by prefetching the root/metadata pages and a recorded hot-set manifest before serving the first query, bounding the warm-path p99.</li>
+<li><span class="req-tag should">SHOULD</span> persist a small hot-set manifest (the most-referenced <code>PageKey</code>s) to the floor on graceful shutdown and replay it via <code>warm()</code> on next start.</li>
+<li><span class="req-tag may">MAY</span> survive a warm LFC across restarts when local NVMe is durable across the process lifecycle (e.g. a long-lived VM that restarts the engine without losing the scratch disk); on ephemeral substrates the LFC is cold like everything else.</li>
+<li><span class="req-tag may">MAY</span> support keep-warm: the controller issues a periodic lightweight ping to defer scale-to-zero and keep caches resident for latency-sensitive tools (source §4, "keep-warm ping").</li>
+<li><span class="req-tag must-not">MUST NOT</span> let warming block correctness or commits — warming is best-effort and asynchronous; a query that races warming simply takes the normal miss path.</li>
+</ul>
+<div class="callout tip">
+<p class="callout-title">Tuning hook</p>
+<p>The cold-vs-warm p99 gap measured by <a href="09-benchmark-plan.html">Experiment 5</a> is the input to the idle-timeout / keep-warm decision. A large gap argues for a longer idle timeout or keep-warm on hot tools; a small gap (e.g. on R2 where misses are cheap) argues for aggressive scale-to-zero.</p>
+</div>
+</section>
+
+<section>
+<h2>Configuration</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Key</th><th>Type / default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>cache.t1.size</code></td><td>bytes · default 25% RAM</td><td>tier-1 page-cache capacity. Larger = higher t1 hit ratio, less executor headroom.</td></tr>
+<tr><td><code>cache.t1.policy</code></td><td><code>clock</code> | <code>2q</code> | <code>lru</code> · default <code>clock</code></td><td>tier-1 replacement policy.</td></tr>
+<tr><td><code>lfc.enabled</code></td><td>bool · default <code>true</code></td><td>enable the NVMe LFC. Set false on substrates with no local disk (Workers).</td></tr>
+<tr><td><code>lfc.path</code></td><td>path · e.g. <code>/var/cache/engine/lfc</code></td><td>NVMe directory for LFC slab files. MUST be local, ephemeral storage.</td></tr>
+<tr><td><code>lfc.size</code></td><td>bytes · default 8 GiB</td><td>LFC capacity, bounded by free space at <code>lfc.path</code>.</td></tr>
+<tr><td><code>lfc.admission</code></td><td><code>tinylfu</code> | <code>second_touch</code> | <code>always</code> · default <code>tinylfu</code></td><td>LFC admission policy.</td></tr>
+<tr><td><code>cache.page_size</code></td><td>bytes · default 8192</td><td>page/frame size; MUST match the engine + layer-format page size.</td></tr>
+<tr><td><code>warm.on_start</code></td><td>bool · default <code>true</code></td><td>prefetch metadata + hot-set manifest before serving first query.</td></tr>
+<tr><td><code>warm.manifest_path</code></td><td>floor object key</td><td>where the hot-set manifest is persisted/loaded.</td></tr>
+<tr><td><code>cache.target_hit_ratio</code></td><td>ratio · default 0.95</td><td>overall hit-ratio SLO; breaching it raises an alert (capacity signal).</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Failure</th><th>Effect</th><th>Required handling</th></tr></thead>
+<tbody>
+<tr><td>NVMe full (LFC out of space)</td><td>cannot admit new pages to tier 2</td><td>evict LFC LRU to make room; if still full, skip admission and serve the page from tier 1 / floor. <span class="pill amber">degraded, never incorrect</span></td></tr>
+<tr><td>LFC slab corruption (crc32c mismatch)</td><td>a tier-2 entry is unreadable</td><td>drop the slot, count as a miss, re-fetch from the floor. Corruption in a disposable cache is always recoverable from the durability floor.</td></tr>
+<tr><td>NVMe path unwritable / disk failure</td><td>LFC cannot operate</td><td>disable LFC for the process lifetime, fall through tier 1 → floor, raise an alert. Engine stays correct, just colder.</td></tr>
+<tr><td>tier-1 OOM pressure</td><td>host runtime starved</td><td>respect <code>cache.t1.size</code> as a hard cap; shrink on memory pressure signal before the host OOM-kills the process.</td></tr>
+<tr><td>floor read fails on miss</td><td>page cannot be served</td><td>surface the error to the query (retry policy lives in the <a href="04-object-storage-backend.html">object-storage backend</a>); the cache MUST NOT fabricate or stale-serve a page it does not hold.</td></tr>
+<tr><td>crash between WAL-durable and <code>put_committed</code></td><td>committed page not yet cached</td><td>none needed — re-materialize from floor on next read; the commit is safe in the durable WAL.</td></tr>
+<tr><td>cold start after scale-to-zero</td><td>both tiers empty</td><td>warm-on-start + manifest replay; first reads take the miss path. <span class="pill blue">expected, not a fault</span></td></tr>
+<tr><td>scan / one-shot read flood</td><td>risk of evicting hot set</td><td>scan-resistant tier-1 policy (CLOCK/2Q) + LFC admission filter reject one-touch pages.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Invariant across every failure: <strong>the cache is disposable</strong>. Any corruption, eviction, or loss is recoverable by re-fetching from the durability floor, which is authoritative. No failure of the cache can ever cause data loss — only added latency.</p>
+</section>
+
+<section>
+<h2>Metric cards</h2>
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">≥ 0.95</div><div class="metric-label">overall hit ratio (target SLO)</div></div>
+<div class="metric"><div class="metric-value">≥ 0.90</div><div class="metric-label">tier-1 hit ratio (embeddability indicator)</div></div>
+<div class="metric"><div class="metric-value">&lt; 1 ms</div><div class="metric-label">warm read p99 (tier 1 / LFC)</div></div>
+<div class="metric"><div class="metric-value">~100s ms</div><div class="metric-label">cold read p99 (floor, post scale-to-zero)</div></div>
+<div class="metric"><div class="metric-value">1 − hit</div><div class="metric-label">fraction of reads that become object-store GETs (= egress, off R2)</div></div>
+<div class="metric"><div class="metric-value">0</div><div class="metric-label">acked writes ever sourced from cache (durability boundary)</div></div>
+</div>
+</section>
+
+<section>
+<h2>Dependencies / existing pieces to start from</h2>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> reuse a proven buffer-pool/CLOCK implementation from the engine-core lineage (libSQL / LeanStore-Umbra buffer manager) rather than writing tier 1 from scratch (source §2.A, §6).</li>
+<li><span class="req-tag should">SHOULD</span> adopt the LFC concept directly from the Neon local-file-cache design (NVMe spill below shared buffers) — the closest shipping analog to this two-tier shape.</li>
+<li><span class="req-tag may">MAY</span> lean on RocksDB's local-tier caching underneath the page store if the <a href="04-object-storage-backend.html">object-storage backend</a> uses it instead of SlateDB (source §2.C notes RocksDB "if you want local-tier caching underneath").</li>
+<li><span class="req-tag should">SHOULD</span> use a TinyLFU/W-TinyLFU admission sketch (Caffeine lineage) for the LFC.</li>
+</ul>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> serve a tier-1 hit with zero syscalls and zero network I/O (verified by syscall trace on a warm-loop read).</li>
+<li><span class="req-tag must">MUST</span> return snapshot-correct versions: a property test with interleaved long readers and a writer shows every reader sees exactly its snapshot's version, never a future one.</li>
+<li><span class="req-tag must">MUST</span> pass <a href="09-benchmark-plan.html">Experiment 4</a> crash injection: no acked write is ever lost when the process is killed between WAL-durable and <code>put_committed</code>.</li>
+<li><span class="req-tag must">MUST</span> recover from LFC corruption: a deliberately flipped crc32c byte yields a miss + floor re-fetch, never a served bad page (fault-injection test).</li>
+<li><span class="req-tag must">MUST</span> export every metric in the metrics list with per-tier granularity.</li>
+<li><span class="req-tag should">SHOULD</span> meet <code>cache.target_hit_ratio</code> ≥ 0.95 on the representative read-heavy/bursty internal-tool workload after warm-up.</li>
+<li><span class="req-tag should">SHOULD</span> reduce post-idle warm p99 measurably with <code>warm.on_start = true</code> vs off, quantified by <a href="09-benchmark-plan.html">Experiment 5</a> (warm vs cold CDFs).</li>
+<li><span class="req-tag must">MUST</span> keep working (correct, slower) with <code>lfc.enabled = false</code> for the WASM/Workers target.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> need a CLOCK-Pro / W-TinyLFU upgrade for tier 1 if HNSW vector traversal (the "nastiest cache case", source §11) pollutes CLOCK — its random pointer-chasing is the adversarial pattern. Open: should the vector index get a dedicated cache partition?</li>
+<li><span class="req-tag may">MAY</span> want version-chain length limits per page to bound memory under pathologically long-lived snapshots; trade-off between chain GC aggressiveness and forcing live readers to the floor.</li>
+<li>Open: optimal default split of RAM between tier 1 and host-runtime/executor working memory across substrates (Cloud Run container vs Worker isolate) — needs per-target measurement.</li>
+<li>Open: should the LFC persist a warm hot-set across graceful restarts on durable-NVMe VMs, and is the complexity worth it vs always warming from the manifest?</li>
+<li>Risk: on egress-billed stores (S3/GCS), a low hit ratio couples directly to the egress bill — the cache's SLO is partly a <em>cost</em> SLO. R2's zero egress (source §10) structurally de-risks this; non-R2 deployments must watch <code>cache.miss.object_reads</code> as a spend signal.</li>
+<li>Risk: warming aggressiveness vs cold-start time — over-eager warm-on-start can lengthen the very cold start it aims to soften. Needs the Experiment 5 curve to tune.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">MVCC snapshot LSNs and version visibility the cache must honour.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">the trait whose read path the cache fronts before the floor.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">immutable LSN-versioned layer format the cache mirrors and falls through to.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">scale-to-zero and keep-warm that drive cold/warm cache transitions.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiment 4 (acked-write durability) and Experiment 5 (cold vs warm reads).</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">substrate cold-start cost and why R2 zero-egress de-risks misses.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">HNSW vector search — the hardest cache case, leaning hardest on tier 1.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

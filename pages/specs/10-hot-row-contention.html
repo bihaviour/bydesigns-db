@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hot-Row Contention Strategy · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">10 · HOT</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Hot-Row Contention Strategy</h1>
+<p class="lede">Concurrent writes to the same row must be serialized — that is correct database semantics, not a defect — so this spec separates the irreducible cost (serialization) from the manufactured cost (paying a network handoff for conflicts coarse locking invented), and lays out a layered, correct-but-slow-by-default policy that ships safe under any developer SQL and escalates only the rare irreducibly-contended outlier to coupled Postgres.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This page is the engineering policy for <strong>hot-row write contention</strong>: the case where many concurrent transactions update the <em>same logical value</em> stored in one row — a counter, an inventory level, a balance. It expands §9 of the design note into a buildable strategy: what the engine guarantees by default, what guidance and helpers it ships, what gets flagged, and what gets routed off the disaggregated engine entirely.</p>
+<p>The scope is deliberately narrow. Contention is a <em>correctness-vs-throughput</em> property of a workload, not a defect of the storage architecture. The disaggregated engine's two weak axes are characterised in <a href="09-benchmark-plan.html">Benchmark &amp; Validation Plan</a> as <strong>W1 — commit latency</strong> (each commit is a network/S3 round-trip, not a local fsync) and <strong>W2 — write serialization</strong> (single writer per database). Hot-row contention is the place where W1 and W2 compound, so it is the page where the platform commits to a position.</p>
+<div class="callout note">
+<p class="callout-title">Note</p>
+<p>The headline: correctness is handled <em>universally</em> (the engine serializes same-row writers like every serious database does), performance is handled <em>per-tool</em> (shard where we control the SQL; route the irreducible outlier to Postgres). No workload is ever at risk of incorrectness — only the rare contended outlier is at risk of being slow, and that one has a named escape hatch.</p>
+</div>
+</section>
+
+<section>
+<h2>Premise — the correct semantics</h2>
+<p>Concurrent writes to the <em>same row</em> MUST be serialized. This is correct behaviour, not a limitation. Every serious database serializes contended writers — Postgres takes a row lock and resolves visibility through MVCC; none of them parallelizes two writes to the same value, because the problem is <strong>inherently sequential</strong>: each write must see the prior committed value before it can compute its own result.</p>
+
+<div class="diagram">
+<pre>
+   correct (what every DB does)              impossible (what no DB does)
+
+   W1 ─ read n=5 ─ write n=6 ─ commit        W1 ─ read n=5 ─ write n=6 ─┐
+                                  │           W2 ─ read n=5 ─ write n=6 ─┘  ← both read 5,
+   W2 ──────────── read n=6 ─ write n=7         lost update: n=6, not 7
+                                  │
+                              serialized:           "parallel" same-row writes
+                              n ends at 7           silently corrupt the value
+</pre>
+<p class="diagram-caption">Same-row writes have a read-modify-write dependency. Serializing them is the only correct outcome; "parallelizing" them is the lost-update bug.</p>
+</div>
+
+<p>The only two engineering variables are therefore:</p>
+<dl class="fields">
+<dt>lock granularity</dt>
+<dd>How much else gets blocked while one writer holds the row. Per-row blocks only same-row writers; per-database blocks every writer in the DB. The engine's single-writer-per-DB model (see <a href="02-engine-core.html">Engine Core</a>) is per-DB granularity.</dd>
+<dt>handoff cost</dt>
+<dd>What it costs to pass the right-to-write from one serialized writer to the next. Local Postgres pays ~one fsync (~100&micro;s); the disaggregated engine pays a durable network round-trip + ack (~10ms). This is W1 made concrete.</dd>
+</dl>
+
+<p>Everything downstream is a consequence of moving these two dials. Nothing in this spec attempts to make same-row writes parallel — that would be a correctness bug, not an optimization.</p>
+</section>
+
+<section>
+<h2>Where it happens — the hot-row catalog</h2>
+<p>A hot row is almost always a <strong>shared number that must stay correct under concurrent updates</strong>. The recurring patterns:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Pattern</th><th>The shared value</th><th>Why every write must see the previous</th></tr></thead>
+<tbody>
+<tr><td>View / like / play counter</td><td>one count on a popular item</td><td><code>n = n + 1</code> — increment is read-modify-write</td></tr>
+<tr><td>Inventory / seat / ticket decrement</td><td>units remaining</td><td>MUST NOT oversell; the check-and-decrement must be atomic against the prior value</td></tr>
+<tr><td>Rate-limit / quota counter</td><td>requests used per user/window</td><td>the limit decision depends on the running total</td></tr>
+<tr><td>Shared account balance</td><td>one money figure</td><td>debit/credit must apply to the committed balance, never a stale one</td></tr>
+<tr><td>Hot status / <code>updated_at</code> on a parent</td><td>a single field many children touch</td><td>last-writer-wins still serializes; many children funnel onto one row</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Signature:</strong> one row that is semantically a single shared value, where correctness requires every write to see the previous one.</p>
+
+<p><strong>Contrast — the case that parallelizes freely:</strong> many writers each inserting a <em>different</em> row (logs, events, append-only orders) have no read-modify-write dependency between them. They can commit in any order. They are the green case.</p>
+
+<div class="callout tip">
+<p class="callout-title">Contention, not volume, is the problem</p>
+<p>A million inserts a second into a million distinct rows is not a hot-row problem — it is a throughput problem solved by lanes (W2 / sharding) and batching (W1). A thousand updates a second to <em>one</em> row is a hot-row problem no matter how low the absolute volume. Diagnose by dependency between writes, never by request rate.</p>
+</div>
+</section>
+
+<section>
+<h2>Per-row vs per-database lock cost over the network</h2>
+<p>The cost model is the load-bearing argument of this page. It reproduces the §9 comparison: a local per-row lock (Postgres), a hypothetical per-row lock over the network, and this engine's naive per-DB lock over the network.</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Axis</th>
+<th>Per-row, local (Postgres)</th>
+<th>Per-row, networked</th>
+<th>Per-DB, networked (this engine, naive)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>What blocks</strong></td>
+<td>same-row writers only</td>
+<td>same-row writers only</td>
+<td><strong>every writer in the DB</strong></td>
+</tr>
+<tr>
+<td><strong>Handoff cost</strong></td>
+<td>~fsync, ~100&micro;s</td>
+<td>round-trip + ack, ~10ms</td>
+<td>round-trip + ack, ~10ms</td>
+</tr>
+<tr>
+<td><strong>Same-row contenders</strong></td>
+<td>serialize, drain fast</td>
+<td>slow but bounded</td>
+<td>same as per-row (contenders overlap anyway)</td>
+</tr>
+<tr>
+<td><strong>Different-row writers</strong></td>
+<td><span class="pill green">full parallel</span></td>
+<td><span class="pill green">full parallel</span></td>
+<td><span class="pill red">all serialize — catastrophic</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<p>Two facts follow directly from the table:</p>
+<ol>
+<li><strong>The network makes every handoff ~100&times; costlier (10ms vs 100&micro;s).</strong> This is the fixed cost of a durable-over-network commit — W1. It applies to every serialized handoff, contended or not.</li>
+<li><strong>Per-DB granularity multiplies how <em>often</em> you pay it.</strong> It forces serialization on writes that have no real conflict, turning free parallel writes into expensive queued ones. Coarse locking <em>manufactures</em> contention out of independent writes.</li>
+</ol>
+
+<div class="callout warning">
+<p class="callout-title">The expensive part is the manufactured contention, not the lock</p>
+<p>Look at the columns: <em>same-row</em> contention costs effectively the same under per-row or per-DB granularity — the contenders overlap on one row regardless. The granularity gap only bites on <em>different-row</em> writes (the common case), where per-row stays fully parallel and naive per-DB forces a 10ms serialized handoff between writes that never conflicted. The cost you most want to avoid is paying the expensive network handoff for contention you manufactured by locking too coarsely.</p>
+</div>
+</section>
+
+<section>
+<h2>Many-small-DBs recovers per-row-like granularity</h2>
+<p>The fix for manufactured contention on a per-DB-lock engine is not a finer lock inside one database — it is <strong>more databases</strong>. If each tool, tenant, or independent write stream is its own database, "per-DB lock" stops meaning "everything waits" and starts meaning "only related writes wait."</p>
+
+<div class="diagram">
+<pre>
+  ONE big DB, per-DB lock                MANY small DBs, per-DB lock each
+  (manufactured contention)              (granularity recovered)
+
+  W_a (row A) ─┐                         DB1: W_a (row A) ── own lane ──►
+  W_b (row B) ─┤ all queue on            DB2: W_b (row B) ── own lane ──►
+  W_c (row C) ─┤ ONE per-DB lock         DB3: W_c (row C) ── own lane ──►
+  W_d (row D) ─┘ even though no            ↑ no shared lock between
+                 two conflict               unrelated streams = parallel
+</pre>
+<p class="diagram-caption">Database boundaries substitute for row-level lock granularity. Splitting unrelated write streams into their own DBs converts a single serialized queue into N independent lanes (W2).</p>
+</div>
+
+<p><strong>Database boundaries substitute for row-level lock granularity.</strong> This is the deep reason the architecture leans on sharding into many small databases — not merely billing or operational isolation, but making the coarse networked lock <em>affordable</em>. The single-writer-per-DB ceiling stops being a throughput cap the moment "per DB" maps to "per independent write stream." This is exactly the W2 lever validated by Experiment 3's "N separate databases scale linearly" check in <a href="09-benchmark-plan.html">Benchmark &amp; Validation Plan</a>.</p>
+
+<div class="callout note">
+<p class="callout-title">What sharding does and does not solve</p>
+<p>Sharding recovers granularity for writes to <em>different</em> rows by giving them different lanes (W2). It does <strong>nothing</strong> for two writes that genuinely target the same row in the same DB — those still serialize, correctly. Sharding moves the per-DB lock closer to a per-row lock; it cannot abolish the read-modify-write dependency on a truly shared value.</p>
+</div>
+</section>
+
+<section>
+<h2>Recommendation — layered policy</h2>
+<p>The platform <strong>cannot control how each tool writes SQL</strong>. A developer will write a naive <code>UPDATE counter SET n = n + 1</code> and the engine must do something correct with it. The policy is therefore <em>correct-but-slow by default</em>, with escalation for flagged outliers, in three layers of decreasing automaticity.</p>
+
+<h3>Layer 1 — Option 2 (route-to-Postgres) is the mandatory safety net</h3>
+<p>This layer is non-optional and requires nothing from the developer. The disaggregated engine already serializes the hot-row case correctly through its single lane — <strong>correct, just slow</strong>. A naive increment never breaks; it merely runs slowly on the one tool that contends. Experiment 3 (the red-quadrant detector in <a href="09-benchmark-plan.html">Benchmark &amp; Validation Plan</a>) flags that tool, and it moves to coupled Postgres. Correctness is never at risk; only performance, only for the outlier.</p>
+<div class="callout success">
+<p class="callout-title">Why this is the floor</p>
+<p>Because correctness is guaranteed by the engine's serialization regardless of SQL quality, the worst outcome for <em>any</em> tool is "slow," never "wrong." That property — safe under arbitrary developer SQL — is what lets the platform ship Option 1 as guidance rather than enforcement.</p>
+</div>
+
+<h3>Layer 2 — Option 1 (avoid the hot row) is offered as guidance, not enforced</h3>
+<p>Ship the patterns and helpers; use them where the platform controls the tool's schema; never depend on every developer applying them. Both helpers convert "same row" back into "different rows" — moving the workload from the red quadrant into the green one.</p>
+
+<h4>Helper A — sharded counter</h4>
+<p>Split one counter into <kbd>N</kbd> sub-counter rows. Each writer increments a random shard (different rows = parallel); reads sum across shards.</p>
+<pre data-lang="sql"><code>-- N sub-counters instead of one hot row
+CREATE TABLE counter_shards (
+    counter_id  text    NOT NULL,
+    shard       int     NOT NULL,            -- 0 .. N-1
+    n           bigint  NOT NULL DEFAULT 0,
+    PRIMARY KEY (counter_id, shard)
+);
+
+-- WRITE: pick a shard at random -&gt; spreads writers across N different rows
+UPDATE counter_shards
+   SET n = n + 1
+ WHERE counter_id = 'video:42'
+   AND shard = floor(random() * 16);        -- N = 16
+
+-- READ: aggregate the shards into the logical total
+SELECT sum(n) AS total
+  FROM counter_shards
+ WHERE counter_id = 'video:42';</code></pre>
+
+<h4>Helper B — event log + aggregate on read</h4>
+<p>Never update the count at all. Append one immutable event per increment (different rows, always parallel) and compute the total on read.</p>
+<pre data-lang="sql"><code>-- Append-only: every write is a NEW row, zero contention
+CREATE TABLE counter_events (
+    id          bigserial PRIMARY KEY,
+    counter_id  text      NOT NULL,
+    delta       int       NOT NULL DEFAULT 1,
+    ts          timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON counter_events (counter_id);
+
+-- WRITE: pure INSERT, never contends
+INSERT INTO counter_events (counter_id, delta) VALUES ('video:42', 1);
+
+-- READ: fold the events (optionally roll up periodically into a snapshot)
+SELECT coalesce(sum(delta), 0) AS total
+  FROM counter_events
+ WHERE counter_id = 'video:42';</code></pre>
+
+<h3>Layer 3 — Option 3 (Redis / dedicated primitive) is NOT a default</h3>
+<p>A dedicated atomic-counter system adds a second store, a second consistency model, and a second operational surface — which violates the single-account / no-extra-ops posture of the platform. Reserve it for a tool that is <strong>both</strong> extremely contended <strong>and</strong> latency-critical, where neither sharding nor the Postgres route is acceptable. It is an explicit, justified exception, never a reach-for default.</p>
+</section>
+
+<section>
+<h2>Combined effect — W1 and W2 together</h2>
+<p>The two levers attack different bottlenecks and compose. Neither substitutes for the other (per the §9 correction: <em>the queue defeats W1, the sharded many-DB design defeats W2</em>).</p>
+
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">W1</div><div class="metric-label">group commit batches the expensive handoffs for the same-row queue</div></div>
+<div class="metric"><div class="metric-value">W2</div><div class="metric-label">many-small-DBs gives independent lanes for different-row writes</div></div>
+<div class="metric"><div class="metric-value">≈ local</div><div class="metric-label">together: the coarse networked engine behaves close to a fine-grained local one</div></div>
+</div>
+
+<p>Group commit (see <a href="02-engine-core.html">Engine Core</a> and Experiment 2) amortizes the ~10ms network handoff across the batch of commits waiting in one DB's single lane — it makes the same-row queue cheap per commit. Many-small-DBs gives unrelated write streams their own lanes so they never enter that queue in the first place. Applied together, the only workload that survives both mitigations is the irreducible one:</p>
+
+<div class="callout danger">
+<p class="callout-title">The one irreducible case</p>
+<p><strong>Same-row, same-DB, high-rate, latency-critical.</strong> Sharding cannot split a genuinely shared value; group commit batches throughput but cannot lower a single contended write's tail latency; the dependency is sequential by definition. This is exactly the Layer-1 Option-2 Postgres outlier — and it is rare.</p>
+</div>
+</section>
+
+<section>
+<h2>The rule</h2>
+<div class="callout tip">
+<p class="callout-title">One line</p>
+<p><strong>Serialize same-row writes</strong> (correct, universal); <strong>shard to recover granularity</strong> (cheap, where you control it); <strong>route the irreducibly-contended outlier to Postgres</strong> (rare). Correctness handled universally; performance handled per-tool.</p>
+</div>
+</section>
+
+<section>
+<h2>Normative requirements</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> serialize concurrent writes to the same row; the engine MUST NOT under any configuration allow two transactions to apply a read-modify-write to the same row without one observing the other's committed value.</li>
+<li><span class="req-tag must">MUST</span> guarantee that a naive contended <code>UPDATE</code> (e.g. <code>UPDATE counter SET n = n + 1 WHERE id = ?</code>) returns the correct result on the disaggregated engine — slowness under contention is acceptable, incorrectness is not.</li>
+<li><span class="req-tag must">MUST</span> provide the route-to-Postgres escape hatch (Option 2) for any tool flagged as irreducibly contended; this is the mandatory safety net, not an optional add-on.</li>
+<li><span class="req-tag must">MUST</span> never acknowledge a commit before its WAL record is durably stored, even under group commit; batching MUST NOT trade durability for latency (see <a href="09-benchmark-plan.html">Benchmark &amp; Validation Plan</a> Experiment 4).</li>
+<li><span class="req-tag should">SHOULD</span> ship the sharded-counter and event-log helpers (Option 1) as documented patterns plus copy-paste SQL, applied wherever the platform controls the tool's schema.</li>
+<li><span class="req-tag should">SHOULD</span> map each independent write stream to its own database so per-DB locking approximates per-row granularity (the W2 lever).</li>
+<li><span class="req-tag should">SHOULD</span> surface a contention signal (per-row serialized-handoff rate / wait time) so Experiment 3 outliers are detectable in production, not only in benchmarks.</li>
+<li><span class="req-tag may">MAY</span> introduce a dedicated atomic primitive (Option 3, e.g. Redis) for a tool that is both extremely contended and latency-critical, only after Options 1 and 2 are shown insufficient.</li>
+<li><span class="req-tag must-not">MUST NOT</span> default to a second datastore for counters; adding a consistency model and ops surface MUST be a justified per-tool exception.</li>
+<li><span class="req-tag must-not">MUST NOT</span> claim that group commit or sharding solves same-row contention — they solve latency (W1) and lanes (W2) respectively, never the read-modify-write dependency itself.</li>
+</ul>
+</section>
+
+<section>
+<h2>Behaviour &amp; decision algorithm</h2>
+<p>Per-tool placement follows the §9 go/no-go rule, specialised for contention:</p>
+<pre data-lang="text"><code>classify_tool(tool):
+    # 1. Default everything to the correct-but-slow engine.
+    backend = DISAGGREGATED_ENGINE
+
+    # 2. Recover granularity for free where we own the schema.
+    if writes_are_to_distinct_rows(tool) or can_shard(tool):
+        apply(Option1.shard_counter or Option1.event_log)
+        place tool in its own database          # W2 lane
+        return backend                          # green quadrant
+
+    # 3. Measure the contended case (Benchmark Exp 3).
+    p99, plateau = run_exp3(tool)               # same-row writers, swept
+
+    if p99 within tool.write_latency_budget and
+       plateau &gt;= tool.aggregate_write_rate:
+        return backend                          # batching (W1) suffices
+
+    # 4. Irreducible: same-row, same-DB, high-rate, latency-critical.
+    if tool.latency_critical:
+        return COUPLED_POSTGRES                  # Option 2 safety net
+    else:
+        return backend                          # slow but acceptable
+
+    # Option 3 (dedicated primitive) is a manual override here,
+    # never returned automatically.</code></pre>
+<p>The decision is reversible and per-tool: the platform benchmarks the boundary once, then places each tool on the correct side. There is no global on/off switch — correctness is global, placement is local.</p>
+</section>
+
+<section>
+<h2>Configuration knobs</h2>
+<dl class="fields">
+<dt>counter_shard_count (N)</dt>
+<dd>Number of sub-counter rows in the Option-1 sharded-counter helper. Higher N = more parallelism on writes, more rows to sum on read. Default 16; tune to expected concurrent writers.</dd>
+<dt>group_commit_window</dt>
+<dd>Max wait before flushing a batch of commits in a single DB's lane (W1 mitigation). Larger window = better amortization of the ~10ms handoff, higher single-commit tail latency. Owned by <a href="02-engine-core.html">Engine Core</a>; surfaced here because it sets the same-row queue's cost-per-commit.</dd>
+<dt>group_commit_max_batch</dt>
+<dd>Max commits coalesced per durable append, bounding batch latency under bursts.</dd>
+<dt>contention_flag_threshold</dt>
+<dd>Per-row serialized-handoff rate or mean wait time above which a tool is flagged as an Exp-3 outlier and surfaced for Option-2 routing.</dd>
+<dt>db_per_write_stream</dt>
+<dd>Policy toggle: whether independent write streams are auto-placed in separate databases (the W2 lane lever) or co-located.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Mode</th><th>Cause</th><th>Outcome / mitigation</th></tr></thead>
+<tbody>
+<tr><td>Lost update</td><td>two same-row writes both read the stale value (parallelized incorrectly)</td><td><span class="pill red">disqualifying</span> — engine MUST serialize; this MUST NOT be reachable</td></tr>
+<tr><td>Manufactured contention</td><td>unrelated rows in one big DB serialize on the per-DB lock</td><td>shard into many DBs (W2); the granularity gap closes</td></tr>
+<tr><td>Oversell / negative inventory</td><td>decrement not checked against the committed prior value</td><td>same-row serialization makes check-and-decrement atomic; do not bypass it with caching</td></tr>
+<tr><td>Acked-write loss under batching</td><td>group commit acks before WAL is durable</td><td><span class="pill red">disqualifying</span> — see Exp 4; never ack from an in-memory buffer</td></tr>
+<tr><td>Sharded-counter skew</td><td>random shard selection clusters writes onto few shards</td><td>raise N; use a well-distributed shard key; reads still correct, only throughput affected</td></tr>
+<tr><td>Event-log read amplification</td><td><code>SUM</code> over an unbounded event table grows slow</td><td>periodic roll-up into a snapshot row + truncate folded events; read = snapshot + recent tail</td></tr>
+<tr><td>Option-3 split-brain</td><td>counter lives in Redis, source of truth diverges from the SQL DB</td><td>only adopt with an explicit reconciliation/consistency story; this is why it is not a default</td></tr>
+<tr><td>Misdiagnosis by volume</td><td>high-throughput distinct-row workload mistaken for hot-row</td><td>diagnose by write dependency, not request rate; distinct-row volume is a lane/batch problem</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Dependencies &amp; existing pieces to start from</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> build on the engine's MVCC + single-writer-per-DB serialization in <a href="02-engine-core.html">Engine Core</a> — the correctness guarantee this entire strategy rests on.</li>
+<li><span class="req-tag must">MUST</span> use the group-commit machinery (W1 lever) and the durable-append guarantee from <a href="02-engine-core.html">Engine Core</a> and the commit log in <a href="04-object-storage-backend.html">Object-Storage Backend</a> (S3 conditional-write / CAS append, single-writer fencing).</li>
+<li><span class="req-tag must">MUST</span> coordinate single-writer fencing with the CAS token / lease in <a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a> so the serializing writer is unambiguous.</li>
+<li><span class="req-tag should">SHOULD</span> drive per-tool placement from <a href="09-benchmark-plan.html">Benchmark &amp; Validation Plan</a> Experiment 3 (contention wall) and Experiment 2 (group-commit plateau).</li>
+<li><span class="req-tag should">SHOULD</span> reuse the many-small-DBs / sharding posture established in <a href="01-architecture-overview.html">Architecture Overview</a> as the W2 lane mechanism.</li>
+</ul>
+</section>
+
+<section>
+<h2>Acceptance criteria — definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> demonstrate that a naive contended increment produces the correct total under concurrency (no lost updates) on the disaggregated engine.</li>
+<li><span class="req-tag must">MUST</span> pass Experiment 4 unconditionally: every acked commit survives crash injection, including under group commit, with no torn or half state.</li>
+<li><span class="req-tag must">MUST</span> show Experiment 3 flattening/dropping on same-row writers and the N-separate-databases variant scaling linearly (validates W2).</li>
+<li><span class="req-tag should">SHOULD</span> ship documented Option-1 helpers (sharded counter, event-log) with working SQL and a roll-up recipe for the event-log read path.</li>
+<li><span class="req-tag should">SHOULD</span> expose a contention metric and a documented Option-2 routing runbook so a flagged tool can move to coupled Postgres without code changes to other tools.</li>
+<li><span class="req-tag should">SHOULD</span> demonstrate the sharded-counter helper converting a red-quadrant workload to green (Exp-3 throughput recovering toward Exp-2 levels).</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> need a built-in serial/sequence-style primitive: should the engine ship a first-class counter type that auto-shards, so developers get the green path without writing the helper SQL?</li>
+<li><span class="req-tag may">MAY</span> want automatic contention detection that <em>suggests</em> sharding in-product, since the platform cannot enforce developer SQL — how aggressive should auto-flagging be before it becomes noise?</li>
+<li><span class="req-tag should">SHOULD</span> define the event-log roll-up cadence and locking: the roll-up itself touches a snapshot row and could reintroduce a (smaller) hot row — needs its own contention budget.</li>
+<li><span class="req-tag may">MAY</span> revisit whether cross-DB transactions are ever needed; the many-small-DBs lever assumes write streams are independent — workloads that span DBs transactionally break the lane model.</li>
+<li><span class="req-tag must">MUST</span> keep the Option-2 boundary measurable in production, not only in benchmarks, so the "rare outlier" assumption stays falsifiable as workloads evolve.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiment 3 is the red-quadrant detector that flags hot-row outliers; Exp 2 proves the W1 group-commit plateau.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">single-writer fencing via the commit-log CAS token — the mechanism that makes "the serializing writer" unambiguous.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">MVCC snapshot isolation, single-writer-per-DB serialization, and group commit — the correctness floor this strategy stands on.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the S3 CAS commit log whose ~10ms durable handoff sets the per-commit cost the policy works around.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">the many-small-DBs / sharding posture that is the W2 lane lever for recovering lock granularity.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 1 — Embedded Library · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">P1 · MAP</span>
+<span class="badge badge-status status-approved">Implemented</span>
+<span class="spec-date">Phase 1</span>
+</div>
+<h1>Phase 1 — Embedded Library</h1>
+<p class="lede">The implementation map for the in-process embeddable library: <code>libengine</code> + the frozen C ABI + the <code>@yourdb/bun</code> wrapper, backed by <code>LocalFileStorage</code> over a stable <code>Storage</code> seam.</p>
+</header>
+
+<section>
+<h2>Overview</h2>
+<p>This document maps the implemented code to the Phase 1 deliverables, exit criteria, and Definition of Done in <a href="13-roadmap.html">the roadmap</a>, and records the deliberate scope decisions.</p>
+</section>
+
+<section>
+<h2>What shipped</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Deliverable (spec 13 §Phase 1)</th><th>Where</th></tr>
+</thead>
+<tbody>
+<tr><td><code>libengine.a</code> / <code>libengine.so</code> (+<code>.dylib</code>/<code>.dll</code>) static &amp; dynamic libs</td><td><code>crates/engine</code> (<code>crate-type = ["cdylib","staticlib","rlib"]</code>)</td></tr>
+<tr><td><code>engine.h</code> — the stable C ABI (<code>engine_open</code>/<code>exec</code>/<code>query</code>/<code>prepare</code>/<code>begin</code>/<code>commit</code>/…)</td><td><code>crates/engine/include/engine.h</code>, implemented in <code>crates/engine/src/ffi.rs</code></td></tr>
+<tr><td><code>@yourdb/bun</code> thin TypeScript wrapper over <code>bun:ffi</code></td><td><code>clients/bun/</code> (<code>src/ffi.ts</code> raw bindings, <code>src/index.ts</code> typed API)</td></tr>
+<tr><td><code>LocalFileStorage</code> — first concrete <code>Storage</code> impl</td><td><code>crates/storage/src/local.rs</code></td></tr>
+<tr><td>Local cache / in-process working set (the SHOULD)</td><td>the engine's in-process MVCC store (<code>crates/engine/src/store.rs</code>) is the buffer; durability is the WAL</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Exit criteria → evidence</h2>
+<ul>
+<li><strong>Open a <code>file://</code> DB from Bun via FFI; DDL + DML + queries; correct results across a process restart.</strong> <code>clients/bun/test/embedded.test.ts</code> (<code>persists across reopen</code>) and <code>crates/engine/tests/engine.rs</code> (<code>persists_across_restart</code>). State is rebuilt purely by replaying the durable WAL (<code>crates/engine/src/db.rs::replay</code>).</li>
+<li><strong>Basic correctness gate + MVCC snapshot isolation</strong> (a reader sees a stable snapshot across a concurrent committed write). <code>engine.rs::mvcc_snapshot_isolation</code> and <code>embedded.test.ts</code> (<code>MVCC snapshot isolation across two handles</code>). Visibility rules: <code>store.rs::RowVersion</code>.</li>
+<li><strong><code>@yourdb/bun</code> demonstrated end-to-end with no native build step beyond the prebuilt library.</strong> <code>clients/bun/examples/notes.ts</code>.</li>
+<li><strong>Storage seam conformance</strong> (durability-after-ack, monotonic LSN, snapshot reads, fencing, crash hooks, batch reads, branch creation, retention). C1–C8 in <code>crates/storage/src/conformance.rs</code>, run against <code>LocalFileStorage</code> in <code>crates/storage/tests/conformance.rs</code>, plus a torn-trailing-frame recovery test (the in-process analog of <kbd>kill -9</kbd> mid-append).</li>
+<li><strong>No panics across FFI; misuse is defined, not UB.</strong> Every export is wrapped in <code>catch_unwind</code> → <code>ENGINE_ERR_INTERNAL</code>; null handles → <code>ENGINE_ERR_MISUSE</code> (<code>crates/engine/tests/ffi.rs</code>).</li>
+</ul>
+</section>
+
+<section>
+<h2>Architecture decisions (and why)</h2>
+<ul>
+<li><strong>The <code>Storage</code> trait is <code>async</code> from Phase 1.</strong> Spec 13 requires the trait to stay signature-stable once Phase 2 adds the network-bound <code>ObjectStorage</code> backend. Making it async now avoids a later breaking change; <code>LocalFileStorage</code> resolves synchronously and the engine drives it with a tiny dependency-free <code>block_on</code> (<code>crates/storage/src/lib.rs</code>). The C ABI stays synchronous (<code>engine_commit</code> blocks until durable).</li>
+<li><strong>Two buildable additions to the source trait,</strong> both forward-compatible with <code>ObjectStorage</code>: <code>scan_wal</code> (recovery read — the engine replays the durable log on open) and <code>put_page</code> (the page store's write path; the source trait names only the read path <code>get_page</code>). They share one monotonic LSN counter.</li>
+<li><strong>WAL-centric engine.</strong> Durability and recovery go through the WAL; the working set lives in the in-process store (the buffer the cache spec formalizes). The page read API (<code>get_page</code>/<code>get_pages</code>) is implemented and conformance-tested in the storage layer and becomes the cold-read path when <code>ObjectStorage</code> lands in Phase 2 (where cold reads pay a network round-trip and the cache is mandatory).</li>
+<li><strong>Single writer per database, snapshot isolation.</strong> Writers serialize through a write lane; readers capture a snapshot LSN and never block. A minimal first-committer-wins check (<code>exec.rs::check_no_conflict</code>) keeps SI correct for explicit transactions under serialized writers.</li>
+<li><strong>Crash safety.</strong> <code>LocalFileStorage</code> writes CRC-checked, length-prefixed frames and <code>fsync</code>s before returning the commit LSN — never ack-before-durable. On reopen, a torn trailing frame is detected and truncated; the WAL replay then rebuilds state, so every acked commit survives and no half-state is replayed.</li>
+</ul>
+</section>
+
+<section>
+<h2>Deliberate Phase-1 limitations (documented, not accidental)</h2>
+<ul>
+<li><strong>Branching (<code>engine_branch</code>) is reserved, not implemented.</strong> The roadmap explicitly forbids folding a later phase's concern into Phase 1; the ABI symbol is frozen here but returns NULL with an explanatory <code>engine_last_error</code> (copy-on-write branching is Phase 4).</li>
+<li><strong>DDL runs in autocommit only.</strong> <code>CREATE</code>/<code>DROP TABLE</code> inside an explicit transaction returns <code>ENGINE_ERR_TXN</code>. (Row DML is fully transactional.)</li>
+<li><strong>SQL subset.</strong> A focused hand-written parser supports <code>CREATE/DROP TABLE</code>, <code>INSERT</code>, <code>SELECT</code> (projection, <code>WHERE</code>, <code>ORDER BY</code>, <code>LIMIT</code>, <code>COUNT/SUM/MIN/MAX/AVG</code>), <code>UPDATE</code>, <code>DELETE</code>, and <code>BEGIN/COMMIT/ROLLBACK</code>. Joins, GROUP BY, subqueries, and <code>DISTINCT</code> are out of scope for Phase 1 and rejected with <code>ENGINE_ERR_SQL</code>.</li>
+<li><strong><code>s3://</code>/<code>r2://</code> schemes are rejected</strong> with a clear "Phase-2 backend" error; unknown schemes are rejected outright (no silent default).</li>
+<li><strong>In-process database sharing.</strong> Multiple handles to the same <code>file://</code> URL in one process share MVCC state via a registry (so the snapshot-isolation guarantee holds across handles). Cross-process concurrent writers are not a Phase 1 target (single-writer-per-DB; fencing is conformance-tested).</li>
+</ul>
+</section>
+
+<section>
+<h2>Running</h2>
+<pre data-lang="bash"><code>cargo test                                   # storage conformance + engine correctness + FFI
+cargo build -p bydesigns-engine --release    # target/release/libengine.{a,so}
+cd clients/bun &amp;&amp; bun test                    # embedded end-to-end</code></pre>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">Rust library: parser → plan → executor, MVCC via LSN-stamped versions, WAL generation, C ABI.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The narrow <code>Storage</code> trait frozen here and satisfied first by <code>LocalFileStorage</code>.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">The <code>bun:ffi</code> binding over <code>engine.h</code> and the <code>@yourdb/bun</code> wrapper shipped in Phase 1.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The phased plan whose Phase 1 deliverables and Definition of Done this map implements.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db — internal development specification. Implementation map.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine Core · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">02 · ENG</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Engine Core</h1>
+<p class="lede">The engine core is the single Rust library that parses, plans, and executes SQL, manages MVCC transactions, and generates the WAL — shipped simultaneously as an embeddable C-ABI library and a wire-protocol server, with every durable byte routed through a pluggable storage seam rather than the local disk.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>The engine core is <strong>Slot B</strong> of the layer map: the library that turns SQL text into committed state changes. It owns the SQL frontend (parser, planner, executor), the transaction and concurrency machinery (MVCC under snapshot isolation, single-writer serialization), and WAL generation. It never touches a disk directly — all durable reads and writes go through the <code>Storage</code> trait defined in <a href="03-storage-interface.html">Storage Interface</a>, which is the architectural seam that lets the same binary run embedded or disaggregated.</p>
+<p>One artifact serves both deployment shapes. Embedded, the host process (Bun, etc.) links the library and calls it through the C ABI — function-call latency, no socket. As a server, the identical library is wrapped in a wire-protocol listener (<a href="07-server-mode.html">Server Mode</a>). The choice of storage backend is a connection-string scheme, not a recompile.</p>
+<div class="callout note">
+<p class="callout-title">Note</p>
+<p>"Embeddable <em>and</em> disaggregated" stop being contradictory the moment the storage seam is a pluggable backend inside the library rather than a server you connect to. The engine core is the in-process compute; everything network-shaped lives behind the trait.</p>
+</div>
+</section>
+
+<section>
+<h2>Language &amp; build outputs</h2>
+<p>The engine is written in <strong>Rust</strong>: FFI-friendly, links into anything, no GC pauses on the hot path, and a memory model that lets us reason about the FFI boundary precisely. It compiles to both a dynamic and a static library so hosts can choose linking strategy.</p>
+
+<h3>Build outputs</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Artifact</th><th>Form</th><th>Consumer</th></tr></thead>
+<tbody>
+<tr><td><code>libengine.a</code></td><td>staticlib</td><td>Static linking into a host binary / NAPI addon</td></tr>
+<tr><td><code>libengine.so</code> / <code>libengine.dylib</code> / <code>libengine.dll</code></td><td>cdylib</td><td>Dynamic loading via <code>dlopen</code> / <code>bun:ffi</code></td></tr>
+<tr><td><code>engine.h</code></td><td>C ABI header</td><td>The stable boundary <em>every</em> runtime binds to</td></tr>
+<tr><td><code>engine-server</code></td><td>binary</td><td>The library + a wire-protocol listener (see <a href="07-server-mode.html">Server Mode</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>engine.h</code> is the contract. Every binding — <code>bun:ffi</code>, a NAPI addon, the server's own internal calls — goes through the exact same exported symbols. Cargo configuration:</p>
+<pre data-lang="text"><code>[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+# rlib so engine-server can depend on the engine as a normal Rust crate
+# cdylib + staticlib for the FFI consumers</code></pre>
+
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> implement OLAP / columnar execution in the engine core. The row engine has a row-oriented layout; analytical aggregation belongs to a second engine (DuckDB) reading the shared object store — see <a href="12-capabilities.html">Capabilities</a>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> implement the storage backend (LSM layers, S3 CAS log, page materialization) here. That lives behind the trait in <a href="03-storage-interface.html">Storage Interface</a> and <a href="04-object-storage-backend.html">Object-Storage Backend</a>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> embed the connection pooler, the lifecycle controller, or the wire-protocol parsing logic. Those are <a href="06-lifecycle-controller.html">Lifecycle</a> and <a href="07-server-mode.html">Server Mode</a> concerns layered on top.</li>
+<li><span class="req-tag should-not">SHOULD NOT</span> own the page cache implementation internally beyond the buffer-pool interface; the cache hierarchy is specified in <a href="05-local-cache.html">Local Cache</a>, though the engine consumes it on the read path.</li>
+</ul>
+</section>
+
+<section>
+<h2>The C ABI surface</h2>
+<p>The exported C ABI is the stable boundary. It is deliberately narrow, opaque-handle based, and error-code driven — no Rust types, no panics, and no implicit allocation crossing the line uncontrolled. The connection string passed to <code>engine_open</code> selects the storage backend by scheme (<code>file://</code> → <code>LocalFileStorage</code>, <code>s3://</code> → <code>ObjectStorage</code>); the engine itself is identical either way.</p>
+
+<pre data-lang="c"><code>/* engine.h — stable C ABI. All functions are thread-safe unless noted.
+   Opaque handles; callers never see Rust layout. */
+
+typedef struct EngineHandle EngineHandle;   /* a connection */
+typedef struct EngineResult EngineResult;   /* a buffered query result */
+typedef struct EngineStmt   EngineStmt;     /* a prepared statement */
+
+typedef enum {
+    ENGINE_OK            = 0,
+    ENGINE_ERR_SQL       = 1,   /* parse / plan / type error */
+    ENGINE_ERR_CONSTRAINT= 2,   /* unique / fk / check violation */
+    ENGINE_ERR_CONFLICT  = 3,   /* serialization / write conflict */
+    ENGINE_ERR_STORAGE   = 4,   /* backend I/O, CAS rejected, S3 fault */
+    ENGINE_ERR_TXN       = 5,   /* illegal state-machine transition */
+    ENGINE_ERR_MISUSE    = 6,   /* null handle, use-after-free, bad arg */
+    ENGINE_ERR_INTERNAL  = 7    /* bug; engine remains defined, never UB */
+} EngineStatus;
+
+/* ---- lifecycle ------------------------------------------------------ */
+/* url: "file://./local.db" or "s3://bucket/mydb?region=..." (NUL-terminated).
+   Returns NULL on failure; caller then has no handle to query for error. */
+EngineHandle* engine_open(const char* url);
+void          engine_close(EngineHandle* h);          /* idempotent on NULL */
+
+/* ---- one-shot execution -------------------------------------------- */
+/* DDL/DML with no result set. Row count via engine_changes(). */
+EngineStatus  engine_exec(EngineHandle* h, const char* sql);
+
+/* Buffered query. *out receives an owned EngineResult on ENGINE_OK,
+   else NULL. Result is a JSON document by default; a streaming
+   row-iterator is available via the cursor API below. */
+EngineStatus  engine_query(EngineHandle* h, const char* sql, EngineResult** out);
+
+/* ---- prepared statements ------------------------------------------- */
+EngineStatus  engine_prepare(EngineHandle* h, const char* sql, EngineStmt** out);
+/* bind by 1-based positional index; value is a NUL-terminated, typed
+   literal encoding (see "Parameter encoding"). */
+EngineStatus  engine_bind(EngineStmt* s, int idx, const char* value);
+/* step: ENGINE_OK = a row is available; ENGINE_DONE signalled via *done. */
+EngineStatus  engine_step(EngineStmt* s, int* done);
+EngineStatus  engine_finalize(EngineStmt* s);   /* frees the statement */
+EngineStatus  engine_reset(EngineStmt* s);      /* re-execute, keep bindings */
+
+/* ---- transactions -------------------------------------------------- */
+EngineStatus  engine_begin(EngineHandle* h);
+EngineStatus  engine_commit(EngineHandle* h);    /* blocks until WAL durable */
+EngineStatus  engine_rollback(EngineHandle* h);
+
+/* ---- branching ----------------------------------------------------- */
+/* Open a copy-on-write branch at the current LSN of h's database.
+   Returns a NEW handle on a NEW logical database; NULL on failure. */
+EngineHandle* engine_branch(EngineHandle* h, const char* name);
+
+/* ---- result / row access ------------------------------------------- */
+int           engine_result_rows(const EngineResult* r);
+int           engine_result_cols(const EngineResult* r);
+const char*   engine_result_colname(const EngineResult* r, int col);
+/* Borrowed pointer into r; valid until engine_result_free(r). */
+const char*   engine_result_value(const EngineResult* r, int row, int col);
+/* Same for the streaming statement cursor at the current step. */
+const char*   engine_column_value(const EngineStmt* s, int col);
+
+/* ---- errors -------------------------------------------------------- */
+/* Borrowed, thread-local-per-handle C string describing the LAST error
+   on h. Valid until the next call on h. Empty string if none. */
+const char*   engine_last_error(EngineHandle* h);
+long long     engine_changes(EngineHandle* h);   /* rows affected, last stmt */
+long long     engine_last_lsn(EngineHandle* h);  /* commit LSN of last commit */
+
+/* ---- freeing ------------------------------------------------------- */
+void          engine_result_free(EngineResult* r);   /* idempotent on NULL */
+/* statements are freed by engine_finalize; handles by engine_close.   */
+</code></pre>
+
+<h3>Ownership &amp; lifetime of returned pointers</h3>
+<dl class="fields">
+<dt>EngineHandle*</dt><dd>Owned by the caller. Created by <code>engine_open</code> / <code>engine_branch</code>, destroyed only by <code>engine_close</code>. The engine never frees a handle on the caller's behalf.</dd>
+<dt>EngineResult*</dt><dd>Owned by the caller. Must be released exactly once with <code>engine_result_free</code>. All <code>const char*</code> values and column names obtained from it are <strong>borrowed</strong> — they point into the result's arena and become dangling the instant the result is freed.</dd>
+<dt>EngineStmt*</dt><dd>Owned by the caller; released by <code>engine_finalize</code>. Borrowed column values from <code>engine_column_value</code> are valid only until the next <code>engine_step</code> / <code>engine_reset</code> / <code>engine_finalize</code> on that statement.</dd>
+<dt>const char* (errors, values, colnames)</dt><dd>Always <strong>borrowed</strong>, never freed by the caller. Each has the lifetime stated above. Callers MUST copy out before the owning object advances or is freed.</dd>
+</dl>
+
+<h3>Error model — no panics across FFI</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> return an <code>EngineStatus</code> from every fallible function and populate <code>engine_last_error</code> on the handle; functions that return a pointer return <code>NULL</code> on failure.</li>
+<li><span class="req-tag must">MUST NOT</span> let a Rust panic unwind across the FFI boundary. Every exported function is wrapped in <code>catch_unwind</code>; a caught panic maps to <code>ENGINE_ERR_INTERNAL</code> and leaves the handle in a defined, queryable state — never undefined behaviour.</li>
+<li><span class="req-tag must">MUST</span> detect misuse (null handle, use-after-free of a finalized statement, double free) and return <code>ENGINE_ERR_MISUSE</code> rather than dereferencing.</li>
+<li><span class="req-tag should">SHOULD</span> distinguish retryable (<code>ENGINE_ERR_CONFLICT</code>, transient <code>ENGINE_ERR_STORAGE</code>) from terminal errors so bindings can implement retry policy without string-matching messages.</li>
+</ul>
+
+<h3>Parameter encoding (proposed)</h3>
+<p>To keep the ABI string-only and stable, bound values use a one-character type tag prefix: <code>i</code> int8, <code>f</code> float8, <code>s</code> text, <code>b</code> base64-bytes, <code>n</code> NULL (value ignored), <code>v</code> vector (comma list). Example: <code>i42</code>, <code>shello</code>, <code>n</code>. A future revision MAY add a binary-typed bind path; the string path remains for FFI ergonomics.</p>
+
+<div class="callout warning">
+<p class="callout-title">Warning</p>
+<p>The connection-string scheme is load-bearing for security and behaviour: <code>file://</code> selects a purely local backend with no network egress; <code>s3://</code> (and <code>r2://</code>) select the disaggregated backend whose commit pays a network round-trip. The engine MUST reject unknown schemes at <code>engine_open</code> rather than silently defaulting.</p>
+</div>
+</section>
+
+<section>
+<h2>Execution pipeline</h2>
+<p>A statement flows through four stages. Each has a single, testable responsibility.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 760 130" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SQL execution pipeline">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="8"   y="40" width="120" height="48" rx="6"/>
+    <rect x="168" y="40" width="120" height="48" rx="6"/>
+    <rect x="328" y="40" width="120" height="48" rx="6"/>
+    <rect x="488" y="40" width="120" height="48" rx="6"/>
+    <rect x="648" y="40" width="104" height="48" rx="6"/>
+    <line x1="128" y1="64" x2="166" y2="64" marker-end="url(#arr)"/>
+    <line x1="288" y1="64" x2="326" y2="64" marker-end="url(#arr)"/>
+    <line x1="448" y1="64" x2="486" y2="64" marker-end="url(#arr)"/>
+    <line x1="608" y1="64" x2="646" y2="64" marker-end="url(#arr)"/>
+  </g>
+  <g fill="currentColor" font-family="monospace" font-size="12" text-anchor="middle">
+    <text x="68"  y="68">SQL text</text>
+    <text x="228" y="62">parser</text><text x="228" y="78">(AST)</text>
+    <text x="388" y="62">logical</text><text x="388" y="78">plan</text>
+    <text x="548" y="62">physical</text><text x="548" y="78">plan</text>
+    <text x="700" y="68">executor</text>
+  </g>
+</svg>
+<p class="diagram-caption">SQL text → parser → logical plan → physical plan → executor.</p>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Stage</th><th>Input → Output</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><strong>Parser</strong></td><td>SQL text → AST</td><td>Lex and parse to a syntax tree; reject malformed SQL with <code>ENGINE_ERR_SQL</code>. No catalog lookups.</td></tr>
+<tr><td><strong>Logical plan</strong></td><td>AST → logical operators</td><td>Bind names against the catalog, resolve types, apply rewrite rules (predicate pushdown, constant folding, subquery flattening). Backend-agnostic.</td></tr>
+<tr><td><strong>Physical plan</strong></td><td>logical → physical operators</td><td>Choose access methods (B-tree seek vs scan, HNSW probe), join algorithms, and order using catalog statistics. Emits operators that read pages via the buffer pool / <code>Storage</code> trait.</td></tr>
+<tr><td><strong>Executor</strong></td><td>physical → rows / mutations</td><td>Volcano/vectorized pull execution; acquires the MVCC snapshot for reads, emits <code>WalRecord</code>s for writes, drives commit through the transaction manager.</td></tr>
+</tbody>
+</table>
+</div>
+
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> resolve all object names and types in the logical-plan stage; the executor never re-binds.</li>
+<li><span class="req-tag should">SHOULD</span> cache prepared-statement physical plans keyed by SQL text + parameter types to amortize parse/plan cost across <code>engine_reset</code> cycles.</li>
+<li><span class="req-tag may">MAY</span> use vectorized batch execution for read operators; row mutations stay row-at-a-time to keep WAL generation simple.</li>
+</ul>
+</section>
+
+<section>
+<h2>Concurrency &amp; transactions</h2>
+<p>The engine provides <strong>snapshot isolation</strong> through <strong>MVCC</strong>. Every row version is stamped with the LSN of the transaction that created it (and, on update/delete, the LSN that superseded it). Reads see a consistent <em>snapshot LSN</em>; they never block writers and are never blocked by them.</p>
+
+<h3>Readers — snapshot LSN</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> capture a snapshot LSN at the start of each read transaction (or each statement in autocommit) and serve every page at that LSN via <code>get_page(page_id, lsn)</code>.</li>
+<li><span class="req-tag must">MUST</span> make a row version visible to a snapshot iff its creation LSN ≤ snapshot LSN and its supersede LSN (if any) &gt; snapshot LSN.</li>
+<li><span class="req-tag may">MAY</span> run unlimited concurrent readers; readers do not contend with each other or with the writer.</li>
+</ul>
+
+<h3>Writers — one per database</h3>
+<p>There is <strong>one writer per database</strong>. Write transactions are serialized through a single write lane; this is the SQLite-lineage ceiling, deliberately accepted. It is correct — concurrent writes to the same row must be serialized in any database — and the architecture recovers parallelism through many small databases rather than many writers per database.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> serialize all write transactions for a database through a single lane; only one transaction holds write intent at a time.</li>
+<li><span class="req-tag must">MUST</span> assign commit LSNs monotonically; the WAL order is the commit order.</li>
+<li><span class="req-tag should">SHOULD</span> support group commit — batching independent transactions' WAL records into one durable append to amortize the network handoff (defeats W1, commit latency).</li>
+<li><span class="req-tag must-not">MUST NOT</span> rely on batching to add write lanes; lanes come only from sharding into more databases (defeats W2, write serialization).</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Note</p>
+<p>W1 (commit latency) and W2 (write serialization) are different bottlenecks with different levers: the group-commit queue defeats W1; the many-small-databases design defeats W2. The single irreducible case — many writers contending on the <em>same row in the same database</em> at high rate — is routed to coupled Postgres. See <a href="10-hot-row-contention.html">Hot-Row Contention Strategy</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>WAL generation</h2>
+<p>The executor emits write-ahead-log records and hands them to the storage backend; it does not write them itself. <code>Storage::append_wal</code> returns the <strong>commit LSN</strong> once the records are durably stored, and only then does the engine acknowledge the commit. The engine generates records; storage makes them durable.</p>
+
+<h3>WalRecord — conceptual format</h3>
+<pre data-lang="rust"><code>/// One logged change. The engine emits these; Storage::append_wal
+/// makes them durable and returns the commit LSN of the batch.
+struct WalRecord {
+    txn_id: TxnId,          // owning transaction
+    lsn:    Lsn,            // position in the global log order (assigned on append)
+    page_id: PageId,        // page this change targets
+    kind:   ChangeKind,     // see below
+    payload: ChangePayload, // physical or logical change
+}
+
+enum ChangeKind {
+    Insert,                 // new row version
+    Update,                 // supersede old version, write new
+    Delete,                 // tombstone a version
+    Commit,                 // commit marker — durability point for the txn
+    Abort,                  // explicit rollback marker
+}
+
+enum ChangePayload {
+    /// Physical redo/undo: byte image of the page slot before &amp; after.
+    Physical { before: Option&lt;Bytes&gt;, after: Option&lt;Bytes&gt; },
+    /// Logical change: enough to replay against the page store
+    /// (e.g. keyed row delta) without a full byte image.
+    Logical  { key: RowKey, delta: Bytes },
+    /// Marker records (Commit / Abort) carry no page payload.
+    Marker,
+}</code></pre>
+
+<p>A committing transaction emits its data records followed by a single <strong>Commit</strong> marker. The marker's durable append is the atomic commit point: until <code>append_wal</code> returns the commit LSN, the transaction is not committed; after it returns, the transaction is durable even across a crash.</p>
+
+<h3>Durability rule (restated)</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> obtain the commit LSN from <code>Storage::append_wal</code> — meaning the WAL (including the Commit marker) is durably stored — <em>before</em> acknowledging the commit to the caller.</li>
+<li><span class="req-tag must-not">MUST NOT</span> acknowledge a commit from an in-memory buffer. Caching hides <em>read</em> latency completely; it must never hide <em>commit</em> latency, or acked writes can be lost on crash.</li>
+<li><span class="req-tag must">MUST</span> treat page materialization as asynchronous and subordinate to the WAL: a commit is durable once its WAL record is stored, regardless of whether the page store has yet materialized the new page.</li>
+</ul>
+<div class="callout danger">
+<p class="callout-title">Danger</p>
+<p>A fast commit path that loses an acked write under crash is disqualifying, regardless of latency numbers. This is verified by Experiment 4 in the <a href="09-benchmark-plan.html">Benchmark Plan</a> (kill -9 after CAS-append-issued-before-ack, and after-ack-before-materialization). Durability is non-negotiable.</p>
+</div>
+</section>
+
+<section>
+<h2>Transaction lifecycle state machine</h2>
+<p>Each transaction moves through a small, explicit state machine. Illegal transitions return <code>ENGINE_ERR_TXN</code>.</p>
+
+<div class="diagram">
+<pre>
+                 begin                first write
+   ┌────────┐ ───────────▶ ┌────────┐ ──────────▶ (still Active, holds write lane)
+   │  Idle  │              │ Active │
+   └────────┘ ◀─────────── └────────┘
+        ▲     rollback/abort    │ commit
+        │                       ▼
+        │                 ┌────────────┐  append_wal returns commit LSN
+        │   abort on      │ Committing │ ───────────────────────────────┐
+        │   storage fail  └────────────┘                                 ▼
+        │                       │                                 ┌────────────┐
+        └───────────────────────┴──────────────────────────────▶ │ Committed  │
+                                │  failure                        └────────────┘
+                                ▼
+                          ┌──────────┐
+                          │ Aborted  │
+                          └──────────┘
+</pre>
+<p class="diagram-caption">Idle → Active → Committing → Committed | Aborted.</p>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Transition</th><th>Trigger</th><th>Requires</th></tr></thead>
+<tbody>
+<tr><td>Idle → Active</td><td><code>engine_begin</code> (or first statement in autocommit)</td><td>Acquire a snapshot LSN; allocate a TxnId. No write lane yet.</td></tr>
+<tr><td>Active (read) → Active (writer)</td><td>first mutating statement</td><td>Acquire the single write lane for the database; buffer <code>WalRecord</code>s.</td></tr>
+<tr><td>Active → Committing</td><td><code>engine_commit</code></td><td>Emit the Commit marker; call <code>Storage::append_wal</code>. Transaction is not yet durable.</td></tr>
+<tr><td>Committing → Committed</td><td><code>append_wal</code> returns a commit LSN</td><td>WAL durable. Publish row versions at the commit LSN; release the write lane; ack the caller.</td></tr>
+<tr><td>Committing → Aborted</td><td>storage failure / CAS rejected</td><td>No commit LSN obtained; discard buffered records; release the write lane; surface <code>ENGINE_ERR_STORAGE</code> / <code>ENGINE_ERR_CONFLICT</code>.</td></tr>
+<tr><td>Active → Aborted</td><td><code>engine_rollback</code>, constraint failure, or panic</td><td>Discard buffered records; release any held write lane; return to Idle-equivalent (handle reusable).</td></tr>
+</tbody>
+</table>
+</div>
+
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> reject <code>engine_commit</code> / <code>engine_rollback</code> when no transaction is Active with <code>ENGINE_ERR_TXN</code>.</li>
+<li><span class="req-tag must">MUST</span> release the write lane on entry to Committed or Aborted — never leak it on the error path.</li>
+<li><span class="req-tag must">MUST NOT</span> publish any row version before the Committing → Committed transition; a snapshot taken mid-commit MUST NOT observe partial state.</li>
+</ul>
+</section>
+
+<section>
+<h2>Memory &amp; threading model across the FFI boundary</h2>
+<p>The engine is the only party that allocates and frees engine-owned objects. Callers obtain opaque handles and borrowed pointers; ownership rules above govern who frees what. Across the FFI line, all memory crossing is either (a) a NUL-terminated UTF-8 C string the caller owns and the engine copies, or (b) an opaque handle / borrowed pointer the engine owns.</p>
+
+<h3>Thread-safety of a handle</h3>
+<dl class="fields">
+<dt>EngineHandle (connection)</dt><dd>Represents a single logical connection with at most one in-flight statement and at most one open transaction. It is <strong>not</strong> safe to use concurrently from multiple threads. A caller wanting parallelism opens multiple handles.</dd>
+<dt>Multiple handles, same database</dt><dd>Safe and expected. Readers share the snapshot machinery; writers serialize through the one write lane. The engine's internal shared state (catalog, buffer pool, lane) is <code>Send + Sync</code> and synchronized internally.</dd>
+<dt>Branch handles</dt><dd>A handle returned by <code>engine_branch</code> is a fully independent connection on a new logical database; it has its own write lane and may be driven from its own thread.</dd>
+</dl>
+
+<ul class="reqs">
+<li><span class="req-tag must">MUST NOT</span> be called concurrently on a single <code>EngineHandle</code>; behaviour is then <code>ENGINE_ERR_MISUSE</code> at best. One handle = one thread of execution at a time.</li>
+<li><span class="req-tag must">MUST</span> make engine-internal shared state (across handles to the same DB) safe for concurrent access without caller-visible global locks beyond the documented single write lane.</li>
+<li><span class="req-tag should">SHOULD</span> keep <code>engine_last_error</code> scoped per handle so concurrent handles do not clobber each other's error strings.</li>
+<li><span class="req-tag may">MAY</span> run executor read operators on an internal thread pool, provided no caller-visible handle is touched from more than one thread.</li>
+</ul>
+
+<div class="callout tip">
+<p class="callout-title">Tip</p>
+<p>The single-threaded-per-handle rule maps cleanly onto host runtimes: a Bun process opens one handle per concurrent unit of work, and the WASM target (Cloudflare Workers, single-threaded isolate) gets exactly one handle per request — no shared mutable state to reason about. See <a href="08-bun-integration.html">Bun Integration</a> and <a href="11-deployment-targets.html">Deployment Targets</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Build-from-existing guidance</h2>
+<p>Do not start from a blank parser. The SQL frontend and the B-tree access method are enormous, well-trodden surfaces; reuse a proven core and spend the novel effort on the storage seam and the commit path.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Starting point</th><th>Why</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><strong>libSQL</strong> (SQLite-compatible, pluggable)</td><td>Mature SQL frontend, B-tree, WAL concepts; already designed for a pluggable storage layer; SQLite-lineage single-writer semantics match this engine's model.</td><td>Adapt the storage layer to our <code>Storage</code> trait; add LSN-stamped MVCC if not present.</td></tr>
+<tr><td><strong>LeanStore / Umbra lineage</strong> (research OLTP)</td><td>Modern buffer-management and MVCC designs aimed at out-of-memory working sets — close to the "object storage is the cold floor" model.</td><td>Less batteries-included; more integration and SQL-surface work.</td></tr>
+<tr><td><strong>DuckDB pattern</strong> (reference only)</td><td>Proof of a clean embeddable engine + pluggable extension shape — but columnar/OLAP, so a pattern reference, not a base for the row engine.</td><td>Not a starting codebase for OLTP; cited for its embedding pattern. OLAP is composed alongside, not built in — see <a href="12-capabilities.html">Capabilities</a>.</td></tr>
+</tbody>
+</table>
+</div>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> begin from a SQLite-compatible core (libSQL) for fastest time-to-working-demo, given the matching single-writer model.</li>
+<li><span class="req-tag must">MUST</span> preserve the architectural invariant whichever base is chosen: all durable I/O routes through the <code>Storage</code> trait, never directly to a file or the network.</li>
+</ul>
+</section>
+
+<section>
+<h2>Configuration</h2>
+<p>Configuration is supplied via the connection-string query parameters and a small set of open-time options; the engine has no separate config file in embedded mode.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Knob</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>scheme</code> (URL)</td><td>—</td><td>Selects backend: <code>file://</code> local, <code>s3://</code>/<code>r2://</code> disaggregated.</td></tr>
+<tr><td><code>group_commit_window_ms</code></td><td><code>2</code></td><td>Max time the writer batches commits before forcing a durable append (W1 lever).</td></tr>
+<tr><td><code>group_commit_max_txns</code></td><td><code>64</code></td><td>Max transactions per durable WAL batch.</td></tr>
+<tr><td><code>buffer_pool_mb</code></td><td><code>256</code></td><td>In-process page cache size; the embeddability floor (see <a href="05-local-cache.html">Local Cache</a>).</td></tr>
+<tr><td><code>statement_timeout_ms</code></td><td><code>0</code> (off)</td><td>Abort a statement exceeding the budget with <code>ENGINE_ERR_TXN</code>.</td></tr>
+<tr><td><code>read_snapshot</code></td><td><code>statement</code></td><td><code>statement</code> or <code>transaction</code> scoped snapshot LSN capture.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Condition</th><th>Engine behaviour</th></tr></thead>
+<tbody>
+<tr><td>Panic inside an exported call</td><td>Caught by <code>catch_unwind</code> → <code>ENGINE_ERR_INTERNAL</code>; handle stays defined and queryable.</td></tr>
+<tr><td><code>append_wal</code> fails / CAS rejected mid-commit</td><td>Committing → Aborted; no commit LSN; buffered records discarded; <code>ENGINE_ERR_STORAGE</code> or <code>ENGINE_ERR_CONFLICT</code> (fencing).</td></tr>
+<tr><td>Crash after CAS-append issued, before client ack</td><td>On restart, WAL replay determines outcome; if the marker is durable the commit is present, else it never happened — no torn state (Exp 4a).</td></tr>
+<tr><td>Crash after ack, before page materialization</td><td>Commit is durable in the WAL; page store materializes lazily on next read — acked write is never lost (Exp 4b).</td></tr>
+<tr><td>Use-after-free of a result/statement</td><td><code>ENGINE_ERR_MISUSE</code>; no dereference of freed memory.</td></tr>
+<tr><td>Concurrent calls on one handle</td><td>Misuse; not supported. Open multiple handles.</td></tr>
+<tr><td>Cold read after scale-to-zero</td><td>Buffer pool empty; reads hit the backend and pay object-store latency until warm (informs idle-timeout tuning, Exp 5).</td></tr>
+<tr><td>Unknown URL scheme</td><td><code>engine_open</code> returns <code>NULL</code>; no silent default backend.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> build all four artifacts (<code>libengine.a</code>, the cdylib triplet, <code>engine.h</code>, <code>engine-server</code>) from one Cargo workspace on macOS, Linux, and Windows.</li>
+<li><span class="req-tag must">MUST</span> open, exec, query, prepare/bind/step/finalize, and begin/commit/rollback against both <code>file://</code> and <code>s3://</code> backends with byte-identical SQL behaviour.</li>
+<li><span class="req-tag must">MUST</span> pass Experiment 4 (crash safety of the commit path) unconditionally — every acked commit present, no torn or half state, no acked-write loss — before any real data.</li>
+<li><span class="req-tag must">MUST</span> demonstrate snapshot isolation: a long-running reader observes a stable snapshot LSN while a concurrent writer commits new versions.</li>
+<li><span class="req-tag must">MUST</span> survive a fuzz/loom suite over the FFI boundary with zero panics escaping and zero use-after-free under sanitizers.</li>
+<li><span class="req-tag should">SHOULD</span> sustain group-commit throughput at least 10× the single-commit ceiling (Exp 1 vs Exp 2) on independent rows.</li>
+<li><span class="req-tag should">SHOULD</span> create a branch via <code>engine_branch</code> in O(1) — a new LSN pointer, near-zero marginal storage — and write to it without affecting the base.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> the result default be JSON, or should a binary columnar row-iterator be the primary path for large results to avoid serialization overhead across FFI? (Affects <a href="08-bun-integration.html">Bun Integration</a> ergonomics.)</li>
+<li><span class="req-tag may">MAY</span> the engine expose explicit cursors over <code>engine_query</code> for streaming large result sets, rather than always buffering an <code>EngineResult</code>?</li>
+<li><span class="req-tag should">SHOULD</span> resolve whether MVCC garbage collection of old row versions is driven by the engine or coordinated with the page store's compaction + PITR-window GC (see <a href="04-object-storage-backend.html">Object-Storage Backend</a>).</li>
+<li><span class="req-tag should">SHOULD</span> decide how much of the buffer pool the engine owns vs. delegates to <a href="05-local-cache.html">Local Cache</a> for the LFC spill-to-NVMe tier.</li>
+<li><span class="req-tag may">MAY</span> the WAL payload be physical, logical, or hybrid? Physical is simplest for replay; logical is smaller and friendlier to the LSM page store — open for the storage-trait co-design.</li>
+<li><span class="req-tag should">SHOULD</span> evaluate the WASM build constraints early (single-threaded, no native FS, object store via Worker binding) since they bound the threading model — see <a href="11-deployment-targets.html">Deployment Targets</a>.</li>
+</ul>
+<div class="callout warning">
+<p class="callout-title">Warning</p>
+<p>Object-storage-native OLTP is the active frontier (SlateDB, S3-CAS log designs, the libSQL rewrite). The engine core leans on fast-moving foundations with fewer battle-tested guarantees than a coupled Postgres. Track maturity as a first-class risk — see <a href="14-tradeoffs-risks.html">Tradeoffs &amp; Risks</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">Where the engine core sits in the three-slot layer map.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The trait the engine calls instead of touching disk — the seam.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">Where append_wal and get_page bottom out on S3/R2.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">The buffer pool that keeps the engine's read path in-process.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTRL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Cold-start, scale-to-zero, and branch-on-LSN over the engine.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The same library wrapped in a wire-protocol listener.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">Binding engine.h via bun:ffi for the embedded path.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Commit-latency, group-commit, and crash-safety experiments.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention Strategy</span><span class="xref-desc">Why the single write lane is correct, and how to recover granularity.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">OLAP/DuckDB is composed, not built into the engine core.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

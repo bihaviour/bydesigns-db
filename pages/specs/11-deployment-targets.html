@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deployment Targets · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">11 · DEPLOY</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Deployment Targets</h1>
+<p class="lede">The same stack — stateless scale-to-zero compute, the embedded engine, and an object-storage durability floor — runs unchanged across substrates that differ on exactly two axes that matter: whether the engine ships as a native binary or as WebAssembly, and whether reading a page back on a cache miss costs egress; everything else is portable, so you pick the target first, choose native-or-WASM second, and let the architecture follow the workload across vendors rather than binding to any one.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This page is the buildable expansion of source §10 (<em>Deployment targets</em>). It defines where the stack runs, what each substrate demands of the build, and how to choose. The architecture — stateless compute over the <a href="04-object-storage-backend.html">object-storage backend</a>, fronted by the <a href="05-local-cache.html">local cache</a>, driven by the <a href="06-lifecycle-controller.html">lifecycle controller</a> — is identical on every target. Only two variables change:</p>
+<div class="metric-grid">
+<div class="metric"><div class="metric-value">engine form</div><div class="metric-label">native FFI library vs compiled-to-WASM module</div></div>
+<div class="metric"><div class="metric-value">egress cost</div><div class="metric-label">price of a cache-miss read (per-GB out, or $0 on R2)</div></div>
+</div>
+<p>Scope: the native-vs-WASM fork and what it forces; the target matrix (Cloud Run + GCS, Cloud Run + S3, Cloudflare Workers + R2, generic VM + any S3); why R2 zero-egress is structurally — not marginally — important for a read-on-miss engine; the three concrete scenario fits; the portability principle that makes substrate a per-workload choice; per-target requirements and checklists; an egress cost model; failure modes; acceptance criteria; and open questions. Out of scope: the engine internals (<a href="02-engine-core.html">Engine Core</a>), the storage backend implementation (<a href="04-object-storage-backend.html">Object-Storage Backend</a>), and the Bun binding mechanics (<a href="08-bun-integration.html">Bun Integration</a>) — this page consumes those, it does not redefine them.</p>
+</section>
+
+<section>
+<h2>Responsibilities &amp; non-goals</h2>
+<h3>Responsibilities</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> define, for every supported substrate, which engine form is required (native or WASM) and which object store it pairs with.</li>
+<li><span class="req-tag must">MUST</span> keep the compute platform and the object store independently swappable, with the engine and its <a href="03-storage-interface.html">storage trait</a> as the fixed point.</li>
+<li><span class="req-tag must">MUST</span> make the engine form the <em>first</em> decision, because it determines the build pipeline before any other deployment choice.</li>
+<li><span class="req-tag should">SHOULD</span> document the egress consequence of each pairing, since cache-miss rate couples directly to the egress bill on metered stores.</li>
+<li><span class="req-tag should">SHOULD</span> provide a per-target checklist a senior engineer can execute to stand up the stack on that substrate.</li>
+</ul>
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> introduce a second source of truth: every target shares one object-storage durability floor; compute everywhere is stateless.</li>
+<li><span class="req-tag must-not">MUST NOT</span> bind the architecture to a managed database or a single vendor — portability across substrates is the explicit design goal.</li>
+<li><span class="req-tag may">MAY</span> leave provider-specific tuning (instance sizes, idle timeouts, region pinning) to deployment configuration rather than the spec.</li>
+<li>Multi-region active/active and cross-region replication are out of scope here; single-writer-per-DB (source §4) and same-region compute↔bucket co-location are assumed.</li>
+</ul>
+</section>
+
+<section>
+<h2>The one fork that decides everything: engine form</h2>
+<p>There is exactly one branch in this spec that changes <em>what you build</em>, not merely how you configure it: whether the target runs native code or only JavaScript/WASM. Decide it before anything else, because it selects the build pipeline.</p>
+
+<div class="callout warning">
+<p class="callout-title">Pick the target first — it dictates native vs WASM</p>
+<p>The native path is a recompile of the <a href="02-engine-core.html">engine core</a> for the target triple. The WASM path is a <strong>port</strong>: a different storage backend (Worker binding, not an S3 SDK), no native filesystem, and a single-threaded execution model. You cannot defer this choice — it determines the toolchain, the storage backend implementation, and the cold-start profile. Choosing the target first means choosing native or WASM first.</p>
+</div>
+
+<h3>Native targets — the default, drop-in path</h3>
+<p>Cloud Run, any VM, any container host. The engine runs as a native Rust library linked into Bun via <code>bun:ffi</code>, exactly as specified in <a href="08-bun-integration.html">Bun Integration</a> (source §5). No porting; the <code>cdylib</code>/<code>staticlib</code> outputs and the <code>engine.h</code> C ABI bind directly. This is the most drop-in path and the recommended default.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> build the engine as a native library for the target triple (e.g. <code>x86_64-unknown-linux-gnu</code> / <code>aarch64-unknown-linux-gnu</code>) and link it into the Bun process via FFI.</li>
+<li><span class="req-tag must">MUST</span> use the <code>ObjectStorage</code> backend talking to the bucket over the native S3-compatible client (GCS, S3, MinIO, B2).</li>
+<li><span class="req-tag should">SHOULD</span> use the <a href="05-local-cache.html">two-tier cache</a> in full, including the NVMe local-file cache, since a native host has a real filesystem.</li>
+<li><span class="req-tag may">MAY</span> run multi-threaded; the executor and background compaction/GC use OS threads as on any server.</li>
+</ul>
+
+<h3>WASM targets — Cloudflare Workers, a real but ported path</h3>
+<p>Cloudflare Workers run only JavaScript and WebAssembly — native-code binaries cannot be uploaded. The engine therefore <strong>must be compiled to WASM</strong>, and three structural constraints follow. SQLite-lineage engines (the recommended starting point, source §2.A/§6) <em>do</em> compile to WASM, so this is a genuine path — but it is a port, not a recompile, and WASM Workers start slower and run larger than their JS equivalents.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> compile the engine to WebAssembly (e.g. <code>wasm32-unknown-unknown</code> / WASI-subset) and load it inside the Worker isolate — no native FFI on this target.</li>
+<li><span class="req-tag must">MUST</span> implement the storage backend against the Worker's <strong>R2 binding</strong> (<code>env.BUCKET</code>), not a raw S3 SDK; the binding is the only sanctioned object-store access from a Worker.</li>
+<li><span class="req-tag must-not">MUST NOT</span> assume a native filesystem: there is none. The NVMe local-file cache tier MUST be disabled (<code>lfc.enabled = false</code>, see <a href="05-local-cache.html">Local Cache</a>); only the in-isolate tier-1 cache is available.</li>
+<li><span class="req-tag must-not">MUST NOT</span> assume threads: Workers are single-threaded. The executor MUST run single-threaded; no shared-memory parallelism, no background OS threads.</li>
+<li><span class="req-tag should">SHOULD</span> budget for the port as explicit work (toolchain, binding-backed storage, single-thread executor) and expect larger start size / slower cold start than the JS-only Worker baseline.</li>
+</ul>
+
+<div class="diagram">
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The engine-form fork: native FFI path versus WASM Worker path, both ending at an object-storage floor">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-width="1.5" font-family="inherit" font-size="13">
+    <rect x="270" y="14" width="220" height="44" rx="6"/>
+    <text x="380" y="41" stroke="none" fill="currentColor" font-weight="600" text-anchor="middle">Pick target → engine form</text>
+
+    <line x1="330" y1="58" x2="180" y2="92" marker-end="url(#arr)"/>
+    <line x1="430" y1="58" x2="580" y2="92" marker-end="url(#arr)"/>
+
+    <rect x="20" y="96" width="320" height="120" rx="6"/>
+    <text x="36" y="120" stroke="none" fill="currentColor" font-weight="600">NATIVE (Cloud Run, VM, container)</text>
+    <text x="36" y="142" stroke="none" fill="currentColor" font-size="12" opacity="0.85">Rust cdylib/staticlib → Bun via bun:ffi</text>
+    <text x="36" y="162" stroke="none" fill="currentColor" font-size="12" opacity="0.85">S3-compatible client (GCS / S3 / MinIO)</text>
+    <text x="36" y="182" stroke="none" fill="currentColor" font-size="12" opacity="0.85">filesystem yes · threads yes · LFC yes</text>
+    <text x="36" y="204" stroke="none" fill="currentColor" font-size="12" opacity="0.85">recompile, no porting · default path</text>
+
+    <rect x="420" y="96" width="320" height="120" rx="6" stroke-dasharray="5 4"/>
+    <text x="436" y="120" stroke="none" fill="currentColor" font-weight="600">WASM (Cloudflare Workers)</text>
+    <text x="436" y="142" stroke="none" fill="currentColor" font-size="12" opacity="0.85">engine compiled to WebAssembly</text>
+    <text x="436" y="162" stroke="none" fill="currentColor" font-size="12" opacity="0.85">storage via R2 binding (env.BUCKET)</text>
+    <text x="436" y="182" stroke="none" fill="currentColor" font-size="12" opacity="0.85">no FS · single-thread · LFC off</text>
+    <text x="436" y="204" stroke="none" fill="currentColor" font-size="12" opacity="0.85">PORT, not recompile · slower/larger start</text>
+
+    <line x1="180" y1="216" x2="360" y2="262" marker-end="url(#arr)"/>
+    <line x1="580" y1="216" x2="400" y2="262" marker-end="url(#arr)"/>
+
+    <rect x="220" y="266" width="320" height="44" rx="6"/>
+    <text x="380" y="293" stroke="none" fill="currentColor" font-weight="600" text-anchor="middle">Object-storage durability floor (one)</text>
+  </g>
+</svg>
+<p class="diagram-caption">Both paths converge on the same object-storage floor and the same storage trait; the fork is in the build, not the architecture.</p>
+</div>
+</section>
+
+<section>
+<h2>Target matrix</h2>
+<p>The four supported substrates. The engine form is shown as a pill — native (FFI) is green-default; WASM is the build outlier.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Target</th><th>Compute</th><th>Object store</th><th>Engine form</th><th>Egress on cache-miss reads</th><th>Notes</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>Cloud Run + GCS</strong></td>
+<td>native container, scales to zero</td>
+<td>Google Cloud Storage</td>
+<td><span class="pill green">native (FFI)</span></td>
+<td>GCS egress applies</td>
+<td>most drop-in; native engine + better-auth in one Bun process; cold start = container spin-up + cache warm</td>
+</tr>
+<tr>
+<td><strong>Cloud Run + S3</strong></td>
+<td>native container, scales to zero</td>
+<td>AWS S3</td>
+<td><span class="pill green">native (FFI)</span></td>
+<td>S3 egress applies (cross-cloud = pricier)</td>
+<td>as above; watch cross-cloud egress if compute and bucket sit in different clouds</td>
+</tr>
+<tr>
+<td><strong>Cloudflare Workers + R2</strong></td>
+<td>Worker isolate, scales to zero</td>
+<td>R2</td>
+<td><span class="pill build">WASM</span></td>
+<td><strong>$0 — R2 has zero egress</strong></td>
+<td>edge-native; engine MUST be WASM; R2 egress-free is a structural win for a read-on-miss engine</td>
+</tr>
+<tr>
+<td><strong>Generic VM + any S3</strong></td>
+<td>your container, always-on or manual</td>
+<td>any S3-compatible (incl. MinIO, B2)</td>
+<td><span class="pill green">native (FFI)</span></td>
+<td>varies by provider</td>
+<td>full control, you own ops; portable everywhere</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout note">
+<p class="callout-title">Reading the matrix</p>
+<p>Three of four targets are native-FFI; only Workers requires the WASM port. The object-store column is interchangeable on the native rows — Cloud Run can point at GCS, S3, MinIO, or B2 with no architecture change, because the difference is entirely a configuration string on the <a href="03-storage-interface.html">storage trait</a> (<code>s3://…</code> / <code>gcs://…</code>). The egress column is the cost axis; the engine-form column is the build axis.</p>
+</div>
+</section>
+
+<section>
+<h2>Why R2 zero-egress specifically matters for THIS engine</h2>
+<div class="callout success">
+<p class="callout-title">Egress-free storage removes the one cost that scales with miss rate</p>
+<p>This engine is <em>disaggregated</em>: object storage is the durability floor, and the engine <strong>reads pages back on every cache miss</strong> (see <a href="05-local-cache.html">Local Cache</a>). On S3 or GCS those reads are <em>egress</em> — billed per GB out — so the engine's cache-miss rate is <strong>directly coupled to the egress bill</strong>. Worse, scale-to-zero produces a <strong>cold cache after every idle period</strong> (source §4; <a href="09-benchmark-plan.html">Experiment 5</a>): cold cache → more misses → more egress. <strong>R2 charges zero egress at any volume</strong>, which severs that coupling entirely — a cache miss costs only the per-operation fee, never bandwidth. For an engine whose whole model is "read back on miss," egress-free storage is not a marginal saving; it removes the single cost that grows with your miss rate.</p>
+</div>
+<p>The causal chain, made explicit, is the reason R2 is privileged in this design rather than treated as just another bucket:</p>
+<div class="diagram">
+<pre>
+   scale-to-zero  ──▶  idle ──▶ cold cache on next request
+                                      │
+                                      ▼
+                            higher cache-miss rate
+                                      │
+                       ┌──────────────┴──────────────┐
+                       ▼                              ▼
+            S3 / GCS: every miss = egress      R2: egress = $0
+            cost ∝ miss rate (couples)         cost = per-op fee only (decoupled)
+</pre>
+<p class="diagram-caption">On metered stores the cost line tracks the miss line; R2 flattens it. Scale-to-zero, the feature that makes the platform cheap at rest, is exactly what manufactures the misses.</p>
+</div>
+<div class="callout warning">
+<p class="callout-title">R2 trade-off — it is not free of all charges</p>
+<p>Zero egress does not mean zero cost. R2 still bills <strong>per-operation Class A (writes/list) and Class B (reads) fees</strong>, and it <strong>lacks some S3-specific features</strong>. A read-on-miss engine still pays the Class B op cost per miss; that cost is small and flat per operation, but it exists. The win is specific and structural: bandwidth — the component that scales with miss volume — is removed, not all cost.</p>
+</div>
+<p>Consequence for the <a href="05-local-cache.html">cache</a> SLO: on S3/GCS the cache hit-ratio target is partly a <em>cost</em> SLO, since each miss is billable bandwidth; the <code>cache.miss.object_reads</code> counter doubles as a spend signal. On R2 the cache remains a latency optimization but stops being an egress-spend lever, which de-risks the scale-to-zero cold-cache regime structurally.</p>
+</section>
+
+<section>
+<h2>The three scenario fits</h2>
+<p>Three concrete deployment shapes, each mapped to a verdict and the one thing to watch.</p>
+
+<h3>Scenario 1 — scale to ~1,000 at peak</h3>
+<p>Verdict: <span class="pill green">fits well</span> — <em>if</em> the 1,000 is spread across many databases / branches. Stateless compute plus a shared object-storage floor is a horizontal fan-out that scales near-linearly, and readers do not contend. The only poor fit is <span class="pill red">1,000 writers funnelling into ONE database</span> — that hits the single-writer-per-DB ceiling and the hot-row wall of source §8/§9 (<a href="10-hot-row-contention.html">Hot-Row Contention</a>).</p>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> distribute the 1,000 across many DBs/branches so the load fans out across independent lanes (the sharding lever, source §8 W2).</li>
+<li><span class="req-tag must-not">MUST NOT</span> route 1,000 concurrent writers into a single database; that is the red quadrant and belongs on coupled Postgres.</li>
+<li><span class="req-tag should">SHOULD</span> measure the <strong>thundering-herd</strong> case: 1,000 simultaneous cold starts. Extend <a href="09-benchmark-plan.html">Experiment 5</a> to "N concurrent cold starts" to find the spin-up saturation point.</li>
+</ul>
+<div class="callout danger">
+<p class="callout-title">Thundering-herd of cold starts</p>
+<p>Scale-to-zero means 1,000 simultaneous first-requests-after-idle can trigger 1,000 simultaneous cold starts: container/isolate spin-up plus cache warm, all hitting the floor at once. This is a distinct failure mode from steady-state load. The benchmark plan must add a concurrent-cold-start sweep; the <a href="06-lifecycle-controller.html">controller</a> may need keep-warm or staggered admission to bound it.</p>
+</div>
+
+<h3>Scenario 2 — Cloudflare Workers + R2 as the whole database</h3>
+<p>Verdict: <span class="pill blue">purest edge expression</span>, with one explicit catch. Scale-to-zero isolates plus egress-free durability is the cleanest possible statement of the architecture: edge latency and zero bandwidth cost at the durability floor. The catch is the engine-form fork — this target <strong>requires the WASM build</strong>.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> ship the WASM-compiled engine and the R2-binding storage backend (no FFI, no FS, single-thread; see the engine-form section).</li>
+<li><span class="req-tag should">SHOULD</span> budget the WASM port as explicit, scheduled work — it is the gating cost of this scenario, not a free flip.</li>
+<li><span class="req-tag may">MAY</span> accept slower/larger cold starts than a JS-only Worker in exchange for edge latency and zero egress.</li>
+</ul>
+
+<h3>Scenario 3 — Bun app + better-auth (embedded) + engine = Cloud Run + bucket</h3>
+<p>Verdict: <span class="pill green">most drop-in</span> — the direct fulfilment of the original goal. <code>better-auth</code> is a <em>library</em> that stores its state (users, sessions) in your database, so it composes with the embedded engine in one Bun process — no external auth service (see <a href="12-capabilities.html">Capabilities</a>). Cloud Run runs the <strong>native</strong> engine as-is, with no WASM constraint. <code>Cloud Run + GCS</code> ≈ <code>Cloud Run + S3</code> ≈ the disaggregated stack: the compute platform and object store are swappable while the architecture stays identical. That portability is the entire point.</p>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> compose <code>better-auth</code> in-process as a library writing to the same embedded engine — one Bun process, no separate auth deployment.</li>
+<li><span class="req-tag must">MUST</span> run the native engine unmodified on Cloud Run (no WASM port required on this target).</li>
+<li><span class="req-tag may">MAY</span> swap GCS ⇄ S3 ⇄ any S3-compatible store via configuration with no code change; the disaggregated stack is identical across them.</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Scenario</th><th>Substrate</th><th>Engine form</th><th>Verdict</th><th>Watch</th></tr></thead>
+<tbody>
+<tr><td>~1,000 at peak, fanned out</td><td>Cloud Run / VM + bucket</td><td><span class="pill green">native</span></td><td>fits well across many DBs</td><td>thundering-herd of cold starts; never 1,000 writers → 1 DB</td></tr>
+<tr><td>Edge: whole DB on the edge</td><td>Workers + R2</td><td><span class="pill build">WASM</span></td><td>purest edge expression</td><td>budget the WASM port</td></tr>
+<tr><td>Bun + better-auth + engine</td><td>Cloud Run + bucket</td><td><span class="pill green">native</span></td><td>most drop-in, goal-direct</td><td>nothing structural — this is the baseline</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Portability principle</h2>
+<div class="callout tip">
+<p class="callout-title">Two swappable axes, one fixed point</p>
+<p>The <strong>compute platform</strong> and the <strong>object store</strong> are both swappable. The <strong>engine and its <a href="03-storage-interface.html">storage trait</a> are the fixed point.</strong> Choose the substrate per workload — never the other way around.</p>
+</div>
+<p>This is the structural reason the stack is not locked to a vendor. The storage trait abstracts the object store behind <code>get_page</code> / <code>append_wal</code> / <code>flush</code>; the deployment substrate abstracts compute behind "a process that links (native) or loads (WASM) the engine." Both are interchangeable so long as the trait contract holds. The selection rule by workload:</p>
+<dl class="fields">
+<dt>edge / global low-latency</dt><dd>Cloudflare Workers + R2, with a WASM build. Pay the port; gain edge latency and zero egress.</dd>
+<dt>native / most drop-in</dt><dd>Cloud Run + bucket (GCS or S3). Native FFI engine, scale-to-zero, better-auth in-process. The default.</dd>
+<dt>full control / own ops</dt><dd>generic VM + any S3-compatible store (incl. MinIO, B2). Native engine, you own the lifecycle and the egress terms.</dd>
+</dl>
+<p>The architecture <em>follows the workload across substrates</em> rather than binding to one vendor: you run your own engine against whatever object storage is cheapest or closest, never tethered to a managed database. Moving a workload between targets is a build-form and configuration change, not a re-architecture.</p>
+</section>
+
+<section>
+<h2>Egress cost model</h2>
+<p>A back-of-envelope model the controller and capacity planning use to reason about spend. The egress bill is a function of the miss rate, the page size, and the per-GB egress price of the store.</p>
+<pre data-lang="text"><code>egress_bytes_per_period
+    = read_ops_per_period
+    × (1 − cache_hit_ratio)          # misses fall through to the floor
+    × avg_page_or_layer_bytes
+
+egress_cost_per_period
+    = egress_bytes_per_period / GB
+    × store_egress_price_per_GB      # S3/GCS: &gt; 0   ·   R2: 0
+
+# plus, on every store including R2:
+op_cost_per_period
+    = miss_ops_per_period × class_B_read_op_price
+    + write_ops_per_period × class_A_write_op_price</code></pre>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> treat <code>(1 − cache_hit_ratio)</code> as the dominant cost lever on S3/GCS: halving the miss rate halves egress spend.</li>
+<li><span class="req-tag should">SHOULD</span> account for scale-to-zero raising the effective miss rate (cold caches after idle) when estimating S3/GCS egress; <a href="09-benchmark-plan.html">Experiment 5</a> supplies the cold-miss distribution.</li>
+<li><span class="req-tag must">MUST</span> still budget per-operation (Class A/B) fees on R2 even though its <code>store_egress_price_per_GB</code> term is zero.</li>
+<li><span class="req-tag should">SHOULD</span> co-locate compute and bucket in the same region/cloud on S3/GCS to avoid cross-cloud egress multipliers (Cloud Run + S3 cross-cloud is the priciest cell in the matrix).</li>
+</ul>
+</section>
+
+<section>
+<h2>Per-target requirements &amp; checklists</h2>
+
+<h3>Cloud Run + bucket (GCS or S3) — native</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> build the native engine library for the Cloud Run image's target triple and link it into Bun via <code>bun:ffi</code>.</li>
+<li><span class="req-tag must">MUST</span> configure the <code>ObjectStorage</code> backend with the bucket URL (<code>gcs://…</code> or <code>s3://…</code>) and same-region credentials.</li>
+<li><span class="req-tag should">SHOULD</span> enable both cache tiers, including the NVMe LFC, sized to the instance's local disk.</li>
+<li><span class="req-tag should">SHOULD</span> set the <a href="06-lifecycle-controller.html">controller</a> idle timeout / keep-warm to balance scale-to-zero savings against cold-start p99.</li>
+<li><span class="req-tag may">MAY</span> compose <code>better-auth</code> in-process for the BaaS shape (Scenario 3).</li>
+</ul>
+
+<h3>Cloudflare Workers + R2 — WASM</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> compile the engine to WebAssembly and load it in the isolate; no native binary may be uploaded.</li>
+<li><span class="req-tag must">MUST</span> implement storage against the R2 binding (<code>env.BUCKET.get/put</code>), not an S3 SDK.</li>
+<li><span class="req-tag must-not">MUST NOT</span> enable the NVMe LFC (<code>lfc.enabled = false</code>) or spawn threads; tier-1 in-isolate cache only, single-threaded executor.</li>
+<li><span class="req-tag should">SHOULD</span> minimize WASM module size to bound cold-start time, which is slower/larger than a JS-only Worker.</li>
+<li><span class="req-tag should">SHOULD</span> rely on R2 zero egress to absorb the higher cold-cache miss rate that the no-LFC, scale-to-zero profile produces.</li>
+</ul>
+
+<h3>Generic VM + any S3-compatible store — native, self-managed</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> link the native engine and point the backend at any S3-compatible endpoint (AWS S3, MinIO, Backblaze B2).</li>
+<li><span class="req-tag should">SHOULD</span> own the lifecycle explicitly (always-on or manual start/stop) since there is no managed scale-to-zero.</li>
+<li><span class="req-tag should">SHOULD</span> verify the chosen store's egress and per-op pricing against the cost model; terms vary widely by provider.</li>
+<li><span class="req-tag may">MAY</span> use a local MinIO floor for fully self-hosted / air-gapped deployments.</li>
+</ul>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Failure / edge case</th><th>Target(s)</th><th>Effect</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Thundering-herd cold starts</td><td>all scale-to-zero</td><td>N simultaneous spin-ups + cold caches saturate floor and compute</td><td>keep-warm, staggered admission, extend Exp 5 to N concurrent cold starts</td></tr>
+<tr><td>Cross-cloud egress blowout</td><td>Cloud Run + S3 (split cloud)</td><td>every cache miss billed at premium cross-cloud egress</td><td>co-locate bucket with compute, or move to R2</td></tr>
+<tr><td>Native binary on WASM target</td><td>Workers</td><td>build/upload rejected — Workers run no native code</td><td>compile to WASM; storage via R2 binding</td></tr>
+<tr><td>LFC assumed on Workers</td><td>Workers</td><td>no filesystem → cache layer fails / falls through every read</td><td>set <code>lfc.enabled = false</code>; tier-1 only</td></tr>
+<tr><td>Threaded executor on Workers</td><td>Workers</td><td>single-thread isolate cannot spawn threads</td><td>single-threaded executor build for the WASM target</td></tr>
+<tr><td>1,000 writers → one DB</td><td>all</td><td>single-writer ceiling / hot-row wall; throughput collapses</td><td>fan out across DBs/branches; route the irreducible outlier to Postgres (<a href="10-hot-row-contention.html">§10</a>)</td></tr>
+<tr><td>Low hit ratio on metered store</td><td>S3 / GCS</td><td>egress bill tracks miss rate; cost SLO breached</td><td>raise hit ratio; or move to R2 to decouple cost from misses</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Dependencies / existing pieces to start from</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> reuse the same <a href="02-engine-core.html">engine core</a> and <a href="03-storage-interface.html">storage trait</a> across every target — the engine is the fixed point, only its build form changes.</li>
+<li><span class="req-tag should">SHOULD</span> reuse the <a href="04-object-storage-backend.html">object-storage backend</a> (LSM-on-S3 page store + S3-CAS commit log) on native targets, swapping only the client/endpoint per store.</li>
+<li><span class="req-tag should">SHOULD</span> start the WASM path from a SQLite-lineage engine known to compile to WASM (source §6, libSQL), then replace its storage with the R2-binding backend.</li>
+<li><span class="req-tag should">SHOULD</span> use Cloud Run / a generic container as the first deployable substrate (native, drop-in) before attempting the WASM port.</li>
+<li><span class="req-tag may">MAY</span> use MinIO as a local S3-compatible floor for development across all native scenarios.</li>
+</ul>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> demonstrate the identical application running on at least two substrates (e.g. Cloud Run + GCS and generic VM + MinIO) with only configuration changes — no source changes — proving compute/object-store swappability.</li>
+<li><span class="req-tag must">MUST</span> demonstrate the WASM-compiled engine serving reads and commits inside a Cloudflare Worker against R2 via the binding, with <code>lfc.enabled = false</code> and a single-threaded executor.</li>
+<li><span class="req-tag must">MUST</span> verify the engine-form gate: a native binary upload to Workers is rejected, and a WASM build runs — documented as the build-pipeline branch.</li>
+<li><span class="req-tag should">SHOULD</span> publish, per target, a cold-start p99 and a steady-state read/commit p99 (from <a href="09-benchmark-plan.html">Experiments 1 and 5</a>) so targets are comparable.</li>
+<li><span class="req-tag should">SHOULD</span> run the extended Experiment 5 "N concurrent cold starts" sweep on at least one scale-to-zero target and report the saturation point.</li>
+<li><span class="req-tag should">SHOULD</span> confirm, by measurement, that R2 cache-miss reads incur zero egress charge while S3/GCS misses do, validating the cost model's egress term.</li>
+<li><span class="req-tag must">MUST</span> confirm Scenario 3 end to end: a Bun process with embedded engine + in-process better-auth on Cloud Run + bucket, no external auth service.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> need a shared codebase strategy for the native and WASM builds (single-thread / no-FS feature flags vs separate crates) — open: how much of the executor can be conditionally compiled vs forked?</li>
+<li>Open: what is the realistic WASM cold-start and module-size penalty vs native, and is it within the edge-latency budget for the target tools? Needs Experiment 1/5 on the WASM target.</li>
+<li>Open: the thundering-herd saturation point (N concurrent cold starts) per substrate, and whether keep-warm or staggered admission is the better controller lever — see <a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a>.</li>
+<li>Risk: on S3/GCS the cache hit-ratio SLO is partly a cost SLO; a regression couples directly to spend. R2 structurally de-risks this, but its per-op Class A/B fees still accrue and must be modelled.</li>
+<li>Risk: R2 lacking some S3-specific features could force divergence in the storage backend between R2 and S3/GCS targets — open: which features does the backend actually depend on, and are any R2-unsupported?</li>
+<li>Risk: cross-cloud egress on Cloud Run + S3 (split cloud) can dominate cost; co-location must be enforced by deployment policy, not left to chance.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">the miss rate that couples to egress; LFC must be off on the WASM/Workers target.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">scale-to-zero, keep-warm, and the thundering-herd cold-start lever.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">the native FFI binding the drop-in Cloud Run / VM targets use as-is.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiment 5 cold reads, extended to N concurrent cold starts per target.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">the trait that is the fixed point while compute and object store swap.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the S3/GCS/R2 durability floor reached on every cache miss.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention Strategy</span><span class="xref-desc">why 1,000 writers into one DB is the poor-fit case for Scenario 1.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">better-auth composed in-process for the drop-in Cloud Run scenario.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bun Integration · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">08 · BUN</span>
+<span class="badge badge-status status-draft">Draft v0.1</span>
+<span class="spec-date">Updated 2026-06-20</span>
+</div>
+<h1>Bun Integration</h1>
+<p class="lede">Bun is the reference host runtime because its first-class FFI and native-addon support let the <em>same</em> engine library serve the embedded path — <code>bun:ffi</code> calling <code>engine.h</code> in-process with no socket — and the server path — Bun's built-in <code>Bun.sql</code> Postgres client talking to <code>engine-server</code> — without rebuilding the engine.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This spec expands source §5 (Bun adoption path) into a buildable integration design. It defines exactly how a Bun (and, via NAPI, Node) application binds the engine in both deployment shapes the architecture supports:</p>
+<dl class="fields">
+<dt>Path 1 — Embedded in-process</dt>
+<dd>The headline use case. <code>bun:ffi</code> binds the engine's C ABI (<a href="02-engine-core.html">02 — Engine Core</a>'s <code>engine.h</code>) directly; the engine runs inside the Bun process. No server, no socket, no wire protocol — function-call latency on the hot path.</dd>
+<dt>Path 2 — Server mode (Bun as client)</dt>
+<dd>Run <code>engine-server</code> (Postgres wire protocol, <a href="07-server-mode.html">07</a>). Bun connects with its built-in <code>Bun.sql</code> Postgres client — zero extra dependencies — for multi-client access and tools that expect Postgres.</dd>
+</dl>
+<p>It also specifies the <code>@yourdb/bun</code> wrapper package over the raw FFI symbols, the NAPI alternative for one package across Bun and Node, prebuilt-binary packaging and distribution, the normative requirements, failure modes, acceptance criteria, and open questions. The C ABI itself is owned by <a href="02-engine-core.html">02 — Engine Core</a>; this page binds to it and MUST NOT redefine it.</p>
+<div class="callout note">
+<p class="callout-title">Note — storage choice is config, not a rebuild</p>
+<p>In both paths the storage backend is selected by the connection-string scheme passed to <code>engine_open</code> (or to the server): <code>file://</code> → <code>LocalFileStorage</code> (pure-embedded, no network egress), <code>s3://</code> / <code>r2://</code> → the disaggregated <code>ObjectStorage</code> backend (<a href="04-object-storage-backend.html">04</a>). The Bun-facing code is identical regardless of backend; only the URL changes.</p>
+</div>
+</section>
+
+<section>
+<h2>Why Bun</h2>
+<p>The architecture's central claim is that <em>embeddable</em> and <em>storage-disaggregated</em> stop being contradictory once the storage seam is a pluggable backend rather than a server you connect to (source §0/§1). Bun is the host runtime that realizes both halves of that claim from one engine artifact:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> reuse a single engine build across embedded and server stories: <code>bun:ffi</code> links <code>libengine.{dylib,so}</code> in-process; <code>engine-server</code> is the same library wrapped in a listener (source §2.A). No fork in the engine codebase per host.</li>
+<li><span class="req-tag should">SHOULD</span> use the embedded path as the default — it is the fastest route to a working demo with zero infrastructure (source §5 rollout step 1).</li>
+</ul>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Bun capability</th><th>Used by</th><th>Why it matters here</th></tr>
+</thead>
+<tbody>
+<tr><td>First-class FFI (<code>bun:ffi</code>)</td><td>Path 1 (embedded)</td><td>Binds the C ABI directly with JIT'd trampolines; no addon compile step, no socket. The engine runs <em>inside</em> the Bun process.</td></tr>
+<tr><td>Native-addon (NAPI) support</td><td>NAPI alternative</td><td>One compiled addon runs in both Bun <em>and</em> Node — a single package across runtimes.</td></tr>
+<tr><td>Built-in <code>Bun.sql</code> Postgres client</td><td>Path 2 (server)</td><td>If the engine speaks the Postgres wire protocol, Bun talks to it with zero extra deps.</td></tr>
+<tr><td>Single-process composition</td><td>Embedded apps</td><td>better-auth and other libraries share the in-process DB (source §10/§11) — no external services.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Responsibilities &amp; non-goals</h2>
+<h3>Responsibilities</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> bind the stable C ABI from <code>engine.h</code> via <code>bun:ffi</code> for the embedded path, and connect via <code>Bun.sql</code> for the server path.</li>
+<li><span class="req-tag must">MUST</span> marshal JS strings to NUL-terminated C strings for every <code>const char*</code> argument and copy out every <strong>borrowed</strong> <code>const char*</code> return before the owning object advances or is freed.</li>
+<li><span class="req-tag must">MUST</span> map engine status codes and <code>engine_last_error</code> into typed JS errors, distinguishing retryable from terminal failures.</li>
+<li><span class="req-tag must">MUST</span> free every engine-owned resource exactly once — handles via <code>engine_close</code>, results via <code>engine_result_free</code>, statements via <code>engine_finalize</code>.</li>
+<li><span class="req-tag should">SHOULD</span> expose an ergonomic, typed wrapper (<code>@yourdb/bun</code>) so application code never touches raw pointers.</li>
+<li><span class="req-tag may">MAY</span> ship a NAPI addon as an alternative distribution so one package serves Bun and Node.</li>
+</ul>
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> define or alter the C ABI — that contract is owned by <a href="02-engine-core.html">02 — Engine Core</a>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> implement SQL parsing, MVCC, WAL, caching, or storage in the binding layer; the binding is a thin, faithful shim over the engine.</li>
+<li><span class="req-tag must-not">MUST NOT</span> own the wire protocol, the pooler, or the server lifecycle — those are <a href="07-server-mode.html">07 — Server Mode</a>.</li>
+<li>The WASM build is a separate distribution target, not covered here — see <a href="11-deployment-targets.html">11 — Deployment Targets</a>.</li>
+</ul>
+</section>
+
+<section>
+<h2>Two integration paths at a glance</h2>
+<div class="diagram">
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Embedded vs server integration paths">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="20" y="34" width="330" height="64" rx="6"/>
+    <rect x="432" y="34" width="308" height="64" rx="6"/>
+    <rect x="20" y="162" width="220" height="60" rx="6"/>
+    <rect x="302" y="162" width="150" height="60" rx="6"/>
+    <rect x="514" y="162" width="226" height="60" rx="6"/>
+    <line x1="350" y1="66" x2="430" y2="66" marker-end="url(#ah)"/>
+    <line x1="240" y1="192" x2="300" y2="192" marker-end="url(#ah)"/>
+    <line x1="452" y1="192" x2="512" y2="192" marker-end="url(#ah)"/>
+  </g>
+  <g fill="currentColor" font-family="sans-serif" font-size="13">
+    <text x="20" y="22">Path 1 — Embedded (in-process, no socket)</text>
+    <text x="36" y="58">Bun process</text>
+    <text x="448" y="58">object storage (S3 / R2 / MinIO)</text>
+    <text x="20" y="150">Path 2 — Server (Bun is just a client)</text>
+    <text x="36" y="186">Bun process</text>
+    <text x="530" y="186">engine-server (pgwire)</text>
+  </g>
+  <g fill="currentColor" font-family="sans-serif" font-size="11" opacity="0.75">
+    <text x="36" y="76">app → @yourdb/bun → bun:ffi → libengine</text>
+    <text x="36" y="90">storage trait → file:// or s3://</text>
+    <text x="448" y="80">or a local .db file (file://)</text>
+    <text x="36" y="204">app → Bun.sql (pg client)</text>
+    <text x="316" y="190">pooler</text>
+    <text x="316" y="208">(PgBouncer/pgcat)</text>
+    <text x="530" y="208">same libengine + listener</text>
+  </g>
+</svg>
+<p class="diagram-caption">One engine artifact, two host integrations: FFI in-process for embedded; Postgres wire over a pooler for server mode.</p>
+</div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th></th><th>Path 1 — Embedded</th><th>Path 2 — Server</th></tr>
+</thead>
+<tbody>
+<tr><td>Bun mechanism</td><td><code>bun:ffi</code> + <code>@yourdb/bun</code></td><td>built-in <code>Bun.sql</code></td></tr>
+<tr><td>Transport</td><td>direct function calls (no protocol)</td><td>Postgres wire protocol</td></tr>
+<tr><td>Extra deps</td><td>prebuilt native lib for the platform</td><td>none (client is built into Bun)</td></tr>
+<tr><td>Latency on hot path</td><td>function-call (µs over cache hits)</td><td>network round-trip + parse</td></tr>
+<tr><td>Concurrency model</td><td>one engine per process</td><td>many clients via pooler (<a href="07-server-mode.html">07</a>)</td></tr>
+<tr><td>Best for</td><td>single Bun app, edge, demos, branching tools</td><td>multi-client, Postgres-native tools, PostgREST</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Path 1 — Embedded via bun:ffi</h2>
+<p>The headline path. <code>bun:ffi</code>'s <code>dlopen</code> maps the exported symbols of <code>libengine.${suffix}</code> into JS-callable functions. The connection string passed to <code>engine_open</code> selects the storage backend by scheme; the call sequence is identical for <code>file://</code> and <code>s3://</code>.</p>
+
+<h3>Raw FFI binding</h3>
+<p>A faithful binding of the lifecycle + one-shot subset of the ABI. Note the use of Bun's <code>suffix</code> so one source file resolves the right platform extension, and <code>cstring</code> for the engine's NUL-terminated <code>const char*</code> returns.</p>
+<pre data-lang="ts"><code>import { dlopen, FFIType, suffix } from "bun:ffi";
+
+// libengine.dylib (darwin) / libengine.so (linux) / libengine.dll (win)
+const { symbols: lib, close: unloadLib } = dlopen(`libengine.${suffix}`, {
+  // ---- lifecycle ---------------------------------------------------
+  // url is a NUL-terminated cstring: "file://./local.db" or
+  // "s3://bucket/mydb?region=...". Returns an opaque handle, or null.
+  engine_open:    { args: [FFIType.cstring], returns: FFIType.ptr },
+  engine_close:   { args: [FFIType.ptr],     returns: FFIType.void },
+
+  // ---- one-shot execution -----------------------------------------
+  // DDL/DML, no result set. Returns an EngineStatus code.
+  engine_exec:    { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
+  // buffered query: writes an owned EngineResult* into *out (ptr-to-ptr).
+  engine_query:   { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+
+  // ---- prepared statements ----------------------------------------
+  engine_prepare: { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+  engine_bind:    { args: [FFIType.ptr, FFIType.i32, FFIType.cstring], returns: FFIType.i32 },
+  engine_step:    { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 }, // *done out
+  engine_finalize:{ args: [FFIType.ptr], returns: FFIType.i32 },
+  engine_reset:   { args: [FFIType.ptr], returns: FFIType.i32 },
+
+  // ---- transactions ------------------------------------------------
+  engine_begin:   { args: [FFIType.ptr], returns: FFIType.i32 },
+  engine_commit:  { args: [FFIType.ptr], returns: FFIType.i32 }, // blocks until WAL durable
+  engine_rollback:{ args: [FFIType.ptr], returns: FFIType.i32 },
+
+  // ---- branching ---------------------------------------------------
+  // copy-on-write branch at current LSN; NEW handle on a NEW logical DB.
+  engine_branch:  { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
+
+  // ---- result access (borrowed pointers into the result arena) -----
+  engine_result_rows:    { args: [FFIType.ptr], returns: FFIType.i32 },
+  engine_result_cols:    { args: [FFIType.ptr], returns: FFIType.i32 },
+  engine_result_colname: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.cstring },
+  engine_result_value:   { args: [FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.cstring },
+  engine_column_value:   { args: [FFIType.ptr, FFIType.i32], returns: FFIType.cstring },
+
+  // ---- errors / metadata ------------------------------------------
+  engine_last_error: { args: [FFIType.ptr], returns: FFIType.cstring }, // borrowed
+  engine_changes:    { args: [FFIType.ptr], returns: FFIType.i64 },
+  engine_last_lsn:   { args: [FFIType.ptr], returns: FFIType.i64 },
+
+  // ---- freeing -----------------------------------------------------
+  engine_result_free: { args: [FFIType.ptr], returns: FFIType.void }, // idempotent on null
+});
+
+// helper: JS string -&gt; NUL-terminated C string buffer
+const cstr = (s: string) =&gt; Buffer.from(s + "\0", "utf8");
+
+// open: storage backend chosen purely by the URL scheme.
+const h = lib.engine_open(cstr("s3://bucket/mydb?region=us-east-1"));
+// const h = lib.engine_open(cstr("file://./local.db"));   // pure-embedded
+if (h === null) throw new Error("engine_open failed (unknown scheme or storage error)");</code></pre>
+
+<div class="callout warning">
+<p class="callout-title">Open returns NULL with no handle to query</p>
+<p>When <code>engine_open</code> fails it returns <code>NULL</code> — there is no handle on which to call <code>engine_last_error</code>. The binding MUST surface a generic open error (likely an unknown URL scheme, which the engine rejects rather than silently defaulting, or a storage-init failure). Every <em>other</em> error is retrievable via <code>engine_last_error(h)</code>.</p>
+</div>
+
+<h3>String &amp; buffer marshaling</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> pass every <code>const char*</code> argument (URL, SQL, bound value) as a NUL-terminated buffer — a JS string without the trailing <code>\0</code> will read past its end in C.</li>
+<li><span class="req-tag must">MUST</span> declare engine <code>const char*</code> returns as <code>FFIType.cstring</code> so Bun reads up to the NUL; <code>FFIType.ptr</code> would yield a raw address and require manual length handling.</li>
+<li><span class="req-tag must">MUST</span> encode/decode as UTF-8 on both directions to match the engine's text representation.</li>
+<li><span class="req-tag should">SHOULD</span> reuse a single allocation per call site where hot, but MUST keep argument buffers alive for the entire duration of the FFI call.</li>
+</ul>
+
+<h3>Pointer lifetime &amp; ownership</h3>
+<p>The ABI is opaque-handle and arena based; the binding mirrors that contract exactly (see <a href="02-engine-core.html">02 — Engine Core</a>, ownership table):</p>
+<dl class="fields">
+<dt>Handle (<code>engine_open</code> / <code>engine_branch</code>)</dt>
+<dd>Owned by the binding. Destroyed exactly once via <code>engine_close</code>. A branch handle is a <em>new</em> logical database and is freed independently of its parent.</dd>
+<dt>EngineResult* (out of <code>engine_query</code>)</dt>
+<dd>Owned by the binding; released exactly once with <code>engine_result_free</code>. Every value/colname read from it is <strong>borrowed</strong> into its arena and becomes dangling the instant the result is freed — the wrapper MUST copy all values into JS before freeing.</dd>
+<dt>Borrowed const char* (values, colnames, errors)</dt>
+<dd>Never freed by the binding. Valid only until the owning object advances or is freed; for <code>engine_column_value</code>, only until the next <code>engine_step</code>/<code>engine_reset</code>/<code>engine_finalize</code> on that statement. Copy out immediately.</dd>
+</dl>
+
+<h3>Reading a buffered result and the *out pointer</h3>
+<p><code>engine_query</code> writes an owned <code>EngineResult*</code> into a caller-provided <code>EngineResult**</code>. In <code>bun:ffi</code> that is a pointer-to-pointer; allocate an 8-byte slot, pass its pointer, then read the engine pointer back out.</p>
+<pre data-lang="ts"><code>import { ptr, read, toArrayBuffer } from "bun:ffi";
+
+const ENGINE_OK = 0; // see EngineStatus in engine.h (02 — Engine Core)
+
+function query(h: Pointer, sql: string): Record&lt;string, string&gt;[] {
+  const outSlot = new BigUint64Array(1);          // holds the EngineResult*
+  const status  = lib.engine_query(h, cstr(sql), ptr(outSlot));
+  if (status !== ENGINE_OK) throw engineError(h, status);
+
+  const result = Number(outSlot[0]) as Pointer;   // owned EngineResult*
+  try {
+    const rows = lib.engine_result_rows(result);
+    const cols = lib.engine_result_cols(result);
+    const names: string[] = [];
+    for (let c = 0; c &lt; cols; c++) names.push(lib.engine_result_colname(result, c).toString());
+
+    const out: Record&lt;string, string&gt;[] = [];
+    for (let r = 0; r &lt; rows; r++) {
+      const row: Record&lt;string, string&gt; = {};
+      for (let c = 0; c &lt; cols; c++) {
+        // borrowed cstring -&gt; copy into JS BEFORE we free the result
+        row[names[c]] = lib.engine_result_value(result, r, c).toString();
+      }
+      out.push(row);
+    }
+    return out;
+  } finally {
+    lib.engine_result_free(result);               // exactly once; idempotent on null
+  }
+}</code></pre>
+
+<h3>Error retrieval</h3>
+<pre data-lang="ts"><code>function engineError(h: Pointer, status: number): EngineError {
+  // engine_last_error returns a BORROWED, thread-local-per-handle cstring.
+  const msg = lib.engine_last_error(h).toString();   // copy out immediately
+  return new EngineError(status, msg || `engine status ${status}`);
+}</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> read <code>engine_last_error(h)</code> immediately after a non-OK status and copy it into a JS string before issuing any further call on <code>h</code> (the next call may overwrite it).</li>
+<li><span class="req-tag should">SHOULD</span> map the numeric <code>EngineStatus</code> (not the message text) to retryable/terminal categories, so retry policy never string-matches on prose.</li>
+</ul>
+
+<div class="callout tip">
+<p class="callout-title">Same code path, both backends</p>
+<p>Nothing above branches on the storage backend. <code>engine_open("file://...")</code> and <code>engine_open("s3://...")</code> produce handles that are queried, prepared, transacted, and branched through identical FFI calls. The only observable difference is that an <code>s3://</code> commit blocks longer (it pays the network/CAS round-trip; source §4 / <a href="04-object-storage-backend.html">04</a>) while a <code>file://</code> commit is a local fsync.</p>
+</div>
+</section>
+
+<section>
+<h2>TS wrapper package — @yourdb/bun</h2>
+<p>Application code SHOULD never touch raw pointers. <code>@yourdb/bun</code> wraps the FFI symbols in an ergonomic, typed API with structured errors and deterministic resource disposal. It maps one-to-one onto the ABI subset above.</p>
+
+<h3>Public API surface</h3>
+<pre data-lang="ts"><code>// @yourdb/bun
+export function open(url: string): Database;
+
+export interface Database extends Disposable {
+  exec(sql: string): number;                                  // rows affected (engine_changes)
+  query&lt;T = Row&gt;(sql: string, params?: Param[]): T[];          // buffered rows
+  prepare&lt;T = Row&gt;(sql: string): Statement&lt;T&gt;;                 // reusable prepared stmt
+  transaction&lt;R&gt;(fn: (tx: Database) =&gt; R): R;                  // BEGIN/COMMIT/ROLLBACK
+  branch(name: string): Database;                             // copy-on-write @ current LSN
+  readonly lastLsn: bigint;                                   // engine_last_lsn
+  close(): void;                                              // engine_close (idempotent)
+  [Symbol.dispose](): void;                                   // = close()
+}
+
+export interface Statement&lt;T = Row&gt; extends Disposable {
+  all(...params: Param[]): T[];                               // step to ENGINE_DONE, buffer
+  get(...params: Param[]): T | undefined;                     // first row or undefined
+  run(...params: Param[]): number;                            // rows affected
+  [Symbol.dispose](): void;                                   // engine_finalize
+}
+
+export type Param = number | bigint | string | Uint8Array | null | number[]; // -&gt; iN/fN/sN/bN/n/vN
+export type Row = Record&lt;string, string&gt;;
+
+export class EngineError extends Error {
+  readonly status: number;     // EngineStatus code
+  readonly retryable: boolean; // CONFLICT / transient STORAGE
+}</code></pre>
+
+<h3>Intended usage</h3>
+<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+
+// `using` ⇒ db.close() runs deterministically at scope exit (Symbol.dispose)
+using db = open("s3://bucket/mydb?region=us-east-1");
+
+db.exec(`CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)`);
+
+// parameters are tagged and bound positionally (no string interpolation)
+db.query("INSERT INTO notes (id, body) VALUES (?, ?)", [1, "hello"]);
+
+const rows = db.query&lt;{ id: string; body: string }&gt;(
+  "SELECT id, body FROM notes WHERE id = ?", [1],
+);
+
+// prepared statement, reused across iterations; auto-finalized at scope end
+using stmt = db.prepare("SELECT body FROM notes WHERE id = ?");
+for (const id of [1, 2, 3]) {
+  const r = stmt.get(id);
+  if (r) console.log(r.body);
+}
+
+// transaction: commit on normal return, rollback on throw
+db.transaction((tx) =&gt; {
+  tx.exec("UPDATE notes SET body = 'x' WHERE id = 1");
+  tx.exec("INSERT INTO notes (id, body) VALUES (2, 'y')");
+});                       // engine_commit() blocks here until the WAL is durable
+
+// branch = instant clone over shared immutable layers (copy-on-write)
+using preview = db.branch("pr-1234");
+preview.exec("DELETE FROM notes WHERE id = 1");   // diverges from parent; cheap until written</code></pre>
+
+<h3>Parameter mapping</h3>
+<p>JS values map onto the ABI's string-only typed bind encoding (<a href="02-engine-core.html">02 — Engine Core</a>, parameter encoding): a one-character type tag prefixes each value.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>JS type</th><th>Tag</th><th>Encoded example</th></tr>
+</thead>
+<tbody>
+<tr><td><code>number</code> (integer)</td><td><code>i</code> int8</td><td><code>42</code> → <code>"i42"</code></td></tr>
+<tr><td><code>number</code> (float) / <code>bigint</code></td><td><code>f</code> float8 / <code>i</code></td><td><code>3.5</code> → <code>"f3.5"</code></td></tr>
+<tr><td><code>string</code></td><td><code>s</code> text</td><td><code>"hi"</code> → <code>"shi"</code></td></tr>
+<tr><td><code>Uint8Array</code></td><td><code>b</code> base64-bytes</td><td>bytes → <code>"b&lt;base64&gt;"</code></td></tr>
+<tr><td><code>null</code></td><td><code>n</code> NULL</td><td>→ <code>"n"</code></td></tr>
+<tr><td><code>number[]</code></td><td><code>v</code> vector</td><td><code>[0.1,0.2]</code> → <code>"v0.1,0.2"</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Error mapping &amp; resource disposal</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> throw <code>EngineError</code> (carrying the numeric <code>EngineStatus</code> and the copied <code>engine_last_error</code> message) on every non-OK status; <code>NULL</code> handle/result returns map to a distinct open/query error.</li>
+<li><span class="req-tag must">MUST</span> set <code>retryable</code> from the status code (e.g. <code>ENGINE_ERR_CONFLICT</code>, transient <code>ENGINE_ERR_STORAGE</code>) so callers retry without parsing prose.</li>
+<li><span class="req-tag must">MUST</span> implement <code>Symbol.dispose</code> on <code>Database</code> (→ <code>engine_close</code>) and <code>Statement</code> (→ <code>engine_finalize</code>) so <code>using</code> guarantees release even on throw; results MUST be freed before the method returns.</li>
+<li><span class="req-tag must">MUST</span> roll back the transaction (<code>engine_rollback</code>) when <code>fn</code> in <code>transaction()</code> throws, and re-throw; commit only on normal return.</li>
+<li><span class="req-tag should">SHOULD</span> register a <code>FinalizationRegistry</code> as a backstop for handles that escaped a <code>using</code> scope, while still treating explicit disposal as the contract (GC timing is not durability).</li>
+<li><span class="req-tag should">SHOULD</span> mark a disposed object and return <code>ENGINE_ERR_MISUSE</code>-equivalent on use-after-dispose rather than dereferencing a freed pointer.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Note — transaction durability lives in commit</p>
+<p><code>engine_commit</code> blocks until the WAL is durably stored (source §8 durability rule). The wrapper MUST surface that blocking commit as the resolution point of <code>transaction()</code> and MUST NOT report success before it returns <code>ENGINE_OK</code>. Never ack a write from a buffer before durability.</p>
+</div>
+</section>
+
+<section>
+<h2>NAPI alternative — one package across Bun and Node</h2>
+<p>The <code>bun:ffi</code> path is Bun-only. To ship a single package usable in <em>both</em> Bun and Node, compile a NAPI (Node-API) native addon over the same <code>engine.h</code>. NAPI is ABI-stable across Node versions and is supported by Bun, so one <code>.node</code> binary per platform/arch serves both runtimes (source §5).</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th></th><th><code>bun:ffi</code></th><th>NAPI addon</th></tr>
+</thead>
+<tbody>
+<tr><td>Runtimes</td><td>Bun only</td><td>Bun <em>and</em> Node</td></tr>
+<tr><td>Build step</td><td>none (loads dylib at runtime)</td><td>compile per platform/arch</td></tr>
+<tr><td>Marshaling</td><td>in JS (this spec)</td><td>in the addon (C/C++/Rust napi-rs)</td></tr>
+<tr><td>Distribution</td><td>ship <code>libengine.${suffix}</code></td><td>ship prebuilt <code>.node</code> binaries</td></tr>
+<tr><td>Use when</td><td>Bun-native, fastest to ship</td><td>cross-runtime single package</td></tr>
+</tbody>
+</table>
+</div>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> ship the NAPI addon instead of (or alongside) the raw-FFI package when a single Bun+Node package is required.</li>
+<li><span class="req-tag should">SHOULD</span> keep the public TS surface (<code>open</code>/<code>exec</code>/<code>query</code>/<code>transaction</code>/<code>prepare</code>/<code>branch</code>) identical across the FFI and NAPI builds so callers are runtime-agnostic.</li>
+<li><span class="req-tag should">SHOULD</span> implement the addon over the same <code>engine.h</code> (e.g. via <code>napi-rs</code>) so there is exactly one engine boundary regardless of binding mechanism.</li>
+</ul>
+</section>
+
+<section>
+<h2>Path 2 — Server mode (Bun as client)</h2>
+<p>When Bun is just a client, run <code>engine-server</code> (the same library wrapped in a Postgres wire-protocol listener; <a href="07-server-mode.html">07</a>). Because Bun ships a built-in <code>Bun.sql</code> Postgres client, connecting requires zero extra dependencies.</p>
+<pre data-lang="ts"><code>import { SQL } from "bun";
+
+// Connect through the pooler endpoint, not the engine-server directly.
+const sql = new SQL("postgres://user@pooler-host:6432/mydb");
+
+const rows = await sql`SELECT id, body FROM notes WHERE id = ${1}`;
+// tagged-template params are sent as bind parameters (not interpolated).
+
+await sql.begin(async (tx) =&gt; {
+  await tx`UPDATE notes SET body = 'x' WHERE id = ${1}`;
+  await tx`INSERT INTO notes (id, body) VALUES (${2}, ${'y'})`;
+});                                   // COMMIT acked only after WAL is durable</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> connect via the Postgres wire protocol exposed by <code>engine-server</code>; no engine-specific client is needed.</li>
+<li><span class="req-tag should">SHOULD</span> place a pooler (PgBouncer / pgcat in transaction mode) in front to absorb serverless connection bursts; point <code>Bun.sql</code> at the pooler endpoint, not the engine directly. See <a href="07-server-mode.html">07 — Server Mode</a>.</li>
+<li><span class="req-tag should">SHOULD</span> use tagged-template parameters (or the explicit parameter form) rather than string interpolation, so values bind as protocol parameters.</li>
+<li><span class="req-tag must-not">MUST NOT</span> assume multi-writer concurrency per database — the single-writer-per-DB ceiling holds in server mode too (source §4); concurrency scales by many small databases, not many writers per DB.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Note — same engine, different listener</p>
+<p>The engine binary is identical to the embedded one; only the wire-protocol listener differs (source §1/§5). A tool can move from embedded to server mode without an engine rebuild — and a Postgres-native tool such as PostgREST can point at <code>engine-server</code> directly (source §11 / <a href="12-capabilities.html">12</a>).</p>
+</div>
+</section>
+
+<section>
+<h2>Packaging &amp; distribution</h2>
+<p>The embedded path requires the native engine library to be present at runtime for the host's platform/arch. Distribution mirrors the prevailing prebuilt-binary pattern: a thin JS package plus per-platform binary subpackages installed via optional dependencies.</p>
+
+<h3>Platform / arch matrix</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Target</th><th>Library file</th><th>Bun <code>suffix</code></th><th>Distribution package</th></tr>
+</thead>
+<tbody>
+<tr><td><code>darwin-arm64</code></td><td><code>libengine.dylib</code></td><td><code>dylib</code></td><td><code>@yourdb/bun-darwin-arm64</code></td></tr>
+<tr><td><code>darwin-x64</code></td><td><code>libengine.dylib</code></td><td><code>dylib</code></td><td><code>@yourdb/bun-darwin-x64</code></td></tr>
+<tr><td><code>linux-x64</code></td><td><code>libengine.so</code></td><td><code>so</code></td><td><code>@yourdb/bun-linux-x64</code></td></tr>
+<tr><td><code>linux-arm64</code></td><td><code>libengine.so</code></td><td><code>so</code></td><td><code>@yourdb/bun-linux-arm64</code></td></tr>
+<tr><td><code>win32-x64</code></td><td><code>engine.dll</code></td><td><code>dll</code></td><td><code>@yourdb/bun-win32-x64</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Suffix handling &amp; resolution</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> use Bun's <code>suffix</code> to form the library filename (<code>libengine.${suffix}</code>) so one source path resolves the correct extension per OS.</li>
+<li><span class="req-tag must">MUST</span> resolve the binary from the installed per-platform subpackage for the current <code>process.platform</code> + <code>process.arch</code>, and fail with a clear, actionable error when none matches (naming the missing <code>platform-arch</code> package).</li>
+<li><span class="req-tag should">SHOULD</span> publish each platform binary as an <code>optionalDependencies</code> entry keyed by <code>os</code>/<code>cpu</code> so the package manager installs only the matching one.</li>
+<li><span class="req-tag should">SHOULD</span> embed an ABI version constant in both <code>engine.h</code> and the wrapper and verify it at <code>dlopen</code> time, failing fast on mismatch rather than calling a stale symbol.</li>
+<li><span class="req-tag may">MAY</span> support an <code>YOURDB_ENGINE_PATH</code> environment override for local builds and unusual deployment layouts.</li>
+</ul>
+
+<h3>Install flow</h3>
+<div class="diagram">
+<pre>
+  bun add @yourdb/bun
+        │
+        ▼
+  resolves optionalDependencies by { os, cpu }
+        │
+        ├─ darwin-arm64  → @yourdb/bun-darwin-arm64 (libengine.dylib)
+        ├─ linux-x64     → @yourdb/bun-linux-x64    (libengine.so)
+        └─ ...           → (exactly one matches; others skipped)
+        │
+        ▼
+  import { open } from "@yourdb/bun"
+        │
+        ▼
+  dlopen(`libengine.${suffix}`) from the resolved subpackage
+        │
+        ▼
+  verify ABI version constant  →  ready
+</pre>
+<p class="diagram-caption">A thin JS package selects exactly one prebuilt native binary at install time; <code>dlopen</code> + ABI check at first use.</p>
+</div>
+<div class="callout warning">
+<p class="callout-title">WASM is a separate target</p>
+<p>The WebAssembly build (for Cloudflare Workers + R2) is <em>not</em> a prebuilt native binary and is not distributed through this matrix — it is a distinct compilation target with its own constraints (single-threaded, no native FS, storage via the Worker binding). It is a port, not a recompile. See <a href="11-deployment-targets.html">11 — Deployment Targets</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Configuration</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Knob</th><th>Scope</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td>connection URL scheme</td><td>both</td><td><code>file://</code> → local, no egress; <code>s3://</code>/<code>r2://</code> → disaggregated. Selects the storage backend; same call path.</td></tr>
+<tr><td><code>YOURDB_ENGINE_PATH</code></td><td>embedded</td><td>Override the resolved library path (local builds, custom layouts).</td></tr>
+<tr><td><code>binding</code> (<code>ffi</code> / <code>napi</code>)</td><td>embedded</td><td>Which binding mechanism the package uses; <code>napi</code> for Bun+Node single package.</td></tr>
+<tr><td>pooler endpoint</td><td>server</td><td><code>Bun.sql</code> connection string points at the pooler (transaction mode), not the engine.</td></tr>
+<tr><td><code>maxConnections</code> (<code>Bun.sql</code>)</td><td>server</td><td>Client-side pool size; coordinate with the upstream pooler limits (<a href="07-server-mode.html">07</a>).</td></tr>
+<tr><td><code>finalizationBackstop</code></td><td>wrapper</td><td>Enable/disable the GC-based handle backstop; explicit <code>using</code>/<code>close</code> remains the contract.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Failure</th><th>Mechanism</th><th>Handling</th></tr>
+</thead>
+<tbody>
+<tr><td>ABI mismatch</td><td>Installed <code>libengine</code> predates/postdates the wrapper's expected symbol set or struct layout.</td><td>Verify an embedded ABI version constant at <code>dlopen</code>; fail fast with a clear "engine ABI vX, wrapper expects vY — upgrade <code>@yourdb/bun</code> or the binary" error. Never call a stale symbol — that is undefined behaviour.</td></tr>
+<tr><td>Missing native library</td><td>No per-platform subpackage matched <code>os</code>/<code>cpu</code> (unsupported arch, pruned optional dep, manual copy).</td><td>Surface an actionable error naming the expected <code>@yourdb/bun-&lt;platform&gt;-&lt;arch&gt;</code> package and the <code>YOURDB_ENGINE_PATH</code> override; do not attempt to load a wrong-arch binary.</td></tr>
+<tr><td><code>engine_open</code> returns NULL</td><td>Unknown URL scheme (engine rejects rather than defaulting) or storage init failure.</td><td>Throw an open error; no handle exists to query, so the message is generic but states the URL scheme. Validate the scheme client-side first for a better message.</td></tr>
+<tr><td>Use-after-free of borrowed value</td><td>JS keeps a value/colname pointer after the result/statement advanced or was freed.</td><td>Wrapper copies all borrowed cstrings into JS before freeing; never exposes raw pointers. Reading after dispose returns a misuse error, not a crash.</td></tr>
+<tr><td>Double free / use-after-dispose</td><td><code>close()</code>/<code>finalize()</code> called twice, or method on a disposed object.</td><td><code>engine_close</code>/<code>engine_result_free</code> are idempotent on NULL; the wrapper marks disposed and returns a misuse error rather than re-freeing.</td></tr>
+<tr><td>Panic across FFI</td><td>Engine internal error.</td><td>Engine wraps every export in <code>catch_unwind</code> → <code>ENGINE_ERR_INTERNAL</code>; the binding maps it to an <code>EngineError</code>. No unwind crosses the boundary (<a href="02-engine-core.html">02</a>).</td></tr>
+<tr><td>Server connection storm</td><td>Many serverless invocations open Postgres connections at once.</td><td>Pooler in transaction mode absorbs the burst; <code>Bun.sql</code> targets the pooler, not the engine (<a href="07-server-mode.html">07</a>).</td></tr>
+<tr><td>Commit appears to hang</td><td><code>engine_commit</code> blocking on a slow S3/CAS round-trip.</td><td>Expected for <code>s3://</code> — commit pays the durable-over-network cost (source §4). Surface as latency, never ack early; tune via group commit at the backend (<a href="04-object-storage-backend.html">04</a>).</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Dependencies &amp; existing pieces to start from</h2>
+<dl class="fields">
+<dt>C ABI (<code>engine.h</code>)</dt>
+<dd>The stable boundary owned by <a href="02-engine-core.html">02 — Engine Core</a>. This binding is downstream of it; pin the ABI version.</dd>
+<dt><code>bun:ffi</code></dt>
+<dd>Bun's built-in FFI module: <code>dlopen</code>, <code>FFIType</code>, <code>suffix</code>, <code>ptr</code>/<code>read</code>. No third-party dependency for the embedded path.</dd>
+<dt><code>Bun.sql</code></dt>
+<dd>Bun's built-in Postgres client for the server path. Zero extra deps.</dd>
+<dt>NAPI / <code>napi-rs</code></dt>
+<dd>For the cross-runtime addon over the same <code>engine.h</code> (Bun + Node).</dd>
+<dt>Pooler</dt>
+<dd>PgBouncer / pgcat (transaction mode) for server-mode bursts — configured in <a href="07-server-mode.html">07 — Server Mode</a>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> open a <code>file://</code> database via <code>bun:ffi</code>, run <code>exec</code>/<code>query</code>/prepared/transaction/<code>branch</code>, and close cleanly with no leaked handles, results, or statements (validated under a leak check).</li>
+<li><span class="req-tag must">MUST</span> open the <em>same</em> code against an <code>s3://</code> URL with no source changes and pass the same functional suite (storage chosen by scheme only).</li>
+<li><span class="req-tag must">MUST</span> map every non-OK <code>EngineStatus</code> to a typed <code>EngineError</code> carrying the copied <code>engine_last_error</code> message and a correct <code>retryable</code> flag.</li>
+<li><span class="req-tag must">MUST</span> demonstrate deterministic disposal: <code>using</code> scopes and explicit <code>close()</code>/<code>finalize()</code> release engine resources on both normal return and thrown exceptions; <code>transaction()</code> rolls back on throw.</li>
+<li><span class="req-tag must">MUST</span> fail fast and legibly on ABI mismatch and on a missing platform binary (no stale-symbol call, no wrong-arch load).</li>
+<li><span class="req-tag should">SHOULD</span> connect via <code>Bun.sql</code> through a pooler to <code>engine-server</code> and pass the same functional suite over the wire.</li>
+<li><span class="req-tag should">SHOULD</span> publish prebuilt binaries for at least <code>darwin-arm64</code>, <code>darwin-x64</code>, <code>linux-x64</code>, and <code>linux-arm64</code>, installable via <code>bun add</code> with correct optional-dependency resolution.</li>
+<li><span class="req-tag should">SHOULD</span> keep the public TS surface identical across the FFI and NAPI builds (a runtime-agnostic conformance test).</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul>
+<li><strong>FFI call overhead vs micro-batching.</strong> For very chatty workloads, does per-call FFI trampoline cost warrant a batched submit API (multiple statements per crossing), or does <code>bun:ffi</code>'s JIT'd path make it negligible? Quantify against the embedded micro-loop in <a href="09-benchmark-plan.html">09</a>.</li>
+<li><strong>Streaming large results.</strong> The wrapper buffers an <code>EngineResult</code>; for large scans, expose the cursor API (<code>engine_step</code>/<code>engine_column_value</code>) as an async iterator? Coordinate with the engine's streaming cursor question in <a href="02-engine-core.html">02</a>.</li>
+<li><strong>GC vs determinism.</strong> How aggressively to lean on <code>FinalizationRegistry</code> as a backstop without letting callers treat GC timing as resource management — durability and lifetime must stay explicit.</li>
+<li><strong>NAPI vs FFI as the default.</strong> Ship FFI-only first (Bun-native, simplest) and add NAPI later, or lead with NAPI for cross-runtime reach from day one? Affects the packaging story.</li>
+<li><strong>Worker thread safety.</strong> Is one engine handle usable across Bun Worker threads, or strictly one handle per thread? The single-writer-per-DB ceiling suggests per-thread handles; confirm against the engine's threading model.</li>
+<li><strong>WASM binding shape.</strong> The Workers build cannot use <code>bun:ffi</code> or a <code>.node</code> addon; what is the JS↔WASM call shape and does the <code>@yourdb/bun</code> surface survive unchanged? See <a href="11-deployment-targets.html">11</a>.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="02-engine-core.html"><span class="xref-id">CORE</span><span class="xref-title">Engine Core</span><span class="xref-desc">Owns engine.h — the C ABI this page binds via bun:ffi.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">engine-server + pooler that Bun.sql connects to in Path 2.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam selected by the file:// vs s3:// connection scheme.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">Why an s3:// commit blocks: durable-over-network round-trip.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (FFI/NAPI) vs the separate WASM build for Workers+R2.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">better-auth and PostgREST composing around the embedded engine.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Embedded FFI micro-loop vs pgbench over the wire.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">Where the host runtime sits in the three-slot layer map.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-20.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

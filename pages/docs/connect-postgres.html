@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect with a Postgres client · bydesigns-db docs</title>
+<meta name="description" content="Start engine-server and connect with psql, Bun's SQL client, generic Postgres drivers, or PostgREST over the supported pgwire subset.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">PG</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Connect</span>
+</div>
+<h1>Connect with a Postgres client</h1>
+<p class="lede"><code>engine-server</code> is the embedded engine behind a Postgres-wire listener. Start it with a storage URL and any Postgres client — <code>psql</code>, <code>Bun.sql</code>, a generic driver, or PostgREST — connects over a defined subset of the Postgres wire protocol. There is no second engine and no custom driver to write.</p>
+</header>
+
+<section>
+<h2>Start the server</h2>
+<p>Run <code>bydesigns-server</code> with two arguments: <code>--listen HOST:PORT</code> for the bind address and <code>--db URL</code> for the storage backend. The <code>--db</code> URL scheme selects the backend exactly as the embedded path does — <code>file://</code> for pure-embedded, <code>s3://</code>/<code>r2://</code>/<code>gs://</code> for disaggregated.</p>
+<pre data-lang="bash"><code># Embedded backend (local file)
+cargo run -p bydesigns-server -- --listen 127.0.0.1:5433 --db file://./srv.db
+
+# Disaggregated backend (object storage; credentials from the environment)
+cargo run -p bydesigns-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/app</code></pre>
+<p>With no flags it defaults to <code>--listen 127.0.0.1:5433</code> and <code>--db file://./engine-server.db</code>. The short forms <code>-l</code> and <code>-d</code> are accepted.</p>
+<div class="callout tip">
+<p class="callout-title">Same engine, just behind a listener</p>
+<p>The SQL parser, MVCC, WAL, local cache, and <code>Storage</code> trait are byte-for-byte the embedded build. The only thing server mode adds is a protocol listener that turns wire messages into the same engine calls <code>bun:ffi</code> makes in-process. Develop embedded and deploy as a server (or the reverse) without changing your SQL or your data.</p>
+</div>
+</section>
+
+<section>
+<h2>Authentication and TLS</h2>
+<p>The server speaks the Postgres frontend/backend protocol (version 3.0). For the current build, connect <strong>cleartext with <code>sslmode=disable</code></strong> using trust auth — pass any user (e.g. <code>postgres</code>); no password is required. Always set <code>sslmode=disable</code> so the client does not attempt a TLS upgrade.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> set <code>sslmode=disable</code> on the client connection string; the listener serves cleartext.</li>
+<li><span class="req-tag must">MUST</span> keep this on a trusted network — there is no transport encryption on the cleartext path. Put real bucket credentials in the server's environment, never in the client URL.</li>
+<li><span class="req-tag should">SHOULD</span> front the server with a TLS-terminating pooler or proxy when exposing it beyond localhost (see <a href="connection-pooling.html">Connection pooling</a>).</li>
+</ul>
+</section>
+
+<section>
+<h2>Connect with psql</h2>
+<p>Point <code>psql</code> at the listener with key/value parameters or a URI. Either form works as long as SSL is disabled.</p>
+<pre data-lang="bash"><code>psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"
+
+# or as a URI
+psql "postgres://postgres@127.0.0.1:5433/srv?sslmode=disable"</code></pre>
+<pre data-lang="sql"><code>CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+INSERT INTO notes VALUES (1, 'hello');
+SELECT id, body FROM notes WHERE id = 1;</code></pre>
+</section>
+
+<section>
+<h2>Connect with Bun's SQL client</h2>
+<p>Bun ships a built-in Postgres client, so a Bun app connects with zero extra dependencies — just a connection string with <code>sslmode=disable</code>. Parameterized tagged-template queries map onto the extended-query path.</p>
+<pre data-lang="ts"><code>import { SQL } from "bun";
+
+const sql = new SQL("postgres://postgres@127.0.0.1:5433/srv?sslmode=disable");
+
+await sql`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`;
+await sql`INSERT INTO notes VALUES (${1}, ${"hello"})`;   // parameter binding
+const rows = await sql`SELECT id, body FROM notes WHERE id = ${1}`;</code></pre>
+<div class="callout note">
+<p class="callout-title">Embedded vs. wire</p>
+<p>For a single app that owns its database, the embedded path (<a href="connect-bun.html">Connect from Bun</a>) avoids the socket entirely and runs at function-call latency. Reach for <code>Bun.sql</code> when you want multiple clients, existing Postgres tooling, or a network boundary.</p>
+</div>
+</section>
+
+<section>
+<h2>Connect with a generic Postgres driver</h2>
+<p>Any driver that speaks protocol 3.0 and tolerates trust auth over cleartext will connect — <code>node-postgres</code>, <code>pgx</code>, <code>psycopg</code>, and similar. Use the simple-query path for un-parameterized statements and the extended-query path (<code>Parse</code>/<code>Bind</code>/<code>Describe</code>/<code>Execute</code>/<code>Sync</code>) for parameter binding and prepared statements.</p>
+<pre data-lang="ts"><code>import { Client } from "pg"; // node-postgres
+
+const client = new Client({
+  host: "127.0.0.1",
+  port: 5433,
+  user: "postgres",
+  ssl: false,                 // sslmode=disable
+});
+await client.connect();
+const { rows } = await client.query("SELECT id, body FROM notes WHERE id = $1", [1]);
+await client.end();</code></pre>
+</section>
+
+<section>
+<h2>What the wire subset supports</h2>
+<p>The target is a <strong>subset</strong> of the Postgres wire protocol — the message flows real clients in this stack actually use — not bug-for-bug Postgres fidelity. What is supported:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Capability</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Startup + trust auth (cleartext, <code>sslmode=disable</code>)</td><td>Supported</td></tr>
+<tr><td>Simple query protocol (<code>Query</code> → rows → <code>CommandComplete</code>)</td><td>Supported</td></tr>
+<tr><td>Extended query protocol (<code>Parse</code>/<code>Bind</code>/<code>Describe</code>/<code>Execute</code>/<code>Sync</code>/<code>Close</code>)</td><td>Supported</td></tr>
+<tr><td>Parameter binding and row description</td><td>Supported</td></tr>
+<tr><td>Field-tagged <code>ErrorResponse</code> with SQLSTATE</td><td>Supported</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">It is a subset, not full Postgres</p>
+<p>Aiming for full Postgres wire/SQL fidelity is out of scope. The SQL surface is the engine's focused subset (see the <a href="sql-reference.html">SQL reference</a>); a driver that depends on Postgres-specific catalog introspection or features outside the subset may not connect cleanly. Stick to the clients and queries above.</p>
+</div>
+</section>
+
+<section>
+<h2>REST for free with PostgREST</h2>
+<p>Because the engine speaks pgwire in server mode, <strong>PostgREST</strong> can point at it directly: it introspects the schema and serves an auto-generated REST API with no bespoke REST code. Run PostgREST in front of <code>engine-server</code> and inherit the existing REST layer rather than building one.</p>
+<pre data-lang="bash"><code># postgrest.conf (sketch)
+db-uri = "postgres://postgres@127.0.0.1:5433/srv?sslmode=disable"
+db-schemas = "public"
+db-anon-role = "postgres"</code></pre>
+<p>Keep PostgREST and the server on a trusted network; the cleartext connection between them carries no transport security on its own.</p>
+</section>
+
+<section>
+<h2>Pooling for bursty clients</h2>
+<p>Server mode is the only mode with sockets, so it is the only mode that needs a connection pool. For serverless or bursty client populations, place a transaction-mode pooler (PgBouncer / pgcat) in front of <code>engine-server</code> — see <a href="connection-pooling.html">Connection pooling</a> for the config and caveats. <code>engine-server</code> never bundles a pooler; it is a separate, composable process.</p>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="connect.html"><span class="xref-id">CONN</span><span class="xref-title">Connect to your database</span><span class="xref-desc">The connection model and how to choose a backend.</span></a>
+<a class="xref" href="connection-pooling.html"><span class="xref-id">POOL</span><span class="xref-title">Connection pooling</span><span class="xref-desc">Absorb serverless connection bursts in front of the server.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-id">BUN</span><span class="xref-title">Connect from Bun (embedded)</span><span class="xref-desc">The in-process path at function-call latency.</span></a>
+<a class="xref" href="sql-reference.html"><span class="xref-id">SQL</span><span class="xref-title">SQL reference</span><span class="xref-desc">The supported SQL surface and types.</span></a>
+<a class="xref" href="../specs/07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The full pgwire-subset specification.</span></a>
+<a class="xref" href="scale-to-zero.html"><span class="xref-id">S2Z</span><span class="xref-title">Scale-to-zero</span><span class="xref-desc">Cold-start, keep-warm, and idle teardown.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

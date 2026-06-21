@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect from Bun (embedded) · bydesigns-db docs</title>
+<meta name="description" content="The full embedded bydesigns-db API over bun:ffi: open, exec, parameterized query, prepared statements, transactions, branching, and error handling.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">BUN</span>
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Connect</span>
+</div>
+<h1>Connect from Bun (embedded)</h1>
+<p class="lede">The embedded path links the native engine in-process and drives it over the C ABI through <code>bun:ffi</code>. The <code>@yourdb/bun</code> wrapper hides the raw pointers behind a small typed surface — <code>open</code>, <code>exec</code>, <code>query</code>, <code>prepare</code>, <code>transaction</code>, and <code>branch</code> — at function-call latency, with deterministic resource cleanup.</p>
+</header>
+
+<section>
+<h2>Load the library</h2>
+<p>The wrapper auto-discovers the built native library from <code>target/release</code> then <code>target/debug</code>. Build it once before running anything that imports <code>@yourdb/bun</code>; the loader binds whatever it finds, so a stale binary runs silently if you forget to rebuild after an engine change.</p>
+<pre data-lang="bash"><code>cargo build -p bydesigns-engine --release   # → target/release/libengine.{a,so,dylib}
+cd clients/bun &amp;&amp; bun install</code></pre>
+<p>To point at a specific build (a non-standard target dir, a packaged artifact, or a CI path), set <code>YOURDB_ENGINE_PATH</code> to the absolute library path; it overrides auto-discovery.</p>
+<pre data-lang="bash"><code>YOURDB_ENGINE_PATH=/abs/path/libengine.so bun test</code></pre>
+<div class="callout note">
+<p class="callout-title">Rebuild after engine or ABI changes</p>
+<p>The wrapper pins an expected ABI version. After any change that touches the C ABI or engine behaviour, rebuild the release <code>libengine</code> before running Bun — otherwise you are testing a stale binary against the new wrapper.</p>
+</div>
+</section>
+
+<section>
+<h2>Open a database</h2>
+<p><code>open(url)</code> returns a <code>Database</code> handle. The URL scheme selects the durable storage backend — <code>file://</code> for pure-embedded, <code>s3://</code>/<code>r2://</code>/<code>gs://</code> for disaggregated. An unknown scheme or a storage-init failure throws an <code>EngineError</code>; nothing is silently defaulted.</p>
+<pre data-lang="ts"><code>import { open } from "@yourdb/bun";
+
+using db = open("file://./local.db");   // pure-embedded, zero network
+// using db = open("s3://my-bucket/app");  // disaggregated; creds from the environment</code></pre>
+<p>The <code>using</code> declaration disposes the handle at scope exit (see <a href="#resource-management">Resource management</a>). Bucket credentials always come from the environment, never from code.</p>
+</section>
+
+<section>
+<h2>Run statements: exec</h2>
+<p><code>exec(sql)</code> runs a single statement with no result set and returns the number of rows affected. Use it for DDL and for writes whose rows you do not need back.</p>
+<pre data-lang="ts"><code>db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
+
+const affected = db.exec("INSERT INTO notes VALUES (1, 'hello')");
+console.log(affected); // 1</code></pre>
+<div class="callout note">
+<p class="callout-title">DDL is autocommit-only</p>
+<p><code>CREATE</code>/<code>DROP TABLE</code> run only in autocommit; inside an explicit <code>transaction()</code> they fail with a transaction error. Row DML (<code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>) is fully transactional. See the <a href="sql-reference.html">SQL reference</a> for the supported surface.</p>
+</div>
+</section>
+
+<section>
+<h2>Query and parameter binding</h2>
+<p><code>query(sql, params?)</code> runs a query and buffers every row into an array. Each row is a plain object keyed by column name; <strong>all values come back as strings, and a SQL <code>NULL</code> comes back as JavaScript <code>null</code></strong>. Cast on the application side if you need numbers or dates.</p>
+<pre data-lang="ts"><code>const rows = db.query("SELECT id, body FROM notes");
+// [{ id: "1", body: "hello" }]   ← values are strings; NULL → null</code></pre>
+<p>Pass positional parameters with <code>?</code> placeholders and a value array. This is the safe path — values never touch the SQL text — and is what you should use for any user-supplied input.</p>
+<pre data-lang="ts"><code>db.query("INSERT INTO notes VALUES (?, ?)", [2, "from a param"]);
+
+const some = db.query(
+  "SELECT id, body FROM notes WHERE id = ?",
+  [2],
+);</code></pre>
+<h3>Parameter types</h3>
+<p>A <code>Param</code> is one of the following. Each is encoded with a one-character type tag before it crosses the FFI boundary.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>JS type</th><th>Encoded as</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>number</code> (integer)</td><td>integer</td><td>Whole numbers bind as integers.</td></tr>
+<tr><td><code>number</code> (fractional)</td><td>float</td><td>Non-integer numbers bind as floats.</td></tr>
+<tr><td><code>bigint</code></td><td>integer</td><td>For values beyond the safe integer range.</td></tr>
+<tr><td><code>boolean</code></td><td>integer (<code>0</code>/<code>1</code>)</td><td><code>true</code> → <code>1</code>, <code>false</code> → <code>0</code>.</td></tr>
+<tr><td><code>string</code></td><td>string</td><td>Bound verbatim.</td></tr>
+<tr><td><code>Uint8Array</code></td><td>blob</td><td>Carried base64-encoded across the ABI.</td></tr>
+<tr><td><code>number[]</code></td><td>vector</td><td>A numeric vector (joined as a comma list).</td></tr>
+<tr><td><code>null</code></td><td>null</td><td>Binds SQL <code>NULL</code>.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Prepared statements</h2>
+<p><code>prepare(sql)</code> compiles a statement once and returns a reusable <code>Statement</code>. Reuse it across many bind/execute cycles to skip re-parsing on the hot path. The methods take positional bind values as arguments:</p>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> <code>all(...params)</code> — execute and buffer every row into an array.</li>
+<li><span class="req-tag may">MAY</span> <code>get(...params)</code> — execute and return the first row, or <code>undefined</code>.</li>
+<li><span class="req-tag may">MAY</span> <code>run(...params)</code> — execute a write and return rows affected.</li>
+</ul>
+<pre data-lang="ts"><code>using insert = db.prepare("INSERT INTO notes VALUES (?, ?)");
+for (const [id, body] of [[10, "a"], [11, "b"], [12, "c"]]) {
+  insert.run(id, body);            // reused, re-bound each call
+}
+
+using byId = db.prepare("SELECT id, body FROM notes WHERE id = ?");
+const one = byId.get(11);          // { id: "11", body: "b" } | undefined
+const many = byId.all(10);         // [{ id: "10", body: "a" }]</code></pre>
+<p><code>query(sql, params)</code> is itself a one-shot prepared statement under the hood; reach for an explicit <code>prepare</code> when the same SQL runs repeatedly.</p>
+</section>
+
+<section>
+<h2>Transactions</h2>
+<p><code>db.transaction(fn)</code> wraps <code>fn</code> in <code>BEGIN</code> … <code>COMMIT</code>. On a normal return it commits and returns <code>fn</code>'s value; if <code>fn</code> throws, it rolls back and re-throws the original error. <strong>The commit blocks until the WAL is durable</strong> — the call does not return until the write is crash-safe.</p>
+<pre data-lang="ts"><code>const id = db.transaction((tx) =&gt; {
+  tx.exec("INSERT INTO notes VALUES (20, 'tx-a')");
+  tx.exec("INSERT INTO notes VALUES (21, 'tx-b')");
+  return 21;                       // returned from transaction()
+});                                // ← COMMIT returns only after WAL fsync
+
+// A throw inside the body rolls back and re-throws:
+db.transaction((tx) =&gt; {
+  tx.exec("INSERT INTO notes VALUES (22, 'never')");
+  throw new Error("abort");        // ROLLBACK, then this error propagates
+});</code></pre>
+<div class="callout warning">
+<p class="callout-title">DDL inside a transaction is rejected</p>
+<p>Keep <code>CREATE</code>/<code>DROP TABLE</code> out of the transaction body — they run in autocommit only and will throw a transaction error inside <code>transaction()</code>.</p>
+</div>
+</section>
+
+<section id="resource-management">
+<h2>Resource management</h2>
+<p>Both <code>Database</code> and <code>Statement</code> own native resources and implement <code>Symbol.dispose</code>, so a <code>using</code> declaration releases them deterministically at scope exit — no GC dependency. You can also release explicitly:</p>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> prefer <code>using db = open(...)</code> / <code>using stmt = db.prepare(...)</code> so cleanup is automatic and exception-safe.</li>
+<li><span class="req-tag may">MAY</span> call <code>db.close()</code> / <code>stmt.finalize()</code> when you need to release before scope exit. Using a closed handle throws a misuse error.</li>
+</ul>
+<pre data-lang="ts"><code>{
+  using db = open("file://./local.db");
+  // ... use db ...
+}                                  // db is disposed here
+
+// or explicitly:
+const db2 = open("file://./other.db");
+try { /* ... */ } finally { db2.close(); }</code></pre>
+</section>
+
+<section>
+<h2>Errors, retries, and the commit LSN</h2>
+<p>Failures throw an <code>EngineError</code> carrying the numeric engine <code>status</code> and a <code>retryable</code> flag. <code>retryable</code> is <code>true</code> for a write–write conflict (<code>ERR_CONFLICT</code>, first-committer-wins lost) or a transient storage error (<code>ERR_STORAGE</code>) — retry the transaction in those cases. Other statuses (SQL errors, misuse) are not worth retrying.</p>
+<pre data-lang="ts"><code>import { EngineError } from "@yourdb/bun";
+
+function withRetry&lt;R&gt;(fn: () =&gt; R, attempts = 3): R {
+  for (let i = 0; ; i++) {
+    try {
+      return fn();
+    } catch (e) {
+      if (e instanceof EngineError &amp;&amp; e.retryable &amp;&amp; i &lt; attempts - 1) continue;
+      throw e;
+    }
+  }
+}
+
+withRetry(() =&gt; db.transaction((tx) =&gt; tx.exec("UPDATE notes SET body='x' WHERE id=1")));</code></pre>
+<p><code>db.lastLsn</code> returns the commit LSN of the last commit on this connection as a <code>bigint</code> — the monotonic, durable commit point you just reached. It is also the fork point a branch is taken at.</p>
+<pre data-lang="ts"><code>db.transaction((tx) =&gt; tx.exec("INSERT INTO notes VALUES (30, 'lsn')"));
+console.log(db.lastLsn);           // e.g. 873n</code></pre>
+</section>
+
+<section>
+<h2>Branching</h2>
+<p><code>db.branch(name)</code> creates an instant copy-on-write fork at this connection's current committed LSN and returns a new <code>Database</code> bound to the branch. The branch sees the base's committed data but writes in isolation — neither the base nor a sibling ever observes a branch's writes, and creating one copies no pages. Close the returned handle when done.</p>
+<pre data-lang="ts"><code>using preview = db.branch("preview");
+preview.exec("INSERT INTO notes VALUES (40, 'branch-only')");
+
+db.query("SELECT id FROM notes WHERE id = 40");      // []  — base unaffected
+preview.query("SELECT id FROM notes WHERE id = 40"); // [{ id: "40" }]</code></pre>
+<div class="callout note">
+<p class="callout-title">Branch scope</p>
+<p>Branch-of-branch and branching inside an open transaction are rejected (the call throws). See <a href="branching.html">Branching</a> for the isolation rules and lifecycle.</p>
+</div>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="connect.html"><span class="xref-id">CONN</span><span class="xref-title">Connect to your database</span><span class="xref-desc">The connection model and how to choose a backend.</span></a>
+<a class="xref" href="getting-started.html"><span class="xref-id">QS</span><span class="xref-title">Quickstart</span><span class="xref-desc">Build the engine and run your first database in ~5 minutes.</span></a>
+<a class="xref" href="sql-reference.html"><span class="xref-id">SQL</span><span class="xref-title">SQL reference</span><span class="xref-desc">The supported SQL surface and types.</span></a>
+<a class="xref" href="branching.html"><span class="xref-id">BR</span><span class="xref-title">Branching</span><span class="xref-desc">Copy-on-write forks and their isolation rules.</span></a>
+<a class="xref" href="connect-postgres.html"><span class="xref-id">PG</span><span class="xref-title">Connect with a Postgres client</span><span class="xref-desc">The same engine behind a wire listener.</span></a>
+<a class="xref" href="c-abi.html"><span class="xref-id">ABI</span><span class="xref-title">C ABI</span><span class="xref-desc">The frozen embedding contract the wrapper binds.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">bydesigns-db documentation · Licensed under AGPL-3.0.</footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
