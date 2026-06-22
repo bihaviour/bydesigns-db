@@ -334,15 +334,19 @@ impl Parser {
         } else if self.is_kw("delete") {
             self.delete()
         } else if self.eat_kw("begin") {
-            let _ = self.eat_kw("transaction") || self.eat_kw("work") || self.eat_kw("deferred");
+            let _ = self.eat_kw("transaction") || self.eat_kw("work");
+            self.eat_transaction_modes();
             Ok(Stmt::Begin)
         } else if self.eat_kw("start") {
             let _ = self.eat_kw("transaction");
+            self.eat_transaction_modes();
             Ok(Stmt::Begin)
-        } else if self.eat_kw("commit") {
+        } else if self.eat_kw("commit") || self.eat_kw("end") {
+            // END [WORK|TRANSACTION] is a COMMIT synonym.
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             Ok(Stmt::Commit)
-        } else if self.eat_kw("rollback") {
+        } else if self.eat_kw("rollback") || self.eat_kw("abort") {
+            // ABORT [WORK|TRANSACTION] is a ROLLBACK synonym (PostgREST uses it).
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             Ok(Stmt::Rollback)
         } else {
@@ -350,6 +354,36 @@ impl Parser {
                 "unsupported statement starting at {:?}",
                 self.peek()
             )))
+        }
+    }
+
+    /// Consume the optional transaction-mode list after BEGIN / START
+    /// TRANSACTION (`ISOLATION LEVEL …`, `READ ONLY` / `READ WRITE`,
+    /// `[NOT] DEFERRABLE`), comma- or space-separated. The engine runs one
+    /// snapshot-isolation mode, so these are accepted and ignored — needed for
+    /// clients (PostgREST) that open `BEGIN ISOLATION LEVEL READ COMMITTED READ
+    /// ONLY`.
+    fn eat_transaction_modes(&mut self) {
+        loop {
+            let _ = self.skip(Tok::Comma);
+            if self.eat_kw("isolation") {
+                let _ = self.eat_kw("level");
+                // SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED
+                if self.eat_kw("serializable") {
+                } else if self.eat_kw("repeatable") {
+                    let _ = self.eat_kw("read");
+                } else if self.eat_kw("read") {
+                    let _ = self.eat_kw("committed") || self.eat_kw("uncommitted");
+                }
+            } else if self.eat_kw("read") {
+                let _ = self.eat_kw("only") || self.eat_kw("write");
+            } else if self.eat_kw("not") {
+                let _ = self.eat_kw("deferrable");
+            } else if self.eat_kw("deferrable") {
+                // accepted
+            } else {
+                break;
+            }
         }
     }
 

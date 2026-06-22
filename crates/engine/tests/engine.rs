@@ -238,6 +238,35 @@ fn aggregates_and_arithmetic() {
 }
 
 #[test]
+fn transaction_keywords_and_modes() {
+    let p = db_path("txnkw");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+
+    // BEGIN with a full transaction-mode list (PostgREST's exact form) commits.
+    db.exec("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY")
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)").unwrap();
+    db.exec("COMMIT").unwrap();
+    assert_eq!(db.query("SELECT id FROM t").unwrap().rows.len(), 1);
+
+    // ABORT is a ROLLBACK synonym — the insert is discarded.
+    db.exec("BEGIN").unwrap();
+    db.exec("INSERT INTO t VALUES (2)").unwrap();
+    db.exec("ABORT").unwrap();
+    assert_eq!(db.query("SELECT id FROM t").unwrap().rows.len(), 1);
+
+    // END is a COMMIT synonym (START TRANSACTION + modes also parse).
+    db.exec("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (3)").unwrap();
+    db.exec("END").unwrap();
+    assert_eq!(db.query("SELECT id FROM t").unwrap().rows.len(), 2);
+
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
 fn parse_errors_are_sql_status() {
     let p = db_path("parseerr");
     let mut db = Connection::open(&url_for(&p)).unwrap();
