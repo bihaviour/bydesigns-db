@@ -181,8 +181,28 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
   inside an explicit transaction it returns `ENGINE_ERR_TXN`. Row DML is fully
   transactional.
 - The SQL surface is a focused subset; unsupported syntax returns `ENGINE_ERR_SQL`
-  (joins, GROUP BY, subqueries, DISTINCT are out of scope). Phase 5 adds the
+  (joins, subqueries, CTEs, DISTINCT remain out of scope). Phase 5 adds the
   `vector(N)` type, the `<->`/`<=>`/`<#>` distance operators, and HNSW indexes.
+  The PostgREST-compat work (#27) additionally grows the *engine* surface with
+  `::` casts, `GROUP BY`/`HAVING`, `LIMIT … OFFSET`, scalar functions, and
+  `json_agg`/`json_build_object` (single-table). The engine also tracks
+  **foreign-key metadata** (parsed from inline `REFERENCES` / table-level
+  `FOREIGN KEY`, persisted in the `CreateTable` WAL op, exposed via
+  `Connection::catalog`); it is metadata only — the engine does not enforce
+  referential integrity in this phase. The PostgREST-specific glue (version
+  probe, binary catalog reflection — tables *and* FK relationships — and
+  data-path rewriting of PostgREST's fixed `pgrst_source` query templates —
+  GET/POST/PATCH/DELETE *and* FK-embedding reads — into engine-runnable SQL)
+  stays in `crates/server` (`introspect.rs`/`reflect.rs`/`datapath.rs`), never
+  the engine. Unmodified PostgREST 14.13 serves full CRUD over the engine with
+  zero engine changes; FK-based resource embedding works end-to-end —
+  relationships reflect into PostgREST's schema cache, and the embedding
+  data-path (`?select=col,rel(col)`, both many-to-one and one-to-many) is
+  decomposed by the server (`datapath::parse_embed`) into per-relation engine
+  queries whose nested JSON it assembles itself — a nested-loop join in
+  composition glue, so the engine never sees `LEFT JOIN LATERAL`, `row_to_json`,
+  or `json_agg`. The rewrite is built against PostgREST 14.13's *captured* SQL
+  (`local-e2e/postgrest-corpus-embedding.log`).
 
 ## When changing things
 

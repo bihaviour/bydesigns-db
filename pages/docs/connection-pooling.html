@@ -52,7 +52,7 @@
 
 <section>
 <h2>PgBouncer config sketch</h2>
-<p>A minimal transaction-mode PgBouncer in front of <code>engine-server</code>. The client edge absorbs the burst; the backend pool stays small and can drain to zero so the engine idle-stops.</p>
+<p>A minimal transaction-mode PgBouncer in front of <code>engine-server</code>. The client edge absorbs the burst; the backend pool stays small and can drain to zero so the engine idle-stops. Ready-to-run versions of this (plus a pgcat equivalent) live in the repo under <code>deploy/pooler/</code> — <code>pgbouncer.ini</code>, <code>pgcat.toml</code>, and a <code>README.md</code> with the run and soak-test commands.</p>
 <pre data-lang="bash"><code># pgbouncer.ini (sketch)
 [databases]
 srv = host=127.0.0.1 port=5433 dbname=srv
@@ -69,6 +69,26 @@ server_idle_timeout = 30           # drop idle backends → engine can idle-stop
 <p>Clients then connect to the pooler (port <code>6432</code>) instead of the server directly:</p>
 <pre data-lang="bash"><code>psql "host=127.0.0.1 port=6432 user=postgres dbname=srv sslmode=disable"</code></pre>
 <p><strong>pgcat</strong> is the alternative when you also want sharding or load-balancing across many backend nodes; it offers the same transaction pooling plus query routing. Either way the pooler is a separate process — keep it out of <code>engine-server</code>.</p>
+</section>
+
+<section>
+<h2>Bun.sql against the pooled endpoint</h2>
+<p>Bun's built-in <code>Bun.sql</code> is a Postgres client, so it reaches the pooler with an ordinary connection string — point it at the pooler port (<code>6432</code>), not the server. In transaction mode a backend is returned to the pool at each transaction boundary, so wrap related statements in <code>sql.begin()</code> to keep them on one borrowed backend.</p>
+<pre data-lang="ts"><code>import { SQL } from "bun";
+
+// Connect to the POOLER (6432), not engine-server (5433). Cleartext wire.
+const sql = new SQL("postgres://postgres@127.0.0.1:6432/srv?sslmode=disable");
+
+await sql`CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)`;
+
+// One transaction = one borrowed backend, returned to the pool at commit.
+await sql.begin(async (tx) => {
+  await tx`INSERT INTO notes VALUES (1, 'hello from Bun.sql')`;
+});
+
+const rows = await sql`SELECT body FROM notes WHERE id = ${1}`;
+await sql.end();</code></pre>
+<p>This is the same connection string a non-pooled client would use against <code>engine-server</code> directly — only the port changes. The full runnable notes plus a <code>pgbench</code> soak command are in <code>deploy/pooler/README.md</code>.</p>
 </section>
 
 <section>

@@ -4,8 +4,10 @@
 //! engine handle = one thread; parallelism comes from multiple handles sharing
 //! the process-global `Database`, exactly as in the embedded path.
 
+use crate::datapath;
 use crate::introspect::{self, Canned, SERVER_VERSION};
 use crate::protocol::{read_message, read_startup, Frontend, Out, Startup};
+use crate::reflect;
 use crate::types::{
     column_type_oid, decode_param, encode_value, infer_column_oid, type_len, OID_TEXT,
 };
@@ -24,6 +26,28 @@ struct Prepared {
     /// Highest `$n` seen — the parameter count reported by `Describe`.
     nparams: usize,
     param_oids: Vec<i32>,
+    /// How to shape the engine result before sending it (e.g. wrap a PostgREST
+    /// read into its `body`/`page_total` response).
+    postprocess: Postprocess,
+}
+
+/// Post-processing applied to a prepared statement's engine result.
+enum Postprocess {
+    /// Send the engine result as-is.
+    None,
+    /// Wrap the rows into PostgREST's data-path response (a single row whose
+    /// `body` column is the JSON array of the rows).
+    PgrstRead,
+    /// PostgREST INSERT (POST): build engine INSERTs from the JSON body param.
+    PgrstInsert(datapath::InsertPlan),
+    /// PostgREST UPDATE (PATCH): SET values from the JSON body param, filtered by
+    /// the de-qualified WHERE clause carrying the remaining `$n` parameters.
+    PgrstUpdate(datapath::UpdatePlan),
+    /// PostgREST DELETE: the de-qualified WHERE clause + its `$n` parameters.
+    PgrstDelete(datapath::DeletePlan),
+    /// PostgREST FK-embedding read: decompose into per-relation engine queries
+    /// and assemble the nested JSON body (spec 12 composition glue).
+    PgrstEmbed(datapath::EmbedRead),
 }
 
 /// A bound portal and its (lazily) materialized result.
@@ -198,6 +222,7 @@ impl Session {
     // ---- simple query protocol ------------------------------------------
 
     fn simple_query(&mut self, out: &mut Out, sql: &str) {
+        log_sql("simple", sql);
         let stmts = split_statements(sql);
         if stmts.is_empty() {
             out.empty_query_response();
@@ -213,10 +238,24 @@ impl Session {
         }
     }
 
-    fn run_simple_one(&mut self, out: &mut Out, sql: &str) -> Result<(), ()> {
+    /// Inspect a statement, resolving a schema-cache reflection against the live
+    /// catalog (the pure `introspect::intercept` cannot reach the engine).
+    fn inspect(&self, sql: &str) -> Canned {
         match introspect::intercept(sql, &self.user, &self.database) {
-            Canned::Rows { columns, rows, tag } => {
-                let oids = infer_oids(&columns, &rows);
+            Canned::Reflect(kind) => reflect::reflect(kind, &self.conn.catalog()),
+            other => other,
+        }
+    }
+
+    fn run_simple_one(&mut self, out: &mut Out, sql: &str) -> Result<(), ()> {
+        match self.inspect(sql) {
+            Canned::Rows {
+                columns,
+                oids,
+                rows,
+                tag,
+            } => {
+                let oids = resolve_oids(oids, &columns, &rows);
                 self.send_rows(out, &columns, &oids, &rows, &[]);
                 out.command_complete(&tag);
                 Ok(())
@@ -225,6 +264,7 @@ impl Session {
                 out.command_complete(&tag);
                 Ok(())
             }
+            Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Pass => match self.conn.query(sql) {
                 Ok(rs) => {
                     if !rs.columns.is_empty() {
@@ -255,12 +295,61 @@ impl Session {
         if self.skip_until_sync {
             return;
         }
+        log_sql("parse", &sql);
+        // PostgREST write (POST/PATCH/DELETE): nothing to prepare on the engine —
+        // the row values / filters arrive as parameters and are applied at execute.
+        if let Some(write) = datapath::parse_write(&sql) {
+            let nparams = datapath::max_param(&sql).max(1);
+            let postprocess = match write {
+                datapath::Write::Insert(p) => Postprocess::PgrstInsert(p),
+                datapath::Write::Update(p) => Postprocess::PgrstUpdate(p),
+                datapath::Write::Delete(p) => Postprocess::PgrstDelete(p),
+            };
+            self.stmts.insert(
+                name,
+                Prepared {
+                    sql,
+                    order: vec![],
+                    nparams,
+                    param_oids,
+                    postprocess,
+                },
+            );
+            out.parse_complete();
+            return;
+        }
+        // PostgREST FK-embedding read: nothing to prepare on the engine — the
+        // embed is decomposed into per-relation queries assembled at execute.
+        if let Some(embed) = datapath::parse_embed(&sql) {
+            let nparams = datapath::max_param(&sql);
+            self.stmts.insert(
+                name,
+                Prepared {
+                    sql,
+                    order: vec![],
+                    nparams,
+                    param_oids,
+                    postprocess: Postprocess::PgrstEmbed(embed),
+                },
+            );
+            out.parse_complete();
+            return;
+        }
+        // PostgREST read template: can't run on the engine as-is — rewrite it to
+        // the inner SELECT and flag the result for body/page_total wrapping.
+        let (engine_sql, postprocess) =
+            match (datapath::is_read(&sql), datapath::rewrite_read(&sql)) {
+                (true, Some(inner)) => (inner, Postprocess::PgrstRead),
+                _ => (sql.clone(), Postprocess::None),
+            };
         // Intercepted (introspection) statements never reach the engine parser.
-        let prepared = if matches!(
-            introspect::intercept(&sql, &self.user, &self.database),
-            Canned::Pass
-        ) {
-            let (rewritten, order) = rewrite_placeholders(&sql);
+        let to_engine = matches!(postprocess, Postprocess::PgrstRead)
+            || matches!(
+                introspect::intercept(&sql, &self.user, &self.database),
+                Canned::Pass
+            );
+        let prepared = if to_engine {
+            let (rewritten, order) = rewrite_placeholders(&engine_sql);
             if let Err(e) = self.conn.prepare(&rewritten) {
                 let (code, msg) = describe_error(&e.to_string());
                 return self.fail(out, code, &msg);
@@ -271,6 +360,7 @@ impl Session {
                 order,
                 nparams,
                 param_oids,
+                postprocess,
             }
         } else {
             Prepared {
@@ -278,6 +368,7 @@ impl Session {
                 order: vec![],
                 nparams: 0,
                 param_oids,
+                postprocess: Postprocess::None,
             }
         };
         self.stmts.insert(name, prepared);
@@ -338,12 +429,42 @@ impl Session {
             let order_len = prep.order.len();
             out.parameter_description(&oids);
 
-            match introspect::intercept(&sql, &self.user, &self.database) {
-                Canned::Rows { columns, rows, .. } => {
-                    let oids = infer_oids(&columns, &rows);
+            // A PostgREST read/write reports a fixed response column shape,
+            // independent of the inner query's columns.
+            match &prep.postprocess {
+                Postprocess::PgrstRead | Postprocess::PgrstEmbed(_) => {
+                    let cols: Vec<String> = datapath::BODY_COLUMNS
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect();
+                    out.row_description(&fields(&cols, &datapath::BODY_OIDS, &[]));
+                    return;
+                }
+                Postprocess::PgrstInsert(_)
+                | Postprocess::PgrstUpdate(_)
+                | Postprocess::PgrstDelete(_) => {
+                    let cols: Vec<String> = datapath::WRITE_COLUMNS
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect();
+                    out.row_description(&fields(&cols, &datapath::WRITE_OIDS, &[]));
+                    return;
+                }
+                Postprocess::None => {}
+            }
+
+            match self.inspect(&sql) {
+                Canned::Rows {
+                    columns,
+                    oids,
+                    rows,
+                    ..
+                } => {
+                    let oids = resolve_oids(oids, &columns, &rows);
                     out.row_description(&fields(&columns, &oids, &[]));
                 }
                 Canned::Tag(_) => out.no_data(),
+                Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
                 Canned::Pass if is_row_returning(&sql) => match self.dummy_columns(&sql, order_len)
                 {
                     Ok(Some((columns, oids))) => out.row_description(&fields(&columns, &oids, &[])),
@@ -424,10 +545,96 @@ impl Session {
         let sql = prep.sql.clone();
         let order = prep.order.clone();
         let params = p.params.clone();
+        // Extract what the postprocess paths need without holding the borrow.
+        let insert_plan = match &prep.postprocess {
+            Postprocess::PgrstInsert(plan) => Some((plan.table.clone(), plan.columns.clone())),
+            _ => None,
+        };
+        let update_plan = match &prep.postprocess {
+            Postprocess::PgrstUpdate(plan) => Some((
+                plan.table.clone(),
+                plan.set_columns.clone(),
+                plan.where_clause.clone(),
+            )),
+            _ => None,
+        };
+        let delete_plan = match &prep.postprocess {
+            Postprocess::PgrstDelete(plan) => Some((plan.table.clone(), plan.where_clause.clone())),
+            _ => None,
+        };
+        let embed_plan = match &prep.postprocess {
+            Postprocess::PgrstEmbed(plan) => Some(plan.clone()),
+            _ => None,
+        };
+        let is_read = matches!(prep.postprocess, Postprocess::PgrstRead);
 
-        let mat = match introspect::intercept(&sql, &self.user, &self.database) {
-            Canned::Rows { columns, rows, tag } => Mat {
-                oids: infer_oids(&columns, &rows),
+        // A PostgREST read: run the (rewritten) inner SELECT on the engine, then
+        // wrap its rows into the body/page_total response shape.
+        if is_read {
+            let inner = self.run_engine(&sql, &params, &order)?;
+            let mat = Mat {
+                columns: datapath::BODY_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                oids: datapath::BODY_OIDS.to_vec(),
+                rows: vec![datapath::body_row(&inner.columns, &inner.rows)],
+                tag: "SELECT 1".to_string(),
+                has_rows: true,
+            };
+            self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+            return Ok(());
+        }
+
+        // A PostgREST FK-embedding read: decompose into per-relation engine
+        // queries and assemble the nested JSON body.
+        if let Some(plan) = embed_plan {
+            let (body, count) = self.run_pgrst_embed(&plan, &params, &order)?;
+            let mat = Mat {
+                columns: datapath::BODY_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                oids: datapath::BODY_OIDS.to_vec(),
+                rows: vec![datapath::body_row_json(body, count)],
+                tag: "SELECT 1".to_string(),
+                has_rows: true,
+            };
+            self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+            return Ok(());
+        }
+
+        // A PostgREST INSERT: parse the JSON body parameter into rows and run an
+        // engine INSERT per row; report the count as page_total.
+        if let Some((table, columns)) = insert_plan {
+            let count = self.run_pgrst_insert(&table, &columns, &params)?;
+            self.set_write_result(portal, count);
+            return Ok(());
+        }
+
+        // A PostgREST UPDATE (PATCH): SET values from the JSON body, filtered by
+        // the de-qualified WHERE; report the affected-row count as page_total.
+        if let Some((table, columns, where_clause)) = update_plan {
+            let count = self.run_pgrst_update(&table, &columns, &where_clause, &params)?;
+            self.set_write_result(portal, count);
+            return Ok(());
+        }
+
+        // A PostgREST DELETE: run the de-qualified DELETE with its `$n` filters.
+        if let Some((table, where_clause)) = delete_plan {
+            let count = self.run_pgrst_delete(&table, &where_clause, &params)?;
+            self.set_write_result(portal, count);
+            return Ok(());
+        }
+
+        let mat = match self.inspect(&sql) {
+            Canned::Rows {
+                columns,
+                oids,
+                rows,
+                tag,
+            } => Mat {
+                oids: resolve_oids(oids, &columns, &rows),
                 columns,
                 rows,
                 tag,
@@ -440,10 +647,249 @@ impl Session {
                 tag,
                 has_rows: false,
             },
+            Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Pass => self.run_engine(&sql, &params, &order)?,
         };
         self.portals.get_mut(portal).unwrap().materialized = Some(mat);
         Ok(())
+    }
+
+    /// Cache a write's response (return=minimal): a single row whose `page_total`
+    /// is the affected-row count, in PostgREST's write column shape.
+    fn set_write_result(&mut self, portal: &str, count: i64) {
+        let mat = Mat {
+            columns: datapath::WRITE_COLUMNS
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            oids: datapath::WRITE_OIDS.to_vec(),
+            rows: vec![datapath::write_body_row(count)],
+            tag: "SELECT 1".to_string(),
+            has_rows: true,
+        };
+        self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+    }
+
+    /// Execute a PostgREST UPDATE (PATCH): the SET values are the JSON body
+    /// parameter (`$1`); the WHERE clause carries the remaining `$n` filters.
+    /// One engine UPDATE binds the SET values first, then the filter parameters.
+    fn run_pgrst_update(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        where_clause: &str,
+        params: &[Value],
+    ) -> Result<i64, (String, String)> {
+        let body = body_text(params)?;
+        let row = datapath::json_rows(&body, columns)
+            .map_err(|e| ("22023".to_string(), e))?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let assignments = columns
+            .iter()
+            .map(|c| format!("{c} = ?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let engine_sql = if where_clause.is_empty() {
+            format!("UPDATE {table} SET {assignments}")
+        } else {
+            format!("UPDATE {table} SET {assignments} WHERE {where_clause}")
+        };
+        // The SET `?`s pass through unchanged; only the WHERE `$n` are rewritten.
+        let (rewritten, where_order) = rewrite_placeholders(&engine_sql);
+        let mut st = self
+            .conn
+            .prepare(&rewritten)
+            .map_err(|e| split_err(&e.to_string()))?;
+        let mut pos = 1;
+        for v in row {
+            st.bind(pos, v).map_err(|e| split_err(&e.to_string()))?;
+            pos += 1;
+        }
+        for &num in &where_order {
+            let v = params.get(num - 1).cloned().unwrap_or(Value::Null);
+            st.bind(pos, v).map_err(|e| split_err(&e.to_string()))?;
+            pos += 1;
+        }
+        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        Ok(self.conn.last_changes)
+    }
+
+    /// Execute a PostgREST DELETE: the de-qualified WHERE clause carries the
+    /// `$n` filter parameters, bound positionally.
+    fn run_pgrst_delete(
+        &mut self,
+        table: &str,
+        where_clause: &str,
+        params: &[Value],
+    ) -> Result<i64, (String, String)> {
+        let engine_sql = if where_clause.is_empty() {
+            format!("DELETE FROM {table}")
+        } else {
+            format!("DELETE FROM {table} WHERE {where_clause}")
+        };
+        let (rewritten, order) = rewrite_placeholders(&engine_sql);
+        let mut st = self
+            .conn
+            .prepare(&rewritten)
+            .map_err(|e| split_err(&e.to_string()))?;
+        for (j, &num) in order.iter().enumerate() {
+            let v = params.get(num - 1).cloned().unwrap_or(Value::Null);
+            st.bind(j + 1, v).map_err(|e| split_err(&e.to_string()))?;
+        }
+        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        Ok(self.conn.last_changes)
+    }
+
+    /// Execute a PostgREST INSERT: the row data is the JSON body parameter
+    /// (`$1`); parse it into rows and run one engine INSERT per row. Returns the
+    /// number of rows inserted (PostgREST's `page_total`).
+    fn run_pgrst_insert(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        params: &[Value],
+    ) -> Result<i64, (String, String)> {
+        let body = body_text(params)?;
+        let rows = datapath::json_rows(&body, columns).map_err(|e| ("22023".to_string(), e))?;
+        let placeholders = vec!["?"; columns.len()].join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table,
+            columns.join(", "),
+            placeholders
+        );
+        let mut count = 0i64;
+        for row in rows {
+            let mut st = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| split_err(&e.to_string()))?;
+            for (i, v) in row.into_iter().enumerate() {
+                st.bind(i + 1, v).map_err(|e| split_err(&e.to_string()))?;
+            }
+            st.execute().map_err(|e| split_err(&e.to_string()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Execute a PostgREST FK-embedding read: fetch the base rows, then resolve
+    /// each embedded relation per base row with a correlated engine query, and
+    /// assemble the nested JSON body. Returns `(body, row_count)`. This is a
+    /// nested-loop join done in the server (composition glue, spec 12) — the
+    /// engine never sees LATERAL, `row_to_json`, or `json_agg`.
+    fn run_pgrst_embed(
+        &mut self,
+        plan: &datapath::EmbedRead,
+        params: &[Value],
+        _order: &[usize],
+    ) -> Result<(String, i64), (String, String)> {
+        use datapath::EmbedItem;
+        // Base columns to fetch: every emitted column plus each embed's
+        // correlation column (deduped, order-stable).
+        let mut fetch: Vec<String> = Vec::new();
+        let mut want = |c: &str| {
+            if !fetch.iter().any(|f| f == c) {
+                fetch.push(c.to_string());
+            }
+        };
+        for item in &plan.items {
+            match item {
+                EmbedItem::Column { column, .. } => want(column),
+                EmbedItem::Relation(e) => want(&e.base_col),
+            }
+        }
+        let base_sql = if plan.base_tail.is_empty() {
+            format!("SELECT {} FROM {}", fetch.join(", "), plan.base_table)
+        } else {
+            format!(
+                "SELECT {} FROM {} {}",
+                fetch.join(", "),
+                plan.base_table,
+                plan.base_tail
+            )
+        };
+        // The base tail may carry `$n` filter placeholders; rewrite + bind them.
+        let (base_rewritten, base_order) = rewrite_placeholders(&base_sql);
+        let base = self.run_engine(&base_rewritten, params, &base_order)?;
+        let idx = |name: &str| base.columns.iter().position(|c| c == name);
+
+        let mut objects: Vec<String> = Vec::with_capacity(base.rows.len());
+        for row in &base.rows {
+            let mut obj = String::from("{");
+            for (i, item) in plan.items.iter().enumerate() {
+                if i > 0 {
+                    obj.push(',');
+                }
+                match item {
+                    EmbedItem::Column { key, column } => {
+                        let v = idx(column)
+                            .and_then(|ix| row.get(ix))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        obj.push_str(&datapath::json_key(key));
+                        obj.push(':');
+                        obj.push_str(&datapath::json_value(&v));
+                    }
+                    EmbedItem::Relation(e) => {
+                        let key_val = idx(&e.base_col)
+                            .and_then(|ix| row.get(ix))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let (rcols, rrows) = self.run_embed_relation(e, key_val)?;
+                        obj.push_str(&datapath::json_key(&e.key));
+                        obj.push(':');
+                        if e.to_many {
+                            obj.push_str(&datapath::json_array(&rcols, &rrows));
+                        } else if let Some(first) = rrows.first() {
+                            obj.push_str(&datapath::json_object(&rcols, first));
+                        } else {
+                            obj.push_str("null");
+                        }
+                    }
+                }
+            }
+            obj.push('}');
+            objects.push(obj);
+        }
+        let count = objects.len() as i64;
+        Ok((format!("[{}]", objects.join(",")), count))
+    }
+
+    /// Run one embed's correlated query: `SELECT <rel cols> FROM <rel> WHERE
+    /// <rel col> = <key>`. Returns the relation's column names and matching rows.
+    #[allow(clippy::type_complexity)]
+    fn run_embed_relation(
+        &mut self,
+        e: &datapath::Embed,
+        key: Value,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>), (String, String)> {
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} = ?",
+            e.rel_columns.join(", "),
+            e.rel_table,
+            e.rel_col
+        );
+        let mut st = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| split_err(&e.to_string()))?;
+        st.bind(1, key).map_err(|e| split_err(&e.to_string()))?;
+        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        let nc = st.column_count();
+        let columns: Vec<String> = (0..nc)
+            .map(|c| st.column_name(c).unwrap_or("").to_string())
+            .collect();
+        let mut rows = Vec::new();
+        while st.step().map_err(|e| split_err(&e.to_string()))? {
+            let row: Vec<Value> = (0..nc)
+                .map(|c| st.column_value(c).cloned().unwrap_or(Value::Null))
+                .collect();
+            rows.push(row);
+        }
+        Ok((columns, rows))
     }
 
     /// Execute a parameterized statement on the engine and collect its result.
@@ -553,6 +999,60 @@ impl Session {
     }
 }
 
+// ---- SQL capture (corpus collection) --------------------------------------
+
+/// Where captured SQL is written. Configured once from `TWILL_LOG_SQL`:
+/// unset/empty → off; `1`/`true`/`stderr`/`-` → stderr; anything else → a file
+/// path appended to. This is a debugging/diagnostic aid for building a
+/// wire-client SQL corpus (e.g. PostgREST); it logs statement *text* only,
+/// never bound parameter values.
+enum SqlSink {
+    Off,
+    Stderr,
+    File(std::sync::Mutex<std::fs::File>),
+}
+
+fn sql_sink() -> &'static SqlSink {
+    static SINK: std::sync::OnceLock<SqlSink> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| match std::env::var("TWILL_LOG_SQL") {
+        Ok(v) if !v.trim().is_empty() => {
+            let v = v.trim();
+            if matches!(v, "1" | "true" | "stderr" | "-") {
+                SqlSink::Stderr
+            } else {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(v)
+                {
+                    Ok(f) => SqlSink::File(std::sync::Mutex::new(f)),
+                    Err(e) => {
+                        eprintln!("[twill] TWILL_LOG_SQL: cannot open {v:?}: {e}; using stderr");
+                        SqlSink::Stderr
+                    }
+                }
+            }
+        }
+        _ => SqlSink::Off,
+    })
+}
+
+/// Record one received statement (preserving its formatting) with a record
+/// separator so multi-line client SQL stays readable and greppable.
+fn log_sql(tag: &str, sql: &str) {
+    let record = format!("-- [{tag}]\n{}\n", sql.trim_end());
+    match sql_sink() {
+        SqlSink::Off => {}
+        SqlSink::Stderr => eprint!("{record}"),
+        SqlSink::File(m) => {
+            if let Ok(mut f) = m.lock() {
+                let _ = f.write_all(record.as_bytes());
+                let _ = f.flush();
+            }
+        }
+    }
+}
+
 // ---- helpers --------------------------------------------------------------
 
 fn msg_name(m: &Frontend) -> String {
@@ -636,6 +1136,16 @@ fn infer_oids(columns: &[String], rows: &[Vec<Value>]) -> Vec<i32> {
         .collect()
 }
 
+/// Use a canned result's explicit per-column OIDs when given (a reflected query
+/// carrying pre-encoded binary), otherwise infer them from the values.
+fn resolve_oids(explicit: Vec<i32>, columns: &[String], rows: &[Vec<Value>]) -> Vec<i32> {
+    if explicit.is_empty() {
+        infer_oids(columns, rows)
+    } else {
+        explicit
+    }
+}
+
 /// Leading SQL keyword, uppercased — used to build the CommandComplete tag.
 fn classify(sql: &str) -> String {
     sql.trim_start()
@@ -681,6 +1191,16 @@ fn describe_error(msg: &str) -> (&'static str, String) {
 fn split_err(msg: &str) -> (String, String) {
     let (c, m) = describe_error(msg);
     (c.to_string(), m)
+}
+
+/// The JSON request body for a PostgREST write — always the first parameter
+/// (`$1`), sent as text or bytes by the driver.
+fn body_text(params: &[Value]) -> Result<String, (String, String)> {
+    match params.first() {
+        Some(Value::Text(s)) => Ok(s.clone()),
+        Some(Value::Blob(b)) => Ok(String::from_utf8_lossy(b).into_owned()),
+        _ => Err(("22023".into(), "missing JSON request body".into())),
+    }
 }
 
 /// Rewrite Postgres `$n` placeholders to the engine's positional `?`, returning

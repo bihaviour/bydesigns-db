@@ -119,3 +119,65 @@ fn pgwire_contended_counter_never_loses_an_update() {
         "no update may be lost over the pgwire path"
     );
 }
+
+#[test]
+fn pgwire_transaction_mode_pooling_preserves_correctness() {
+    // Pooler shape (issue #20). Serverless clients open a *burst* of short-lived
+    // connections; a transaction-mode pooler (PgBouncer/pgcat) absorbs that burst
+    // by multiplexing the many client transactions onto a small, stable set of
+    // backend connections, returning a backend to the pool at each transaction
+    // boundary. The engine therefore never sees the raw client churn — it sees a
+    // few long-lived backends, each carrying a stream of transactions.
+    //
+    // This test models exactly that backend side: a small fixed pool of backend
+    // connections, with many independent transactions (BEGIN / write a distinct
+    // row / COMMIT) driven across them concurrently. It pins the two properties
+    // #20 requires of the engine under a pooler, without the external pooler in
+    // the loop:
+    //
+    //   * the bounded backend set carries the whole transaction load — every
+    //     transaction is accepted and completes (no overload), and
+    //   * transaction-mode multiplexing preserves correctness — across the full
+    //     burst every committed row is durable, none lost or duplicated.
+    //
+    // The pooler binary itself (and the raw client-churn it absorbs in front of
+    // the engine) is verified manually against this same listener — see
+    // `deploy/pooler/README.md` and `pages/docs/connection-pooling.html`.
+    const BACKENDS: usize = 4; // the pooler's stable backend pool (transaction mode)
+    const TXNS_PER_BACKEND: usize = 80; // many client transactions multiplexed on
+
+    let addr = start_server(unique_url());
+    {
+        let mut setup = PgClient::connect(&addr).unwrap();
+        setup
+            .exec("CREATE TABLE c (id INTEGER PRIMARY KEY, backend INTEGER)")
+            .unwrap();
+    }
+
+    let barrier = Barrier::new(BACKENDS);
+    thread::scope(|s| {
+        for b in 0..BACKENDS {
+            let addr = &addr;
+            let barrier = &barrier;
+            s.spawn(move || {
+                // One persistent backend connection, as a pooler would hold.
+                let mut c = PgClient::connect(addr).expect("listener accepts the backend");
+                barrier.wait(); // all backends carry their load together
+                for i in 0..TXNS_PER_BACKEND {
+                    let id = b * TXNS_PER_BACKEND + i; // a distinct row per transaction
+                    c.exec("BEGIN").unwrap();
+                    c.exec(&format!("INSERT INTO c (id, backend) VALUES ({id}, {b})"))
+                        .unwrap();
+                    c.exec("COMMIT").unwrap(); // backend returns to the pool here
+                }
+            });
+        }
+    });
+
+    let mut check = PgClient::connect(&addr).unwrap();
+    assert_eq!(
+        check.query_scalar_i64("SELECT COUNT(*) FROM c").unwrap(),
+        (BACKENDS * TXNS_PER_BACKEND) as i64,
+        "every transaction multiplexed through the backend pool must survive"
+    );
+}

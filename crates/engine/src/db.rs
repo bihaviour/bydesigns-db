@@ -196,6 +196,11 @@ impl Database {
         self.store.read().unwrap().committed_lsn
     }
 
+    /// Snapshot of every table's schema, for catalog reflection (spec 07).
+    pub fn catalog(&self) -> Vec<crate::catalog::TableSchema> {
+        self.store.read().unwrap().table_schemas()
+    }
+
     /// Group-commit counters `(durable_appends, commits)`. Under concurrency
     /// `commits > durable_appends` means transactions coalesced into shared
     /// durable appends (the W1 lever; spec 09 Experiment 2). An observability

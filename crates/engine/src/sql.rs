@@ -1,10 +1,11 @@
-//! A focused SQL frontend: lexer + recursive-descent parser producing the
-//! engine's internal statement AST (spec 02 — parser stage). The supported
-//! subset is deliberately small for Phase 1 (DDL + DML + queries + transaction
-//! control); anything outside it is rejected with `ENGINE_ERR_SQL` rather than
-//! silently mis-parsed.
+//! A focused SQL frontend: a recursive-descent parser (over the token stream
+//! from [`crate::lex`]) producing the engine's internal statement AST (spec 02 —
+//! parser stage). The supported subset is deliberately small for Phase 1 (DDL +
+//! DML + queries + transaction control); anything outside it is rejected with
+//! `ENGINE_ERR_SQL` rather than silently mis-parsed.
 
 use crate::error::{EngineError, Result};
+use crate::lex::{lex, Tok};
 use crate::value::ColumnType;
 use crate::vector::{IndexParams, Metric};
 
@@ -15,6 +16,7 @@ pub enum Stmt {
     CreateTable {
         name: String,
         columns: Vec<ColumnSpec>,
+        foreign_keys: Vec<ForeignKeySpec>,
         if_not_exists: bool,
     },
     DropTable {
@@ -58,6 +60,20 @@ pub struct ColumnSpec {
     pub ty: ColumnType,
     pub primary_key: bool,
     pub not_null: bool,
+    /// An inline `REFERENCES <table>[(<col>)]` constraint: the referenced table
+    /// and, optionally, the referenced column (defaulting to its primary key).
+    pub references: Option<(String, Option<String>)>,
+}
+
+/// A foreign key as parsed from `CREATE TABLE` (inline or table-level). The
+/// referenced columns may be empty, meaning "the referenced table's primary
+/// key", resolved against the catalog when the table is created.
+#[derive(Debug)]
+pub struct ForeignKeySpec {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub foreign_table: String,
+    pub foreign_columns: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -65,22 +81,17 @@ pub struct SelectStmt {
     pub items: Vec<SelItem>,
     pub from: Option<String>,
     pub filter: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
     pub order_by: Vec<(Expr, bool)>, // (expr, ascending)
-    pub limit: Option<i64>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
 }
 
 #[derive(Debug)]
 pub enum SelItem {
     Star,
-    Expr {
-        expr: Expr,
-        alias: Option<String>,
-    },
-    Aggregate {
-        func: AggFunc,
-        arg: AggArg,
-        alias: Option<String>,
-    },
+    Expr { expr: Expr, alias: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,12 +101,15 @@ pub enum AggFunc {
     Min,
     Max,
     Avg,
+    /// `json_agg(expr)` — aggregate the group's values into a JSON array. The
+    /// data-path shape PostgREST wraps result sets in.
+    JsonAgg,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AggArg {
     Star,
-    Expr(Expr),
+    Expr(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +139,53 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// Postgres `expr::type` cast — coerces the inner value to `target`.
+    Cast {
+        e: Box<Expr>,
+        target: CastTarget,
+    },
+    /// A scalar function call, e.g. `coalesce(a, 0)`, `lower(name)`. Aggregate
+    /// functions parse to [`Expr::Aggregate`] instead.
+    Func {
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// An aggregate over the current group (or the whole table when there is no
+    /// `GROUP BY`). Parses anywhere an expression may appear, so it nests inside
+    /// scalars — e.g. `coalesce(json_agg(x), '[]')`.
+    Aggregate {
+        func: AggFunc,
+        arg: AggArg,
+    },
+}
+
+/// The storage class a `::type` cast coerces to. Types we don't specifically
+/// model (uuid, json, timestamp, regclass, …) map to [`CastTarget::Passthrough`]
+/// and leave the value unchanged — lenient by design, for wire compatibility.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CastTarget {
+    Int,
+    Real,
+    Text,
+    Bool,
+    Passthrough,
+}
+
+impl CastTarget {
+    /// Map a SQL type's leading word to a cast target.
+    fn from_word(w: &str) -> CastTarget {
+        match w.to_ascii_lowercase().as_str() {
+            "int" | "integer" | "int2" | "int4" | "int8" | "smallint" | "bigint" | "oid"
+            | "serial" | "bigserial" => CastTarget::Int,
+            "real" | "float" | "float4" | "float8" | "double" | "numeric" | "decimal" => {
+                CastTarget::Real
+            }
+            "text" | "varchar" | "character" | "char" | "name" | "json" | "jsonb" | "uuid"
+            | "citext" | "bytea" | "bpchar" => CastTarget::Text,
+            "bool" | "boolean" => CastTarget::Bool,
+            _ => CastTarget::Passthrough,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -166,214 +227,6 @@ impl BinOp {
 pub enum UnOp {
     Not,
     Neg,
-}
-
-// ---- lexer ----------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq)]
-enum Tok {
-    Word(String),
-    Int(i64),
-    Real(f64),
-    Str(String),
-    Param,
-    LParen,
-    RParen,
-    LBracket,
-    RBracket,
-    Comma,
-    Semi,
-    Dot,
-    Star,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    Plus,
-    Minus,
-    Slash,
-    Percent,
-    VecL2,     // <->
-    VecCosine, // <=>
-    VecIp,     // <#>
-    Eof,
-}
-
-fn lex(sql: &str) -> Result<Vec<Tok>> {
-    let b = sql.as_bytes();
-    let mut i = 0;
-    let mut out = Vec::new();
-    while i < b.len() {
-        let c = b[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        // line comment: `-- ... <eol>`
-        if c == b'-' && b.get(i + 1) == Some(&b'-') {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if let Some(tok) = simple_token(c) {
-            out.push(tok);
-            i += 1;
-            continue;
-        }
-        let (tok, next) = match c {
-            b'<' | b'>' | b'!' => lex_operator(b, i)?,
-            b'\'' => lex_string(b, i)?,
-            b'"' => lex_quoted_ident(b, i)?,
-            _ if c.is_ascii_digit() => lex_number(b, i)?,
-            _ if c == b'_' || c.is_ascii_alphabetic() => lex_word(b, i),
-            other => {
-                return Err(EngineError::sql(format!(
-                    "unexpected character '{}'",
-                    other as char
-                )))
-            }
-        };
-        out.push(tok);
-        i = next;
-    }
-    out.push(Tok::Eof);
-    Ok(out)
-}
-
-/// Single-byte tokens with no multi-character form.
-fn simple_token(c: u8) -> Option<Tok> {
-    Some(match c {
-        b'(' => Tok::LParen,
-        b')' => Tok::RParen,
-        b'[' => Tok::LBracket,
-        b']' => Tok::RBracket,
-        b',' => Tok::Comma,
-        b';' => Tok::Semi,
-        b'.' => Tok::Dot,
-        b'*' => Tok::Star,
-        b'+' => Tok::Plus,
-        b'-' => Tok::Minus,
-        b'/' => Tok::Slash,
-        b'%' => Tok::Percent,
-        b'?' => Tok::Param,
-        b'=' => Tok::Eq,
-        _ => return None,
-    })
-}
-
-/// Comparison operators with optional second character (`<=`, `<>`, `>=`, `!=`)
-/// plus the three-character vector distance operators (`<->`, `<=>`, `<#>`).
-fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize)> {
-    let two = b.get(i + 1).copied();
-    Ok(match b[i] {
-        b'<' => lex_lt(b, i),
-        b'>' => match two {
-            Some(b'=') => (Tok::Ge, i + 2),
-            _ => (Tok::Gt, i + 1),
-        },
-        _ => match two {
-            // `!`
-            Some(b'=') => (Tok::Ne, i + 2),
-            _ => return Err(EngineError::sql("unexpected '!'")),
-        },
-    })
-}
-
-/// Disambiguate `<`: the three-char distance operators bind first, then `<=` /
-/// `<>`, then bare `<`.
-fn lex_lt(b: &[u8], i: usize) -> (Tok, usize) {
-    let two = b.get(i + 1).copied();
-    let three = b.get(i + 2).copied();
-    match (two, three) {
-        (Some(b'-'), Some(b'>')) => (Tok::VecL2, i + 3),
-        (Some(b'='), Some(b'>')) => (Tok::VecCosine, i + 3),
-        (Some(b'#'), Some(b'>')) => (Tok::VecIp, i + 3),
-        (Some(b'='), _) => (Tok::Le, i + 2),
-        (Some(b'>'), _) => (Tok::Ne, i + 2),
-        _ => (Tok::Lt, i + 1),
-    }
-}
-
-/// String literal; `''` escapes a single quote. `i` points at the opening quote.
-fn lex_string(b: &[u8], mut i: usize) -> Result<(Tok, usize)> {
-    i += 1;
-    let mut s = String::new();
-    loop {
-        let Some(&ch) = b.get(i) else {
-            return Err(EngineError::sql("unterminated string literal"));
-        };
-        if ch == b'\'' {
-            if b.get(i + 1) == Some(&b'\'') {
-                s.push('\'');
-                i += 2;
-            } else {
-                return Ok((Tok::Str(s), i + 1));
-            }
-        } else {
-            s.push(ch as char);
-            i += 1;
-        }
-    }
-}
-
-/// Double-quoted identifier. `i` points at the opening quote.
-fn lex_quoted_ident(b: &[u8], mut i: usize) -> Result<(Tok, usize)> {
-    i += 1;
-    let start = i;
-    while i < b.len() && b[i] != b'"' {
-        i += 1;
-    }
-    if i >= b.len() {
-        return Err(EngineError::sql("unterminated quoted identifier"));
-    }
-    let ident = std::str::from_utf8(&b[start..i]).unwrap().to_string();
-    Ok((Tok::Word(ident), i + 1))
-}
-
-/// Integer or real literal, with optional fraction and exponent.
-fn lex_number(b: &[u8], mut i: usize) -> Result<(Tok, usize)> {
-    let start = i;
-    let mut is_real = false;
-    while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
-        if b[i] == b'.' {
-            is_real = true;
-        }
-        i += 1;
-    }
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        is_real = true;
-        i += 1;
-        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-            i += 1;
-        }
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    let text = std::str::from_utf8(&b[start..i]).unwrap();
-    let parse_real = || text.parse().map_err(|_| EngineError::sql("bad number"));
-    let tok = if is_real {
-        Tok::Real(parse_real()?)
-    } else {
-        match text.parse::<i64>() {
-            Ok(n) => Tok::Int(n),
-            Err(_) => Tok::Real(parse_real()?), // out of i64 range -> real
-        }
-    };
-    Ok((tok, i))
-}
-
-/// Bare identifier / keyword (`[A-Za-z_][A-Za-z0-9_]*`).
-fn lex_word(b: &[u8], mut i: usize) -> (Tok, usize) {
-    let start = i;
-    while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
-        i += 1;
-    }
-    let word = std::str::from_utf8(&b[start..i]).unwrap().to_string();
-    (Tok::Word(word), i)
 }
 
 // ---- parser ---------------------------------------------------------------
@@ -496,15 +349,19 @@ impl Parser {
         } else if self.is_kw("delete") {
             self.delete()
         } else if self.eat_kw("begin") {
-            let _ = self.eat_kw("transaction") || self.eat_kw("work") || self.eat_kw("deferred");
+            let _ = self.eat_kw("transaction") || self.eat_kw("work");
+            self.eat_transaction_modes();
             Ok(Stmt::Begin)
         } else if self.eat_kw("start") {
             let _ = self.eat_kw("transaction");
+            self.eat_transaction_modes();
             Ok(Stmt::Begin)
-        } else if self.eat_kw("commit") {
+        } else if self.eat_kw("commit") || self.eat_kw("end") {
+            // END [WORK|TRANSACTION] is a COMMIT synonym.
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             Ok(Stmt::Commit)
-        } else if self.eat_kw("rollback") {
+        } else if self.eat_kw("rollback") || self.eat_kw("abort") {
+            // ABORT [WORK|TRANSACTION] is a ROLLBACK synonym (PostgREST uses it).
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             Ok(Stmt::Rollback)
         } else {
@@ -512,6 +369,36 @@ impl Parser {
                 "unsupported statement starting at {:?}",
                 self.peek()
             )))
+        }
+    }
+
+    /// Consume the optional transaction-mode list after BEGIN / START
+    /// TRANSACTION (`ISOLATION LEVEL …`, `READ ONLY` / `READ WRITE`,
+    /// `[NOT] DEFERRABLE`), comma- or space-separated. The engine runs one
+    /// snapshot-isolation mode, so these are accepted and ignored — needed for
+    /// clients (PostgREST) that open `BEGIN ISOLATION LEVEL READ COMMITTED READ
+    /// ONLY`.
+    fn eat_transaction_modes(&mut self) {
+        loop {
+            let _ = self.skip(Tok::Comma);
+            if self.eat_kw("isolation") {
+                let _ = self.eat_kw("level");
+                // SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED
+                if self.eat_kw("serializable") {
+                } else if self.eat_kw("repeatable") {
+                    let _ = self.eat_kw("read");
+                } else if self.eat_kw("read") {
+                    let _ = self.eat_kw("committed") || self.eat_kw("uncommitted");
+                }
+            } else if self.eat_kw("read") {
+                let _ = self.eat_kw("only") || self.eat_kw("write");
+            } else if self.eat_kw("not") {
+                let _ = self.eat_kw("deferrable");
+            } else if self.eat_kw("deferrable") {
+                // accepted
+            } else {
+                break;
+            }
         }
     }
 
@@ -528,9 +415,29 @@ impl Parser {
         let name = self.ident()?;
         self.expect(Tok::LParen)?;
         let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
-            let col = self.column_spec()?;
-            columns.push(col);
+            // A table-level constraint (`[CONSTRAINT n] PRIMARY KEY/UNIQUE/FOREIGN
+            // KEY/CHECK …`) rather than a column definition. Only FOREIGN KEY is
+            // captured; PRIMARY KEY/UNIQUE/CHECK are consumed and ignored, as
+            // composite keys are out of Phase-1 scope (a single-column key is
+            // declared inline on its column instead).
+            if self.peek_table_constraint() {
+                if let Some(fk) = self.table_constraint()? {
+                    foreign_keys.push(fk);
+                }
+            } else {
+                let col = self.column_spec()?;
+                if let Some((ft, fc)) = col.references.clone() {
+                    foreign_keys.push(ForeignKeySpec {
+                        name: None,
+                        columns: vec![col.name.clone()],
+                        foreign_table: ft,
+                        foreign_columns: fc.into_iter().collect(),
+                    });
+                }
+                columns.push(col);
+            }
             if self.skip(Tok::Comma) {
                 continue;
             }
@@ -543,6 +450,7 @@ impl Parser {
         Ok(Stmt::CreateTable {
             name,
             columns,
+            foreign_keys,
             if_not_exists,
         })
     }
@@ -560,6 +468,7 @@ impl Parser {
         }
         let mut primary_key = false;
         let mut not_null = false;
+        let mut references = None;
         loop {
             if self.eat_kw("primary") {
                 self.expect_kw("key")?;
@@ -572,6 +481,8 @@ impl Parser {
                 // explicit nullable
             } else if self.eat_kw("unique") {
                 // treated like a constraint marker; uniqueness enforced for PK only in P1
+            } else if self.eat_kw("references") {
+                references = Some(self.references_target()?);
             } else {
                 break;
             }
@@ -581,7 +492,93 @@ impl Parser {
             ty,
             primary_key,
             not_null,
+            references,
         })
+    }
+
+    /// The `<table>[(<col>)]` after a `REFERENCES` keyword.
+    fn references_target(&mut self) -> Result<(String, Option<String>)> {
+        let table = self.ident()?;
+        let column = if self.skip(Tok::LParen) {
+            let c = self.ident()?;
+            self.expect(Tok::RParen)?;
+            Some(c)
+        } else {
+            None
+        };
+        Ok((table, column))
+    }
+
+    /// Does the next token begin a table-level constraint clause?
+    fn peek_table_constraint(&self) -> bool {
+        self.peek_word().is_some_and(|w| {
+            ["constraint", "primary", "unique", "foreign", "check"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k))
+        })
+    }
+
+    /// Parse a table-level constraint, returning a foreign key when it declares
+    /// one. `PRIMARY KEY`/`UNIQUE`/`CHECK` are consumed and ignored (`None`).
+    fn table_constraint(&mut self) -> Result<Option<ForeignKeySpec>> {
+        let mut name = None;
+        if self.eat_kw("constraint") {
+            name = Some(self.ident()?);
+        }
+        if self.eat_kw("foreign") {
+            self.expect_kw("key")?;
+            let columns = self.paren_ident_list()?;
+            self.expect_kw("references")?;
+            let foreign_table = self.ident()?;
+            let foreign_columns = if self.peek() == &Tok::LParen {
+                self.paren_ident_list()?
+            } else {
+                Vec::new()
+            };
+            return Ok(Some(ForeignKeySpec {
+                name,
+                columns,
+                foreign_table,
+                foreign_columns,
+            }));
+        }
+        // PRIMARY KEY (cols) / UNIQUE (cols) / CHECK (…): consume and ignore.
+        let _ = self.eat_kw("primary") && self.eat_kw("key");
+        let _ = self.eat_kw("unique") || self.eat_kw("check");
+        if self.peek() == &Tok::LParen {
+            self.skip_balanced_parens()?;
+        }
+        Ok(None)
+    }
+
+    /// A parenthesized, comma-separated identifier list: `(a, b, c)`.
+    fn paren_ident_list(&mut self) -> Result<Vec<String>> {
+        self.expect(Tok::LParen)?;
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.ident()?);
+            if self.skip(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(Tok::RParen)?;
+        Ok(cols)
+    }
+
+    /// Consume a balanced `( … )` group (for constraint bodies we don't model).
+    fn skip_balanced_parens(&mut self) -> Result<()> {
+        self.expect(Tok::LParen)?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.bump() {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth -= 1,
+                Tok::Eof => return Err(EngineError::sql("unterminated constraint")),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Parse an optional `(n)` / `(p,s)` type suffix. For a vector type the first
@@ -808,6 +805,43 @@ impl Parser {
         } else {
             None
         };
+        let group_by = self.parse_group_by()?;
+        let having = if self.eat_kw("having") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit_offset()?;
+        Ok(SelectStmt {
+            items,
+            from,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    /// `GROUP BY expr, ...` (empty when absent).
+    fn parse_group_by(&mut self) -> Result<Vec<Expr>> {
+        let mut group_by = Vec::new();
+        if self.eat_kw("group") {
+            self.expect_kw("by")?;
+            loop {
+                group_by.push(self.expr()?);
+                if !self.skip(Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(group_by)
+    }
+
+    /// `ORDER BY expr [ASC|DESC], ...` (empty when absent).
+    fn parse_order_by(&mut self) -> Result<Vec<(Expr, bool)>> {
         let mut order_by = Vec::new();
         if self.eat_kw("order") {
             self.expect_kw("by")?;
@@ -820,31 +854,50 @@ impl Parser {
                     true
                 };
                 order_by.push((e, asc));
-                if self.skip(Tok::Comma) {
+                if !self.skip(Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(order_by)
+    }
+
+    /// `LIMIT n` / `OFFSET m` in either order (`LIMIT ALL` means no limit).
+    fn parse_limit_offset(&mut self) -> Result<(Option<Expr>, Option<Expr>)> {
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            if limit.is_none() && self.eat_kw("limit") {
+                if self.eat_kw("all") {
                     continue;
                 }
+                limit = Some(self.limit_value("LIMIT")?);
+            } else if offset.is_none() && self.eat_kw("offset") {
+                offset = Some(self.limit_value("OFFSET")?);
+                let _ = self.eat_kw("row") || self.eat_kw("rows");
+            } else {
                 break;
             }
         }
-        let limit = if self.eat_kw("limit") {
-            match self.bump() {
-                Tok::Int(n) => Some(n),
-                other => {
-                    return Err(EngineError::sql(format!(
-                        "LIMIT expects an integer, found {other:?}"
-                    )))
-                }
-            }
-        } else {
-            None
-        };
-        Ok(SelectStmt {
-            items,
-            from,
-            filter,
-            order_by,
-            limit,
-        })
+        Ok((limit, offset))
+    }
+
+    /// A LIMIT / OFFSET count: an integer literal (optionally negated) or a `?`
+    /// parameter (PostgREST parameterizes pagination), resolved at execution.
+    fn limit_value(&mut self, what: &str) -> Result<Expr> {
+        if self.peek() == &Tok::Param {
+            self.bump();
+            let idx = self.next_param;
+            self.next_param += 1;
+            return Ok(Expr::Param(idx));
+        }
+        let neg = self.skip(Tok::Minus);
+        match self.bump() {
+            Tok::Int(n) => Ok(Expr::Int(if neg { -n } else { n })),
+            other => Err(EngineError::sql(format!(
+                "{what} expects an integer or parameter, found {other:?}"
+            ))),
+        }
     }
 
     fn select_item(&mut self) -> Result<SelItem> {
@@ -852,25 +905,8 @@ impl Parser {
             self.bump();
             return Ok(SelItem::Star);
         }
-        // Aggregate function?
-        if let Some(w) = self.peek_word() {
-            if let Some(func) = agg_func(w) {
-                // lookahead: must be followed by '('
-                if self.toks.get(self.pos + 1) == Some(&Tok::LParen) {
-                    self.bump(); // func name
-                    self.expect(Tok::LParen)?;
-                    let arg = if self.peek() == &Tok::Star {
-                        self.bump();
-                        AggArg::Star
-                    } else {
-                        AggArg::Expr(self.expr()?)
-                    };
-                    self.expect(Tok::RParen)?;
-                    let alias = self.opt_alias()?;
-                    return Ok(SelItem::Aggregate { func, arg, alias });
-                }
-            }
-        }
+        // Aggregates (and trailing `::type` casts on them, e.g. `count(*)::int`)
+        // parse through the ordinary expression grammar now, so this is uniform.
         let expr = self.expr()?;
         let alias = self.opt_alias()?;
         Ok(SelItem::Expr { expr, alias })
@@ -1099,8 +1135,105 @@ impl Parser {
         } else if self.skip(Tok::Plus) {
             self.unary_expr()
         } else {
-            self.primary()
+            self.cast_expr()
         }
+    }
+
+    /// Parse a primary then any trailing `::type` casts (left-associative; binds
+    /// tighter than unary minus, matching Postgres so `-1::int` == `-(1::int)`).
+    fn cast_expr(&mut self) -> Result<Expr> {
+        let mut e = self.primary()?;
+        while self.skip(Tok::DColon) {
+            let target = self.parse_cast_type()?;
+            e = Expr::Cast {
+                e: Box::new(e),
+                target,
+            };
+        }
+        Ok(e)
+    }
+
+    /// Consume a (possibly schema-qualified, multi-word, parameterized, array)
+    /// type name after `::`. Only the leading word picks the target; the rest is
+    /// consumed and ignored so any Postgres type spelling parses.
+    fn parse_cast_type(&mut self) -> Result<CastTarget> {
+        let mut word = self.ident()?;
+        if self.skip(Tok::Dot) {
+            word = self.ident()?; // schema-qualified: `pg_catalog.text`
+        }
+        let target = CastTarget::from_word(&word);
+        self.eat_type_modifiers(&word);
+        if self.skip(Tok::LParen) {
+            // precision/scale, e.g. `(255)` or `(10, 2)` — consume balanced
+            while self.peek() != &Tok::RParen && self.peek() != &Tok::Eof {
+                self.bump();
+            }
+            self.expect(Tok::RParen)?;
+        }
+        while self.skip(Tok::LBracket) {
+            self.expect(Tok::RBracket)?; // array marker `[]`
+        }
+        Ok(target)
+    }
+
+    /// Consume the trailing words of a multi-word type name (e.g. the
+    /// `precision` of `double precision`, the `with time zone` of `timestamp`).
+    fn eat_type_modifiers(&mut self, word: &str) {
+        match word.to_ascii_lowercase().as_str() {
+            "double" => {
+                self.eat_kw("precision");
+            }
+            "character" | "bit" => {
+                self.eat_kw("varying");
+            }
+            "timestamp" | "time" if self.eat_kw("with") || self.eat_kw("without") => {
+                self.eat_kw("time");
+                self.eat_kw("zone");
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse the argument list of a call; the function name `name` has been
+    /// consumed and the cursor sits on `(`. Aggregate names produce
+    /// [`Expr::Aggregate`]; everything else a scalar [`Expr::Func`].
+    fn func_call(&mut self, name: String) -> Result<Expr> {
+        if let Some(func) = agg_func(&name) {
+            return self.aggregate_call(func);
+        }
+        self.expect(Tok::LParen)?;
+        let mut args = Vec::new();
+        if self.peek() != &Tok::RParen {
+            // A bare `*` argument is only meaningful to `count(*)` (an aggregate,
+            // handled above); tolerate it here so a stray one fails at eval.
+            if self.peek() == &Tok::Star {
+                self.bump();
+            } else {
+                loop {
+                    args.push(self.expr()?);
+                    if self.skip(Tok::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Expr::Func { name, args })
+    }
+
+    /// Parse `(* | [DISTINCT] expr)` for an aggregate; cursor sits on `(`.
+    fn aggregate_call(&mut self, func: AggFunc) -> Result<Expr> {
+        self.expect(Tok::LParen)?;
+        let _ = self.eat_kw("distinct") || self.eat_kw("all");
+        let arg = if self.peek() == &Tok::Star {
+            self.bump();
+            AggArg::Star
+        } else {
+            AggArg::Expr(Box::new(self.expr()?))
+        };
+        self.expect(Tok::RParen)?;
+        Ok(Expr::Aggregate { func, arg })
     }
 
     fn primary(&mut self) -> Result<Expr> {
@@ -1142,8 +1275,10 @@ impl Parser {
                     Ok(Expr::Int(0))
                 } else {
                     self.bump();
-                    // table.column -> use column part (single-table queries in P1)
-                    if self.skip(Tok::Dot) {
+                    if self.peek() == &Tok::LParen {
+                        self.func_call(w)
+                    } else if self.skip(Tok::Dot) {
+                        // table.column -> use column part (single-table in P1)
                         let col = self.ident()?;
                         Ok(Expr::Column(col))
                     } else {
@@ -1210,20 +1345,22 @@ fn agg_func(w: &str) -> Option<AggFunc> {
         _ if w.eq_ignore_ascii_case("min") => Some(AggFunc::Min),
         _ if w.eq_ignore_ascii_case("max") => Some(AggFunc::Max),
         _ if w.eq_ignore_ascii_case("avg") => Some(AggFunc::Avg),
+        _ if w.eq_ignore_ascii_case("json_agg") => Some(AggFunc::JsonAgg),
+        _ if w.eq_ignore_ascii_case("jsonb_agg") => Some(AggFunc::JsonAgg),
         _ => None,
     }
 }
 
 fn is_constraint_kw(w: &str) -> bool {
-    ["primary", "not", "null", "unique"]
+    ["primary", "not", "null", "unique", "references"]
         .iter()
         .any(|k| w.eq_ignore_ascii_case(k))
 }
 
 fn is_clause_kw(w: &str) -> bool {
     [
-        "from", "where", "order", "limit", "group", "having", "as", "and", "or", "is", "like",
-        "asc", "desc",
+        "from", "where", "order", "limit", "offset", "group", "having", "as", "and", "or", "is",
+        "like", "asc", "desc",
     ]
     .iter()
     .any(|k| w.eq_ignore_ascii_case(k))

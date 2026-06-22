@@ -26,6 +26,7 @@ mod db;
 mod error;
 mod exec;
 mod group_commit;
+mod lex;
 mod sql;
 mod store;
 mod value;
@@ -35,7 +36,7 @@ mod wal;
 pub mod conn;
 pub mod ffi;
 
-pub use conn::{Connection, Statement};
+pub use conn::{CatalogColumn, CatalogForeignKey, CatalogTable, Connection, Statement};
 pub use db::Database;
 pub use error::{EngineError, EngineStatus, Result};
 pub use exec::ResultSet;

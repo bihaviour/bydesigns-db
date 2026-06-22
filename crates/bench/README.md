@@ -76,7 +76,11 @@ Set `TWILL_BENCH_GIT_SHA` to pin the recorded commit in CI/automation.
 - **Server-mode (`--transport pgwire`)** drives the experiments through the
   Postgres wire path via a small in-crate client (`src/pgclient.rs`) — no
   external Postgres tooling, so the wire path is exercised in `cargo test`
-  (`tests/pgwire.rs`) against an in-process listener. `pgbench` and TPC-C (via
+  (`tests/pgwire.rs`) against an in-process listener. `tests/pgwire.rs` also
+  pins the **pooler** property (issue #20): a bounded backend pool carries the
+  whole transaction load with no lost or duplicated commits, modelling what a
+  transaction-mode pooler (PgBouncer/pgcat) presents to the engine. The pooler
+  configs and a `pgbench` soak command live in `deploy/pooler/`. `pgbench` and TPC-C (via
   `go-tpc`/BenchBase) remain the off-the-shelf drivers for real-host runs and a
   realistic OLTP mix (spec 09); point `--server` at the same `engine-server`
   they target to compare.

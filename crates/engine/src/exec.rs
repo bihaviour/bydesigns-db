@@ -8,7 +8,7 @@
 
 use crate::catalog::TableSchema;
 use crate::error::{EngineError, Result};
-use crate::sql::{AggArg, AggFunc, BinOp, Expr, SelItem, SelectStmt, UnOp};
+use crate::sql::{AggArg, AggFunc, BinOp, CastTarget, Expr, SelItem, SelectStmt, UnOp};
 use crate::store::{RowVersion, Store, PENDING};
 use crate::value::{parse_vector, ColumnType, Value};
 use crate::vector::{distance, Metric};
@@ -36,6 +36,32 @@ struct EvalCtx<'a> {
     row: Option<&'a [Value]>,
     schema: Option<&'a TableSchema>,
     params: &'a [Value],
+    /// The rows of the current group, present only while projecting an
+    /// aggregated query. When set, [`Expr::Aggregate`] folds over these rows;
+    /// when `None`, an aggregate expression is an error.
+    group: Option<&'a [&'a [Value]]>,
+}
+
+impl<'a> EvalCtx<'a> {
+    /// A context with no row/schema/group — for constant expressions and params.
+    fn root(params: &'a [Value]) -> Self {
+        EvalCtx {
+            row: None,
+            schema: None,
+            params,
+            group: None,
+        }
+    }
+
+    /// A per-row context (no group); used by scans, writes, and ORDER BY.
+    fn row(row: &'a [Value], schema: &'a TableSchema, params: &'a [Value]) -> Self {
+        EvalCtx {
+            row: Some(row),
+            schema: Some(schema),
+            params,
+            group: None,
+        }
+    }
 }
 
 // ---- expression evaluation ------------------------------------------------
@@ -108,7 +134,77 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let rv = eval(r, ctx)?;
             eval_binary(*op, lv, rv)
         }
+        Expr::Cast { e, target } => {
+            let v = eval(e, ctx)?;
+            cast_value(v, *target)
+        }
+        Expr::Func { name, args } => {
+            let vals: Vec<Value> = args.iter().map(|a| eval(a, ctx)).collect::<Result<_>>()?;
+            call_func(name, vals)
+        }
+        Expr::Aggregate { func, arg } => {
+            let group = ctx.group.ok_or_else(|| {
+                EngineError::sql("aggregate function not allowed in this context")
+            })?;
+            let schema = ctx
+                .schema
+                .ok_or_else(|| EngineError::sql("aggregate requires a table"))?;
+            compute_aggregate(*func, arg, schema, group, ctx.params)
+        }
     }
+}
+
+/// Coerce a value to a `::type` cast target. NULL casts to NULL; unmodelled
+/// targets pass the value through unchanged. Bad numeric text errors, matching
+/// Postgres `invalid input syntax`.
+fn cast_value(v: Value, target: CastTarget) -> Result<Value> {
+    if v.is_null() || target == CastTarget::Passthrough {
+        return Ok(v);
+    }
+    match target {
+        CastTarget::Int => match v {
+            Value::Int(i) => Ok(Value::Int(i)),
+            Value::Real(r) => Ok(Value::Int(r.round() as i64)),
+            Value::Text(s) => parse_int_text(&s),
+            other => Err(cast_err(&other, "integer")),
+        },
+        CastTarget::Real => match v {
+            Value::Int(i) => Ok(Value::Real(i as f64)),
+            Value::Real(r) => Ok(Value::Real(r)),
+            Value::Text(s) => s.trim().parse::<f64>().map(Value::Real).map_err(|_| {
+                EngineError::sql(format!("invalid input syntax for type real: {s:?}"))
+            }),
+            other => Err(cast_err(&other, "real")),
+        },
+        CastTarget::Text => Ok(match v.render() {
+            Some(s) => Value::Text(s),
+            None => Value::Null,
+        }),
+        CastTarget::Bool => match v.as_bool() {
+            Some(b) => Ok(Value::Int(b as i64)),
+            None => Ok(Value::Null),
+        },
+        CastTarget::Passthrough => Ok(v),
+    }
+}
+
+/// Parse integer text the way Postgres `::int` does: accept an integer literal,
+/// or a real literal that it rounds.
+fn parse_int_text(s: &str) -> Result<Value> {
+    let t = s.trim();
+    if let Ok(i) = t.parse::<i64>() {
+        return Ok(Value::Int(i));
+    }
+    if let Ok(r) = t.parse::<f64>() {
+        return Ok(Value::Int(r.round() as i64));
+    }
+    Err(EngineError::sql(format!(
+        "invalid input syntax for type integer: {s:?}"
+    )))
+}
+
+fn cast_err(v: &Value, ty: &str) -> EngineError {
+    EngineError::sql(format!("cannot cast {} to {ty}", v.type_name()))
 }
 
 fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
@@ -336,29 +432,79 @@ pub fn run_select(
         if !row_visible(v, snapshot, writer) {
             continue;
         }
-        let ctx = EvalCtx {
-            row: Some(&v.values),
-            schema: Some(schema),
-            params,
-        };
+        let ctx = EvalCtx::row(&v.values, schema, params);
         if predicate(&sel.filter, &ctx)? {
             matched.push(&v.values);
         }
     }
 
-    let has_agg = sel
-        .items
-        .iter()
-        .any(|i| matches!(i, SelItem::Aggregate { .. }));
-    if has_agg {
-        return aggregate_select(sel, schema, &matched, params);
+    if is_aggregated(sel) {
+        return grouped_select(sel, schema, &matched, params);
     }
 
     order_matched(sel, schema, &mut matched, params)?;
-    if let Some(limit) = sel.limit {
+    let limit = eval_count(&sel.limit, params)?;
+    let offset = eval_count(&sel.offset, params)?;
+    apply_offset_limit(&mut matched, limit, offset);
+    project(sel, schema, &matched, params)
+}
+
+/// A query is aggregated if it has a `GROUP BY` / `HAVING`, or any projected
+/// expression folds an aggregate.
+fn is_aggregated(sel: &SelectStmt) -> bool {
+    if !sel.group_by.is_empty() || sel.having.is_some() {
+        return true;
+    }
+    sel.items.iter().any(|i| match i {
+        SelItem::Expr { expr, .. } => expr_has_aggregate(expr),
+        SelItem::Star => false,
+    })
+}
+
+/// Whether an expression tree contains an aggregate call anywhere.
+fn expr_has_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Aggregate { .. } => true,
+        Expr::Cast { e, .. } | Expr::Unary { e, .. } | Expr::IsNull { e, .. } => {
+            expr_has_aggregate(e)
+        }
+        Expr::Binary { l, r, .. } => expr_has_aggregate(l) || expr_has_aggregate(r),
+        Expr::Like { e, pattern, .. } => expr_has_aggregate(e) || expr_has_aggregate(pattern),
+        Expr::Func { args, .. } => args.iter().any(expr_has_aggregate),
+        _ => false,
+    }
+}
+
+/// Evaluate a LIMIT / OFFSET count expression (an integer literal or a `?`
+/// parameter) to a number; `None` means the clause was absent or NULL.
+fn eval_count(opt: &Option<Expr>, params: &[Value]) -> Result<Option<i64>> {
+    let Some(e) = opt else { return Ok(None) };
+    let ctx = EvalCtx::root(params);
+    match eval(e, &ctx)? {
+        Value::Null => Ok(None),
+        Value::Int(n) => Ok(Some(n)),
+        Value::Real(r) => Ok(Some(r as i64)),
+        Value::Text(s) => s
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| EngineError::sql("LIMIT/OFFSET must be an integer")),
+        other => Err(EngineError::sql(format!(
+            "LIMIT/OFFSET must be an integer, found {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Drop the first `offset` rows, then keep at most `limit` (both clamped at 0).
+fn apply_offset_limit(matched: &mut Vec<&Vec<Value>>, limit: Option<i64>, offset: Option<i64>) {
+    if let Some(off) = offset {
+        let off = (off.max(0) as usize).min(matched.len());
+        matched.drain(..off);
+    }
+    if let Some(limit) = limit {
         matched.truncate(limit.max(0) as usize);
     }
-    project(sel, schema, &matched, params)
 }
 
 enum ProjItem {
@@ -377,7 +523,8 @@ fn order_matched(
     if sel.order_by.is_empty() {
         return Ok(());
     }
-    let keys = &sel.order_by;
+    let keys = resolved_order_keys(sel);
+    let keys = &keys;
     let mut indexed: Vec<usize> = (0..matched.len()).collect();
     let mut err: Option<EngineError> = None;
     indexed.sort_by(|&a, &b| {
@@ -393,6 +540,33 @@ fn order_matched(
     Ok(())
 }
 
+/// Resolve each `ORDER BY` key against the select list: a bare column that
+/// matches an output alias is replaced by that item's expression (Postgres
+/// resolves `ORDER BY <alias>`). Other keys pass through unchanged.
+fn resolved_order_keys(sel: &SelectStmt) -> Vec<(Expr, bool)> {
+    sel.order_by
+        .iter()
+        .map(|(e, asc)| (resolve_alias(sel, e), *asc))
+        .collect()
+}
+
+fn resolve_alias(sel: &SelectStmt, expr: &Expr) -> Expr {
+    if let Expr::Column(name) = expr {
+        for item in &sel.items {
+            if let SelItem::Expr {
+                expr: e,
+                alias: Some(a),
+            } = item
+            {
+                if a.eq_ignore_ascii_case(name) {
+                    return e.clone();
+                }
+            }
+        }
+    }
+    expr.clone()
+}
+
 /// Compare two rows by the ordered key list, recording the first eval error.
 fn order_key_cmp(
     keys: &[(Expr, bool)],
@@ -403,16 +577,8 @@ fn order_key_cmp(
     err: &mut Option<EngineError>,
 ) -> Ordering {
     for (expr, asc) in keys {
-        let ca = EvalCtx {
-            row: Some(ra),
-            schema: Some(schema),
-            params,
-        };
-        let cb = EvalCtx {
-            row: Some(rb),
-            schema: Some(schema),
-            params,
-        };
+        let ca = EvalCtx::row(ra, schema, params);
+        let cb = EvalCtx::row(rb, schema, params);
         let (va, vb) = match (eval(expr, &ca), eval(expr, &cb)) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) | (_, Err(e)) => {
@@ -454,9 +620,6 @@ fn project(
                 types.push(expr_type(expr, Some(schema)));
                 plan.push(ProjItem::Expr(expr.clone()));
             }
-            SelItem::Aggregate { .. } => {
-                return Err(EngineError::sql("aggregate not allowed in this position"))
-            }
         }
     }
 
@@ -467,11 +630,7 @@ fn project(
             match p {
                 ProjItem::Column(i) => out.push(vals[*i].clone()),
                 ProjItem::Expr(e) => {
-                    let ctx = EvalCtx {
-                        row: Some(vals),
-                        schema: Some(schema),
-                        params,
-                    };
+                    let ctx = EvalCtx::row(vals, schema, params);
                     out.push(eval(e, &ctx)?);
                 }
             }
@@ -495,19 +654,15 @@ struct KnnPlan<'a> {
 }
 
 /// Recognize a top-k nearest-neighbour query, independent of whether an index
-/// exists (the executor checks that next).
-fn knn_plan(sel: &SelectStmt) -> Option<KnnPlan<'_>> {
-    let limit = sel.limit?;
+/// exists (the executor checks that next). `limit` is the already-evaluated
+/// LIMIT count (KNN requires a non-negative LIMIT).
+fn knn_plan(sel: &SelectStmt, limit: Option<i64>) -> Option<KnnPlan<'_>> {
+    let limit = limit?;
     if limit < 0 || sel.order_by.len() != 1 {
         return None;
     }
     let (order_expr, asc) = &sel.order_by[0];
-    if !asc
-        || sel
-            .items
-            .iter()
-            .any(|i| matches!(i, SelItem::Aggregate { .. }))
-    {
+    if !asc || sel.offset.is_some() || is_aggregated(sel) {
         return None;
     }
     let Expr::Binary { op, l, r } = order_expr else {
@@ -536,7 +691,8 @@ fn knn_select(
     writer: Option<u64>,
     params: &[Value],
 ) -> Result<Option<ResultSet>> {
-    let Some(plan) = knn_plan(sel) else {
+    let limit = eval_count(&sel.limit, params)?;
+    let Some(plan) = knn_plan(sel, limit) else {
         return Ok(None);
     };
     if plan.limit == 0 {
@@ -549,11 +705,7 @@ fn knn_select(
         return Ok(None);
     }
     // Evaluate the (constant) query vector; bail to the scan path if it is not one.
-    let cctx = EvalCtx {
-        row: None,
-        schema: None,
-        params,
-    };
+    let cctx = EvalCtx::root(params);
     let Some(query) = to_vec_operand(&eval(plan.query, &cctx)?) else {
         return Ok(None);
     };
@@ -578,11 +730,7 @@ fn knn_select(
         if !row_visible(v, snapshot, writer) {
             continue;
         }
-        let ctx = EvalCtx {
-            row: Some(&v.values),
-            schema: Some(schema),
-            params,
-        };
+        let ctx = EvalCtx::row(&v.values, schema, params);
         if predicate(&sel.filter, &ctx)? {
             matched.push(&v.values);
             if matched.len() >= plan.limit {
@@ -607,7 +755,35 @@ fn expr_type(expr: &Expr, schema: Option<&TableSchema>) -> ColumnType {
         Expr::Column(name) => schema
             .and_then(|s| s.column_index(name).map(|i| s.columns[i].ty))
             .unwrap_or(ColumnType::Text),
+        // A cast reports its target type (a passthrough keeps the inner type).
+        Expr::Cast { e, target } => match target {
+            CastTarget::Passthrough => expr_type(e, schema),
+            other => cast_column_type(*other),
+        },
+        Expr::Aggregate { func, arg } => match schema {
+            Some(s) => agg_type(*func, arg, s),
+            None => ColumnType::Text,
+        },
+        Expr::Func { name, .. } => func_type(name),
         _ => ColumnType::Text,
+    }
+}
+
+/// Best-effort result type of a scalar function (for column-OID reporting).
+fn func_type(name: &str) -> ColumnType {
+    match name.to_ascii_lowercase().as_str() {
+        "length" | "char_length" | "character_length" | "abs" | "round" | "ceil" | "ceiling"
+        | "floor" => ColumnType::Integer,
+        _ => ColumnType::Text,
+    }
+}
+
+/// The result-set column type a non-passthrough cast target reports.
+fn cast_column_type(t: CastTarget) -> ColumnType {
+    match t {
+        CastTarget::Int | CastTarget::Bool => ColumnType::Integer,
+        CastTarget::Real => ColumnType::Real,
+        CastTarget::Text | CastTarget::Passthrough => ColumnType::Text,
     }
 }
 
@@ -616,6 +792,7 @@ fn agg_type(func: AggFunc, arg: &AggArg, schema: &TableSchema) -> ColumnType {
     match func {
         AggFunc::Count => ColumnType::Integer,
         AggFunc::Avg => ColumnType::Real,
+        AggFunc::JsonAgg => ColumnType::Text, // JSON text
         AggFunc::Sum => match arg {
             AggArg::Expr(e) if matches!(expr_type(e, Some(schema)), ColumnType::Real) => {
                 ColumnType::Real
@@ -630,16 +807,16 @@ fn agg_type(func: AggFunc, arg: &AggArg, schema: &TableSchema) -> ColumnType {
 }
 
 fn constant_select(sel: &SelectStmt, params: &[Value]) -> Result<ResultSet> {
-    if sel.items.iter().any(|i| !matches!(i, SelItem::Expr { .. })) {
-        return Err(EngineError::sql(
-            "SELECT without FROM cannot use * or aggregates",
-        ));
+    for item in &sel.items {
+        match item {
+            SelItem::Star => return Err(EngineError::sql("SELECT * requires a FROM clause")),
+            SelItem::Expr { expr, .. } if expr_has_aggregate(expr) => {
+                return Err(EngineError::sql("aggregate requires a FROM clause"))
+            }
+            SelItem::Expr { .. } => {}
+        }
     }
-    let ctx = EvalCtx {
-        row: None,
-        schema: None,
-        params,
-    };
+    let ctx = EvalCtx::root(params);
     let mut columns = Vec::new();
     let mut types = Vec::new();
     let mut row = Vec::new();
@@ -657,37 +834,98 @@ fn constant_select(sel: &SelectStmt, params: &[Value]) -> Result<ResultSet> {
     })
 }
 
-fn aggregate_select(
+/// Execute an aggregated `SELECT`: partition `matched` into groups by the
+/// `GROUP BY` keys (one group of everything when there is none), evaluate each
+/// projected expression — which may fold aggregates or reference group-key
+/// columns — once per group, filter by `HAVING`, then order / offset / limit.
+fn grouped_select(
     sel: &SelectStmt,
     schema: &TableSchema,
     matched: &[&Vec<Value>],
     params: &[Value],
 ) -> Result<ResultSet> {
-    if !sel
-        .items
-        .iter()
-        .all(|i| matches!(i, SelItem::Aggregate { .. }))
-    {
-        return Err(EngineError::sql(
-            "cannot mix aggregates and plain columns without GROUP BY",
-        ));
-    }
-    let mut columns = Vec::new();
-    let mut types = Vec::new();
-    let mut row = Vec::new();
-    for item in &sel.items {
-        if let SelItem::Aggregate { func, arg, alias } = item {
-            columns.push(alias.clone().unwrap_or_else(|| agg_name(*func)));
-            types.push(agg_type(*func, arg, schema));
-            row.push(compute_aggregate(*func, arg, schema, matched, params)?);
+    // Partition into groups, preserving first-seen order for determinism.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<&[Value]>> =
+        std::collections::HashMap::new();
+    for r in matched {
+        let row: &[Value] = r;
+        let key = group_key(&sel.group_by, schema, row, params)?;
+        match groups.get_mut(&key) {
+            Some(v) => v.push(row),
+            None => {
+                order.push(key.clone());
+                groups.insert(key, vec![row]);
+            }
         }
     }
-    // LIMIT 0 suppresses the single aggregate row.
-    let rows = if sel.limit == Some(0) {
-        vec![]
-    } else {
-        vec![row]
-    };
+    // With no GROUP BY, an empty input still yields one (all-rows) group so a
+    // bare aggregate like `count(*)` returns a single 0 row.
+    if sel.group_by.is_empty() && order.is_empty() {
+        order.push(String::new());
+        groups.insert(String::new(), Vec::new());
+    }
+
+    // Column names + types from the projection (aggregate-aware).
+    let mut columns = Vec::new();
+    let mut types = Vec::new();
+    for item in &sel.items {
+        match item {
+            SelItem::Star => {
+                for c in &schema.columns {
+                    columns.push(c.name.clone());
+                    types.push(c.ty);
+                }
+            }
+            SelItem::Expr { expr, alias } => {
+                columns.push(column_name(expr, alias, columns.len()));
+                types.push(expr_type(expr, Some(schema)));
+            }
+        }
+    }
+
+    // Build (representative-row, group-rows) and compute each output row.
+    let mut out_rows: Vec<(Vec<Value>, Vec<&[Value]>)> = Vec::new();
+    for key in &order {
+        let rows = groups.remove(key).unwrap();
+        let repr = rows.first().copied();
+        let ctx = EvalCtx {
+            row: repr,
+            schema: Some(schema),
+            params,
+            group: Some(&rows),
+        };
+        // HAVING filters whole groups.
+        if let Some(h) = &sel.having {
+            if !eval(h, &ctx)?.as_bool().unwrap_or(false) {
+                continue;
+            }
+        }
+        let mut out = Vec::new();
+        for item in &sel.items {
+            match item {
+                SelItem::Star => {
+                    let r = repr.ok_or_else(|| EngineError::sql("SELECT * over an empty group"))?;
+                    out.extend(r.iter().cloned());
+                }
+                SelItem::Expr { expr, .. } => out.push(eval(expr, &ctx)?),
+            }
+        }
+        out_rows.push((out, rows));
+    }
+
+    // ORDER BY (evaluated in each group's aggregate-aware context).
+    order_groups(sel, schema, &mut out_rows, params)?;
+
+    let mut rows: Vec<Vec<Value>> = out_rows.into_iter().map(|(o, _)| o).collect();
+    // OFFSET / LIMIT over the produced group rows.
+    if let Some(off) = eval_count(&sel.offset, params)? {
+        let off = (off.max(0) as usize).min(rows.len());
+        rows.drain(..off);
+    }
+    if let Some(limit) = eval_count(&sel.limit, params)? {
+        rows.truncate(limit.max(0) as usize);
+    }
     Ok(ResultSet {
         columns,
         types,
@@ -695,33 +933,116 @@ fn aggregate_select(
     })
 }
 
+/// A stable key for the `GROUP BY` tuple of one row.
+fn group_key(
+    group_by: &[Expr],
+    schema: &TableSchema,
+    row: &[Value],
+    params: &[Value],
+) -> Result<String> {
+    if group_by.is_empty() {
+        return Ok(String::new());
+    }
+    let ctx = EvalCtx::row(row, schema, params);
+    let mut key = String::new();
+    for e in group_by {
+        key.push_str(&value_key(&eval(e, &ctx)?));
+        key.push('\u{1}');
+    }
+    Ok(key)
+}
+
+/// Sort the produced group rows by `ORDER BY`, evaluating each key in the
+/// group's aggregate-aware context (so `ORDER BY count(*) DESC` works).
+fn order_groups(
+    sel: &SelectStmt,
+    schema: &TableSchema,
+    out_rows: &mut [(Vec<Value>, Vec<&[Value]>)],
+    params: &[Value],
+) -> Result<()> {
+    if sel.order_by.is_empty() {
+        return Ok(());
+    }
+    let keys = resolved_order_keys(sel);
+    let mut err: Option<EngineError> = None;
+    out_rows.sort_by(|a, b| {
+        if err.is_some() {
+            return Ordering::Equal;
+        }
+        for (expr, asc) in &keys {
+            let ca = EvalCtx {
+                row: a.1.first().copied(),
+                schema: Some(schema),
+                params,
+                group: Some(&a.1),
+            };
+            let cb = EvalCtx {
+                row: b.1.first().copied(),
+                schema: Some(schema),
+                params,
+                group: Some(&b.1),
+            };
+            let (va, vb) = match (eval(expr, &ca), eval(expr, &cb)) {
+                (Ok(x), Ok(y)) => (x, y),
+                (Err(e), _) | (_, Err(e)) => {
+                    err = Some(e);
+                    return Ordering::Equal;
+                }
+            };
+            let ord = null_aware_cmp(&va, &vb);
+            let ord = if *asc { ord } else { ord.reverse() };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Fold an aggregate over the rows of a group (the group is empty only for a
+/// bare aggregate over an empty input, which yields the SQL identity element).
 fn compute_aggregate(
     func: AggFunc,
     arg: &AggArg,
     schema: &TableSchema,
-    matched: &[&Vec<Value>],
+    rows: &[&[Value]],
     params: &[Value],
 ) -> Result<Value> {
     if let (AggFunc::Count, AggArg::Star) = (func, arg) {
-        return Ok(Value::Int(matched.len() as i64));
+        return Ok(Value::Int(rows.len() as i64));
     }
     let AggArg::Expr(expr) = arg else {
         return Err(EngineError::sql("only COUNT(*) takes a star argument"));
     };
-    // Evaluate the argument over non-null values.
+
+    // json_agg keeps every element (including NULLs and group order); the
+    // others fold over non-NULL values only.
+    if matches!(func, AggFunc::JsonAgg) {
+        if rows.is_empty() {
+            return Ok(Value::Null); // PostgREST wraps this in coalesce(…, '[]')
+        }
+        let mut parts = Vec::with_capacity(rows.len());
+        for r in rows {
+            let ctx = EvalCtx::row(r, schema, params);
+            parts.push(value_to_json(&eval(expr, &ctx)?));
+        }
+        return Ok(Value::Text(format!("[{}]", parts.join(","))));
+    }
+
     let mut vals: Vec<Value> = Vec::new();
-    for r in matched {
-        let ctx = EvalCtx {
-            row: Some(r),
-            schema: Some(schema),
-            params,
-        };
+    for r in rows {
+        let ctx = EvalCtx::row(r, schema, params);
         let v = eval(expr, &ctx)?;
         if !v.is_null() {
             vals.push(v);
         }
     }
     Ok(match func {
+        AggFunc::JsonAgg => unreachable!("handled above"),
         AggFunc::Count => Value::Int(vals.len() as i64),
         AggFunc::Min => vals
             .into_iter()
@@ -779,18 +1100,165 @@ fn agg_name(f: AggFunc) -> String {
         AggFunc::Min => "min",
         AggFunc::Max => "max",
         AggFunc::Avg => "avg",
+        AggFunc::JsonAgg => "json_agg",
     }
     .to_string()
 }
 
+/// The default output column name Postgres would assign an unaliased item: the
+/// column for a bare column ref, the function name for a call/aggregate, else a
+/// positional `?columnN?`-style fallback.
 fn column_name(expr: &Expr, alias: &Option<String>, idx: usize) -> String {
     if let Some(a) = alias {
         return a.clone();
     }
     match expr {
         Expr::Column(c) => c.clone(),
+        Expr::Aggregate { func, .. } => agg_name(*func),
+        Expr::Func { name, .. } => name.to_ascii_lowercase(),
+        Expr::Cast { e, .. } => column_name(e, &None, idx),
         _ => format!("col{}", idx + 1),
     }
+}
+
+/// Dispatch a scalar function call. Unknown functions are an error (rather than
+/// silently NULL) so typos surface; the set here covers the common standard SQL
+/// helpers plus the JSON builders PostgREST-style projections lean on.
+fn call_func(name: &str, args: Vec<Value>) -> Result<Value> {
+    let lname = name.to_ascii_lowercase();
+    match lname.as_str() {
+        // NULL handling.
+        "coalesce" => Ok(args
+            .into_iter()
+            .find(|v| !v.is_null())
+            .unwrap_or(Value::Null)),
+        "nullif" => {
+            let a = args.first().cloned().unwrap_or(Value::Null);
+            let b = args.get(1).cloned().unwrap_or(Value::Null);
+            Ok(if a.sql_eq(&b) == Some(true) {
+                Value::Null
+            } else {
+                a
+            })
+        }
+        // Strings.
+        "lower" => Ok(map_text(args, |s| s.to_lowercase())),
+        "upper" => Ok(map_text(args, |s| s.to_uppercase())),
+        "trim" | "btrim" => Ok(map_text(args, |s| s.trim().to_string())),
+        "ltrim" => Ok(map_text(args, |s| s.trim_start().to_string())),
+        "rtrim" => Ok(map_text(args, |s| s.trim_end().to_string())),
+        "length" | "char_length" | "character_length" => Ok(match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(v) => Value::Int(text_of(v).chars().count() as i64),
+        }),
+        "concat" => Ok(Value::Text(
+            args.iter()
+                .filter(|v| !v.is_null())
+                .map(text_of)
+                .collect::<Vec<_>>()
+                .concat(),
+        )),
+        // Numbers.
+        "abs" => Ok(match args.into_iter().next() {
+            Some(Value::Int(i)) => Value::Int(i.wrapping_abs()),
+            Some(Value::Real(r)) => Value::Real(r.abs()),
+            Some(Value::Null) | None => Value::Null,
+            Some(other) => return Err(EngineError::sql(format!("abs() of {}", other.type_name()))),
+        }),
+        "round" => Ok(match args.into_iter().next() {
+            Some(Value::Int(i)) => Value::Int(i),
+            Some(Value::Real(r)) => Value::Int(r.round() as i64),
+            Some(Value::Null) | None => Value::Null,
+            Some(other) => {
+                return Err(EngineError::sql(format!(
+                    "round() of {}",
+                    other.type_name()
+                )))
+            }
+        }),
+        // JSON builders (best-effort; the engine has no native json type, so the
+        // result is JSON-encoded text — see [`value_to_json`]).
+        "to_json" | "to_jsonb" => Ok(Value::Text(value_to_json(
+            args.first().unwrap_or(&Value::Null),
+        ))),
+        "json_build_object" | "jsonb_build_object" => json_build_object(&args),
+        other => Err(EngineError::sql(format!("unknown function: {other}"))),
+    }
+}
+
+/// Apply `f` to a single text argument, propagating NULL and rendering non-text
+/// scalars to their text form first.
+fn map_text(args: Vec<Value>, f: impl Fn(&str) -> String) -> Value {
+    match args.into_iter().next() {
+        Some(Value::Null) | None => Value::Null,
+        Some(v) => Value::Text(f(&text_of(&v))),
+    }
+}
+
+/// Render a value to its text form for string functions (NULL → empty string;
+/// callers handle NULL propagation before calling where it matters).
+fn text_of(v: &Value) -> String {
+    v.render().unwrap_or_default()
+}
+
+/// `json_build_object(k1, v1, k2, v2, …)` → a JSON object. Keys render to text;
+/// values are JSON-encoded.
+fn json_build_object(args: &[Value]) -> Result<Value> {
+    if args.len() % 2 != 0 {
+        return Err(EngineError::sql(
+            "json_build_object requires an even number of arguments",
+        ));
+    }
+    let mut parts = Vec::with_capacity(args.len() / 2);
+    for pair in args.chunks(2) {
+        let key = json_quote(&text_of(&pair[0]));
+        parts.push(format!("{key}:{}", value_to_json(&pair[1])));
+    }
+    Ok(Value::Text(format!("{{{}}}", parts.join(","))))
+}
+
+/// Encode a value as a JSON fragment. NB: the engine has no json type, so a
+/// `Text` value is encoded as a JSON string — a value that is itself already
+/// JSON is therefore re-quoted. (Faithful nested-JSON output is part of the
+/// embedding work that needs the real PostgREST corpus.)
+fn value_to_json(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Real(r) => {
+            if r.is_finite() {
+                format!("{r}")
+            } else {
+                "null".to_string()
+            }
+        }
+        Value::Text(s) => json_quote(s),
+        Value::Blob(b) => json_quote(&crate::value::base64_encode(b)),
+        Value::Vector(_) => {
+            let xs = v.as_vector().unwrap();
+            let parts: Vec<String> = xs.iter().map(|x| format!("{x}")).collect();
+            format!("[{}]", parts.join(","))
+        }
+    }
+}
+
+/// Quote and escape a string as a JSON string literal.
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---- writes (validate fully, then apply: atomic per statement) -------------
@@ -809,11 +1277,7 @@ pub fn run_insert(
         .schema
         .clone();
     let ncols = schema.columns.len();
-    let ctx = EvalCtx {
-        row: None,
-        schema: None,
-        params,
-    };
+    let ctx = EvalCtx::root(params);
 
     let mut staged: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for row_exprs in rows {
@@ -965,11 +1429,7 @@ pub fn run_delete(
         if !v.visible_to_writer(snapshot, owner) {
             continue;
         }
-        let ctx = EvalCtx {
-            row: Some(&v.values),
-            schema: Some(&schema),
-            params,
-        };
+        let ctx = EvalCtx::row(&v.values, &schema, params);
         if predicate(filter, &ctx)? {
             check_no_conflict(v, snapshot, owner)?;
             victims.push(v.vid);
@@ -1021,11 +1481,7 @@ pub fn run_update(
         if !v.visible_to_writer(snapshot, owner) {
             continue;
         }
-        let ctx = EvalCtx {
-            row: Some(&v.values),
-            schema: Some(&schema),
-            params,
-        };
+        let ctx = EvalCtx::row(&v.values, &schema, params);
         if !predicate(filter, &ctx)? {
             continue;
         }
