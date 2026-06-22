@@ -32,13 +32,14 @@ struct Prepared {
 }
 
 /// Post-processing applied to a prepared statement's engine result.
-#[derive(Clone, Copy, PartialEq)]
 enum Postprocess {
     /// Send the engine result as-is.
     None,
     /// Wrap the rows into PostgREST's data-path response (a single row whose
     /// `body` column is the JSON array of the rows).
     PgrstRead,
+    /// PostgREST INSERT (POST): build engine INSERTs from the JSON body param.
+    PgrstInsert(datapath::InsertPlan),
 }
 
 /// A bound portal and its (lazily) materialized result.
@@ -287,14 +288,31 @@ impl Session {
             return;
         }
         log_sql("parse", &sql);
-        // PostgREST's read template can't run on the engine as-is; rewrite it to
+        // PostgREST INSERT (POST): nothing to prepare on the engine — the row
+        // values arrive as the JSON body parameter and are inserted at execute.
+        if let Some(plan) = datapath::parse_insert(&sql) {
+            self.stmts.insert(
+                name,
+                Prepared {
+                    sql,
+                    order: vec![],
+                    nparams: 1,
+                    param_oids,
+                    postprocess: Postprocess::PgrstInsert(plan),
+                },
+            );
+            out.parse_complete();
+            return;
+        }
+        // PostgREST read template: can't run on the engine as-is — rewrite it to
         // the inner SELECT and flag the result for body/page_total wrapping.
-        let (engine_sql, postprocess) = match datapath::rewrite_read(&sql) {
-            Some(inner) if datapath::is_read(&sql) => (inner, Postprocess::PgrstRead),
-            _ => (sql.clone(), Postprocess::None),
-        };
+        let (engine_sql, postprocess) =
+            match (datapath::is_read(&sql), datapath::rewrite_read(&sql)) {
+                (true, Some(inner)) => (inner, Postprocess::PgrstRead),
+                _ => (sql.clone(), Postprocess::None),
+            };
         // Intercepted (introspection) statements never reach the engine parser.
-        let to_engine = postprocess == Postprocess::PgrstRead
+        let to_engine = matches!(postprocess, Postprocess::PgrstRead)
             || matches!(
                 introspect::intercept(&sql, &self.user, &self.database),
                 Canned::Pass
@@ -378,18 +396,28 @@ impl Session {
             let oids = param_oids_for(prep);
             let sql = prep.sql.clone();
             let order_len = prep.order.len();
-            let postprocess = prep.postprocess;
             out.parameter_description(&oids);
 
-            // A PostgREST read reports the fixed body/page_total column shape,
-            // regardless of the inner query's columns.
-            if postprocess == Postprocess::PgrstRead {
-                let cols: Vec<String> = datapath::BODY_COLUMNS
-                    .iter()
-                    .map(|c| c.to_string())
-                    .collect();
-                out.row_description(&fields(&cols, &datapath::BODY_OIDS, &[]));
-                return;
+            // A PostgREST read/write reports a fixed response column shape,
+            // independent of the inner query's columns.
+            match &prep.postprocess {
+                Postprocess::PgrstRead => {
+                    let cols: Vec<String> = datapath::BODY_COLUMNS
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect();
+                    out.row_description(&fields(&cols, &datapath::BODY_OIDS, &[]));
+                    return;
+                }
+                Postprocess::PgrstInsert(_) => {
+                    let cols: Vec<String> = datapath::WRITE_COLUMNS
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect();
+                    out.row_description(&fields(&cols, &datapath::WRITE_OIDS, &[]));
+                    return;
+                }
+                Postprocess::None => {}
             }
 
             match self.inspect(&sql) {
@@ -484,11 +512,16 @@ impl Session {
         let sql = prep.sql.clone();
         let order = prep.order.clone();
         let params = p.params.clone();
-        let postprocess = prep.postprocess;
+        // Extract what the postprocess paths need without holding the borrow.
+        let insert_plan = match &prep.postprocess {
+            Postprocess::PgrstInsert(plan) => Some((plan.table.clone(), plan.columns.clone())),
+            _ => None,
+        };
+        let is_read = matches!(prep.postprocess, Postprocess::PgrstRead);
 
         // A PostgREST read: run the (rewritten) inner SELECT on the engine, then
         // wrap its rows into the body/page_total response shape.
-        if postprocess == Postprocess::PgrstRead {
+        if is_read {
             let inner = self.run_engine(&sql, &params, &order)?;
             let mat = Mat {
                 columns: datapath::BODY_COLUMNS
@@ -497,6 +530,24 @@ impl Session {
                     .collect(),
                 oids: datapath::BODY_OIDS.to_vec(),
                 rows: vec![datapath::body_row(&inner.columns, &inner.rows)],
+                tag: "SELECT 1".to_string(),
+                has_rows: true,
+            };
+            self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+            return Ok(());
+        }
+
+        // A PostgREST INSERT: parse the JSON body parameter into rows and run an
+        // engine INSERT per row; report the count as page_total.
+        if let Some((table, columns)) = insert_plan {
+            let count = self.run_pgrst_insert(&table, &columns, &params)?;
+            let mat = Mat {
+                columns: datapath::WRITE_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                oids: datapath::WRITE_OIDS.to_vec(),
+                rows: vec![datapath::write_body_row(count)],
                 tag: "SELECT 1".to_string(),
                 has_rows: true,
             };
@@ -529,6 +580,43 @@ impl Session {
         };
         self.portals.get_mut(portal).unwrap().materialized = Some(mat);
         Ok(())
+    }
+
+    /// Execute a PostgREST INSERT: the row data is the JSON body parameter
+    /// (`$1`); parse it into rows and run one engine INSERT per row. Returns the
+    /// number of rows inserted (PostgREST's `page_total`).
+    fn run_pgrst_insert(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        params: &[Value],
+    ) -> Result<i64, (String, String)> {
+        let body = match params.first() {
+            Some(Value::Text(s)) => s.clone(),
+            Some(Value::Blob(b)) => String::from_utf8_lossy(b).into_owned(),
+            _ => return Err(("22023".into(), "missing JSON request body".into())),
+        };
+        let rows = datapath::json_rows(&body, columns).map_err(|e| ("22023".to_string(), e))?;
+        let placeholders = vec!["?"; columns.len()].join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table,
+            columns.join(", "),
+            placeholders
+        );
+        let mut count = 0i64;
+        for row in rows {
+            let mut st = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| split_err(&e.to_string()))?;
+            for (i, v) in row.into_iter().enumerate() {
+                st.bind(i + 1, v).map_err(|e| split_err(&e.to_string()))?;
+            }
+            st.execute().map_err(|e| split_err(&e.to_string()))?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Execute a parameterized statement on the engine and collect its result.
