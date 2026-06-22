@@ -12,6 +12,12 @@
   var SECTION_KEY = window.SITE_SECTION || "";
   var REPO = "https://github.com/bihaviour/twill-db";
 
+  // ---- Analytics config -----------------------------------------------------
+  // GA4 Measurement ID. Replace the placeholder with the real "G-XXXXXXXXXX"
+  // id from the GA4 property (Admin → Data Streams). Until it starts with "G-",
+  // analytics stays inert: no Google script loads and no banner is shown.
+  var GA4_MEASUREMENT_ID = "G-84B7FR998L";
+
   // ---- Top site header (Home / Docs / Specs / Release) ----------------------
   var NAV = [
     { key: "home",    label: "Home",    href: "index.html" },
@@ -395,4 +401,81 @@
     window.addEventListener("scroll", function () { if (!ticking) { window.requestAnimationFrame(function () { spy(); ticking = false; }); ticking = true; } });
     spy();
   }
+
+  // ---- Analytics + cookie consent -------------------------------------------
+  // Google Consent Mode v2 (Advanced). gtag.js loads on every page so the tag is
+  // always present (and detectable by Google's installation check), but every
+  // signal defaults to "denied" until the visitor clicks "Accept": before consent
+  // GA sends only cookieless pings (no identifiers, no analytics cookie). The
+  // choice is remembered in localStorage; "Accept" grants analytics storage,
+  // "Decline" keeps it cookieless. Inert until a real "G-" id is configured.
+  (function analytics() {
+    var ID = GA4_MEASUREMENT_ID;
+    if (typeof ID !== "string" || ID.slice(0, 2) !== "G-") return; // inert until configured
+
+    var STORE_KEY = "bd-consent"; // "granted" | "denied"
+    var stored;
+    try { stored = localStorage.getItem(STORE_KEY); } catch (e) { stored = null; }
+
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { window.dataLayer.push(arguments); }
+
+    // Consent Mode v2 default — honour a stored grant, otherwise "denied".
+    gtag("consent", "default", {
+      ad_storage: "denied",
+      ad_user_data: "denied",
+      ad_personalization: "denied",
+      analytics_storage: stored === "granted" ? "granted" : "denied",
+      wait_for_update: 500,
+    });
+    gtag("set", "ads_data_redaction", true);
+    gtag("set", "url_passthrough", true);
+
+    // Advanced mode: load gtag.js immediately (gated server-side by consent).
+    var s = document.createElement("script");
+    s.async = true;
+    s.src = "https://www.googletagmanager.com/gtag/js?id=" + encodeURIComponent(ID);
+    document.head.appendChild(s);
+    gtag("js", new Date());
+    gtag("config", ID, { anonymize_ip: true });
+
+    function grant() {
+      try { localStorage.setItem(STORE_KEY, "granted"); } catch (e) {}
+      gtag("consent", "update", { analytics_storage: "granted" });
+    }
+
+    function deny() {
+      try { localStorage.setItem(STORE_KEY, "denied"); } catch (e) {}
+      gtag("consent", "update", { analytics_storage: "denied" });
+    }
+
+    if (stored === "granted" || stored === "denied") return; // decision already made
+
+    // No decision yet — show the banner.
+    function showBanner() {
+      var bar = document.createElement("div");
+      bar.className = "consent-banner";
+      bar.setAttribute("role", "dialog");
+      bar.setAttribute("aria-label", "Cookie consent");
+      bar.innerHTML =
+        '<p class="consent-text">We use Google Analytics to understand how the docs are used. '
+          + 'No analytics cookies are set unless you accept. '
+          + '<a href="' + BASE + 'index.html#privacy">Learn more</a>.</p>'
+        + '<div class="consent-actions">'
+          + '<button class="consent-btn consent-decline" type="button">Decline</button>'
+          + '<button class="consent-btn consent-accept" type="button">Accept</button>'
+        + '</div>';
+      document.body.appendChild(bar);
+      requestAnimationFrame(function () { bar.classList.add("show"); });
+      bar.querySelector(".consent-accept").addEventListener("click", function () {
+        grant(); bar.remove();
+      });
+      bar.querySelector(".consent-decline").addEventListener("click", function () {
+        deny(); bar.remove();
+      });
+    }
+
+    if (document.body) showBanner();
+    else document.addEventListener("DOMContentLoaded", showBanner);
+  })();
 })();

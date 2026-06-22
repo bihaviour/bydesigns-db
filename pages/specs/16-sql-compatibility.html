@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Compatibility &amp; Mapping (PostgreSQL / SQLite → Twill) · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">16 · SQLMAP</span>
+<span class="badge badge-status status-draft">Draft · Proposed</span>
+<span class="spec-date">Phase 6 (proposed)</span>
+</div>
+<h1>SQL Compatibility &amp; Mapping — PostgreSQL / SQLite → Twill DB</h1>
+<p class="lede">A complete, honest map of the PostgreSQL and SQLite SQL surface onto Twill DB: what the hand-written frontend (<code>sql.rs</code> → <code>exec.rs</code>) accepts <em>today</em>, what is mappable by rewrite, what is <em>proposed</em> for a Phase&nbsp;6 surface-completeness effort, and what stays out of scope by design. Then a concrete implementation spec for the gaps — <strong>all of it parser + executor work; the storage seam never moves</strong> (<code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>).</p>
+</header>
+
+<section>
+<h2>Purpose &amp; framing</h2>
+<p>Twill DB speaks a deliberately small, hand-parsed SQL subset (spec <a href="02-engine-core.html">02</a>; user-facing surface in <a href="../docs/sql-reference.html">docs/sql-reference</a>). The request behind this spec — "map every SQL that works in PostgreSQL and SQLite to Twill, then specify how to implement it" — is answered in two halves:</p>
+<ol>
+<li><strong>The mapping</strong> (§"Feature mapping"): every major area of the PostgreSQL and SQLite grammar, classified against Twill's current engine and given a mapping strategy. "Every SQL" is, taken literally, unbounded (PostgreSQL alone is hundreds of statement forms, thousands of built-in functions, and an extensible type system); this spec is exhaustive at the level of <em>language area</em> and representative-but-not-line-complete at the level of individual built-in functions, which it handles by <em>policy</em> rather than enumeration.</li>
+<li><strong>The implementation</strong> (§"Implementation spec"): a staged plan (Phase 6A–6E) that grows the frontend to cover the common, OLTP-shaped majority of that surface, with the AST / module / test changes for each stage and the invariants every stage must preserve.</li>
+</ol>
+<p class="callout">Twill is an <strong>OLTP</strong> engine with a pluggable storage seam, not a PostgreSQL re-implementation. The goal of Phase&nbsp;6 is <em>"the SQL an application actually issues against an OLTP database parses and runs the same on Twill"</em>, not byte-for-byte dialect parity. Where PostgreSQL and SQLite disagree (typing, quoting, boolean handling), Twill picks one documented behaviour and shims the other on the dialect boundary (server mode reports as PostgreSQL; the embedded path leans SQLite).</p>
+</section>
+
+<section>
+<h2>Invariants this spec must not break</h2>
+<p>The mapping and every implementation stage are bound by the project's load-bearing rules (<code>.claude/rules/storage-seam.md</code>, <code>rust.md</code>):</p>
+<ul>
+<li><strong>The <code>Storage</code> trait does not change.</strong> SQL surface is entirely a frontend concern: lexer/parser (<code>sql.rs</code>), AST, executor (<code>exec.rs</code>), and the row/value model (<code>value.rs</code>, <code>store.rs</code>). No new feature here may add a method to <code>trait Storage</code> or leak a backend concept into it. <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>, the C1–C8 conformance suite stays green, branching/scale-to-zero are unaffected.</li>
+<li><strong>The C ABI stays frozen unless a symbol is genuinely needed.</strong> SQL flows through the existing <code>engine_prepare</code>/<code>engine_exec</code>/result-set path; new statement forms and richer result shapes do <em>not</em> add C symbols. <code>ENGINE_ABI_VERSION</code> stays <code>3</code> unless a stage introduces a new export or changes an existing export's contract (called out per stage).</li>
+<li><strong>MVCC, single-writer, group commit, durability are untouched.</strong> New read shapes (joins, grouping, subqueries) run against the same snapshot; new write shapes (<code>RETURNING</code>, upsert, <code>INSERT … SELECT</code>) emit the same <code>WalOp</code> batch and publish at the same commit LSN. No statement may ack before durable.</li>
+<li><strong>Reject, never mis-parse.</strong> Anything still unsupported after a stage must return <code>ENGINE_ERR_SQL</code> with a clear message — never silently ignored or mis-executed (the existing contract; cf. <code>OR REPLACE</code> being parsed-and-ignored is itself a documented hazard this spec tightens).</li>
+</ul>
+</section>
+
+<section>
+<h2>Status legend</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Mark</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><strong>✅ Supported</strong></td><td>Parses and executes today, with the documented semantics.</td></tr>
+<tr><td><strong>◑ Partial</strong></td><td>A subset works; notable limits called out.</td></tr>
+<tr><td><strong>↻ Map by rewrite</strong></td><td>Not native, but expressible in the supported subset by a mechanical client- or shim-side rewrite (no engine change required).</td></tr>
+<tr><td><strong>⊕ Proposed</strong></td><td>Out today; targeted by a named Phase&nbsp;6 stage below.</td></tr>
+<tr><td><strong>✗ Out of scope</strong></td><td>Deliberately excluded (OLAP-shaped, server-admin, or extensibility surface that conflicts with the engine's design); kept rejected.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Feature mapping</h2>
+
+<h3>Data types &amp; storage classes</h3>
+<p>Twill stores five dynamic storage classes — <code>Value::{Null,Int(i64),Real(f64),Text,Blob,Vector}</code> (<code>value.rs</code>) — with SQLite-style name-based affinity (<code>ColumnType::from_sql</code>). Declared column types are advisory affinities, not hard constraints (the SQLite model), except <code>vector(N)</code>, whose dimension is enforced. The map below is therefore "declared type → affinity bucket".</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>PostgreSQL / SQLite type</th><th>Twill class</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>SMALLINT</code>/<code>INT</code>/<code>INTEGER</code>/<code>BIGINT</code>/<code>INT2/4/8</code>, SQLite <code>INTEGER</code></td><td><code>Integer</code> (i64)</td><td>✅</td><td>Any name containing <code>INT</code>. All integers are 64-bit; <code>SMALLINT</code> range is not separately enforced.</td></tr>
+<tr><td><code>REAL</code>/<code>DOUBLE PRECISION</code>/<code>FLOAT</code>/<code>NUMERIC(p,s)</code>/<code>DECIMAL</code></td><td><code>Real</code> (f64)</td><td>◑</td><td><code>NUMERIC/DECIMAL</code> map to <code>f64</code> — <strong>no exact-decimal arithmetic</strong>. The <code>(p,s)</code> suffix is parsed and ignored. Exact numerics are ✗ (see non-goals).</td></tr>
+<tr><td><code>TEXT</code>/<code>VARCHAR(n)</code>/<code>CHAR(n)</code>/<code>CLOB</code>/<code>STRING</code></td><td><code>Text</code> (UTF-8)</td><td>✅</td><td><code>(n)</code> length is parsed and ignored (SQLite semantics); no length enforcement.</td></tr>
+<tr><td><code>BYTEA</code> / SQLite <code>BLOB</code></td><td><code>Blob</code></td><td>✅</td><td>Rendered base64 over the string-only C ABI; bound back via the same.</td></tr>
+<tr><td><code>BOOLEAN</code> / <code>true</code>/<code>false</code></td><td><code>Integer</code> 0/1</td><td>◑</td><td>Literals <code>true</code>/<code>false</code> parse to <code>1</code>/<code>0</code>. No distinct boolean class; server mode must report the column as <code>bool</code> for round-trip — <strong>⊕ 6E</strong> (dialect shim).</td></tr>
+<tr><td><code>vector(N)</code> (pgvector)</td><td><code>Vector</code></td><td>✅</td><td>Phase 5. Dimension declared and enforced; literals <code>[1,2,3]</code> / <code>'[1,2,3]'</code>.</td></tr>
+<tr><td><code>DATE</code>/<code>TIME</code>/<code>TIMESTAMP[TZ]</code>/<code>INTERVAL</code></td><td><code>Text</code>/<code>Integer</code></td><td>⊕ 6C</td><td>No native temporal type. Map to ISO-8601 <code>Text</code> or epoch <code>Integer</code> + a date/time function pack (SQLite's <code>date()</code>/<code>strftime()</code> model). See functions.</td></tr>
+<tr><td><code>JSON</code>/<code>JSONB</code></td><td><code>Text</code></td><td>⊕ 6C / ✗</td><td>Stored as <code>Text</code>; a minimal accessor pack (<code>json_extract</code>, <code>-></code>/<code>-&gt;&gt;</code>) is ⊕ 6C. Full <code>JSONB</code> indexing/operators are ✗.</td></tr>
+<tr><td><code>uuid</code></td><td><code>Text</code>/<code>Blob</code></td><td>↻</td><td>Store as <code>Text</code>; <code>gen_random_uuid()</code> is a ⊕ 6C function.</td></tr>
+<tr><td>Arrays <code>int[]</code>, composite types, ranges, <code>enum</code>, <code>hstore</code>, geometric, network types</td><td>—</td><td>✗</td><td>PostgreSQL extensible/structured types; out of scope for an OLTP core (store as <code>Text</code>/<code>Blob</code> + app-side encode if needed).</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>DDL — data definition</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
+<tbody>
+<tr><td><code>CREATE TABLE [IF NOT EXISTS]</code> with typed columns</td><td>✅</td><td>Autocommit only (<code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code>) — intentional, spec 02.</td></tr>
+<tr><td><code>PRIMARY KEY</code> (single column), <code>NOT NULL</code>, <code>NULL</code></td><td>✅</td><td>PK implies <code>NOT NULL</code> + uniqueness (enforced via <code>pk_keys</code>).</td></tr>
+<tr><td><code>UNIQUE</code> (non-PK column / constraint)</td><td>◑ → ⊕ 6D</td><td>Parsed today but <strong>only the PK is enforced</strong>. Real secondary uniqueness is ⊕ 6D.</td></tr>
+<tr><td>Composite <code>PRIMARY KEY (a,b)</code>, table-level constraints</td><td>⊕ 6D</td><td>Parser accepts only column-level PK today.</td></tr>
+<tr><td><code>DEFAULT</code>, <code>CHECK</code>, <code>FOREIGN KEY</code>/<code>REFERENCES</code>, <code>GENERATED</code>/<code>AUTOINCREMENT</code></td><td>⊕ 6D</td><td>Not parsed today. <code>DEFAULT</code> and <code>CHECK</code> are tractable (catalog + insert/update path). FK enforcement and cascades are heavier — <code>CHECK</code>/<code>DEFAULT</code> in 6D, FK a documented stretch.</td></tr>
+<tr><td><code>DROP TABLE [IF EXISTS]</code></td><td>✅</td><td>Autocommit only.</td></tr>
+<tr><td><code>CREATE INDEX … USING hnsw</code>, <code>DROP INDEX</code></td><td>✅</td><td>Phase 5 vector index.</td></tr>
+<tr><td><code>CREATE INDEX</code> (B-tree, scalar columns)</td><td>↻ / ⊕ 6D</td><td>Accepted-and-no-op today is <em>not</em> offered (only HNSW parses). Scalar secondary indexes are a real planner feature — ⊕ 6D (optional; the engine is in-memory MVCC so a full scan is the current plan).</td></tr>
+<tr><td><code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code>, <code>RENAME TO</code></td><td>⊕ 6D</td><td>Common migration DDL; ⊕ 6D. Column add/drop is a catalog + row-reshape operation over the WAL.</td></tr>
+<tr><td><code>CREATE VIEW</code></td><td>⊕ 6D</td><td>Storable as a named, re-parsed <code>SelectStmt</code> in the catalog; depends on 6B (joins/subqueries) to be useful.</td></tr>
+<tr><td><code>CREATE SEQUENCE</code>, <code>SERIAL</code>/<code>BIGSERIAL</code></td><td>↻ / ⊕ 6D</td><td>Map to an auto-increment integer PK (6D <code>AUTOINCREMENT</code>) or app-side IDs. Standalone sequences are ✗ for now.</td></tr>
+<tr><td><code>CREATE TRIGGER</code>, <code>CREATE FUNCTION</code>/PL&#47;pgSQL, <code>CREATE EXTENSION</code>, <code>CREATE SCHEMA</code>, roles/<code>GRANT</code></td><td>✗</td><td>Procedural / server-admin / extensibility surface. Out of scope for the engine core (auth is composed around, spec 12).</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>DML — data manipulation</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
+<tbody>
+<tr><td><code>INSERT INTO t [(cols)] VALUES (…)[, (…)]</code></td><td>✅</td><td>Multi-row supported. Fully transactional.</td></tr>
+<tr><td><code>INSERT … DEFAULT VALUES</code></td><td>⊕ 6D</td><td>Needs <code>DEFAULT</code> support.</td></tr>
+<tr><td><code>INSERT INTO t SELECT …</code></td><td>⊕ 6A</td><td>Replace the <code>VALUES</code>-only source with "rows from a query" — reuses the executor's result rows as the insert source.</td></tr>
+<tr><td><code>UPDATE … SET … [WHERE]</code>, <code>DELETE … [WHERE]</code></td><td>✅</td><td>Fully transactional; first-committer-wins conflict checks.</td></tr>
+<tr><td><code>UPDATE … FROM …</code>, <code>DELETE … USING …</code></td><td>⊕ 6B</td><td>Join-driven DML; depends on the join machinery.</td></tr>
+<tr><td><code>… RETURNING *</code> / column list (PG; SQLite 3.35+)</td><td>⊕ 6A</td><td>Project the affected new row versions through a result set on the existing exec path. High value, low risk.</td></tr>
+<tr><td>Upsert: PG <code>INSERT … ON CONFLICT (…) DO UPDATE/NOTHING</code>, SQLite <code>INSERT … ON CONFLICT …</code> / <code>OR REPLACE</code>/<code>OR IGNORE</code></td><td>◑ → ⊕ 6A</td><td><strong>Hazard today:</strong> <code>OR REPLACE</code>/<code>OR IGNORE</code> are parsed and <em>silently ignored</em>, so they fall through to plain insert (and can fail PK). 6A implements true conflict actions and tightens the silent-ignore.</td></tr>
+<tr><td><code>TRUNCATE</code></td><td>↻</td><td><code>DELETE FROM t</code> with no <code>WHERE</code> (already supported); a native fast-path is ✗.</td></tr>
+<tr><td><code>MERGE</code></td><td>✗</td><td>Covered functionally by upsert (6A).</td></tr>
+<tr><td><code>COPY</code> (bulk load)</td><td>↻</td><td>Use batched multi-row <code>INSERT</code> from the client. Native <code>COPY</code> wire support is a server-mode concern (spec 07), not core SQL.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Queries — <code>SELECT</code></h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
+<tbody>
+<tr><td>Projection: <code>*</code>, expressions, <code>AS</code> alias</td><td>✅</td><td>—</td></tr>
+<tr><td><code>FROM</code> single table; <code>SELECT</code> with no <code>FROM</code> (constants)</td><td>✅</td><td>—</td></tr>
+<tr><td><code>WHERE</code></td><td>✅</td><td>Full expression predicate, three-valued logic.</td></tr>
+<tr><td><code>ORDER BY expr [ASC|DESC]</code> (multi-key)</td><td>✅</td><td>Ranks by <em>expressions</em>, not output aliases or ordinals. <code>NULLS FIRST/LAST</code> ⊕ 6A (NULLs sort first today).</td></tr>
+<tr><td><code>LIMIT n</code></td><td>✅</td><td>Integer literal only.</td></tr>
+<tr><td><code>OFFSET n</code>, <code>LIMIT … OFFSET …</code>, <code>FETCH FIRST</code></td><td>⊕ 6A</td><td>Trivial parser + slice addition.</td></tr>
+<tr><td>Aggregates <code>COUNT/SUM/MIN/MAX/AVG</code> (whole-table)</td><td>◑</td><td>Work only when <em>all</em> select items are aggregates; cannot mix with plain columns (no grouping).</td></tr>
+<tr><td><code>GROUP BY</code> / <code>HAVING</code></td><td>⊕ 6B</td><td>Reserved as keywords today but unimplemented. The big aggregation gap.</td></tr>
+<tr><td><code>DISTINCT</code>, <code>COUNT(DISTINCT x)</code></td><td>◑ → ⊕ 6B</td><td><code>SELECT DISTINCT</code> is explicitly rejected today; implement with grouping.</td></tr>
+<tr><td><code>JOIN</code> (<code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code>), <code>ON</code>/<code>USING</code>, table aliases, multi-table <code>FROM</code></td><td>⊕ 6B</td><td>The single largest item. Requires multi-source <code>FROM</code>, qualified <code>table.col</code> resolution (today the table qualifier is parsed then dropped), and a nested-loop join. INNER + LEFT first; RIGHT/FULL after.</td></tr>
+<tr><td>Subqueries: scalar, <code>IN (SELECT …)</code>, <code>EXISTS</code>, derived tables <code>FROM (SELECT …)</code>, correlated</td><td>⊕ 6B</td><td>AST already boxes expressions; add a <code>Expr::Subquery</code> + derived-table source. Correlated last.</td></tr>
+<tr><td>CTEs <code>WITH … AS (…)</code>, recursive CTEs</td><td>⊕ 6B / ✗</td><td>Non-recursive CTEs map to derived tables (6B). Recursive CTEs are ✗ for the OLTP core.</td></tr>
+<tr><td>Set ops <code>UNION [ALL]</code> / <code>INTERSECT</code> / <code>EXCEPT</code></td><td>⊕ 6B</td><td>Compose two result sets; column-count/type compatibility checked.</td></tr>
+<tr><td>Window functions <code>OVER (…)</code></td><td>✗</td><td>OLAP-shaped; out of scope for the core (compose DuckDB, spec 12).</td></tr>
+<tr><td><code>LATERAL</code>, <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>TABLESAMPLE</code></td><td>✗</td><td>Out of scope.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Expressions &amp; operators</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
+<tbody>
+<tr><td>Literals: integer, real, string (<code>''</code> escape), <code>NULL</code>, <code>TRUE</code>/<code>FALSE</code>, vector <code>[…]</code></td><td>✅</td><td>—</td></tr>
+<tr><td>Comparison <code>= &lt;&gt; != &lt; &lt;= &gt; &gt;=</code>, logical <code>AND/OR/NOT</code>, three-valued logic</td><td>✅</td><td>—</td></tr>
+<tr><td>Arithmetic <code>+ - * / %</code>, unary <code>-</code>/<code>+</code></td><td>✅</td><td>Int overflow promotes to real; integer <code>/</code> and <code>%</code> by zero → NULL (SQLite-ish).</td></tr>
+<tr><td><code>IS [NOT] NULL</code></td><td>✅</td><td>—</td></tr>
+<tr><td><code>[NOT] LIKE</code></td><td>◑</td><td><code>%</code>/<code>_</code> wildcards, <strong>ASCII case-insensitive</strong> (PG <code>LIKE</code> is case-sensitive; this matches PG <code>ILIKE</code>). <code>ESCAPE</code> clause ⊕ 6A. Add case-sensitive <code>LIKE</code> + <code>ILIKE</code> split in 6E (dialect).</td></tr>
+<tr><td>Vector distance <code>&lt;-&gt;</code> / <code>&lt;=&gt;</code> / <code>&lt;#&gt;</code></td><td>✅</td><td>Phase 5.</td></tr>
+<tr><td>String concat <code>||</code></td><td>⊕ 6A</td><td>One lexer token + one <code>BinOp</code>; high value.</td></tr>
+<tr><td><code>BETWEEN … AND …</code>, <code>IN (list)</code>, <code>NOT IN</code></td><td>⊕ 6A</td><td>Desugar <code>BETWEEN</code> to <code>&gt;= AND &lt;=</code>; <code>IN (list)</code> to an OR-chain / set test.</td></tr>
+<tr><td><code>CASE WHEN … THEN … ELSE … END</code> (searched + simple)</td><td>⊕ 6A</td><td>New <code>Expr::Case</code>; pure evaluator addition.</td></tr>
+<tr><td><code>CAST(x AS type)</code> / PG <code>x::type</code></td><td>⊕ 6A</td><td>New <code>Expr::Cast</code> over the existing affinity-coercion machinery (<code>ColumnType::coerce</code>).</td></tr>
+<tr><td><code>COALESCE</code>/<code>NULLIF</code>/<code>GREATEST</code>/<code>LEAST</code></td><td>⊕ 6A</td><td>Variadic scalar built-ins (see functions).</td></tr>
+<tr><td><code>x LIKE … ESCAPE c</code>, <code>SIMILAR TO</code>, POSIX regex <code>~</code>/<code>~*</code></td><td>⊕ 6A / ✗</td><td><code>ESCAPE</code> 6A. <code>SIMILAR TO</code>/regex are ✗ (no regex engine; keep deps minimal).</td></tr>
+<tr><td>Parameters: <code>?</code> positional</td><td>✅</td><td>PG <code>$1</code> and named <code>:name</code> → ⊕ 6E (dialect shim; server mode already speaks the extended protocol).</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Functions</h3>
+<p><strong>Policy, not enumeration.</strong> PostgreSQL ships thousands of built-ins and SQLite a few hundred; Twill will implement a curated <em>OLTP-common</em> set as native scalar/aggregate functions and reject the rest with <code>ENGINE_ERR_SQL</code>. Scalar function calls are <strong>not parsed at all today</strong> (a bare word becomes a column reference; only the five aggregates are special-cased), so this is a clean addition: a <code>Expr::Call{name, args}</code> node plus a dispatch table in <code>exec.rs</code>.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Function group</th><th>Examples</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Aggregates (whole-table)</td><td><code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code></td><td>✅</td></tr>
+<tr><td>Aggregates (grouped + more)</td><td>the above per-group, <code>group_concat</code>/<code>string_agg</code>, <code>total</code></td><td>⊕ 6B</td></tr>
+<tr><td>String</td><td><code>length</code>, <code>lower</code>, <code>upper</code>, <code>substr/substring</code>, <code>trim</code>/<code>ltrim</code>/<code>rtrim</code>, <code>replace</code>, <code>coalesce</code>, <code>concat</code>, <code>instr</code>/<code>position</code>, <code>like</code></td><td>⊕ 6C</td></tr>
+<tr><td>Numeric / math</td><td><code>abs</code>, <code>round</code>, <code>ceil</code>, <code>floor</code>, <code>mod</code>, <code>power</code>, <code>sqrt</code>, <code>min</code>/<code>max</code> scalar, <code>random</code></td><td>⊕ 6C</td></tr>
+<tr><td>Conditional / null</td><td><code>coalesce</code>, <code>nullif</code>, <code>ifnull</code>, <code>greatest</code>, <code>least</code>, <code>iif</code></td><td>⊕ 6A</td></tr>
+<tr><td>Date / time</td><td><code>now</code>/<code>current_timestamp</code>, <code>date</code>, <code>time</code>, <code>datetime</code>, <code>strftime</code>, <code>extract</code>, <code>date_trunc</code></td><td>⊕ 6C</td></tr>
+<tr><td>UUID / misc</td><td><code>gen_random_uuid</code>, <code>typeof</code>, <code>hex</code>, <code>cast</code></td><td>⊕ 6C</td></tr>
+<tr><td>JSON</td><td><code>json_extract</code>, <code>json_array</code>, <code>json_object</code>, <code>-&gt;</code>/<code>-&gt;&gt;</code></td><td>⊕ 6C (minimal)</td></tr>
+<tr><td>Vector</td><td>distance operators; <code>vector_dims</code>, <code>l2_distance</code> etc.</td><td>✅ ops / ⊕ 6C named forms</td></tr>
+<tr><td>Server-administrative / system</td><td><code>pg_*</code>, <code>current_setting</code>, <code>nextval</code>, full-text <code>to_tsvector</code></td><td>✗</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Transactions &amp; session</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
+<tbody>
+<tr><td><code>BEGIN [TRANSACTION|WORK|DEFERRED]</code>, <code>START TRANSACTION</code></td><td>✅</td><td>—</td></tr>
+<tr><td><code>COMMIT</code>, <code>ROLLBACK</code> (<code>[TRANSACTION|WORK]</code>)</td><td>✅</td><td>—</td></tr>
+<tr><td>Snapshot isolation (the only level)</td><td>✅</td><td>Single-writer, first-committer-wins; equivalent to PG <code>REPEATABLE READ</code>/SI.</td></tr>
+<tr><td><code>SET TRANSACTION ISOLATION LEVEL …</code></td><td>↻ 6E</td><td>Accept-and-pin-to-SI (PG <code>SERIALIZABLE</code>/<code>REPEATABLE READ</code> map to SI; weaker levels are upgraded). Parsed-and-honoured-as-SI shim.</td></tr>
+<tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>⊕ 6D</td><td>Partial rollback within a txn over the pending-version set in <code>conn.rs</code>/<code>store.rs</code>.</td></tr>
+<tr><td><code>SET</code>/<code>SHOW</code> (GUCs), <code>SET search_path</code>, <code>PRAGMA</code> (SQLite)</td><td>↻ 6E</td><td>Accept-and-ignore the common no-op session settings on the server boundary so real clients/ORMs connect; reject unknown ones.</td></tr>
+<tr><td><code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code></td><td>⊕ 6E</td><td>Emit a single-plan textual description (the engine has one strategy per shape); useful for client compatibility.</td></tr>
+<tr><td><code>VACUUM</code>, <code>ANALYZE</code>, <code>ATTACH</code>/<code>DETACH</code> (SQLite), <code>LISTEN</code>/<code>NOTIFY</code> (PG)</td><td>✗ / ↻</td><td><code>VACUUM</code>/<code>ANALYZE</code> accept-and-no-op (6E). <code>ATTACH</code> conflicts with the URL-scheme backend model; <code>LISTEN/NOTIFY</code> out of scope.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Dialect-specific quirks (PostgreSQL vs SQLite)</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Area</th><th>PostgreSQL</th><th>SQLite</th><th>Twill resolution</th></tr></thead>
+<tbody>
+<tr><td>Typing</td><td>Strict, static</td><td>Dynamic affinity</td><td>Twill is dynamic-affinity (SQLite model); server mode reports affinity-derived OIDs. ⊕ 6E.</td></tr>
+<tr><td>Identifier quoting</td><td><code>"x"</code></td><td><code>"x"</code> or <code>[x]</code> or <code>`x`</code></td><td><code>"x"</code> supported; <code>[x]</code>/<code>`x`</code> ⊕ 6E.</td></tr>
+<tr><td>String concat</td><td><code>||</code></td><td><code>||</code></td><td>⊕ 6A.</td></tr>
+<tr><td><code>LIKE</code> case</td><td>case-sensitive (+<code>ILIKE</code>)</td><td>case-insensitive (ASCII)</td><td>Today = SQLite (insensitive). Split <code>LIKE</code>/<code>ILIKE</code> ⊕ 6E.</td></tr>
+<tr><td>Boolean</td><td>real <code>bool</code></td><td>0/1 integer</td><td>0/1 integer; report as <code>bool</code> on the wire ⊕ 6E.</td></tr>
+<tr><td>Auto IDs</td><td><code>SERIAL</code>/<code>IDENTITY</code></td><td><code>INTEGER PRIMARY KEY [AUTOINCREMENT]</code> / <code>rowid</code></td><td><code>AUTOINCREMENT</code>-style integer PK ⊕ 6D; expose a <code>rowid</code> alias optionally.</td></tr>
+<tr><td>Placeholders</td><td><code>$1</code></td><td><code>?</code>, <code>?NNN</code>, <code>:name</code></td><td><code>?</code> today; <code>$1</code>/<code>:name</code> ⊕ 6E.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Implementation spec</h2>
+<p>The gaps cluster into five stages, ordered by value/risk. They are <strong>additive frontend changes</strong>: each grows the <code>Stmt</code>/<code>Expr</code> AST (<code>sql.rs</code>), the parser, and the executor (<code>exec.rs</code>), plus the catalog (<code>catalog.rs</code>) and transaction manager (<code>conn.rs</code>) for the few stateful items. None touches <code>trait Storage</code>; the WAL op set (<code>wal.rs</code>) only grows if a stage adds a new durable catalog fact (called out). Proposed as <strong>Phase 6 — SQL Surface Completeness</strong> in the roadmap (spec <a href="13-roadmap.html">13</a>); ship the stages as independent, individually-testable increments.</p>
+
+<h3>Stage 6A — Expression &amp; single-table completeness (low risk, high value)</h3>
+<p>The cheapest, highest-coverage wins; no new execution model, only richer expressions and result shapes over the existing single-table scan.</p>
+<ul>
+<li><strong>Lexer:</strong> add <code>||</code> (concat) and <code>::</code> (cast) tokens; keep the existing <code>&lt;</code>-disambiguation discipline (vector ops bind first) in <code>lex_lt</code>.</li>
+<li><strong>AST / parser:</strong> <code>Expr::Case</code>, <code>Expr::Cast{expr, ty}</code>, <code>Expr::InList{expr, list, negated}</code>, <code>Expr::Between{expr, lo, hi, negated}</code>, <code>Expr::Call{name, args}</code>, and <code>BinOp::Concat</code>. Add <code>SelectStmt.offset: Option&lt;i64&gt;</code> and per-key <code>NULLS FIRST/LAST</code>. Add <code>LIKE … ESCAPE</code>.</li>
+<li><strong>Executor:</strong> evaluator arms for the new nodes (CASE short-circuits; CAST routes through <code>ColumnType::coerce</code> + explicit text↔number parsing; <code>||</code> is text concat with NULL propagation; <code>IN</code>/<code>BETWEEN</code> desugar). A scalar-function dispatch table seeded with the conditional/null group (<code>coalesce</code>, <code>nullif</code>, <code>ifnull</code>, <code>iif</code>, <code>greatest</code>, <code>least</code>) — string/math/date land in 6C against the same table.</li>
+<li><strong><code>RETURNING</code>:</strong> <code>run_insert</code>/<code>run_update</code>/<code>run_delete</code> already build the affected new row versions; thread an optional projection list through and return a <code>ResultSet</code> instead of just a row count. The C ABI already exposes a result-set channel from <code>engine_exec</code>, so this is shape-only — <strong>no ABI bump</strong>.</li>
+<li><strong>Upsert:</strong> implement <code>ON CONFLICT (col) DO NOTHING|UPDATE SET …</code> and SQLite <code>OR IGNORE</code>/<code>OR REPLACE</code> against the existing PK conflict path in <code>run_insert</code> (it already detects committed vs. concurrent-pending clashes). <strong>Stop silently ignoring</strong> <code>OR REPLACE</code>/<code>OR IGNORE</code>.</li>
+<li><strong><code>INSERT … SELECT</code>:</strong> let the insert source be a parsed <code>SelectStmt</code> evaluated to rows, fed into the same staging/validation loop.</li>
+<li><strong>Tests:</strong> extend <code>crates/engine/tests/engine</code> for each operator/function; <code>tests/ffi.rs</code> for <code>RETURNING</code> over the C ABI; a <code>bun test</code> pass after a release rebuild.</li>
+<li><strong>Versions:</strong> <code>ENGINE_ABI_VERSION</code> stays <code>3</code>; <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>.</li>
+</ul>
+
+<h3>Stage 6B — Multi-table &amp; aggregation (the big one)</h3>
+<p>The structural jump: more than one row source, qualified names, grouping. This is where the executor gains a small relational layer above the per-table scan, staying brute-force (nested-loop, hash-group) — appropriate for an in-memory MVCC OLTP store.</p>
+<ul>
+<li><strong>AST:</strong> generalize <code>SelectStmt.from</code> from <code>Option&lt;String&gt;</code> to a <code>FromClause</code> tree: base tables with aliases, <code>JOIN</code> nodes (<code>Inner/Left/Right/Full/Cross</code>) with <code>ON</code>/<code>USING</code>, and derived tables (<code>(SELECT …) AS a</code>). Add <code>group_by: Vec&lt;Expr&gt;</code>, <code>having: Option&lt;Expr&gt;</code>, <code>distinct: bool</code>, and a <code>set_op</code> wrapper (<code>UNION/INTERSECT/EXCEPT [ALL]</code>). Add <code>Expr::Subquery</code> (scalar) and <code>Expr::Exists</code>/<code>Expr::InSubquery</code>.</li>
+<li><strong>Name resolution:</strong> replace the "drop the table qualifier, keep the column" shortcut in <code>primary()</code> with a real binder: resolve <code>alias.col</code> against the active <code>FromClause</code>'s column namespace; raise <code>ENGINE_ERR_SQL</code> on ambiguous/unknown.</li>
+<li><strong>Executor:</strong> a row-source iterator model — scan, nested-loop join (with LEFT/RIGHT/FULL null-extension), then a grouping operator (hash by the <code>GROUP BY</code> key, fold aggregates per group, filter by <code>HAVING</code>), then DISTINCT, then order/limit/offset. All over the same MVCC snapshot; visibility is still resolved per base-row exactly as today. Correlated subqueries re-evaluate per outer row (documented as O(n·m), fine for OLTP cardinalities).</li>
+<li><strong>Grouped aggregates:</strong> generalize <code>compute_aggregate</code> to run per group; add <code>group_concat</code>/<code>string_agg</code> and <code>COUNT(DISTINCT …)</code>.</li>
+<li><strong>Views &amp; CTEs:</strong> non-recursive <code>WITH</code> and <code>CREATE VIEW</code> become named derived tables (the view body is a stored, re-bound <code>SelectStmt</code>; a <code>CreateView</code> WAL op carries the text — a new durable catalog fact, so this sub-item alone touches <code>wal.rs</code> and the catalog, still not the storage trait).</li>
+<li><strong>Tests:</strong> a dedicated <code>tests/joins.rs</code> and <code>tests/grouping.rs</code> with MVCC-visibility cases across joins; parity checks for set ops.</li>
+<li><strong>Versions:</strong> <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>. <code>ENGINE_ABI_VERSION</code> stays <code>3</code> (still text-in/result-out). The <code>CreateView</code>/(optional) catalog WAL ops are additive WAL records, replayed like any other.</li>
+</ul>
+
+<h3>Stage 6C — Function library</h3>
+<ul>
+<li>Populate the 6A scalar-dispatch table with the string, numeric/math, date/time, UUID, and minimal-JSON groups from the functions table. Date/time follows the SQLite model (text/epoch + <code>strftime</code>/<code>date</code>), avoiding a native temporal type and keeping the value model unchanged.</li>
+<li><strong>Determinism &amp; durability:</strong> non-deterministic functions (<code>now()</code>, <code>random()</code>, <code>gen_random_uuid()</code>) are evaluated <em>once at execution time</em> and the resulting concrete value is what lands in the <code>WalOp</code> — so replay reproduces the stored value exactly (never re-rolls). This is the same discipline that keeps the vector index replay-deterministic.</li>
+<li>Keep dependencies minimal (rust.md): hand-roll or use the existing base64-style in-house helpers; no new crates for date parsing or JSON unless justified.</li>
+<li><strong>Tests:</strong> per-function unit coverage; an explicit replay-determinism test for the non-deterministic functions.</li>
+</ul>
+
+<h3>Stage 6D — Constraints, schema evolution &amp; savepoints</h3>
+<ul>
+<li><strong>Catalog:</strong> store <code>DEFAULT</code> expressions, <code>CHECK</code> predicates, secondary <code>UNIQUE</code>, and composite/table-level <code>PRIMARY KEY</code> in <code>TableSchema</code>. Enforce in the insert/update validation pass (which already validates fully before mutating — atomic per statement). Secondary UNIQUE reuses the <code>pk_keys</code> machinery generalized to N key sets.</li>
+<li><strong><code>AUTOINCREMENT</code>/<code>SERIAL</code>:</strong> a monotonic per-table counter in the catalog, advanced and WAL-logged on insert (a new durable fact → additive WAL op).</li>
+<li><strong><code>ALTER TABLE</code>:</strong> <code>ADD COLUMN</code> (null/default backfill), <code>DROP COLUMN</code>, <code>RENAME</code> as catalog mutations replayed from new WAL ops; existing in-memory row versions reshape on replay.</li>
+<li><strong><code>SAVEPOINT</code>/<code>ROLLBACK TO</code>:</strong> tag pending row versions with a savepoint depth in <code>conn.rs</code>; <code>ROLLBACK TO</code> tombstones pending versions above the mark (reuses <code>Store::rollback_pending</code>). No durable change — savepoints live entirely in the in-flight writer's pending set.</li>
+<li><strong>Scalar (B-tree) secondary indexes:</strong> <em>optional.</em> Like the HNSW index, a derived in-memory structure rebuilt on replay (<code>rebuild_indexes</code>); a <code>CreateIndex</code>-style WAL op already exists as the model. Default plan remains a full MVCC scan, so this is a latency optimization, not a correctness requirement.</li>
+<li><strong>Versions:</strong> new WAL ops are additive; <code>STORAGE_TRAIT_VERSION</code> unchanged. DDL remains autocommit-only (spec 02 boundary preserved).</li>
+</ul>
+
+<h3>Stage 6E — Dialect shims (compatibility surface)</h3>
+<p>Make real PostgreSQL/SQLite clients and ORMs connect without surprises, concentrated at the boundary so the core stays one dialect.</p>
+<ul>
+<li>Placeholder forms <code>$1</code> and <code>:name</code> (normalize to the existing positional model); identifier quoting <code>[x]</code>/<code>`x`</code>; <code>LIKE</code> vs <code>ILIKE</code> split (case-sensitive default for PG mode); boolean reported as <code>bool</code> on the wire.</li>
+<li>Accept-and-pin <code>SET TRANSACTION ISOLATION LEVEL</code> to SI; accept-and-no-op the common session <code>SET</code>/<code>SHOW</code>/<code>PRAGMA</code>/<code>VACUUM</code>/<code>ANALYZE</code> that ORMs emit on connect, rejecting unknown ones (never silently swallow semantics-bearing statements).</li>
+<li><code>EXPLAIN</code> returns the single chosen plan as text.</li>
+<li>Most of 6E lives in <code>crates/server</code> (the pgwire boundary, spec <a href="07-server-mode.html">07</a>) and the Bun wrapper, keeping dialect translation out of the embedded engine core where it can.</li>
+</ul>
+</section>
+
+<section>
+<h2>Deliberate non-goals (kept rejected)</h2>
+<ul>
+<li><strong>OLAP-shaped query features</strong> — window functions, <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>LATERAL</code>, recursive CTEs. Composed via DuckDB over shared storage (spec <a href="12-capabilities.html">12</a>), not built into the OLTP core.</li>
+<li><strong>Procedural &amp; extensibility surface</strong> — PL/pgSQL, <code>CREATE FUNCTION</code>/<code>TRIGGER</code>/<code>EXTENSION</code>/<code>SCHEMA</code>, roles/<code>GRANT</code>, <code>LISTEN</code>/<code>NOTIFY</code>, full-text search. Auth and services are composed <em>around</em> the engine, not welded in.</li>
+<li><strong>Exact-decimal / arbitrary-precision numerics</strong> — <code>NUMERIC(p,s)</code> maps to <code>f64</code>. A true decimal type would extend the value model (spec 02) and is out of scope here.</li>
+<li><strong>PostgreSQL's structured/extensible type system</strong> — arrays, composite types, ranges, enums, geometric/network types, <code>hstore</code>. Encode app-side into <code>Text</code>/<code>Blob</code>.</li>
+<li><strong>Storage-engine-conflicting statements</strong> — <code>ATTACH</code>/<code>DETACH</code> (backend is chosen by URL scheme, not at runtime), tablespaces, physical storage parameters.</li>
+</ul>
+<p>Everything in this list stays a clean <code>ENGINE_ERR_SQL</code> rejection — the "reject, never mis-parse" contract is part of the engine's correctness story.</p>
+</section>
+
+<section>
+<h2>Acceptance &amp; verification</h2>
+<ul>
+<li>Each stage ships with engine tests that would fail without it (testing.md), the C-ABI surface re-checked in <code>tests/ffi.rs</code>, and — after a <code>cargo build -p twill-engine --release</code> — a green <code>bun test</code>.</li>
+<li>The C1–C8 storage conformance suite, the Phase-4 branching battery, and the Experiment-4 crash gate must stay green at every stage — they cannot regress, because no stage touches the storage seam or the commit/recovery path.</li>
+<li>Each shipped stage updates <a href="../docs/sql-reference.html">docs/sql-reference</a> (the user-facing surface) and this spec's status marks in lock-step (git-workflow.md: specs and docs track behaviour).</li>
+<li>A compatibility corpus — a checked-in set of representative PostgreSQL- and SQLite-flavoured statements with expected results — runs as the regression gate for "the SQL an application actually issues", growing as stages land.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">The parser/executor pipeline (<code>sql.rs</code> → <code>exec.rs</code> → <code>conn.rs</code>) every stage extends.</span></a>
+<a class="xref" href="../docs/sql-reference.html"><span class="xref-id">SQL</span><span class="xref-title">SQL Reference (docs)</span><span class="xref-desc">The exact surface accepted today — the "Supported" column of this map, kept in sync as stages land.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">Where the dialect shims (6E) live — pgwire clients/ORMs connect at this boundary.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">The deciding rule that keeps OLAP/auth/service surface composed around the core, not in it.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">Where Phase 6 — SQL Surface Completeness slots into the phased plan.</span></a>
+<a class="xref" href="phase-5-capabilities.html"><span class="xref-id">P5</span><span class="xref-title">Phase 5 — Vector Search</span><span class="xref-desc">The precedent: a SQL capability added additively over the frozen storage seam.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB — internal development specification. Draft / proposed. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

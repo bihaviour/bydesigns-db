@@ -7,7 +7,23 @@
 
 import { dlopen, FFIType, suffix, CString, ptr, type Pointer } from "bun:ffi";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
+
+/**
+ * The published per-platform binary package for the current host, e.g.
+ * `@twilldb/engine-linux-x64`. These are the optionalDependencies of
+ * `@twilldb/bun`; npm/bun installs only the one matching `os`+`cpu`, so an
+ * end user gets a working engine with no `cargo build` and no postinstall.
+ */
+function platformPackage(): string | undefined {
+  const arches: Record<string, string> = { x64: "x64", arm64: "arm64" };
+  const oses: Record<string, string> = { linux: "linux", darwin: "darwin", win32: "win32" };
+  const arch = arches[process.arch];
+  const os = oses[process.platform];
+  if (!arch || !os) return undefined;
+  return `@twilldb/engine-${os}-${arch}`;
+}
 
 /** Locate libengine.{so,dylib,dll}. Override with TWILLDB_ENGINE_PATH. */
 function resolveLibraryPath(): string {
@@ -15,6 +31,20 @@ function resolveLibraryPath(): string {
   if (override) return override;
 
   const file = `libengine.${suffix}`;
+
+  // 1) Installed from npm: resolve the matching per-platform binary package.
+  const pkg = platformPackage();
+  if (pkg) {
+    try {
+      const req = createRequire(import.meta.url);
+      const binary = join(dirname(req.resolve(`${pkg}/package.json`)), file);
+      if (existsSync(binary)) return binary;
+    } catch {
+      // package not installed (e.g. running from a source checkout) — fall through.
+    }
+  }
+
+  // 2) Source checkout: pick up a locally built libengine from the cargo target dir.
   const here = import.meta.dir; // clients/bun/src
   const candidates = [
     join(here, "..", "..", "..", "target", "release", file),
@@ -75,8 +105,10 @@ try {
 } catch (e) {
   throw new Error(
     `@twilldb/bun: failed to load the engine library at "${LIB_PATH}". ` +
-      `Set TWILLDB_ENGINE_PATH to the built libengine.${suffix}, or build it with ` +
-      `\`cargo build -p twill-engine --release\`. Original error: ${(e as Error).message}`,
+      `If you installed from npm, the per-platform binary package (${platformPackage() ?? "unsupported platform"}) ` +
+      `is missing or your platform is unsupported. From a source checkout, build it with ` +
+      `\`cargo build -p twill-engine --release\` or set TWILLDB_ENGINE_PATH to a built ` +
+      `libengine.${suffix}. Original error: ${(e as Error).message}`,
   );
 }
 

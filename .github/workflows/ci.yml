@@ -113,20 +113,78 @@ jobs:
           TWILLDB_ENGINE_PATH: ${{ github.workspace }}/target/release/libengine.so
         run: bun test
 
+  # Cross-platform prebuilt libengine — the delivery backend that both the npm
+  # per-platform packages and native/FFI embedders consume. Each target builds
+  # on its own native runner (no cross toolchain) and uploads one artifact.
+  build-natives:
+    name: Build libengine (${{ matrix.pkg }})
+    needs: [quality, security, complexity, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One starved/flaky leg must not cancel the others (and with it the release).
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: linux-x64,    runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  bin: libengine.so,    artifact: libengine-linux-x64.so }
+          - { pkg: linux-arm64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, bin: libengine.so,    artifact: libengine-linux-arm64.so }
+          # Both macOS targets build on Apple-Silicon runners (macos-13 Intel hosts
+          # are scarce/deprecated); x86_64 is a cross-compile via the universal SDK.
+          - { pkg: darwin-x64,   runner: macos-14,         target: x86_64-apple-darwin,       bin: libengine.dylib, artifact: libengine-darwin-x64.dylib }
+          - { pkg: darwin-arm64, runner: macos-14,         target: aarch64-apple-darwin,      bin: libengine.dylib, artifact: libengine-darwin-arm64.dylib }
+          - { pkg: win32-x64,    runner: windows-latest,   target: x86_64-pc-windows-msvc,    bin: engine.dll,      artifact: engine-win32-x64.dll }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release libengine
+        run: cargo build -p twill-engine --release --target ${{ matrix.target }}
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.pkg }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+      # Ship the (platform-independent) C ABI header exactly once.
+      - name: Stage header (linux-x64 only)
+        if: matrix.pkg == 'linux-x64'
+        run: cp crates/engine/include/engine.h dist/engine.h
+      - uses: actions/upload-artifact@v4
+        if: matrix.pkg == 'linux-x64'
+        with:
+          name: engine-header
+          path: dist/engine.h
+          if-no-files-found: error
+
   release:
     name: Tag & release
-    needs: [quality, security, complexity, test]
+    needs: [build-natives]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      created: ${{ steps.release.outputs.created }}
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build release artifacts
-        run: cargo build -p twill-engine --release
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: engine-*
+          path: artifacts
+          merge-multiple: true
       - name: Resolve version
         id: ver
         run: |
@@ -135,20 +193,84 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
       - name: Create tag & release if new
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.ver.outputs.tag }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists — nothing to do."
+            echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          cp crates/engine/include/engine.h "engine-${TAG}.h"
-          cp target/release/libengine.so "libengine-${TAG}-linux-x64.so"
           gh release create "$TAG" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
             --generate-notes \
-            "libengine-${TAG}-linux-x64.so" \
-            "engine-${TAG}.h"
+            artifacts/libengine-*.so artifacts/libengine-*.dylib \
+            artifacts/engine-*.dll artifacts/engine.h
+          echo "created=true" >> "$GITHUB_OUTPUT"
           echo "Created release $TAG."
+
+  # Publish @twilldb/bun + its per-platform binary packages. The binary packages
+  # publish first so the wrapper's optionalDependencies resolve on install.
+  publish-npm:
+    name: Publish npm packages
+    needs: [release]
+    if: needs.release.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: engine-*
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble per-platform packages
+        working-directory: clients/bun
+        run: |
+          bun run scripts/sync-version.ts
+          bun run scripts/build-npm-packages.ts ../../artifacts --out dist/npm
+      - name: Publish binary packages then wrapper
+        working-directory: clients/bun
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in dist/npm/*/; do
+            echo "publishing $dir"
+            npm publish "$dir" --access public
+          done
+          npm publish --access public
+
+  # engine-server (pgwire) container image for the self-host / managed path.
+  docker:
+    name: Publish server image
+    needs: [release]
+    if: needs.release.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/bihaviour/twill-db:${{ needs.release.outputs.version }}
+            ghcr.io/bihaviour/twill-db:latest

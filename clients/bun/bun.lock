@@ -11,6 +11,13 @@
         "bun-types": "^1.3.14",
         "typescript": "^6.0.3",
       },
+      "optionalDependencies": {
+        "@twilldb/engine-darwin-arm64": "0.3.2",
+        "@twilldb/engine-darwin-x64": "0.3.2",
+        "@twilldb/engine-linux-arm64": "0.3.2",
+        "@twilldb/engine-linux-x64": "0.3.2",
+        "@twilldb/engine-win32-x64": "0.3.2",
+      },
     },
   },
   "packages": {

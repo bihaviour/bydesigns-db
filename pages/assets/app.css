@@ -641,3 +641,39 @@ kbd {
   .site-header .menu-btn { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; cursor: pointer; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 1rem; }
   .site-header .gh-link .gh-text { display: none; }
 }
+
+/* =============================================================================
+   Cookie consent banner (analytics opt-in — see assets/app.js).
+   ============================================================================= */
+.consent-banner {
+  position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 1000;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+  max-width: 720px; margin: 0 auto;
+  padding: 14px 18px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  opacity: 0; transform: translateY(12px);
+  transition: opacity .25s ease, transform .25s ease;
+}
+.consent-banner.show { opacity: 1; transform: translateY(0); }
+.consent-banner .consent-text {
+  flex: 1 1 280px; margin: 0; font-size: .85rem; line-height: 1.5;
+  color: var(--text-soft);
+}
+.consent-banner .consent-text a { color: var(--accent-text); text-decoration: underline; }
+.consent-banner .consent-actions { display: flex; gap: 8px; margin-left: auto; }
+.consent-banner .consent-btn {
+  cursor: pointer; font: inherit; font-size: .82rem; font-weight: 600;
+  padding: 7px 16px; border-radius: 999px; border: 1px solid var(--border-strong);
+  background: var(--surface); color: var(--text);
+}
+.consent-banner .consent-btn:hover { background: var(--bg-soft); }
+.consent-banner .consent-accept {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.consent-banner .consent-accept:hover { filter: brightness(1.05); background: var(--accent); }
+@media (max-width: 560px) {
+  .consent-banner .consent-actions { width: 100%; margin-left: 0; }
+  .consent-banner .consent-btn { flex: 1; }
+}

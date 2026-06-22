@@ -23,12 +23,14 @@ window.SECTION = {
     { label: "Validation", items: [
       { file: "09-benchmark-plan.html",      id: "BENCH", title: "Benchmark & Validation Plan" },
       { file: "10-hot-row-contention.html",  id: "HOT",   title: "Hot-Row Contention Strategy" },
+      { file: "15-twill-bench.html",         id: "TBENCH", title: "Twill Bench CLI" },
     ]},
     { label: "Operations & Planning", items: [
       { file: "11-deployment-targets.html", id: "DEPLOY", title: "Deployment Targets" },
       { file: "12-capabilities.html",       id: "CAP",    title: "Capabilities: Build-in vs Compose" },
       { file: "13-roadmap.html",            id: "ROAD",   title: "Roadmap & Build Sequence" },
       { file: "14-tradeoffs-risks.html",    id: "RISK",   title: "Tradeoffs & Risk Register" },
+      { file: "16-sql-compatibility.html",  id: "SQLMAP", title: "SQL Compatibility & Mapping" },
     ]},
     { label: "Implementation Maps", items: [
       { file: "phase-1-embedded.html",            id: "P1", title: "Phase 1 — Embedded Library" },
