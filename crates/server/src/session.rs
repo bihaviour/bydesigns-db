@@ -6,6 +6,7 @@
 
 use crate::introspect::{self, Canned, SERVER_VERSION};
 use crate::protocol::{read_message, read_startup, Frontend, Out, Startup};
+use crate::reflect;
 use crate::types::{
     column_type_oid, decode_param, encode_value, infer_column_oid, type_len, OID_TEXT,
 };
@@ -214,10 +215,24 @@ impl Session {
         }
     }
 
-    fn run_simple_one(&mut self, out: &mut Out, sql: &str) -> Result<(), ()> {
+    /// Inspect a statement, resolving a schema-cache reflection against the live
+    /// catalog (the pure `introspect::intercept` cannot reach the engine).
+    fn inspect(&self, sql: &str) -> Canned {
         match introspect::intercept(sql, &self.user, &self.database) {
-            Canned::Rows { columns, rows, tag } => {
-                let oids = infer_oids(&columns, &rows);
+            Canned::Reflect(kind) => reflect::reflect(kind, &self.conn.catalog()),
+            other => other,
+        }
+    }
+
+    fn run_simple_one(&mut self, out: &mut Out, sql: &str) -> Result<(), ()> {
+        match self.inspect(sql) {
+            Canned::Rows {
+                columns,
+                oids,
+                rows,
+                tag,
+            } => {
+                let oids = resolve_oids(oids, &columns, &rows);
                 self.send_rows(out, &columns, &oids, &rows, &[]);
                 out.command_complete(&tag);
                 Ok(())
@@ -226,6 +241,7 @@ impl Session {
                 out.command_complete(&tag);
                 Ok(())
             }
+            Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Pass => match self.conn.query(sql) {
                 Ok(rs) => {
                     if !rs.columns.is_empty() {
@@ -340,12 +356,18 @@ impl Session {
             let order_len = prep.order.len();
             out.parameter_description(&oids);
 
-            match introspect::intercept(&sql, &self.user, &self.database) {
-                Canned::Rows { columns, rows, .. } => {
-                    let oids = infer_oids(&columns, &rows);
+            match self.inspect(&sql) {
+                Canned::Rows {
+                    columns,
+                    oids,
+                    rows,
+                    ..
+                } => {
+                    let oids = resolve_oids(oids, &columns, &rows);
                     out.row_description(&fields(&columns, &oids, &[]));
                 }
                 Canned::Tag(_) => out.no_data(),
+                Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
                 Canned::Pass if is_row_returning(&sql) => match self.dummy_columns(&sql, order_len)
                 {
                     Ok(Some((columns, oids))) => out.row_description(&fields(&columns, &oids, &[])),
@@ -427,9 +449,14 @@ impl Session {
         let order = prep.order.clone();
         let params = p.params.clone();
 
-        let mat = match introspect::intercept(&sql, &self.user, &self.database) {
-            Canned::Rows { columns, rows, tag } => Mat {
-                oids: infer_oids(&columns, &rows),
+        let mat = match self.inspect(&sql) {
+            Canned::Rows {
+                columns,
+                oids,
+                rows,
+                tag,
+            } => Mat {
+                oids: resolve_oids(oids, &columns, &rows),
                 columns,
                 rows,
                 tag,
@@ -442,6 +469,7 @@ impl Session {
                 tag,
                 has_rows: false,
             },
+            Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Pass => self.run_engine(&sql, &params, &order)?,
         };
         self.portals.get_mut(portal).unwrap().materialized = Some(mat);
@@ -690,6 +718,16 @@ fn infer_oids(columns: &[String], rows: &[Vec<Value>]) -> Vec<i32> {
     (0..columns.len())
         .map(|c| infer_column_oid(rows, c))
         .collect()
+}
+
+/// Use a canned result's explicit per-column OIDs when given (a reflected query
+/// carrying pre-encoded binary), otherwise infer them from the values.
+fn resolve_oids(explicit: Vec<i32>, columns: &[String], rows: &[Vec<Value>]) -> Vec<i32> {
+    if explicit.is_empty() {
+        infer_oids(columns, rows)
+    } else {
+        explicit
+    }
 }
 
 /// Leading SQL keyword, uppercased — used to build the CommandComplete tag.

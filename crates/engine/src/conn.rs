@@ -7,7 +7,7 @@ use crate::db::{commit_error, Database};
 use crate::error::{EngineError, Result};
 use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet};
 use crate::sql::{self, Stmt};
-use crate::value::Value;
+use crate::value::{ColumnType, Value};
 use crate::vector::{IndexDef, IndexParams};
 use crate::wal::WalOp;
 use std::ffi::CString;
@@ -37,6 +37,34 @@ pub struct Connection {
     pub last_lsn: i64,
 }
 
+/// A reflected table, for wire-protocol catalog introspection ([`Connection::catalog`]).
+pub struct CatalogTable {
+    pub name: String,
+    pub columns: Vec<CatalogColumn>,
+}
+
+/// A reflected column: its Postgres type name plus key / nullability flags.
+pub struct CatalogColumn {
+    pub name: String,
+    /// The Postgres type name a client expects (`integer`, `text`, …).
+    pub pg_type: &'static str,
+    pub not_null: bool,
+    pub primary_key: bool,
+    /// 1-based ordinal position in the table.
+    pub position: i32,
+}
+
+/// Map an engine storage class to the Postgres type name clients introspect.
+fn pg_type_name(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Integer => "bigint",
+        ColumnType::Real => "double precision",
+        ColumnType::Text => "text",
+        ColumnType::Blob => "bytea",
+        ColumnType::Vector(_) => "text",
+    }
+}
+
 impl Connection {
     pub fn open(url: &str) -> Result<Connection> {
         Ok(Connection {
@@ -50,6 +78,32 @@ impl Connection {
 
     pub fn in_transaction(&self) -> bool {
         self.txn.is_some()
+    }
+
+    /// Reflect the catalog (tables + columns) for wire-protocol introspection
+    /// (e.g. the pgwire server answering a PostgREST schema-cache query). Returns
+    /// tables sorted by name, each column carrying its Postgres type name and
+    /// key/nullability flags.
+    pub fn catalog(&self) -> Vec<CatalogTable> {
+        self.db
+            .catalog()
+            .into_iter()
+            .map(|s| CatalogTable {
+                name: s.name,
+                columns: s
+                    .columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| CatalogColumn {
+                        name: c.name,
+                        pg_type: pg_type_name(c.ty),
+                        not_null: c.not_null,
+                        primary_key: c.primary_key,
+                        position: (i + 1) as i32,
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Create a copy-on-write branch off this connection's database at its

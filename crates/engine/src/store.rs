@@ -125,6 +125,13 @@ impl Store {
         self.tables.contains_key(&Self::key(name))
     }
 
+    /// Every table's schema, sorted by name — the basis for catalog reflection.
+    pub fn table_schemas(&self) -> Vec<TableSchema> {
+        let mut v: Vec<TableSchema> = self.tables.values().map(|t| t.schema.clone()).collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
     pub fn insert_table(&mut self, schema: TableSchema) {
         let k = Self::key(&schema.name);
         self.tables.insert(k, Table::new(schema));

@@ -36,7 +36,7 @@ mod wal;
 pub mod conn;
 pub mod ffi;
 
-pub use conn::{Connection, Statement};
+pub use conn::{CatalogColumn, CatalogTable, Connection, Statement};
 pub use db::Database;
 pub use error::{EngineError, EngineStatus, Result};
 pub use exec::ResultSet;

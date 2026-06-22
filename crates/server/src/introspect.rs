@@ -20,15 +20,29 @@ pub const SERVER_VERSION_NUM: &str = "150000";
 /// The outcome of inspecting a statement before it reaches the engine.
 pub enum Canned {
     /// A canned result set (column names + rows) and a CommandComplete tag.
+    /// `oids` is either empty (infer per-column from the values) or one explicit
+    /// Postgres type OID per column (needed when a column carries pre-encoded
+    /// binary, e.g. the schema-cache arrays).
     Rows {
         columns: Vec<String>,
+        oids: Vec<i32>,
         rows: Vec<Vec<Value>>,
         tag: String,
     },
     /// A canned CommandComplete tag with no rows (e.g. `SET`).
     Tag(String),
+    /// A schema-cache query the session must answer by reflecting the live
+    /// catalog (the pure classifier here has no catalog access).
+    Reflect(ReflectKind),
     /// Not intercepted — hand the statement to the engine.
     Pass,
+}
+
+/// Which PostgREST schema-cache query to reflect from the catalog.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReflectKind {
+    /// The tables/columns/PK query (`pg_relation_is_updatable`).
+    Tables,
 }
 
 /// The advertised value of a GUC / run-time setting, for `SHOW` and
@@ -56,6 +70,7 @@ fn setting_value(name: &str) -> &'static str {
 fn one_row(col: &str, value: &str) -> Canned {
     Canned::Rows {
         columns: vec![col.to_string()],
+        oids: vec![],
         rows: vec![vec![Value::Text(value.to_string())]],
         tag: "SELECT 1".to_string(),
     }
@@ -68,6 +83,7 @@ fn one_row(col: &str, value: &str) -> Canned {
 fn empty_rows(columns: &[&str]) -> Canned {
     Canned::Rows {
         columns: columns.iter().map(|c| c.to_string()).collect(),
+        oids: vec![],
         rows: vec![],
         tag: "SELECT 0".to_string(),
     }
@@ -100,21 +116,25 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
         return one_row(name, setting_value(name));
     }
 
+    // PostgREST's per-request preamble: `SELECT set_config('search_path', $1,
+    // true), set_config('role', $2, true), …`. It sets session GUCs (search_path,
+    // role, JWT claims) the engine has no notion of, and ignores the returned
+    // values — answer with one row of empty strings, one per set_config call.
+    if s.starts_with("select set_config(") {
+        let n = s.matches("set_config(").count().max(1);
+        return Canned::Rows {
+            columns: vec!["set_config".to_string(); n],
+            oids: vec![],
+            rows: vec![vec![Value::Text(String::new()); n]],
+            tag: "SELECT 1".to_string(),
+        };
+    }
+
     // PostgREST's schema-cache introspection (a recursive pg_catalog query the
     // engine cannot execute). Reflected from the real catalog elsewhere; for now
     // a placeholder empty result with the exact 9-column shape PostgREST decodes.
     if s.contains("pg_relation_is_updatable") {
-        return empty_rows(&[
-            "table_schema",
-            "table_name",
-            "table_description",
-            "is_view",
-            "insertable",
-            "updatable",
-            "deletable",
-            "pk_cols",
-            "columns",
-        ]);
+        return Canned::Reflect(ReflectKind::Tables);
     }
 
     // PostgREST loads the timezone list (for the `Prefer: timezone=` header).
@@ -220,6 +240,7 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
                 "server_version".to_string(),
                 "version".to_string(),
             ],
+            oids: vec![],
             rows: vec![vec![
                 Value::Int(SERVER_VERSION_NUM.parse().unwrap_or(150000)),
                 Value::Text(SERVER_VERSION.to_string()),
@@ -261,6 +282,7 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
         "select pg_backend_pid()" => {
             return Canned::Rows {
                 columns: vec!["pg_backend_pid".to_string()],
+                oids: vec![],
                 rows: vec![vec![Value::Int(std::process::id() as i64)]],
                 tag: "SELECT 1".to_string(),
             }
@@ -372,11 +394,20 @@ mod tests {
         // intercepted with an empty, correctly-shaped result so the engine never
         // sees the un-runnable pg_catalog SQL and the cache loads. Column counts
         // match what PostgREST decodes.
-        let cases = [
-            (
+        // The tables query is reflected from the live catalog by the session,
+        // so the pure classifier returns the Reflect marker.
+        assert!(matches!(
+            intercept(
                 "...pg_relation_is_updatable(c.oid::regclass, TRUE) & 8...",
-                9,
+                "postgres",
+                "srv"
             ),
+            Canned::Reflect(ReflectKind::Tables)
+        ));
+
+        // The remaining schema-cache queries are answered with an empty,
+        // correctly-shaped result (no catalog needed).
+        let cases = [
             ("...JOIN pks_uniques_cols ... contype = 'f'...", 8),
             ("...with recursive pks_fks as ... column_dependencies...", 7),
             ("...rettype_is_setof ... proargmodes::text[]...", 13),

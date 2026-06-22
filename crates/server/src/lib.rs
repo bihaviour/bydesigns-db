@@ -21,6 +21,7 @@
 
 mod introspect;
 mod protocol;
+mod reflect;
 mod session;
 mod types;
 
