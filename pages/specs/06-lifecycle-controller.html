@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">06 · CTL</span>
+<span class="badge badge-id">06</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -416,14 +416,14 @@ pub struct InstanceStatus {
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OSB</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">Supplies the CAS commit log (fence token) and LSN-versioned page store that branching and fencing ride on.</span></a>
-<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The storage trait and branch primitives the controller drives for start/stop and create/list/delete.</span></a>
-<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Cache warm is the dominant cold-start tail term and the basis for warm-pool retention.</span></a>
-<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention</span><span class="xref-desc">The single-writer lane serializes contended writes; per-DB/branch boundaries recover granularity.</span></a>
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark Plan</span><span class="xref-desc">Experiment 5 and its N-concurrent-cold-starts extension validate idle-timeout and keep-warm tuning.</span></a>
-<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode</span><span class="xref-desc">Wire listener and pooler consume controller status to route writes to the current lease holder.</span></a>
-<a class="xref" href="02-engine-core.html"><span class="xref-id">CORE</span><span class="xref-title">Engine Core</span><span class="xref-desc">The stateless engine the controller starts, warms, and stops; MVCC/WAL is durable in Slot C.</span></a>
-<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native vs WASM isolate lifecycles and egress costs shape cold-start and idle-timeout policy.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">Supplies the CAS commit log (fence token) and LSN-versioned page store that branching and fencing ride on.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The storage trait and branch primitives the controller drives for start/stop and create/list/delete.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-title">Local Cache</span><span class="xref-desc">Cache warm is the dominant cold-start tail term and the basis for warm-pool retention.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-title">Hot-Row Contention</span><span class="xref-desc">The single-writer lane serializes contended writes; per-DB/branch boundaries recover granularity.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark Plan</span><span class="xref-desc">Experiment 5 and its N-concurrent-cold-starts extension validate idle-timeout and keep-warm tuning.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode</span><span class="xref-desc">Wire listener and pooler consume controller status to route writes to the current lease holder.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">The stateless engine the controller starts, warms, and stops; MVCC/WAL is durable in Slot C.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native vs WASM isolate lifecycles and egress costs shape cold-start and idle-timeout policy.</span></a>
 </div>
 </section>
 

@@ -140,14 +140,32 @@ body {
 
 .nav-group { margin: var(--s4) 0; }
 .nav-group-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
   padding: 0 var(--s5);
   margin: 0 0 var(--s2);
+  font-family: inherit;
   font-size: .68rem;
   font-weight: 700;
   letter-spacing: .1em;
   text-transform: uppercase;
   color: var(--text-muted);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
 }
+.nav-group-label:hover { color: var(--heading); }
+.nav-group-caret {
+  font-size: .6rem;
+  line-height: 1;
+  transform: rotate(90deg);
+  transition: transform .12s;
+}
+.nav-group.collapsed .nav-group-caret { transform: rotate(0deg); }
+.nav-group.collapsed .nav-group-items { display: none; }
 .nav-link {
   display: flex;
   align-items: baseline;
@@ -167,17 +185,6 @@ body {
   background: var(--accent-soft);
   font-weight: 600;
 }
-.nav-link .nav-id {
-  font-family: var(--font-mono);
-  font-size: .66rem;
-  color: var(--text-muted);
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 0 4px;
-  flex: none;
-}
-.nav-link.active .nav-id { color: var(--accent-text); border-color: var(--accent); background: transparent; }
 
 /* ---------- Page header ---------- */
 .page-header { margin-bottom: var(--s6); }
@@ -329,6 +336,7 @@ ul.reqs > li:last-child { border-bottom: 0; }
 .req-tag.should   { background: var(--should); }
 .req-tag.may      { background: var(--may); }
 .req-tag.must-not { background: var(--mustnot); }
+.req-tag.stage    { background: var(--accent-soft); color: var(--accent-text); }
 
 /* ---------- Diagram ---------- */
 .diagram {
@@ -348,7 +356,6 @@ ul.reqs > li:last-child { border-bottom: 0; }
   transition: border-color .12s, box-shadow .12s, transform .12s;
 }
 .xref:hover { border-color: var(--accent); box-shadow: var(--shadow); transform: translateY(-1px); }
-.xref .xref-id { font-family: var(--font-mono); font-size: .68rem; color: var(--text-muted); }
 .xref .xref-title { display: block; color: var(--heading); font-weight: 650; margin: 3px 0; font-size: .95rem; }
 .xref .xref-desc { display: block; color: var(--text-soft); font-size: .82rem; line-height: 1.45; }
 

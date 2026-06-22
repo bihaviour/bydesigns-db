@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">13 · ROAD</span>
+<span class="badge badge-id">13</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -29,7 +29,7 @@
 <p>It does <strong>not</strong> redefine component internals — those live in the per-component specs (<a href="02-engine-core.html">Engine Core</a>, <a href="03-storage-interface.html">Storage Interface</a>, <a href="04-object-storage-backend.html">Object-Storage Backend</a>, and the rest). This page is the schedule and the critical path; the component pages are the blueprints.</p>
 <div class="callout note">
 <p class="callout-title">What this plan governs</p>
-<p>Five phases (embedded library → object storage → server mode → controller → optional capabilities), a build-vs-buy shopping list that says which slots to build and which to inherit, the inter-phase critical path, a per-phase Definition of Done, and a milestone table. Phases gate on the experiments defined in the <a href="09-benchmark-plan.html">Benchmark Plan</a>.</p>
+<p>Six phases (embedded library → object storage → server mode → controller → optional capabilities → SQL surface completeness), a build-vs-buy shopping list that says which slots to build and which to inherit, the inter-phase critical path, a per-phase Definition of Done, and a milestone table. Phases gate on the experiments defined in the <a href="09-benchmark-plan.html">Benchmark Plan</a>.</p>
 </div>
 </section>
 
@@ -228,6 +228,40 @@ const rows = await sql`select 1 as n`;</code></pre>
 </section>
 
 <section>
+<h2>Phase 6 — SQL surface completeness</h2>
+<p><span class="pill blue">frontend only</span> <span class="pill green">seam unchanged</span> With the core platform shipped, grow the hand-written SQL frontend (<code>sql.rs</code> → <code>exec.rs</code>) to cover the common, OLTP-shaped majority of the PostgreSQL and SQLite surface — so the SQL an application actually issues against an OLTP database parses and runs the same on Twill. This is surface-completeness work, <em>not</em> a PostgreSQL re-implementation and not byte-for-byte dialect parity. Every change is additive frontend work (lexer/parser, AST, executor, with <code>catalog.rs</code> and <code>conn.rs</code> for the few stateful items), so the storage seam never moves.</p>
+<h3>Invariants every stage preserves</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> leave the <code>Storage</code> trait unchanged — <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>, the C1–C8 conformance suite stays green, branching and scale-to-zero unaffected.</li>
+<li><span class="req-tag must">MUST</span> keep the C ABI frozen — SQL flows through the existing <code>engine_prepare</code> / <code>engine_exec</code> / result-set path; <code>ENGINE_ABI_VERSION</code> stays <code>3</code> unless a stage genuinely needs a new export (called out per stage).</li>
+<li><span class="req-tag must">MUST</span> leave MVCC, single-writer, group commit and durability untouched: new read shapes run against the same snapshot, new write shapes emit the same <code>WalOp</code> batch at the same commit LSN, nothing acks before durable.</li>
+<li><span class="req-tag must-not">MUST NOT</span> mis-parse — anything still unsupported after a stage returns a clear <code>ENGINE_ERR_SQL</code>, never silently ignored or mis-executed.</li>
+</ul>
+<h3>Deliverables — five independently-shippable stages</h3>
+<ul class="reqs">
+<li><span class="req-tag stage">6A</span> <span>Expression &amp; single-table completeness — <code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, <code>||</code>, <code>OFFSET</code>, <code>NULLS FIRST/LAST</code>, <code>RETURNING</code>, upsert (<code>ON CONFLICT</code>) and <code>INSERT … SELECT</code>. The cheapest, highest-coverage wins; no new execution model, only richer expressions and result shapes over the existing single-table scan.</span></li>
+<li><span class="req-tag stage">6B</span> <span>Multi-table &amp; aggregation — joins, <code>GROUP BY</code>/<code>HAVING</code>, subqueries, set operations, views &amp; non-recursive CTEs. The executor gains a small relational layer (nested-loop join, hash-group) above the per-table MVCC scan. The single largest stage.</span></li>
+<li><span class="req-tag stage">6C</span> <span>Function library — a curated OLTP-common set of string, math, date/time, UUID and JSON scalar/aggregate functions; non-deterministic ones (<code>now()</code>, <code>random()</code>, <code>gen_random_uuid()</code>) evaluate once at execution so replay reproduces the stored value exactly.</span></li>
+<li><span class="req-tag stage">6D</span> <span>Constraints, schema evolution &amp; savepoints — <code>CHECK</code>/<code>DEFAULT</code>/secondary <code>UNIQUE</code>, <code>AUTOINCREMENT</code>/<code>SERIAL</code>, <code>ALTER TABLE</code>, and <code>SAVEPOINT</code>/<code>ROLLBACK TO</code> (new catalog facts are additive WAL ops; DDL stays autocommit-only).</span></li>
+<li><span class="req-tag stage">6E</span> <span>Dialect shims — placeholder forms (<code>$1</code>/<code>:name</code> → <code>?</code>), identifier quoting, <code>LIKE</code> vs <code>ILIKE</code>, isolation-level pinning and session no-ops — concentrated at the pgwire boundary so the engine core stays one dialect.</span></li>
+</ul>
+<h3>Deliberate non-goals</h3>
+<p>Kept rejected with a clean <code>ENGINE_ERR_SQL</code>: OLAP-shaped query features (window functions, <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>LATERAL</code>, recursive CTEs — compose DuckDB); the procedural &amp; extensibility surface (PL/pgSQL, <code>CREATE FUNCTION</code>/<code>TRIGGER</code>/<code>EXTENSION</code>, roles/<code>GRANT</code>, <code>LISTEN</code>/<code>NOTIFY</code>); exact-decimal numerics (<code>NUMERIC(p,s)</code> maps to <code>f64</code>); PostgreSQL's structured type system (arrays, composite types, ranges, enums); and storage-engine-conflicting statements (<code>ATTACH</code>/<code>DETACH</code>, tablespaces).</p>
+<h3>Specs it draws on</h3>
+<p><a href="16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a> (the stage-by-stage gap map and dialect decisions) · <a href="02-engine-core.html">Engine Core</a> (the parser → executor the stages extend) · <a href="07-server-mode.html">Server Mode &amp; Wire Protocol</a> (where the 6E dialect shims live).</p>
+<h3>Exit criteria &amp; gate</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> ship each stage with engine tests that would fail without it, the C-ABI surface re-checked in <code>tests/ffi.rs</code>, and a green <code>bun test</code> after <code>cargo build -p twill-engine --release</code>.</li>
+<li><span class="req-tag must">MUST</span> keep the C1–C8 storage conformance suite, the Phase-4 branching battery, and the Experiment-4 crash gate green at every stage (no stage touches the seam or the commit/recovery path).</li>
+<li><span class="req-tag should">SHOULD</span> grow a checked-in compatibility corpus of representative PostgreSQL- and SQLite-flavoured statements with expected results, run as the regression gate as stages land.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Independent of the storage backbone</p>
+<p>Because Phase 6 is pure frontend work, it can proceed in parallel with the Phase 5 capability composition — the two touch disjoint surfaces (SQL frontend vs. storage/vector). Each shipped stage updates <a href="../docs/sql-reference.html">the SQL reference</a> and this spec's status marks in lock-step.</p>
+</div>
+</section>
+
+<section>
 <h2>Build-vs-buy shopping list</h2>
 <p>Per slot: whether to build from scratch, and the existing piece to start from (2026). The two <span class="pill build">build</span> slots — the storage trait and the Bun binding — are the load-bearing original work; almost everything else is inherited or adapted.</p>
 <div class="table-wrap">
@@ -309,8 +343,9 @@ P3 engine-server + pgwire   P4 controller (idle-stop, branch, CAS fence)
        └───────────┬─────────────┘
                    ▼
 P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
+P6 SQL surface completeness — 6A–6E   [frontend only; parallel to P5, seam unchanged]
 </pre>
-<p class="diagram-caption">Backbone is serial (P1 → P2 → {P3, P4}); the CAS log built in P2 is the shared prerequisite for both server-mode fencing and the controller's fence token.</p>
+<p class="diagram-caption">Backbone is serial (P1 → P2 → {P3, P4}); the CAS log built in P2 is the shared prerequisite for both server-mode fencing and the controller's fence token. P5 and P6 are additive layers on the shipped engine — capabilities and SQL surface — that move no seam.</p>
 </div>
 </section>
 
@@ -328,6 +363,8 @@ P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
 <dd>Engine scales to zero on idle and cold-starts with the CAS fence re-acquired by exactly one writer; branch created in O(pointer) time with copy-on-write isolation; Exp 5 distributions captured; thundering-herd (N concurrent cold starts) bounded without correctness loss.</dd>
 <dt>Phase 5 DoD (optional)</dt>
 <dd>Vector type + HNSW index behind the <code>Storage</code> trait, branching with the DB; better-auth / PostgREST / DuckDB composed against the shared object-storage floor without modifying the engine core.</dd>
+<dt>Phase 6 DoD</dt>
+<dd>Stages 6A–6E land independently, each with engine tests that would fail without it and a green <code>bun test</code> after a release rebuild; the C1–C8 conformance suite, the branching battery, and the Exp 4 crash gate stay green throughout; the compatibility corpus passes as the regression gate. <code>STORAGE_TRAIT_VERSION</code> stays 2 and the C ABI stays frozen.</dd>
 </dl>
 </section>
 
@@ -374,6 +411,13 @@ P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
 <td>Per-capability acceptance</td>
 <td>Platform grows by composition</td>
 </tr>
+<tr>
+<td><strong>M6 — SQL surface</strong></td>
+<td>SQL surface completeness (stages 6A–6E) over the same engine</td>
+<td>16, 02, 07</td>
+<td>Per-stage tests + compatibility corpus</td>
+<td>Real Postgres/SQLite apps run unmodified</td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -410,14 +454,15 @@ P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">the seam frozen in Phase 1 and reused unchanged across every later phase — the reason storage is config, not a rebuild.</span></a>
-<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">the bun:ffi binding shipped in Phase 1 and the Bun.sql client path unlocked in Phase 3.</span></a>
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the LSM page store + S3-CAS commit log built in Phase 2; its CAS token becomes the Phase 4 fence.</span></a>
-<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">the pgwire listener wrapped around the same library in Phase 3, plus pooler guidance.</span></a>
-<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">the Phase 4 lifecycle state machine, branch-on-LSN, and single-writer CAS fencing.</span></a>
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">the experiments that gate Phases 2–4 (Exp 1/2/4, Exp 2/3 server, Exp 5 + thundering-herd).</span></a>
-<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">the optional Phase 5 work: vector search in-core, and composing better-auth / PostgREST / DuckDB.</span></a>
-<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">the three-slot layer map this roadmap delivers slot by slot, phase by phase.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">the seam frozen in Phase 1 and reused unchanged across every later phase — the reason storage is config, not a rebuild.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">the bun:ffi binding shipped in Phase 1 and the Bun.sql client path unlocked in Phase 3.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the LSM page store + S3-CAS commit log built in Phase 2; its CAS token becomes the Phase 4 fence.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">the pgwire listener wrapped around the same library in Phase 3, plus pooler guidance.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">the Phase 4 lifecycle state machine, branch-on-LSN, and single-writer CAS fencing.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">the experiments that gate Phases 2–4 (Exp 1/2/4, Exp 2/3 server, Exp 5 + thundering-herd).</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">the optional Phase 5 work: vector search in-core, and composing better-auth / PostgREST / DuckDB.</span></a>
+<a class="xref" href="16-sql-compatibility.html"><span class="xref-title">SQL Compatibility &amp; Mapping</span><span class="xref-desc">the Phase 6 stage-by-stage SQL gap map and the dialect decisions shimmed at the pgwire boundary.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-title">Architecture Overview</span><span class="xref-desc">the three-slot layer map this roadmap delivers slot by slot, phase by phase.</span></a>
 </div>
 </section>
 

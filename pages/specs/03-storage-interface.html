@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">03 · STOR</span>
+<span class="badge badge-id">03</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -600,12 +600,12 @@ pub async fn run_conformance(make: impl Fn() -&gt; BoxFut&lt;Box&lt;dyn Storage&
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">The sole caller of this trait; produces WAL records and chooses read LSNs.</span></a>
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">ObjectStorage internals: LSM-on-S3 layers and the S3-CAS commit log.</span></a>
-<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Sits above the read path; the trait is the cache's miss path, never the commit path.</span></a>
-<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Drives fence acquire/release on cold start and branch-on-LSN creation.</span></a>
-<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">Where this seam sits in the three-slot layer map.</span></a>
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation</span><span class="xref-desc">Hosts the crash-injection harness that gates C1/C5 durability.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">The sole caller of this trait; produces WAL records and chooses read LSNs.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">ObjectStorage internals: LSM-on-S3 layers and the S3-CAS commit log.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-title">Local Cache</span><span class="xref-desc">Sits above the read path; the trait is the cache's miss path, never the commit path.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Drives fence acquire/release on cold start and branch-on-LSN creation.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-title">Architecture Overview</span><span class="xref-desc">Where this seam sits in the three-slot layer map.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation</span><span class="xref-desc">Hosts the crash-injection harness that gates C1/C5 durability.</span></a>
 </div>
 </section>
 
