@@ -93,6 +93,33 @@
     <div class="timeline">
 
       <div class="tl-item next">
+        <h3>SQL surface completeness <span class="chip planned">Phase 6 · Planned</span></h3>
+        <p><span class="ver">richer SQL frontend — parser + executor only; the storage seam never moves</span></p>
+        <p>Grow the hand-written SQL frontend (<code>sql.rs</code> → <code>exec.rs</code>) to cover the common, OLTP-shaped majority of the PostgreSQL and SQLite surface, so the SQL an application actually issues parses and runs the same on Twill. This is surface-completeness work, not a PostgreSQL re-implementation: every change is additive frontend work, so <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>, <code>ENGINE_ABI_VERSION</code> stays <code>3</code>, and the C1–C8 conformance suite, branching, and scale-to-zero are untouched. Anything still unsupported returns a clean <code>ENGINE_ERR_SQL</code> — reject, never mis-parse.</p>
+        <ul class="reqs">
+          <li><span class="req-tag stage">6A</span><span>Expression &amp; single-table completeness — <code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, <code>||</code>, <code>OFFSET</code>, <code>RETURNING</code>, upsert (<code>ON CONFLICT</code>), <code>INSERT … SELECT</code>.</span></li>
+          <li><span class="req-tag stage">6B</span><span>Multi-table &amp; aggregation — joins, <code>GROUP BY</code>/<code>HAVING</code>, subqueries, set operations, views &amp; non-recursive CTEs. The largest stage.</span></li>
+          <li><span class="req-tag stage">6C</span><span>Function library — a curated OLTP-common set of string, math, date/time, UUID and JSON functions, evaluated once at execution so replay stays deterministic.</span></li>
+          <li><span class="req-tag stage">6D</span><span>Constraints, schema evolution &amp; savepoints — <code>CHECK</code>/<code>DEFAULT</code>/<code>UNIQUE</code>, <code>AUTOINCREMENT</code>/<code>SERIAL</code>, <code>ALTER TABLE</code>, <code>SAVEPOINT</code> (DDL stays autocommit-only).</span></li>
+          <li><span class="req-tag stage">6E</span><span>Dialect shims — placeholder forms, identifier quoting, <code>LIKE</code>/<code>ILIKE</code>, isolation-level pinning and session no-ops, concentrated at the pgwire boundary so the core stays one dialect.</span></li>
+        </ul>
+        <p>Detail in <a href="../specs/16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/60" target="_blank" rel="noopener">issue #60</a>.</p>
+      </div>
+
+      <div class="tl-item next">
+        <h3>Twill Bench CLI <span class="chip progress">Building out</span></h3>
+        <p><span class="ver">benchmarking + correctness + serverless-efficiency CLI</span></p>
+        <p>Grow the existing <code>crates/bench</code> driver — today's spec-09 latency floor, group-commit curve and contention wall over both transports (embedded FFI + pgwire) and both backends (<code>file://</code> / <code>s3://</code>) — into the full Twill Bench tool: one driver that answers <em>is it fast</em>, <em>is the data still correct under stress</em>, and <em>how efficiently did the serverless architecture use compute</em>. Per the architecture guardrails, reporting/export stays CLI-only and feature-gated, and lifecycle metrics are sourced from <code>twill-controller</code> and the server, never the thread-free engine core.</p>
+        <ul class="reqs">
+          <li><span class="req-tag stage">Mix</span><span>Request-mix scenarios — <code>read-heavy</code> / <code>write-heavy</code> / <code>mixed-oltp</code> with configurable ratio control, deterministic under a seed.</span></li>
+          <li><span class="req-tag stage">Check</span><span>Correctness profiles — <code>bank-transfer</code>, <code>inventory</code>, <code>counter</code>, <code>document-editing</code> with ACID-invariant assertions (a violation fails with exit code 2).</span></li>
+          <li><span class="req-tag stage">Report</span><span>Reporting — <code>--json</code>-only mode, the full exit-code table, and <code>compare --baseline --candidate</code> for release-over-release diffs.</span></li>
+          <li><span class="req-tag stage">Lifecycle</span><span>Lifecycle scenarios &amp; serverless-efficiency metrics — <code>burst</code>, <code>scale-to-zero</code> (Exp 5 cold read), <code>long-run</code>; compute active/idle, scale-to-zero count, compute-seconds/query.</span></li>
+        </ul>
+        <p>Detail in <a href="../specs/15-twill-bench.html">Twill Bench CLI</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/49" target="_blank" rel="noopener">issue #49</a>.</p>
+      </div>
+
+      <div class="tl-item next">
         <h3>Vector hardening <span class="chip planned">Planned</span></h3>
         <p><span class="ver">deferred items from the vector-search scope boundaries</span></p>
         <ul class="reqs">

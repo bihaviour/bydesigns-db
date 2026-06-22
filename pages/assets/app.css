@@ -336,6 +336,7 @@ ul.reqs > li:last-child { border-bottom: 0; }
 .req-tag.should   { background: var(--should); }
 .req-tag.may      { background: var(--may); }
 .req-tag.must-not { background: var(--mustnot); }
+.req-tag.stage    { background: var(--accent-soft); color: var(--accent-text); }
 
 /* ---------- Diagram ---------- */
 .diagram {
