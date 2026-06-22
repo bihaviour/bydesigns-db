@@ -127,46 +127,8 @@ impl WalOp {
         let op = match tag {
             OP_CREATE => {
                 let name = c.str()?;
-                let n = c.u32()? as usize;
-                let mut columns = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let cname = c.str()?;
-                    let ty = c.coltype()?;
-                    let flags = c.u8()?;
-                    columns.push(Column {
-                        name: cname,
-                        ty,
-                        primary_key: flags & 1 != 0,
-                        not_null: flags & 2 != 0,
-                    });
-                }
-                // Foreign keys, if present. A record written before FK support
-                // ends right after the columns, so an exhausted cursor means
-                // "no foreign keys" rather than a truncation error.
-                let mut foreign_keys = Vec::new();
-                if !c.at_end() {
-                    let nfk = c.u32()? as usize;
-                    for _ in 0..nfk {
-                        let name = c.str()?;
-                        let foreign_table = c.str()?;
-                        let ncol = c.u32()? as usize;
-                        let mut cols = Vec::with_capacity(ncol);
-                        for _ in 0..ncol {
-                            cols.push(c.str()?);
-                        }
-                        let nfcol = c.u32()? as usize;
-                        let mut fcols = Vec::with_capacity(nfcol);
-                        for _ in 0..nfcol {
-                            fcols.push(c.str()?);
-                        }
-                        foreign_keys.push(ForeignKey {
-                            name,
-                            columns: cols,
-                            foreign_table,
-                            foreign_columns: fcols,
-                        });
-                    }
-                }
+                let columns = decode_columns(&mut c)?;
+                let foreign_keys = decode_foreign_keys(&mut c)?;
                 WalOp::CreateTable {
                     schema: TableSchema {
                         name,
@@ -218,6 +180,58 @@ impl WalOp {
         };
         Ok(op)
     }
+}
+
+/// Decode a `CreateTable`'s column list (count-prefixed).
+fn decode_columns(c: &mut Cursor) -> Result<Vec<Column>> {
+    let n = c.u32()? as usize;
+    let mut columns = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = c.str()?;
+        let ty = c.coltype()?;
+        let flags = c.u8()?;
+        columns.push(Column {
+            name,
+            ty,
+            primary_key: flags & 1 != 0,
+            not_null: flags & 2 != 0,
+        });
+    }
+    Ok(columns)
+}
+
+/// Decode the foreign-key section, if present. A record written before FK support
+/// ends right after the columns, so an exhausted cursor means "no foreign keys"
+/// rather than a truncation error (backward-compatible decode).
+fn decode_foreign_keys(c: &mut Cursor) -> Result<Vec<ForeignKey>> {
+    let mut foreign_keys = Vec::new();
+    if c.at_end() {
+        return Ok(foreign_keys);
+    }
+    let nfk = c.u32()? as usize;
+    for _ in 0..nfk {
+        let name = c.str()?;
+        let foreign_table = c.str()?;
+        let columns = decode_str_list(c)?;
+        let foreign_columns = decode_str_list(c)?;
+        foreign_keys.push(ForeignKey {
+            name,
+            columns,
+            foreign_table,
+            foreign_columns,
+        });
+    }
+    Ok(foreign_keys)
+}
+
+/// Decode a count-prefixed list of strings.
+fn decode_str_list(c: &mut Cursor) -> Result<Vec<String>> {
+    let n = c.u32()? as usize;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(c.str()?);
+    }
+    Ok(v)
 }
 
 fn put_u32(b: &mut Vec<u8>, v: u32) {
