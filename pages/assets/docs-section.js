@@ -6,23 +6,23 @@ window.SECTION = {
   brand: { title: "Documentation", sub: "Use & operate Twill DB" },
   groups: [
     { label: "Get started", items: [
-      { file: "index.html",          id: "OV", title: "Introduction" },
-      { file: "getting-started.html", id: "QS", title: "Quickstart" },
+      { file: "index.html",          title: "Introduction" },
+      { file: "getting-started.html", title: "Quickstart" },
     ]},
     { label: "Connect", items: [
-      { file: "connect.html",            id: "CONN", title: "Connect to your database" },
-      { file: "connect-bun.html",        id: "BUN",  title: "Connect from Bun (embedded)" },
-      { file: "connect-postgres.html",   id: "PG",   title: "Connect with a Postgres client" },
-      { file: "connection-pooling.html", id: "POOL", title: "Connection pooling" },
+      { file: "connect.html",            title: "Connect to your database" },
+      { file: "connect-bun.html",        title: "Connect from Bun (embedded)" },
+      { file: "connect-postgres.html",   title: "Connect with a Postgres client" },
+      { file: "connection-pooling.html", title: "Connection pooling" },
     ]},
     { label: "Guides", items: [
-      { file: "branching.html",     id: "BR", title: "Branching" },
-      { file: "scale-to-zero.html", id: "S0", title: "Scale-to-zero & lifecycle" },
-      { file: "hot-row.html",       id: "HOT", title: "Hot-row contention" },
+      { file: "branching.html",     title: "Branching" },
+      { file: "scale-to-zero.html", title: "Scale-to-zero & lifecycle" },
+      { file: "hot-row.html",       title: "Hot-row contention" },
     ]},
     { label: "Reference", items: [
-      { file: "sql-reference.html", id: "SQL", title: "SQL reference" },
-      { file: "c-abi.html",         id: "ABI", title: "C ABI reference" },
+      { file: "sql-reference.html", title: "SQL reference" },
+      { file: "c-abi.html",         title: "C ABI reference" },
     ]},
   ],
 };

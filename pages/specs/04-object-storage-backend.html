@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">04 · OBJ</span>
+<span class="badge badge-id">04</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -360,12 +360,12 @@
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The trait this backend implements: get_page / append_wal / flush.</span></a>
-<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Keeps S3 latency off the read hot path; absorbs the cache-miss/egress cost.</span></a>
-<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTRL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Branch-on-LSN, scale-to-zero, and single-writer fencing via the CAS token.</span></a>
-<a class="xref" href="02-engine-core.html"><span class="xref-id">CORE</span><span class="xref-title">Engine Core</span><span class="xref-desc">Generates the WAL records and MVCC LSNs this backend consumes.</span></a>
-<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">S3 vs R2 vs MinIO; why R2 zero-egress matters; native vs WASM engine form.</span></a>
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Commit-latency floor, group-commit curve, and the crash-safety gate.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The trait this backend implements: get_page / append_wal / flush.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-title">Local Cache</span><span class="xref-desc">Keeps S3 latency off the read hot path; absorbs the cache-miss/egress cost.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Branch-on-LSN, scale-to-zero, and single-writer fencing via the CAS token.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">Generates the WAL records and MVCC LSNs this backend consumes.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">S3 vs R2 vs MinIO; why R2 zero-egress matters; native vs WASM engine form.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Commit-latency floor, group-commit curve, and the crash-safety gate.</span></a>
 </div>
 </section>
 

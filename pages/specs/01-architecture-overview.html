@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">01 · ARCH</span>
+<span class="badge badge-id">01</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -488,17 +488,17 @@ const h = db.engine_open(Buffer.from("s3://bucket/mydb\0"));
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">Interior of Slot B: parser, planner, executor, MVCC, WAL generation.</span></a>
-<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam — full versioned trait signatures and error model.</span></a>
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">Slot C internals: LSM layers, S3-CAS commit log, compaction/GC/PITR.</span></a>
-<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Shared buffer + LFC — the component embeddability depends on.</span></a>
-<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Scale-to-zero, cold start, branch-on-LSN, CAS fencing.</span></a>
-<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">Slot A server listener: pgwire/HTTP and the pooler.</span></a>
-<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">Slot A embedded: C ABI, bun:ffi and NAPI bindings.</span></a>
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiments 1–5 that validate the architecture's two weak axes.</span></a>
-<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention</span><span class="xref-desc">Single-writer ceiling, sharding for lanes, route-to-Postgres outlier.</span></a>
-<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native vs WASM engine form; R2 zero-egress for cache-miss reads.</span></a>
-<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">What goes into the engine vs around it over shared storage.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">Interior of Slot B: parser, planner, executor, MVCC, WAL generation.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam — full versioned trait signatures and error model.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">Slot C internals: LSM layers, S3-CAS commit log, compaction/GC/PITR.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-title">Local Cache</span><span class="xref-desc">Shared buffer + LFC — the component embeddability depends on.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Scale-to-zero, cold start, branch-on-LSN, CAS fencing.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">Slot A server listener: pgwire/HTTP and the pooler.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">Slot A embedded: C ABI, bun:ffi and NAPI bindings.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiments 1–5 that validate the architecture's two weak axes.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-title">Hot-Row Contention</span><span class="xref-desc">Single-writer ceiling, sharding for lanes, route-to-Postgres outlier.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native vs WASM engine form; R2 zero-egress for cache-miss reads.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">What goes into the engine vs around it over shared storage.</span></a>
 </div>
 </section>
 

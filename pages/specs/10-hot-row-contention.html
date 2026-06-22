@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">10 · HOT</span>
+<span class="badge badge-id">10</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -373,11 +373,11 @@ SELECT coalesce(sum(delta), 0) AS total
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiment 3 is the red-quadrant detector that flags hot-row outliers; Exp 2 proves the W1 group-commit plateau.</span></a>
-<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">single-writer fencing via the commit-log CAS token — the mechanism that makes "the serializing writer" unambiguous.</span></a>
-<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">MVCC snapshot isolation, single-writer-per-DB serialization, and group commit — the correctness floor this strategy stands on.</span></a>
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the S3 CAS commit log whose ~10ms durable handoff sets the per-commit cost the policy works around.</span></a>
-<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">the many-small-DBs / sharding posture that is the W2 lane lever for recovering lock granularity.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiment 3 is the red-quadrant detector that flags hot-row outliers; Exp 2 proves the W1 group-commit plateau.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">single-writer fencing via the commit-log CAS token — the mechanism that makes "the serializing writer" unambiguous.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">MVCC snapshot isolation, single-writer-per-DB serialization, and group commit — the correctness floor this strategy stands on.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the S3 CAS commit log whose ~10ms durable handoff sets the per-commit cost the policy works around.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-title">Architecture Overview</span><span class="xref-desc">the many-small-DBs / sharding posture that is the W2 lane lever for recovering lock granularity.</span></a>
 </div>
 </section>
 

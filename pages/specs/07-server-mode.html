@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">07 · SRV</span>
+<span class="badge badge-id">07</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -502,13 +502,13 @@ fn engine_cancel(h: EngineHandle, secret: u32) -&gt; Result&lt;(), EngineError&g
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="02-engine-core.html"><span class="xref-id">CORE</span><span class="xref-title">Engine Core</span><span class="xref-desc">The library the listener wraps; same C ABI the embedded path binds.</span></a>
-<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">Path 2 — Bun.sql as a free pgwire client; the embedded counterpart to this front door.</span></a>
-<a class="xref" href="12-capabilities.html"><span class="xref-id">CAPS</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">PostgREST composed in front via wire-compat; interfaces wrap server mode.</span></a>
-<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTRL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Cold-start/idle-stop and the writer-lease fencing token routing depends on.</span></a>
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">CAS fencing that makes a fenced-writer error and durable commit_lsn possible.</span></a>
-<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (pgwire) vs WASM/edge (HTTP/WS); where the pooler lives.</span></a>
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">pgbench through the pooler; server-mode latency percentiles and the crash gate.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">The library the listener wraps; same C ABI the embedded path binds.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">Path 2 — Bun.sql as a free pgwire client; the embedded counterpart to this front door.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">PostgREST composed in front via wire-compat; interfaces wrap server mode.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Cold-start/idle-stop and the writer-lease fencing token routing depends on.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">CAS fencing that makes a fenced-writer error and durable commit_lsn possible.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (pgwire) vs WASM/edge (HTTP/WS); where the pooler lives.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">pgbench through the pooler; server-mode latency percentiles and the crash gate.</span></a>
 </div>
 </section>
 

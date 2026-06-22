@@ -116,22 +116,44 @@
   }
 
   var sidebar = document.getElementById("sidebar");
+  var NAV_COLLAPSE_KEY = "bd-nav-collapsed:" + SECTION_KEY;
+  function readCollapsed() {
+    try { return JSON.parse(localStorage.getItem(NAV_COLLAPSE_KEY) || "{}"); } catch (e) { return {}; }
+  }
   if (sidebar && SECTION) {
     var brand = SECTION.brand || { title: "", sub: "" };
     var html = '<a class="brand" href="index.html">'
       + '<span class="brand-title">' + brand.title + '</span>'
       + '<span class="brand-sub">' + brand.sub + '</span></a>';
+    var collapsed = readCollapsed();
     SECTION.groups.forEach(function (g) {
-      html += '<div class="nav-group"><p class="nav-group-label">' + g.label + '</p>';
+      // Keep the group holding the current page expanded regardless of saved state.
+      var hasActive = g.items.some(function (it) { return it.file === here; });
+      var isCollapsed = !!collapsed[g.label] && !hasActive;
+      html += '<div class="nav-group' + (isCollapsed ? " collapsed" : "") + '">'
+        + '<button type="button" class="nav-group-label" aria-expanded="' + (isCollapsed ? "false" : "true") + '">'
+        + '<span class="nav-group-text">' + g.label + '</span>'
+        + '<span class="nav-group-caret" aria-hidden="true">▸</span></button>'
+        + '<div class="nav-group-items">';
       g.items.forEach(function (it) {
         var active = it.file === here ? " active" : "";
         html += '<a class="nav-link' + active + '" href="' + it.file + '">'
-          + (it.id ? '<span class="nav-id">' + it.id + '</span>' : '')
           + '<span class="nav-text">' + it.title + '</span></a>';
       });
-      html += "</div>";
+      html += "</div></div>";
     });
     sidebar.innerHTML = html;
+    sidebar.querySelectorAll(".nav-group-label").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var group = btn.parentNode;
+        var label = btn.querySelector(".nav-group-text").textContent;
+        var nowCollapsed = group.classList.toggle("collapsed");
+        btn.setAttribute("aria-expanded", nowCollapsed ? "false" : "true");
+        var store = readCollapsed();
+        store[label] = nowCollapsed;
+        try { localStorage.setItem(NAV_COLLAPSE_KEY, JSON.stringify(store)); } catch (e) {}
+      });
+    });
   }
 
   // ---- Heading anchors + TOC ----

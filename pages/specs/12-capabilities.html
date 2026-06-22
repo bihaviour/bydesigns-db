@@ -15,7 +15,7 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">12 · CAP</span>
+<span class="badge badge-id">12</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -389,14 +389,14 @@ object storage  (S3 / R2 / GCS)
 <section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
-<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">the trait the HNSW vector index attaches behind, inheriting branching and S3-backing</span></a>
-<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">pg-wire compatibility is why PostgREST attaches for free</span></a>
-<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">the in-process binding better-auth uses to persist into the embedded engine</span></a>
-<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">vector search leans hardest on the cache; cold HNSW traversal is the worst case</span></a>
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the shared S3 floor DuckDB reads as Parquet/Iceberg snapshots</span></a>
-<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">R2 zero-egress matters most for miss-heavy vector search; composed-layer placement</span></a>
-<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">the small-core-plus-composition shape this page applies to new capabilities</span></a>
-<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">when vector search and each composed layer land in the build order</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">the trait the HNSW vector index attaches behind, inheriting branching and S3-backing</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">pg-wire compatibility is why PostgREST attaches for free</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">the in-process binding better-auth uses to persist into the embedded engine</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-title">Local Cache</span><span class="xref-desc">vector search leans hardest on the cache; cold HNSW traversal is the worst case</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">the shared S3 floor DuckDB reads as Parquet/Iceberg snapshots</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">R2 zero-egress matters most for miss-heavy vector search; composed-layer placement</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-title">Architecture Overview</span><span class="xref-desc">the small-core-plus-composition shape this page applies to new capabilities</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">when vector search and each composed layer land in the build order</span></a>
 </div>
 </section>
 

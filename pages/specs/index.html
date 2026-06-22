@@ -15,7 +15,6 @@
 <article>
 <header class="page-header">
 <div class="spec-meta">
-<span class="badge badge-id">OV</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
 <span class="spec-date">Updated 2026-06-20</span>
 </div>
@@ -118,17 +117,17 @@
 <tr>
 <td><strong>Scale-to-zero</strong></td>
 <td>Compute is stateless — all durable state lives in the storage tier. The controller stops the engine when idle; only object-storage bytes bill at rest. Cold start = process start + cache warm.</td>
-<td><a href="06-lifecycle-controller.html">CTL</a></td>
+<td><a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a></td>
 </tr>
 <tr>
 <td><strong>True embeddability</strong></td>
 <td>A <code>LocalFileStorage</code> backend plus the in-process local cache keep the hot path as function calls, never network calls. The <em>same</em> binary embeds or serves; storage choice is configuration (a connection string), not a rebuild.</td>
-<td><a href="05-local-cache.html">CACHE</a> · <a href="03-storage-interface.html">STOR</a></td>
+<td><a href="05-local-cache.html">Local Cache</a> · <a href="03-storage-interface.html">Storage Interface</a></td>
 </tr>
 <tr>
 <td><strong>Branching</strong></td>
 <td>The page store is versioned by LSN and its layers are immutable, so a branch is a cheap pointer (copy-on-write). Many tools each take a branch off one base with near-zero marginal storage until they diverge.</td>
-<td><a href="06-lifecycle-controller.html">CTL</a> · <a href="04-object-storage-backend.html">OBJ</a></td>
+<td><a href="06-lifecycle-controller.html">Lifecycle &amp; Controller</a> · <a href="04-object-storage-backend.html">Object-Storage Backend</a></td>
 </tr>
 </tbody>
 </table>
@@ -183,33 +182,33 @@ SLOT C — Storage (disaggregated)
 
 <h3>Architecture — the engine and its storage</h3>
 <div class="xref-grid">
-<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">The three slots, the seam, and how embedded and server modes share one engine.</span></a>
-<a class="xref" href="02-engine-core.html"><span class="xref-id">ENG</span><span class="xref-title">Engine Core</span><span class="xref-desc">Rust library: parser → plan → executor, MVCC via LSN-stamped versions, WAL generation, C ABI.</span></a>
-<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The narrow <code>Storage</code> trait — the single most important artifact and the system's seam.</span></a>
-<a class="xref" href="04-object-storage-backend.html"><span class="xref-id">OBJ</span><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">LSM page store on S3/R2, delta/image layers, and the S3-CAS commit log.</span></a>
-<a class="xref" href="05-local-cache.html"><span class="xref-id">CACHE</span><span class="xref-title">Local Cache</span><span class="xref-desc">Shared-buffer cache + LFC spilling to NVMe — the thing that keeps embeddability real.</span></a>
-<a class="xref" href="06-lifecycle-controller.html"><span class="xref-id">CTL</span><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Cold start, idle stop (scale-to-zero), branch-on-LSN, and single-writer fencing.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-title">Architecture Overview</span><span class="xref-desc">The three slots, the seam, and how embedded and server modes share one engine.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">Rust library: parser → plan → executor, MVCC via LSN-stamped versions, WAL generation, C ABI.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The narrow <code>Storage</code> trait — the single most important artifact and the system's seam.</span></a>
+<a class="xref" href="04-object-storage-backend.html"><span class="xref-title">Object-Storage Backend</span><span class="xref-desc">LSM page store on S3/R2, delta/image layers, and the S3-CAS commit log.</span></a>
+<a class="xref" href="05-local-cache.html"><span class="xref-title">Local Cache</span><span class="xref-desc">Shared-buffer cache + LFC spilling to NVMe — the thing that keeps embeddability real.</span></a>
+<a class="xref" href="06-lifecycle-controller.html"><span class="xref-title">Lifecycle &amp; Controller</span><span class="xref-desc">Cold start, idle stop (scale-to-zero), branch-on-LSN, and single-writer fencing.</span></a>
 </div>
 
 <h3>Interfaces — how callers reach the engine</h3>
 <div class="xref-grid">
-<a class="xref" href="07-server-mode.html"><span class="xref-id">SRV</span><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The <code>engine-server</code> binary: same library wrapped in a pgwire / HTTP listener, plus pooler.</span></a>
-<a class="xref" href="08-bun-integration.html"><span class="xref-id">BUN</span><span class="xref-title">Bun Integration</span><span class="xref-desc">Embedded via <code>bun:ffi</code> over <code>engine.h</code> (or NAPI); server via built-in <code>Bun.sql</code>.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The <code>engine-server</code> binary: same library wrapped in a pgwire / HTTP listener, plus pooler.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">Embedded via <code>bun:ffi</code> over <code>engine.h</code> (or NAPI); server via built-in <code>Bun.sql</code>.</span></a>
 </div>
 
 <h3>Validation — proving the boundary holds</h3>
 <div class="xref-grid">
-<a class="xref" href="09-benchmark-plan.html"><span class="xref-id">BENCH</span><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">The five experiments that locate W1 (commit latency) and W2 (write serialization) per tool.</span></a>
-<a class="xref" href="10-hot-row-contention.html"><span class="xref-id">HOT</span><span class="xref-title">Hot-Row Contention Strategy</span><span class="xref-desc">Serialize same-row writes; shard to recover granularity; route the irreducible outlier to Postgres.</span></a>
-<a class="xref" href="15-twill-bench.html"><span class="xref-id">TBENCH</span><span class="xref-title">Twill Bench CLI</span><span class="xref-desc">The benchmarking + correctness + serverless-efficiency CLI that operationalizes the validation plan.</span></a>
+<a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">The five experiments that locate W1 (commit latency) and W2 (write serialization) per tool.</span></a>
+<a class="xref" href="10-hot-row-contention.html"><span class="xref-title">Hot-Row Contention Strategy</span><span class="xref-desc">Serialize same-row writes; shard to recover granularity; route the irreducible outlier to Postgres.</span></a>
+<a class="xref" href="15-twill-bench.html"><span class="xref-title">Twill Bench CLI</span><span class="xref-desc">The benchmarking + correctness + serverless-efficiency CLI that operationalizes the validation plan.</span></a>
 </div>
 
 <h3>Operations &amp; planning</h3>
 <div class="xref-grid">
-<a class="xref" href="11-deployment-targets.html"><span class="xref-id">DEPLOY</span><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (Cloud Run + bucket) vs WASM (Workers + R2); why R2's zero egress matters here.</span></a>
-<a class="xref" href="12-capabilities.html"><span class="xref-id">CAP</span><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">Vectors/HNSW built IN; auth, REST, OLAP composed AROUND the shared storage floor.</span></a>
-<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The build order from embedded library to controller, with milestones and component shopping list.</span></a>
-<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-id">RISK</span><span class="xref-title">Tradeoffs &amp; Risk Register</span><span class="xref-desc">Write latency, single-writer ceiling, cold start, maturity — the honest costs, tracked.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (Cloud Run + bucket) vs WASM (Workers + R2); why R2's zero egress matters here.</span></a>
+<a class="xref" href="12-capabilities.html"><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">Vectors/HNSW built IN; auth, REST, OLAP composed AROUND the shared storage floor.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The build order from embedded library to controller, with milestones and component shopping list.</span></a>
+<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-title">Tradeoffs &amp; Risk Register</span><span class="xref-desc">Write latency, single-writer ceiling, cold start, maturity — the honest costs, tracked.</span></a>
 </div>
 </section>
 
@@ -304,10 +303,10 @@ SLOT C — Storage (disaggregated)
 <h2>Related specifications</h2>
 <p>Start with the architecture overview, then follow the rollout order.</p>
 <div class="xref-grid">
-<a class="xref" href="01-architecture-overview.html"><span class="xref-id">ARCH</span><span class="xref-title">Architecture Overview</span><span class="xref-desc">The full picture of slots, seam, and shared-engine dual mode.</span></a>
-<a class="xref" href="03-storage-interface.html"><span class="xref-id">STOR</span><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam that makes everything else possible.</span></a>
-<a class="xref" href="13-roadmap.html"><span class="xref-id">ROAD</span><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The four-step build order, expanded with milestones.</span></a>
-<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-id">RISK</span><span class="xref-title">Tradeoffs &amp; Risk Register</span><span class="xref-desc">Read this before committing real workloads.</span></a>
+<a class="xref" href="01-architecture-overview.html"><span class="xref-title">Architecture Overview</span><span class="xref-desc">The full picture of slots, seam, and shared-engine dual mode.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam that makes everything else possible.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The four-step build order, expanded with milestones.</span></a>
+<a class="xref" href="14-tradeoffs-risks.html"><span class="xref-title">Tradeoffs &amp; Risk Register</span><span class="xref-desc">Read this before committing real workloads.</span></a>
 </div>
 </section>
 
