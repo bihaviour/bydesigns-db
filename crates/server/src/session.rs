@@ -45,6 +45,9 @@ enum Postprocess {
     PgrstUpdate(datapath::UpdatePlan),
     /// PostgREST DELETE: the de-qualified WHERE clause + its `$n` parameters.
     PgrstDelete(datapath::DeletePlan),
+    /// PostgREST FK-embedding read: decompose into per-relation engine queries
+    /// and assemble the nested JSON body (spec 12 composition glue).
+    PgrstEmbed(datapath::EmbedRead),
 }
 
 /// A bound portal and its (lazily) materialized result.
@@ -315,6 +318,23 @@ impl Session {
             out.parse_complete();
             return;
         }
+        // PostgREST FK-embedding read: nothing to prepare on the engine — the
+        // embed is decomposed into per-relation queries assembled at execute.
+        if let Some(embed) = datapath::parse_embed(&sql) {
+            let nparams = datapath::max_param(&sql);
+            self.stmts.insert(
+                name,
+                Prepared {
+                    sql,
+                    order: vec![],
+                    nparams,
+                    param_oids,
+                    postprocess: Postprocess::PgrstEmbed(embed),
+                },
+            );
+            out.parse_complete();
+            return;
+        }
         // PostgREST read template: can't run on the engine as-is — rewrite it to
         // the inner SELECT and flag the result for body/page_total wrapping.
         let (engine_sql, postprocess) =
@@ -412,7 +432,7 @@ impl Session {
             // A PostgREST read/write reports a fixed response column shape,
             // independent of the inner query's columns.
             match &prep.postprocess {
-                Postprocess::PgrstRead => {
+                Postprocess::PgrstRead | Postprocess::PgrstEmbed(_) => {
                     let cols: Vec<String> = datapath::BODY_COLUMNS
                         .iter()
                         .map(|c| c.to_string())
@@ -542,6 +562,10 @@ impl Session {
             Postprocess::PgrstDelete(plan) => Some((plan.table.clone(), plan.where_clause.clone())),
             _ => None,
         };
+        let embed_plan = match &prep.postprocess {
+            Postprocess::PgrstEmbed(plan) => Some(plan.clone()),
+            _ => None,
+        };
         let is_read = matches!(prep.postprocess, Postprocess::PgrstRead);
 
         // A PostgREST read: run the (rewritten) inner SELECT on the engine, then
@@ -555,6 +579,24 @@ impl Session {
                     .collect(),
                 oids: datapath::BODY_OIDS.to_vec(),
                 rows: vec![datapath::body_row(&inner.columns, &inner.rows)],
+                tag: "SELECT 1".to_string(),
+                has_rows: true,
+            };
+            self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+            return Ok(());
+        }
+
+        // A PostgREST FK-embedding read: decompose into per-relation engine
+        // queries and assemble the nested JSON body.
+        if let Some(plan) = embed_plan {
+            let (body, count) = self.run_pgrst_embed(&plan, &params, &order)?;
+            let mat = Mat {
+                columns: datapath::BODY_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                oids: datapath::BODY_OIDS.to_vec(),
+                rows: vec![datapath::body_row_json(body, count)],
                 tag: "SELECT 1".to_string(),
                 has_rows: true,
             };
@@ -731,6 +773,123 @@ impl Session {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Execute a PostgREST FK-embedding read: fetch the base rows, then resolve
+    /// each embedded relation per base row with a correlated engine query, and
+    /// assemble the nested JSON body. Returns `(body, row_count)`. This is a
+    /// nested-loop join done in the server (composition glue, spec 12) — the
+    /// engine never sees LATERAL, `row_to_json`, or `json_agg`.
+    fn run_pgrst_embed(
+        &mut self,
+        plan: &datapath::EmbedRead,
+        params: &[Value],
+        _order: &[usize],
+    ) -> Result<(String, i64), (String, String)> {
+        use datapath::EmbedItem;
+        // Base columns to fetch: every emitted column plus each embed's
+        // correlation column (deduped, order-stable).
+        let mut fetch: Vec<String> = Vec::new();
+        let mut want = |c: &str| {
+            if !fetch.iter().any(|f| f == c) {
+                fetch.push(c.to_string());
+            }
+        };
+        for item in &plan.items {
+            match item {
+                EmbedItem::Column { column, .. } => want(column),
+                EmbedItem::Relation(e) => want(&e.base_col),
+            }
+        }
+        let base_sql = if plan.base_tail.is_empty() {
+            format!("SELECT {} FROM {}", fetch.join(", "), plan.base_table)
+        } else {
+            format!(
+                "SELECT {} FROM {} {}",
+                fetch.join(", "),
+                plan.base_table,
+                plan.base_tail
+            )
+        };
+        // The base tail may carry `$n` filter placeholders; rewrite + bind them.
+        let (base_rewritten, base_order) = rewrite_placeholders(&base_sql);
+        let base = self.run_engine(&base_rewritten, params, &base_order)?;
+        let idx = |name: &str| base.columns.iter().position(|c| c == name);
+
+        let mut objects: Vec<String> = Vec::with_capacity(base.rows.len());
+        for row in &base.rows {
+            let mut obj = String::from("{");
+            for (i, item) in plan.items.iter().enumerate() {
+                if i > 0 {
+                    obj.push(',');
+                }
+                match item {
+                    EmbedItem::Column { key, column } => {
+                        let v = idx(column)
+                            .and_then(|ix| row.get(ix))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        obj.push_str(&datapath::json_key(key));
+                        obj.push(':');
+                        obj.push_str(&datapath::json_value(&v));
+                    }
+                    EmbedItem::Relation(e) => {
+                        let key_val = idx(&e.base_col)
+                            .and_then(|ix| row.get(ix))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let (rcols, rrows) = self.run_embed_relation(e, key_val)?;
+                        obj.push_str(&datapath::json_key(&e.key));
+                        obj.push(':');
+                        if e.to_many {
+                            obj.push_str(&datapath::json_array(&rcols, &rrows));
+                        } else if let Some(first) = rrows.first() {
+                            obj.push_str(&datapath::json_object(&rcols, first));
+                        } else {
+                            obj.push_str("null");
+                        }
+                    }
+                }
+            }
+            obj.push('}');
+            objects.push(obj);
+        }
+        let count = objects.len() as i64;
+        Ok((format!("[{}]", objects.join(",")), count))
+    }
+
+    /// Run one embed's correlated query: `SELECT <rel cols> FROM <rel> WHERE
+    /// <rel col> = <key>`. Returns the relation's column names and matching rows.
+    #[allow(clippy::type_complexity)]
+    fn run_embed_relation(
+        &mut self,
+        e: &datapath::Embed,
+        key: Value,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>), (String, String)> {
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} = ?",
+            e.rel_columns.join(", "),
+            e.rel_table,
+            e.rel_col
+        );
+        let mut st = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| split_err(&e.to_string()))?;
+        st.bind(1, key).map_err(|e| split_err(&e.to_string()))?;
+        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        let nc = st.column_count();
+        let columns: Vec<String> = (0..nc)
+            .map(|c| st.column_name(c).unwrap_or("").to_string())
+            .collect();
+        let mut rows = Vec::new();
+        while st.step().map_err(|e| split_err(&e.to_string()))? {
+            let row: Vec<Value> = (0..nc)
+                .map(|c| st.column_value(c).cloned().unwrap_or(Value::Null))
+                .collect();
+            rows.push(row);
+        }
+        Ok((columns, rows))
     }
 
     /// Execute a parameterized statement on the engine and collect its result.

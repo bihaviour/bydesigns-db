@@ -192,11 +192,17 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
   referential integrity in this phase. The PostgREST-specific glue (version
   probe, binary catalog reflection — tables *and* FK relationships — and
   data-path rewriting of PostgREST's fixed `pgrst_source` query templates —
-  GET/POST/PATCH/DELETE — into engine-runnable SQL) stays in `crates/server`
-  (`introspect.rs`/`reflect.rs`/`datapath.rs`), never the engine. Unmodified
-  PostgREST 14.13 serves full CRUD over the engine with zero engine changes;
-  FK-based resource embedding reflects relationships into PostgREST's schema
-  cache, with the embedding data-path rewrite landing against captured SQL.
+  GET/POST/PATCH/DELETE *and* FK-embedding reads — into engine-runnable SQL)
+  stays in `crates/server` (`introspect.rs`/`reflect.rs`/`datapath.rs`), never
+  the engine. Unmodified PostgREST 14.13 serves full CRUD over the engine with
+  zero engine changes; FK-based resource embedding works end-to-end —
+  relationships reflect into PostgREST's schema cache, and the embedding
+  data-path (`?select=col,rel(col)`, both many-to-one and one-to-many) is
+  decomposed by the server (`datapath::parse_embed`) into per-relation engine
+  queries whose nested JSON it assembles itself — a nested-loop join in
+  composition glue, so the engine never sees `LEFT JOIN LATERAL`, `row_to_json`,
+  or `json_agg`. The rewrite is built against PostgREST 14.13's *captured* SQL
+  (`local-e2e/postgrest-corpus-embedding.log`).
 
 ## When changing things
 
