@@ -61,6 +61,18 @@ fn one_row(col: &str, value: &str) -> Canned {
     }
 }
 
+/// A zero-row result with the given column names — used to satisfy introspection
+/// queries that have no rows to return here (role settings, the schema cache
+/// before catalog reflection lands). Empty rows carry no data, so the column
+/// count is all the client decodes; no per-column binary encoding is needed.
+fn empty_rows(columns: &[&str]) -> Canned {
+    Canned::Rows {
+        columns: columns.iter().map(|c| c.to_string()).collect(),
+        rows: vec![],
+        tag: "SELECT 0".to_string(),
+    }
+}
+
 /// Inspect a statement; return a canned answer or [`Canned::Pass`].
 pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     let s = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
@@ -88,29 +100,110 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
         return one_row(name, setting_value(name));
     }
 
+    // PostgREST's schema-cache introspection (a recursive pg_catalog query the
+    // engine cannot execute). Reflected from the real catalog elsewhere; for now
+    // a placeholder empty result with the exact 9-column shape PostgREST decodes.
+    if s.contains("pg_relation_is_updatable") {
+        return empty_rows(&[
+            "table_schema",
+            "table_name",
+            "table_description",
+            "is_view",
+            "insertable",
+            "updatable",
+            "deletable",
+            "pk_cols",
+            "columns",
+        ]);
+    }
+
+    // PostgREST loads the timezone list (for the `Prefer: timezone=` header).
+    // The engine has no tz catalog → empty list.
+    if s.contains("pg_timezone_names") {
+        return empty_rows(&["name"]);
+    }
+
+    // PostgREST's cast introspection (pg_cast — domain ⇄ json/text coercions).
+    // No domains/casts here → empty result.
+    if s.contains("pg_cast") || s.contains("castsource") {
+        return empty_rows(&["castsource", "casttarget", "castfunc"]);
+    }
+
+    // PostgREST's computed-relationships query (set-returning functions that act
+    // as relationships). No functions here → empty result.
+    if s.contains("computed_rels") || s.contains("all_relations") {
+        return empty_rows(&[
+            "name",
+            "rel_table_schema",
+            "rel_table_name",
+            "rel_ftable_schema",
+            "rel_ftable_name",
+            "single_row",
+            "is_self",
+        ]);
+    }
+
+    // PostgREST's functions/RPC introspection (pg_proc). No user functions here
+    // → empty result (the /rpc surface is simply empty).
+    if s.contains("rettype_is_setof") || s.contains("proargmodes") {
+        return empty_rows(&[
+            "proc_schema",
+            "proc_name",
+            "proc_description",
+            "args",
+            "schema",
+            "name",
+            "rettype_is_setof",
+            "rettype_is_composite",
+            "rettype_is_composite_alias",
+            "provolatile",
+            "hasvariadic",
+            "transaction_isolation_level",
+            "kvs",
+        ]);
+    }
+
+    // PostgREST's foreign-key relationship query (pg_constraint, contype='f').
+    // The engine does not yet track FK constraints → no relationships (so no
+    // resource embedding until FK metadata lands).
+    if s.contains("pks_uniques_cols") {
+        return empty_rows(&[
+            "table_schema",
+            "table_name",
+            "foreign_table_schema",
+            "foreign_table_name",
+            "is_self",
+            "constraint_name",
+            "cols_and_fcols",
+            "one_to_one",
+        ]);
+    }
+
+    // PostgREST's view-relationship dependency query (recursive, parses view
+    // definitions from pg_rewrite). No views here → empty result.
+    if s.contains("pks_fks") || s.contains("column_dependencies") {
+        return empty_rows(&[
+            "table_schema",
+            "table_name",
+            "view_schema",
+            "view_name",
+            "constraint_name",
+            "constraint_type",
+            "column_dependencies",
+        ]);
+    }
+
     // PostgREST's per-role config-settings query reads `pg_db_role_setting`
     // (custom GUCs set via ALTER ROLE). The engine has no such catalog and no
     // role settings, so the correct answer is zero rows — and PostgREST blocks
     // (retries) until this query succeeds, so it must not fall through and fail.
     if s.contains("pg_db_role_setting") {
-        return Canned::Rows {
-            columns: vec!["key".to_string(), "value".to_string()],
-            rows: vec![],
-            tag: "SELECT 0".to_string(),
-        };
+        return empty_rows(&["key", "value"]);
     }
     // PostgREST's other role-settings query (per-role GUCs via ALTER ROLE,
     // joined against pg_settings). No roles carry settings here → zero rows.
     if s.contains("pg_auth_members") {
-        return Canned::Rows {
-            columns: vec![
-                "rolname".to_string(),
-                "iso_lvl".to_string(),
-                "role_settings".to_string(),
-            ],
-            rows: vec![],
-            tag: "SELECT 0".to_string(),
-        };
+        return empty_rows(&["rolname", "iso_lvl", "role_settings"]);
     }
 
     // PostgREST 14.x's exact startup probe (captured from the real client): one
@@ -270,6 +363,35 @@ mod tests {
                 intercept(q, "postgres", "srv"),
                 Canned::Rows { rows, .. } if rows.is_empty()
             ));
+        }
+    }
+
+    #[test]
+    fn schema_cache_queries_are_intercepted_empty() {
+        // Each PostgREST schema-cache query (matched by a marker token) must be
+        // intercepted with an empty, correctly-shaped result so the engine never
+        // sees the un-runnable pg_catalog SQL and the cache loads. Column counts
+        // match what PostgREST decodes.
+        let cases = [
+            (
+                "...pg_relation_is_updatable(c.oid::regclass, TRUE) & 8...",
+                9,
+            ),
+            ("...JOIN pks_uniques_cols ... contype = 'f'...", 8),
+            ("...with recursive pks_fks as ... column_dependencies...", 7),
+            ("...rettype_is_setof ... proargmodes::text[]...", 13),
+            ("...all_relations as ( ... computed_rels", 7),
+            ("...from pg_cast c ... castsource...", 3),
+            ("SELECT name FROM pg_timezone_names", 1),
+        ];
+        for (sql, ncols) in cases {
+            match intercept(sql, "postgres", "srv") {
+                Canned::Rows { columns, rows, .. } => {
+                    assert_eq!(columns.len(), ncols, "wrong column count for {sql:?}");
+                    assert!(rows.is_empty(), "expected empty rows for {sql:?}");
+                }
+                _ => panic!("schema-cache query not intercepted: {sql:?}"),
+            }
         }
     }
 }
