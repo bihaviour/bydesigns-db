@@ -403,11 +403,12 @@
   }
 
   // ---- Analytics + cookie consent -------------------------------------------
-  // Privacy-first: no Google script is requested and no cookie is set until the
-  // visitor explicitly clicks "Accept". The choice is remembered in
-  // localStorage; "Decline" keeps analytics fully off. Google Consent Mode v2
-  // defaults every signal to "denied" so even an accidental early load tracks
-  // nothing.
+  // Google Consent Mode v2 (Advanced). gtag.js loads on every page so the tag is
+  // always present (and detectable by Google's installation check), but every
+  // signal defaults to "denied" until the visitor clicks "Accept": before consent
+  // GA sends only cookieless pings (no identifiers, no analytics cookie). The
+  // choice is remembered in localStorage; "Accept" grants analytics storage,
+  // "Decline" keeps it cookieless. Inert until a real "G-" id is configured.
   (function analytics() {
     var ID = GA4_MEASUREMENT_ID;
     if (typeof ID !== "string" || ID.slice(0, 2) !== "G-") return; // inert until configured
@@ -419,40 +420,36 @@
     window.dataLayer = window.dataLayer || [];
     function gtag() { window.dataLayer.push(arguments); }
 
-    // Consent Mode v2 default — denied until the visitor opts in.
+    // Consent Mode v2 default — honour a stored grant, otherwise "denied".
     gtag("consent", "default", {
       ad_storage: "denied",
       ad_user_data: "denied",
       ad_personalization: "denied",
-      analytics_storage: "denied",
+      analytics_storage: stored === "granted" ? "granted" : "denied",
+      wait_for_update: 500,
     });
+    gtag("set", "ads_data_redaction", true);
+    gtag("set", "url_passthrough", true);
 
-    var loaded = false;
-    function loadGA() {
-      if (loaded) return;
-      loaded = true;
-      var s = document.createElement("script");
-      s.async = true;
-      s.src = "https://www.googletagmanager.com/gtag/js?id=" + encodeURIComponent(ID);
-      document.head.appendChild(s);
-      gtag("js", new Date());
-      gtag("config", ID, { anonymize_ip: true });
-    }
+    // Advanced mode: load gtag.js immediately (gated server-side by consent).
+    var s = document.createElement("script");
+    s.async = true;
+    s.src = "https://www.googletagmanager.com/gtag/js?id=" + encodeURIComponent(ID);
+    document.head.appendChild(s);
+    gtag("js", new Date());
+    gtag("config", ID, { anonymize_ip: true });
 
     function grant() {
       try { localStorage.setItem(STORE_KEY, "granted"); } catch (e) {}
-      gtag("consent", "update", {
-        analytics_storage: "granted",
-      });
-      loadGA();
+      gtag("consent", "update", { analytics_storage: "granted" });
     }
 
     function deny() {
       try { localStorage.setItem(STORE_KEY, "denied"); } catch (e) {}
+      gtag("consent", "update", { analytics_storage: "denied" });
     }
 
-    if (stored === "granted") { grant(); return; }
-    if (stored === "denied") { return; }
+    if (stored === "granted" || stored === "denied") return; // decision already made
 
     // No decision yet — show the banner.
     function showBanner() {
