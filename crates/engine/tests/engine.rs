@@ -433,3 +433,56 @@ fn scalar_functions_and_json() {
 
     let _ = fs::remove_file(&p);
 }
+
+#[test]
+fn foreign_keys_are_tracked_and_persist() {
+    let p = db_path("fk");
+    let url = url_for(&p);
+    {
+        let mut db = Connection::open(&url).unwrap();
+        db.exec("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        // Inline column REFERENCES with an explicit referenced column.
+        db.exec(
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, \
+             author_id INTEGER REFERENCES authors (id))",
+        )
+        .unwrap();
+        // Table-level FOREIGN KEY whose referenced column defaults to the PK,
+        // plus a named constraint.
+        db.exec(
+            "CREATE TABLE reviews (id INTEGER PRIMARY KEY, book INTEGER, \
+             CONSTRAINT reviews_book_fk FOREIGN KEY (book) REFERENCES books)",
+        )
+        .unwrap();
+
+        let cat = db.catalog();
+        let books = cat.iter().find(|t| t.name == "books").unwrap();
+        assert_eq!(books.foreign_keys.len(), 1);
+        let fk = &books.foreign_keys[0];
+        assert_eq!(fk.name, "books_author_id_fkey"); // synthesized
+        assert_eq!(fk.columns, vec!["author_id".to_string()]);
+        assert_eq!(fk.foreign_table, "authors");
+        assert_eq!(fk.foreign_columns, vec!["id".to_string()]);
+
+        let reviews = cat.iter().find(|t| t.name == "reviews").unwrap();
+        let rfk = &reviews.foreign_keys[0];
+        assert_eq!(rfk.name, "reviews_book_fk"); // declared
+        assert_eq!(rfk.foreign_table, "books");
+        assert_eq!(rfk.foreign_columns, vec!["id".to_string()]); // defaulted to PK
+    }
+
+    // Reopen: the FK metadata is rebuilt purely from the durable WAL.
+    let db = Connection::open(&url).unwrap();
+    let cat = db.catalog();
+    let books = cat.iter().find(|t| t.name == "books").unwrap();
+    assert_eq!(books.foreign_keys.len(), 1);
+    assert_eq!(books.foreign_keys[0].foreign_table, "authors");
+    let reviews = cat.iter().find(|t| t.name == "reviews").unwrap();
+    assert_eq!(
+        reviews.foreign_keys[0].foreign_columns,
+        vec!["id".to_string()]
+    );
+
+    let _ = fs::remove_file(&p);
+}

@@ -41,6 +41,17 @@ pub struct Connection {
 pub struct CatalogTable {
     pub name: String,
     pub columns: Vec<CatalogColumn>,
+    pub foreign_keys: Vec<CatalogForeignKey>,
+}
+
+/// A reflected foreign-key relationship: the local columns and the table +
+/// columns they reference. The pgwire server reflects these into PostgREST's
+/// relationship cache to enable resource embedding.
+pub struct CatalogForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub foreign_table: String,
+    pub foreign_columns: Vec<String>,
 }
 
 /// A reflected column: its Postgres type name plus key / nullability flags.
@@ -100,6 +111,16 @@ impl Connection {
                         not_null: c.not_null,
                         primary_key: c.primary_key,
                         position: (i + 1) as i32,
+                    })
+                    .collect(),
+                foreign_keys: s
+                    .foreign_keys
+                    .into_iter()
+                    .map(|fk| CatalogForeignKey {
+                        name: fk.name,
+                        columns: fk.columns,
+                        foreign_table: fk.foreign_table,
+                        foreign_columns: fk.foreign_columns,
                     })
                     .collect(),
             })
@@ -352,11 +373,74 @@ impl Connection {
         res.map(|_| ())
     }
 
+    /// Resolve parsed foreign keys into catalog form: default the referenced
+    /// columns to the referenced table's primary key, validate the column counts
+    /// agree, and synthesize a `<table>_<cols>_fkey` name when none was declared.
+    /// The engine does not enforce referential integrity in this phase; FKs are
+    /// metadata for the pgwire server to reflect into PostgREST's schema cache.
+    fn resolve_foreign_keys(
+        &self,
+        table: &str,
+        local_columns: &[crate::catalog::Column],
+        specs: &[crate::sql::ForeignKeySpec],
+    ) -> Result<Vec<crate::catalog::ForeignKey>> {
+        let store = self.db.store.read().unwrap();
+        // The primary-key column(s) of a referenced table — looked up in the
+        // store, or among the columns being created for a self-reference.
+        let referenced_pk = |ft: &str| -> Option<Vec<String>> {
+            let pk_of = |cols: &[crate::catalog::Column]| -> Vec<String> {
+                cols.iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .collect()
+            };
+            let pk = if ft.eq_ignore_ascii_case(table) {
+                pk_of(local_columns)
+            } else {
+                pk_of(&store.table(ft)?.schema.columns)
+            };
+            (!pk.is_empty()).then_some(pk)
+        };
+
+        let mut out = Vec::with_capacity(specs.len());
+        for fk in specs {
+            let foreign_columns = if fk.foreign_columns.is_empty() {
+                referenced_pk(&fk.foreign_table).ok_or_else(|| {
+                    EngineError::sql(format!(
+                        "foreign key on {table} references {} which has no known primary key",
+                        fk.foreign_table
+                    ))
+                })?
+            } else {
+                fk.foreign_columns.clone()
+            };
+            if foreign_columns.len() != fk.columns.len() {
+                return Err(EngineError::sql(format!(
+                    "foreign key on {table}: {} local column(s) reference {} column(s)",
+                    fk.columns.len(),
+                    foreign_columns.len()
+                )));
+            }
+            let name = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{table}_{}_fkey", fk.columns.join("_")));
+            out.push(crate::catalog::ForeignKey {
+                name,
+                columns: fk.columns.clone(),
+                foreign_table: fk.foreign_table.clone(),
+                foreign_columns,
+            });
+        }
+        Ok(out)
+    }
+
     fn do_ddl(&self, stmt: &Stmt) -> Result<Option<u64>> {
         match stmt {
             Stmt::CreateTable {
                 name,
                 columns,
+                foreign_keys,
                 if_not_exists,
             } => {
                 if self.db.store.read().unwrap().has_table(name) {
@@ -379,9 +463,11 @@ impl Connection {
                         "composite PRIMARY KEY is not supported in Phase 1",
                     ));
                 }
+                let fks = self.resolve_foreign_keys(name, &cols, foreign_keys)?;
                 let schema = crate::catalog::TableSchema {
                     name: name.clone(),
                     columns: cols,
+                    foreign_keys: fks,
                 };
                 let records = vec![
                     WalOp::CreateTable {

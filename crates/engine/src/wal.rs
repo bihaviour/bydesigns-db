@@ -7,7 +7,7 @@
 //! the group, stamping every produced row version with the marker's commit LSN.
 //! Records after the last marker (an incomplete transaction) are discarded.
 
-use crate::catalog::{Column, TableSchema};
+use crate::catalog::{Column, ForeignKey, TableSchema};
 use crate::error::{EngineError, Result};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexDef, IndexParams, Metric};
@@ -67,6 +67,22 @@ impl WalOp {
                     }
                     b.push(flags);
                 }
+                // Foreign keys follow the columns. Records written before FK
+                // support carry no trailing bytes; decode treats their absence
+                // as "no foreign keys" (see below), so this stays compatible.
+                put_u32(&mut b, schema.foreign_keys.len() as u32);
+                for fk in &schema.foreign_keys {
+                    put_str(&mut b, &fk.name);
+                    put_str(&mut b, &fk.foreign_table);
+                    put_u32(&mut b, fk.columns.len() as u32);
+                    for c in &fk.columns {
+                        put_str(&mut b, c);
+                    }
+                    put_u32(&mut b, fk.foreign_columns.len() as u32);
+                    for c in &fk.foreign_columns {
+                        put_str(&mut b, c);
+                    }
+                }
             }
             WalOp::DropTable { name } => {
                 b.push(OP_DROP);
@@ -124,8 +140,39 @@ impl WalOp {
                         not_null: flags & 2 != 0,
                     });
                 }
+                // Foreign keys, if present. A record written before FK support
+                // ends right after the columns, so an exhausted cursor means
+                // "no foreign keys" rather than a truncation error.
+                let mut foreign_keys = Vec::new();
+                if !c.at_end() {
+                    let nfk = c.u32()? as usize;
+                    for _ in 0..nfk {
+                        let name = c.str()?;
+                        let foreign_table = c.str()?;
+                        let ncol = c.u32()? as usize;
+                        let mut cols = Vec::with_capacity(ncol);
+                        for _ in 0..ncol {
+                            cols.push(c.str()?);
+                        }
+                        let nfcol = c.u32()? as usize;
+                        let mut fcols = Vec::with_capacity(nfcol);
+                        for _ in 0..nfcol {
+                            fcols.push(c.str()?);
+                        }
+                        foreign_keys.push(ForeignKey {
+                            name,
+                            columns: cols,
+                            foreign_table,
+                            foreign_columns: fcols,
+                        });
+                    }
+                }
                 WalOp::CreateTable {
-                    schema: TableSchema { name, columns },
+                    schema: TableSchema {
+                        name,
+                        columns,
+                        foreign_keys,
+                    },
                 }
             }
             OP_DROP => WalOp::DropTable { name: c.str()? },
@@ -226,6 +273,10 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    /// Whether the cursor has consumed every byte of the record.
+    fn at_end(&self) -> bool {
+        self.p >= self.b.len()
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.p + n > self.b.len() {
             return Err(EngineError::internal("WAL record truncated"));

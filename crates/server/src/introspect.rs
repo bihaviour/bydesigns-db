@@ -43,6 +43,9 @@ pub enum Canned {
 pub enum ReflectKind {
     /// The tables/columns/PK query (`pg_relation_is_updatable`).
     Tables,
+    /// The foreign-key relationship query (`pg_constraint`, `contype='f'`),
+    /// which PostgREST turns into resource-embedding relationships.
+    Relationships,
 }
 
 /// The advertised value of a GUC / run-time setting, for `SHOW` and
@@ -184,19 +187,10 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     }
 
     // PostgREST's foreign-key relationship query (pg_constraint, contype='f').
-    // The engine does not yet track FK constraints → no relationships (so no
-    // resource embedding until FK metadata lands).
+    // Reflected from the engine catalog's foreign keys by the session, which
+    // turns each into an embeddable relationship.
     if s.contains("pks_uniques_cols") {
-        return empty_rows(&[
-            "table_schema",
-            "table_name",
-            "foreign_table_schema",
-            "foreign_table_name",
-            "is_self",
-            "constraint_name",
-            "cols_and_fcols",
-            "one_to_one",
-        ]);
+        return Canned::Reflect(ReflectKind::Relationships);
     }
 
     // PostgREST's view-relationship dependency query (recursive, parses view
@@ -405,10 +399,19 @@ mod tests {
             Canned::Reflect(ReflectKind::Tables)
         ));
 
+        // The FK relationship query is likewise reflected from the live catalog.
+        assert!(matches!(
+            intercept(
+                "...JOIN pks_uniques_cols ... contype = 'f'...",
+                "postgres",
+                "srv"
+            ),
+            Canned::Reflect(ReflectKind::Relationships)
+        ));
+
         // The remaining schema-cache queries are answered with an empty,
         // correctly-shaped result (no catalog needed).
         let cases = [
-            ("...JOIN pks_uniques_cols ... contype = 'f'...", 8),
             ("...with recursive pks_fks as ... column_dependencies...", 7),
             ("...rettype_is_setof ... proargmodes::text[]...", 13),
             ("...all_relations as ( ... computed_rels", 7),

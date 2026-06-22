@@ -16,6 +16,7 @@ pub enum Stmt {
     CreateTable {
         name: String,
         columns: Vec<ColumnSpec>,
+        foreign_keys: Vec<ForeignKeySpec>,
         if_not_exists: bool,
     },
     DropTable {
@@ -59,6 +60,20 @@ pub struct ColumnSpec {
     pub ty: ColumnType,
     pub primary_key: bool,
     pub not_null: bool,
+    /// An inline `REFERENCES <table>[(<col>)]` constraint: the referenced table
+    /// and, optionally, the referenced column (defaulting to its primary key).
+    pub references: Option<(String, Option<String>)>,
+}
+
+/// A foreign key as parsed from `CREATE TABLE` (inline or table-level). The
+/// referenced columns may be empty, meaning "the referenced table's primary
+/// key", resolved against the catalog when the table is created.
+#[derive(Debug)]
+pub struct ForeignKeySpec {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub foreign_table: String,
+    pub foreign_columns: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -400,9 +415,29 @@ impl Parser {
         let name = self.ident()?;
         self.expect(Tok::LParen)?;
         let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
-            let col = self.column_spec()?;
-            columns.push(col);
+            // A table-level constraint (`[CONSTRAINT n] PRIMARY KEY/UNIQUE/FOREIGN
+            // KEY/CHECK …`) rather than a column definition. Only FOREIGN KEY is
+            // captured; PRIMARY KEY/UNIQUE/CHECK are consumed and ignored, as
+            // composite keys are out of Phase-1 scope (a single-column key is
+            // declared inline on its column instead).
+            if self.peek_table_constraint() {
+                if let Some(fk) = self.table_constraint()? {
+                    foreign_keys.push(fk);
+                }
+            } else {
+                let col = self.column_spec()?;
+                if let Some((ft, fc)) = col.references.clone() {
+                    foreign_keys.push(ForeignKeySpec {
+                        name: None,
+                        columns: vec![col.name.clone()],
+                        foreign_table: ft,
+                        foreign_columns: fc.into_iter().collect(),
+                    });
+                }
+                columns.push(col);
+            }
             if self.skip(Tok::Comma) {
                 continue;
             }
@@ -415,6 +450,7 @@ impl Parser {
         Ok(Stmt::CreateTable {
             name,
             columns,
+            foreign_keys,
             if_not_exists,
         })
     }
@@ -432,6 +468,7 @@ impl Parser {
         }
         let mut primary_key = false;
         let mut not_null = false;
+        let mut references = None;
         loop {
             if self.eat_kw("primary") {
                 self.expect_kw("key")?;
@@ -444,6 +481,8 @@ impl Parser {
                 // explicit nullable
             } else if self.eat_kw("unique") {
                 // treated like a constraint marker; uniqueness enforced for PK only in P1
+            } else if self.eat_kw("references") {
+                references = Some(self.references_target()?);
             } else {
                 break;
             }
@@ -453,7 +492,93 @@ impl Parser {
             ty,
             primary_key,
             not_null,
+            references,
         })
+    }
+
+    /// The `<table>[(<col>)]` after a `REFERENCES` keyword.
+    fn references_target(&mut self) -> Result<(String, Option<String>)> {
+        let table = self.ident()?;
+        let column = if self.skip(Tok::LParen) {
+            let c = self.ident()?;
+            self.expect(Tok::RParen)?;
+            Some(c)
+        } else {
+            None
+        };
+        Ok((table, column))
+    }
+
+    /// Does the next token begin a table-level constraint clause?
+    fn peek_table_constraint(&self) -> bool {
+        self.peek_word().is_some_and(|w| {
+            ["constraint", "primary", "unique", "foreign", "check"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k))
+        })
+    }
+
+    /// Parse a table-level constraint, returning a foreign key when it declares
+    /// one. `PRIMARY KEY`/`UNIQUE`/`CHECK` are consumed and ignored (`None`).
+    fn table_constraint(&mut self) -> Result<Option<ForeignKeySpec>> {
+        let mut name = None;
+        if self.eat_kw("constraint") {
+            name = Some(self.ident()?);
+        }
+        if self.eat_kw("foreign") {
+            self.expect_kw("key")?;
+            let columns = self.paren_ident_list()?;
+            self.expect_kw("references")?;
+            let foreign_table = self.ident()?;
+            let foreign_columns = if self.peek() == &Tok::LParen {
+                self.paren_ident_list()?
+            } else {
+                Vec::new()
+            };
+            return Ok(Some(ForeignKeySpec {
+                name,
+                columns,
+                foreign_table,
+                foreign_columns,
+            }));
+        }
+        // PRIMARY KEY (cols) / UNIQUE (cols) / CHECK (…): consume and ignore.
+        let _ = self.eat_kw("primary") && self.eat_kw("key");
+        let _ = self.eat_kw("unique") || self.eat_kw("check");
+        if self.peek() == &Tok::LParen {
+            self.skip_balanced_parens()?;
+        }
+        Ok(None)
+    }
+
+    /// A parenthesized, comma-separated identifier list: `(a, b, c)`.
+    fn paren_ident_list(&mut self) -> Result<Vec<String>> {
+        self.expect(Tok::LParen)?;
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.ident()?);
+            if self.skip(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(Tok::RParen)?;
+        Ok(cols)
+    }
+
+    /// Consume a balanced `( … )` group (for constraint bodies we don't model).
+    fn skip_balanced_parens(&mut self) -> Result<()> {
+        self.expect(Tok::LParen)?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.bump() {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth -= 1,
+                Tok::Eof => return Err(EngineError::sql("unterminated constraint")),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Parse an optional `(n)` / `(p,s)` type suffix. For a vector type the first
@@ -1227,7 +1352,7 @@ fn agg_func(w: &str) -> Option<AggFunc> {
 }
 
 fn is_constraint_kw(w: &str) -> bool {
-    ["primary", "not", "null", "unique"]
+    ["primary", "not", "null", "unique", "references"]
         .iter()
         .any(|k| w.eq_ignore_ascii_case(k))
 }

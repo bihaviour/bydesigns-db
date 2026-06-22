@@ -12,6 +12,7 @@
 
 use crate::introspect::{Canned, ReflectKind};
 use engine::{CatalogTable, Value};
+use std::collections::HashSet;
 
 // Postgres type OIDs used in the reflected RowDescription.
 const OID_BOOL: i32 = 16;
@@ -30,6 +31,7 @@ const SCHEMA: &str = "public";
 pub fn reflect(kind: ReflectKind, catalog: &[CatalogTable]) -> Canned {
     match kind {
         ReflectKind::Tables => tables(catalog),
+        ReflectKind::Relationships => relationships(catalog),
     }
 }
 
@@ -89,6 +91,83 @@ fn tables(catalog: &[CatalogTable]) -> Canned {
         oids,
         rows,
         tag: format!("SELECT {}", catalog.len()),
+    }
+}
+
+/// Build the FK-relationship result PostgREST turns into embeddings. One row per
+/// foreign key, with `cols_and_fcols` the `record[]` of (local, foreign) column
+/// pairs PostgREST decodes (`array_agg(row(col.attname, refs.attname))`).
+fn relationships(catalog: &[CatalogTable]) -> Canned {
+    let columns = [
+        "table_schema",
+        "table_name",
+        "foreign_table_schema",
+        "foreign_table_name",
+        "is_self",
+        "constraint_name",
+        "cols_and_fcols",
+        "one_to_one",
+    ]
+    .iter()
+    .map(|c| c.to_string())
+    .collect();
+    let oids = vec![
+        OID_TEXT,       // table_schema
+        OID_TEXT,       // table_name
+        OID_TEXT,       // foreign_table_schema
+        OID_TEXT,       // foreign_table_name
+        OID_BOOL,       // is_self
+        OID_TEXT,       // constraint_name
+        OID_RECORD_ARR, // cols_and_fcols
+        OID_BOOL,       // one_to_one
+    ];
+
+    let mut rows = Vec::new();
+    for t in catalog {
+        // The table's primary key — a FK whose columns match it is one-to-one.
+        let pk: HashSet<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.as_str())
+            .collect();
+        for fk in &t.foreign_keys {
+            let pairs: Vec<Vec<u8>> = fk
+                .columns
+                .iter()
+                .zip(&fk.foreign_columns)
+                .map(|(col, fcol)| {
+                    composite(&[
+                        (OID_TEXT, Some(col.clone().into_bytes())),
+                        (OID_TEXT, Some(fcol.clone().into_bytes())),
+                    ])
+                })
+                .collect();
+            let one_to_one = !pk.is_empty()
+                && fk
+                    .columns
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>()
+                    == pk;
+            rows.push(vec![
+                Value::Text(SCHEMA.to_string()),
+                Value::Text(t.name.clone()),
+                Value::Text(SCHEMA.to_string()),
+                Value::Text(fk.foreign_table.clone()),
+                Value::Blob(bin_bool(fk.foreign_table.eq_ignore_ascii_case(&t.name))),
+                Value::Text(fk.name.clone()),
+                Value::Blob(record_array(&pairs)),
+                Value::Blob(bin_bool(one_to_one)),
+            ]);
+        }
+    }
+
+    Canned::Rows {
+        tag: format!("SELECT {}", rows.len()),
+        columns,
+        oids,
+        rows,
     }
 }
 
@@ -165,7 +244,7 @@ fn array(elem_oid: i32, elems: &[Vec<u8>]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::CatalogColumn;
+    use engine::{CatalogColumn, CatalogForeignKey};
 
     #[test]
     fn empty_array_is_zero_dim() {
@@ -196,6 +275,7 @@ mod tests {
                     position: 2,
                 },
             ],
+            foreign_keys: vec![],
         }];
         match reflect(ReflectKind::Tables, &catalog) {
             Canned::Rows {
@@ -216,6 +296,70 @@ mod tests {
                 assert!(matches!(&row[8], Value::Blob(b) if b.len() > 12));
             }
             _ => panic!("Tables reflection must produce Rows"),
+        }
+    }
+
+    #[test]
+    fn relationships_reflection_shape() {
+        // books.author_id -> authors.id : a many-to-one relationship.
+        let catalog = vec![
+            CatalogTable {
+                name: "authors".into(),
+                columns: vec![CatalogColumn {
+                    name: "id".into(),
+                    pg_type: "bigint",
+                    not_null: true,
+                    primary_key: true,
+                    position: 1,
+                }],
+                foreign_keys: vec![],
+            },
+            CatalogTable {
+                name: "books".into(),
+                columns: vec![
+                    CatalogColumn {
+                        name: "id".into(),
+                        pg_type: "bigint",
+                        not_null: true,
+                        primary_key: true,
+                        position: 1,
+                    },
+                    CatalogColumn {
+                        name: "author_id".into(),
+                        pg_type: "bigint",
+                        not_null: false,
+                        primary_key: false,
+                        position: 2,
+                    },
+                ],
+                foreign_keys: vec![CatalogForeignKey {
+                    name: "books_author_id_fkey".into(),
+                    columns: vec!["author_id".into()],
+                    foreign_table: "authors".into(),
+                    foreign_columns: vec!["id".into()],
+                }],
+            },
+        ];
+        match reflect(ReflectKind::Relationships, &catalog) {
+            Canned::Rows {
+                columns,
+                oids,
+                rows,
+                tag,
+            } => {
+                assert_eq!(columns.len(), 8);
+                assert_eq!(oids[6], OID_RECORD_ARR); // cols_and_fcols
+                assert_eq!(tag, "SELECT 1");
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert!(matches!(&row[1], Value::Text(t) if t == "books"));
+                assert!(matches!(&row[3], Value::Text(t) if t == "authors"));
+                assert!(matches!(&row[4], Value::Blob(b) if b == &[0])); // is_self = false
+                assert!(matches!(&row[5], Value::Text(t) if t == "books_author_id_fkey"));
+                assert!(matches!(&row[6], Value::Blob(b) if b.len() > 12)); // non-empty record[]
+                assert!(matches!(&row[7], Value::Blob(b) if b == &[0])); // one_to_one = false
+            }
+            _ => panic!("Relationships reflection must produce Rows"),
         }
     }
 }
