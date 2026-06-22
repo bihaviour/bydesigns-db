@@ -40,6 +40,11 @@ enum Postprocess {
     PgrstRead,
     /// PostgREST INSERT (POST): build engine INSERTs from the JSON body param.
     PgrstInsert(datapath::InsertPlan),
+    /// PostgREST UPDATE (PATCH): SET values from the JSON body param, filtered by
+    /// the de-qualified WHERE clause carrying the remaining `$n` parameters.
+    PgrstUpdate(datapath::UpdatePlan),
+    /// PostgREST DELETE: the de-qualified WHERE clause + its `$n` parameters.
+    PgrstDelete(datapath::DeletePlan),
 }
 
 /// A bound portal and its (lazily) materialized result.
@@ -288,17 +293,23 @@ impl Session {
             return;
         }
         log_sql("parse", &sql);
-        // PostgREST INSERT (POST): nothing to prepare on the engine — the row
-        // values arrive as the JSON body parameter and are inserted at execute.
-        if let Some(plan) = datapath::parse_insert(&sql) {
+        // PostgREST write (POST/PATCH/DELETE): nothing to prepare on the engine —
+        // the row values / filters arrive as parameters and are applied at execute.
+        if let Some(write) = datapath::parse_write(&sql) {
+            let nparams = datapath::max_param(&sql).max(1);
+            let postprocess = match write {
+                datapath::Write::Insert(p) => Postprocess::PgrstInsert(p),
+                datapath::Write::Update(p) => Postprocess::PgrstUpdate(p),
+                datapath::Write::Delete(p) => Postprocess::PgrstDelete(p),
+            };
             self.stmts.insert(
                 name,
                 Prepared {
                     sql,
                     order: vec![],
-                    nparams: 1,
+                    nparams,
                     param_oids,
-                    postprocess: Postprocess::PgrstInsert(plan),
+                    postprocess,
                 },
             );
             out.parse_complete();
@@ -409,7 +420,9 @@ impl Session {
                     out.row_description(&fields(&cols, &datapath::BODY_OIDS, &[]));
                     return;
                 }
-                Postprocess::PgrstInsert(_) => {
+                Postprocess::PgrstInsert(_)
+                | Postprocess::PgrstUpdate(_)
+                | Postprocess::PgrstDelete(_) => {
                     let cols: Vec<String> = datapath::WRITE_COLUMNS
                         .iter()
                         .map(|c| c.to_string())
@@ -517,6 +530,18 @@ impl Session {
             Postprocess::PgrstInsert(plan) => Some((plan.table.clone(), plan.columns.clone())),
             _ => None,
         };
+        let update_plan = match &prep.postprocess {
+            Postprocess::PgrstUpdate(plan) => Some((
+                plan.table.clone(),
+                plan.set_columns.clone(),
+                plan.where_clause.clone(),
+            )),
+            _ => None,
+        };
+        let delete_plan = match &prep.postprocess {
+            Postprocess::PgrstDelete(plan) => Some((plan.table.clone(), plan.where_clause.clone())),
+            _ => None,
+        };
         let is_read = matches!(prep.postprocess, Postprocess::PgrstRead);
 
         // A PostgREST read: run the (rewritten) inner SELECT on the engine, then
@@ -541,17 +566,22 @@ impl Session {
         // engine INSERT per row; report the count as page_total.
         if let Some((table, columns)) = insert_plan {
             let count = self.run_pgrst_insert(&table, &columns, &params)?;
-            let mat = Mat {
-                columns: datapath::WRITE_COLUMNS
-                    .iter()
-                    .map(|c| c.to_string())
-                    .collect(),
-                oids: datapath::WRITE_OIDS.to_vec(),
-                rows: vec![datapath::write_body_row(count)],
-                tag: "SELECT 1".to_string(),
-                has_rows: true,
-            };
-            self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+            self.set_write_result(portal, count);
+            return Ok(());
+        }
+
+        // A PostgREST UPDATE (PATCH): SET values from the JSON body, filtered by
+        // the de-qualified WHERE; report the affected-row count as page_total.
+        if let Some((table, columns, where_clause)) = update_plan {
+            let count = self.run_pgrst_update(&table, &columns, &where_clause, &params)?;
+            self.set_write_result(portal, count);
+            return Ok(());
+        }
+
+        // A PostgREST DELETE: run the de-qualified DELETE with its `$n` filters.
+        if let Some((table, where_clause)) = delete_plan {
+            let count = self.run_pgrst_delete(&table, &where_clause, &params)?;
+            self.set_write_result(portal, count);
             return Ok(());
         }
 
@@ -582,6 +612,94 @@ impl Session {
         Ok(())
     }
 
+    /// Cache a write's response (return=minimal): a single row whose `page_total`
+    /// is the affected-row count, in PostgREST's write column shape.
+    fn set_write_result(&mut self, portal: &str, count: i64) {
+        let mat = Mat {
+            columns: datapath::WRITE_COLUMNS
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            oids: datapath::WRITE_OIDS.to_vec(),
+            rows: vec![datapath::write_body_row(count)],
+            tag: "SELECT 1".to_string(),
+            has_rows: true,
+        };
+        self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+    }
+
+    /// Execute a PostgREST UPDATE (PATCH): the SET values are the JSON body
+    /// parameter (`$1`); the WHERE clause carries the remaining `$n` filters.
+    /// One engine UPDATE binds the SET values first, then the filter parameters.
+    fn run_pgrst_update(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        where_clause: &str,
+        params: &[Value],
+    ) -> Result<i64, (String, String)> {
+        let body = body_text(params)?;
+        let row = datapath::json_rows(&body, columns)
+            .map_err(|e| ("22023".to_string(), e))?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let assignments = columns
+            .iter()
+            .map(|c| format!("{c} = ?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let engine_sql = if where_clause.is_empty() {
+            format!("UPDATE {table} SET {assignments}")
+        } else {
+            format!("UPDATE {table} SET {assignments} WHERE {where_clause}")
+        };
+        // The SET `?`s pass through unchanged; only the WHERE `$n` are rewritten.
+        let (rewritten, where_order) = rewrite_placeholders(&engine_sql);
+        let mut st = self
+            .conn
+            .prepare(&rewritten)
+            .map_err(|e| split_err(&e.to_string()))?;
+        let mut pos = 1;
+        for v in row {
+            st.bind(pos, v).map_err(|e| split_err(&e.to_string()))?;
+            pos += 1;
+        }
+        for &num in &where_order {
+            let v = params.get(num - 1).cloned().unwrap_or(Value::Null);
+            st.bind(pos, v).map_err(|e| split_err(&e.to_string()))?;
+            pos += 1;
+        }
+        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        Ok(self.conn.last_changes)
+    }
+
+    /// Execute a PostgREST DELETE: the de-qualified WHERE clause carries the
+    /// `$n` filter parameters, bound positionally.
+    fn run_pgrst_delete(
+        &mut self,
+        table: &str,
+        where_clause: &str,
+        params: &[Value],
+    ) -> Result<i64, (String, String)> {
+        let engine_sql = if where_clause.is_empty() {
+            format!("DELETE FROM {table}")
+        } else {
+            format!("DELETE FROM {table} WHERE {where_clause}")
+        };
+        let (rewritten, order) = rewrite_placeholders(&engine_sql);
+        let mut st = self
+            .conn
+            .prepare(&rewritten)
+            .map_err(|e| split_err(&e.to_string()))?;
+        for (j, &num) in order.iter().enumerate() {
+            let v = params.get(num - 1).cloned().unwrap_or(Value::Null);
+            st.bind(j + 1, v).map_err(|e| split_err(&e.to_string()))?;
+        }
+        st.execute().map_err(|e| split_err(&e.to_string()))?;
+        Ok(self.conn.last_changes)
+    }
+
     /// Execute a PostgREST INSERT: the row data is the JSON body parameter
     /// (`$1`); parse it into rows and run one engine INSERT per row. Returns the
     /// number of rows inserted (PostgREST's `page_total`).
@@ -591,11 +709,7 @@ impl Session {
         columns: &[String],
         params: &[Value],
     ) -> Result<i64, (String, String)> {
-        let body = match params.first() {
-            Some(Value::Text(s)) => s.clone(),
-            Some(Value::Blob(b)) => String::from_utf8_lossy(b).into_owned(),
-            _ => return Err(("22023".into(), "missing JSON request body".into())),
-        };
+        let body = body_text(params)?;
         let rows = datapath::json_rows(&body, columns).map_err(|e| ("22023".to_string(), e))?;
         let placeholders = vec!["?"; columns.len()].join(", ");
         let sql = format!(
@@ -918,6 +1032,16 @@ fn describe_error(msg: &str) -> (&'static str, String) {
 fn split_err(msg: &str) -> (String, String) {
     let (c, m) = describe_error(msg);
     (c.to_string(), m)
+}
+
+/// The JSON request body for a PostgREST write — always the first parameter
+/// (`$1`), sent as text or bytes by the driver.
+fn body_text(params: &[Value]) -> Result<String, (String, String)> {
+    match params.first() {
+        Some(Value::Text(s)) => Ok(s.clone()),
+        Some(Value::Blob(b)) => Ok(String::from_utf8_lossy(b).into_owned()),
+        _ => Err(("22023".into(), "missing JSON request body".into())),
+    }
 }
 
 /// Rewrite Postgres `$n` placeholders to the engine's positional `?`, returning

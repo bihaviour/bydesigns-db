@@ -186,7 +186,11 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
   The PostgREST-compat work (#27) additionally grows the *engine* surface with
   `::` casts, `GROUP BY`/`HAVING`, `LIMIT … OFFSET`, scalar functions, and
   `json_agg`/`json_build_object` (single-table); the PostgREST-specific glue
-  (version probe, catalog reflection) stays in `crates/server`, never the engine.
+  (version probe, binary catalog reflection, and data-path rewriting of
+  PostgREST's fixed `pgrst_source` query templates — GET/POST/PATCH/DELETE — into
+  engine-runnable SQL) stays in `crates/server` (`introspect.rs`/`reflect.rs`/
+  `datapath.rs`), never the engine. Unmodified PostgREST 14.13 serves full CRUD
+  over the engine with zero engine changes.
 
 ## When changing things
 

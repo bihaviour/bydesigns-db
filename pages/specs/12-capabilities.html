@@ -198,6 +198,7 @@ object storage  (S3 / R2 / GCS)
 <div class="callout tip">
 <p class="callout-title">Acceptance check for "REST for free"</p>
 <p>The deliverable is not "we built REST"; it is "unmodified PostgREST, pointed at the engine's pgwire endpoint, serves a working REST API against a real schema." If that holds, the engine's wire-compatibility is doing its job and no REST code was written.</p>
+<p><strong>Validated (#27).</strong> Unmodified PostgREST 14.13 boots against the engine's pgwire endpoint, reflects the live catalog (tables, columns, primary keys), and serves full CRUD — <code>GET</code> (filter/order/select/limit), <code>POST</code>, <code>PATCH</code>, and <code>DELETE</code> — with <strong>zero engine changes</strong>. The engine SQL surface stays a focused subset; the PostgREST-specific glue (version probe, binary catalog reflection, and data-path rewriting of PostgREST's fixed <code>pgrst_source</code> query templates into engine-runnable SQL) lives entirely in <code>crates/server</code>, at the boundary — never in the engine core.</p>
 </div>
 </section>
 

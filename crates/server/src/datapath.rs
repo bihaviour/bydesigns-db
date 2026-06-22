@@ -78,6 +78,136 @@ pub fn parse_insert(sql: &str) -> Option<InsertPlan> {
     Some(InsertPlan { table, columns })
 }
 
+/// A parsed PostgREST UPDATE (PATCH): the target table, the columns being set
+/// (their values arrive in the JSON body parameter), and the de-qualified WHERE
+/// clause (still carrying its `$n` filter placeholders).
+pub struct UpdatePlan {
+    pub table: String,
+    pub set_columns: Vec<String>,
+    pub where_clause: String,
+}
+
+/// A parsed PostgREST DELETE: the target table and the de-qualified WHERE clause.
+pub struct DeletePlan {
+    pub table: String,
+    pub where_clause: String,
+}
+
+/// A recognized PostgREST write (POST/PATCH/DELETE) data-path statement.
+pub enum Write {
+    Insert(InsertPlan),
+    Update(UpdatePlan),
+    Delete(DeletePlan),
+}
+
+/// Recognize any PostgREST write template (the `pgrst_source` CTE wrapping an
+/// INSERT / UPDATE / DELETE) and extract the engine-runnable plan.
+pub fn parse_write(sql: &str) -> Option<Write> {
+    if !sql.to_ascii_lowercase().contains("pgrst_source as (") {
+        return None;
+    }
+    parse_insert(sql)
+        .map(Write::Insert)
+        .or_else(|| parse_update(sql).map(Write::Update))
+        .or_else(|| parse_delete(sql).map(Write::Delete))
+}
+
+/// Recognize PostgREST's UPDATE template:
+/// `WITH pgrst_source AS (UPDATE "public"."t" SET "c" = "pgrst_body"."c"
+///  FROM (SELECT $1 AS json_data) … WHERE "public"."t"."id" = $2 RETURNING …)`.
+/// Only the SET *column names* are taken (their values come from the JSON body);
+/// the WHERE is de-qualified for the engine, keeping its `$n` filter parameters.
+pub fn parse_update(sql: &str) -> Option<UpdatePlan> {
+    let inner = inner_cte(sql)?;
+    let lower = inner.to_ascii_lowercase();
+    if !lower.trim_start().starts_with("update ") {
+        return None;
+    }
+    let upd = lower.find("update ")? + "update ".len();
+    let set_kw = lower[upd..].find(" set ")? + upd;
+    let table = last_ident(inner[upd..set_kw].trim());
+    let set_start = set_kw + " set ".len();
+    // The SET list ends at the FROM that introduces PostgREST's payload subquery.
+    let from_rel = lower[set_start..]
+        .find(" from (select")
+        .or_else(|| lower[set_start..].find(" from ("))?
+        + set_start;
+    let set_columns: Vec<String> = inner[set_start..from_rel]
+        .split(',')
+        .filter_map(|a| a.split('=').next())
+        .map(|c| last_ident(c.trim()))
+        .filter(|c| !c.is_empty())
+        .collect();
+    let where_clause = extract_where(&inner, &lower, set_start).unwrap_or_default();
+    if table.is_empty() || set_columns.is_empty() {
+        return None;
+    }
+    Some(UpdatePlan {
+        table,
+        set_columns,
+        where_clause,
+    })
+}
+
+/// Recognize PostgREST's DELETE template:
+/// `WITH pgrst_source AS (DELETE FROM "public"."t" WHERE … RETURNING …)`.
+pub fn parse_delete(sql: &str) -> Option<DeletePlan> {
+    let inner = inner_cte(sql)?;
+    let lower = inner.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    if !trimmed.starts_with("delete from") {
+        return None;
+    }
+    let df = lower.find("delete from")? + "delete from".len();
+    let table_end = lower[df..]
+        .find(" where ")
+        .or_else(|| lower[df..].find(" returning"))
+        .map(|p| p + df)
+        .unwrap_or(inner.len());
+    let table = last_ident(inner[df..table_end].trim());
+    let where_clause = extract_where(&inner, &lower, df).unwrap_or_default();
+    if table.is_empty() {
+        return None;
+    }
+    Some(DeletePlan {
+        table,
+        where_clause,
+    })
+}
+
+/// The de-qualified WHERE clause (without the keyword) between ` where ` and the
+/// trailing ` returning`/end, searching from `from`. `None` if there is no WHERE.
+fn extract_where(inner: &str, lower: &str, from: usize) -> Option<String> {
+    let wpos = lower[from..].find(" where ")? + from + " where ".len();
+    let end = lower[wpos..]
+        .find(" returning")
+        .map(|p| p + wpos)
+        .unwrap_or(inner.len());
+    Some(strip_qualifiers(inner[wpos..end].trim()))
+}
+
+/// The highest `$n` placeholder in a template — the wire parameter count the
+/// server must report at `Describe` (e.g. body `$1` + filter `$2` ⇒ 2).
+pub fn max_param(sql: &str) -> usize {
+    let b = sql.as_bytes();
+    let (mut max, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] == b'$' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            let mut j = i + 1;
+            let mut n = 0usize;
+            while j < b.len() && b[j].is_ascii_digit() {
+                n = n * 10 + (b[j] - b'0') as usize;
+                j += 1;
+            }
+            max = max.max(n);
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    max
+}
+
 /// The single response row for a write (return=minimal): page_total = row count.
 pub fn write_body_row(count: i64) -> Vec<Value> {
     vec![
@@ -540,6 +670,36 @@ mod tests {
         assert_eq!(plan.table, "authors");
         assert_eq!(plan.columns, vec!["id".to_string(), "name".to_string()]);
         assert!(parse_insert("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn parses_update_template() {
+        let sql = "WITH pgrst_source AS (UPDATE \"public\".\"authors\" SET \"name\" = \"pgrst_body\".\"name\" \
+                   FROM (SELECT $1 AS json_data) pgrst_payload, LATERAL (SELECT \"name\" FROM \
+                   json_to_record(pgrst_payload.json_data) AS _(\"name\" text) ) pgrst_body  WHERE  \
+                   \"public\".\"authors\".\"id\" = $2 RETURNING 1) SELECT '' AS total_result_set FROM \
+                   (SELECT * FROM pgrst_source) _postgrest_t";
+        let Some(Write::Update(plan)) = parse_write(sql) else {
+            panic!("expected an update plan");
+        };
+        assert_eq!(plan.table, "authors");
+        assert_eq!(plan.set_columns, vec!["name".to_string()]);
+        assert_eq!(plan.where_clause, "id = $2");
+        assert_eq!(max_param(sql), 2);
+    }
+
+    #[test]
+    fn parses_delete_template() {
+        let sql = "WITH pgrst_source AS (DELETE FROM \"public\".\"authors\"  WHERE  \
+                   \"public\".\"authors\".\"id\" = $1 RETURNING 1) SELECT '' AS total_result_set FROM \
+                   (SELECT * FROM pgrst_source) _postgrest_t";
+        let Some(Write::Delete(plan)) = parse_write(sql) else {
+            panic!("expected a delete plan");
+        };
+        assert_eq!(plan.table, "authors");
+        assert_eq!(plan.where_clause, "id = $1");
+        assert_eq!(max_param(sql), 1);
+        assert!(parse_write("SELECT 1").is_none());
     }
 
     #[test]
