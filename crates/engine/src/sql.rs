@@ -69,8 +69,8 @@ pub struct SelectStmt {
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
     pub order_by: Vec<(Expr, bool)>, // (expr, ascending)
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
 }
 
 #[derive(Debug)]
@@ -738,7 +738,7 @@ impl Parser {
     }
 
     /// `LIMIT n` / `OFFSET m` in either order (`LIMIT ALL` means no limit).
-    fn parse_limit_offset(&mut self) -> Result<(Option<i64>, Option<i64>)> {
+    fn parse_limit_offset(&mut self) -> Result<(Option<Expr>, Option<Expr>)> {
         let mut limit = None;
         let mut offset = None;
         loop {
@@ -746,9 +746,9 @@ impl Parser {
                 if self.eat_kw("all") {
                     continue;
                 }
-                limit = Some(self.signed_int("LIMIT")?);
+                limit = Some(self.limit_value("LIMIT")?);
             } else if offset.is_none() && self.eat_kw("offset") {
-                offset = Some(self.signed_int("OFFSET")?);
+                offset = Some(self.limit_value("OFFSET")?);
                 let _ = self.eat_kw("row") || self.eat_kw("rows");
             } else {
                 break;
@@ -757,13 +757,20 @@ impl Parser {
         Ok((limit, offset))
     }
 
-    /// An integer literal for LIMIT / OFFSET, allowing a leading unary minus.
-    fn signed_int(&mut self, what: &str) -> Result<i64> {
+    /// A LIMIT / OFFSET count: an integer literal (optionally negated) or a `?`
+    /// parameter (PostgREST parameterizes pagination), resolved at execution.
+    fn limit_value(&mut self, what: &str) -> Result<Expr> {
+        if self.peek() == &Tok::Param {
+            self.bump();
+            let idx = self.next_param;
+            self.next_param += 1;
+            return Ok(Expr::Param(idx));
+        }
         let neg = self.skip(Tok::Minus);
         match self.bump() {
-            Tok::Int(n) => Ok(if neg { -n } else { n }),
+            Tok::Int(n) => Ok(Expr::Int(if neg { -n } else { n })),
             other => Err(EngineError::sql(format!(
-                "{what} expects an integer, found {other:?}"
+                "{what} expects an integer or parameter, found {other:?}"
             ))),
         }
     }

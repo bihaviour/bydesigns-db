@@ -4,6 +4,7 @@
 //! engine handle = one thread; parallelism comes from multiple handles sharing
 //! the process-global `Database`, exactly as in the embedded path.
 
+use crate::datapath;
 use crate::introspect::{self, Canned, SERVER_VERSION};
 use crate::protocol::{read_message, read_startup, Frontend, Out, Startup};
 use crate::reflect;
@@ -25,6 +26,19 @@ struct Prepared {
     /// Highest `$n` seen — the parameter count reported by `Describe`.
     nparams: usize,
     param_oids: Vec<i32>,
+    /// How to shape the engine result before sending it (e.g. wrap a PostgREST
+    /// read into its `body`/`page_total` response).
+    postprocess: Postprocess,
+}
+
+/// Post-processing applied to a prepared statement's engine result.
+#[derive(Clone, Copy, PartialEq)]
+enum Postprocess {
+    /// Send the engine result as-is.
+    None,
+    /// Wrap the rows into PostgREST's data-path response (a single row whose
+    /// `body` column is the JSON array of the rows).
+    PgrstRead,
 }
 
 /// A bound portal and its (lazily) materialized result.
@@ -273,12 +287,20 @@ impl Session {
             return;
         }
         log_sql("parse", &sql);
+        // PostgREST's read template can't run on the engine as-is; rewrite it to
+        // the inner SELECT and flag the result for body/page_total wrapping.
+        let (engine_sql, postprocess) = match datapath::rewrite_read(&sql) {
+            Some(inner) if datapath::is_read(&sql) => (inner, Postprocess::PgrstRead),
+            _ => (sql.clone(), Postprocess::None),
+        };
         // Intercepted (introspection) statements never reach the engine parser.
-        let prepared = if matches!(
-            introspect::intercept(&sql, &self.user, &self.database),
-            Canned::Pass
-        ) {
-            let (rewritten, order) = rewrite_placeholders(&sql);
+        let to_engine = postprocess == Postprocess::PgrstRead
+            || matches!(
+                introspect::intercept(&sql, &self.user, &self.database),
+                Canned::Pass
+            );
+        let prepared = if to_engine {
+            let (rewritten, order) = rewrite_placeholders(&engine_sql);
             if let Err(e) = self.conn.prepare(&rewritten) {
                 let (code, msg) = describe_error(&e.to_string());
                 return self.fail(out, code, &msg);
@@ -289,6 +311,7 @@ impl Session {
                 order,
                 nparams,
                 param_oids,
+                postprocess,
             }
         } else {
             Prepared {
@@ -296,6 +319,7 @@ impl Session {
                 order: vec![],
                 nparams: 0,
                 param_oids,
+                postprocess: Postprocess::None,
             }
         };
         self.stmts.insert(name, prepared);
@@ -354,7 +378,19 @@ impl Session {
             let oids = param_oids_for(prep);
             let sql = prep.sql.clone();
             let order_len = prep.order.len();
+            let postprocess = prep.postprocess;
             out.parameter_description(&oids);
+
+            // A PostgREST read reports the fixed body/page_total column shape,
+            // regardless of the inner query's columns.
+            if postprocess == Postprocess::PgrstRead {
+                let cols: Vec<String> = datapath::BODY_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect();
+                out.row_description(&fields(&cols, &datapath::BODY_OIDS, &[]));
+                return;
+            }
 
             match self.inspect(&sql) {
                 Canned::Rows {
@@ -448,6 +484,25 @@ impl Session {
         let sql = prep.sql.clone();
         let order = prep.order.clone();
         let params = p.params.clone();
+        let postprocess = prep.postprocess;
+
+        // A PostgREST read: run the (rewritten) inner SELECT on the engine, then
+        // wrap its rows into the body/page_total response shape.
+        if postprocess == Postprocess::PgrstRead {
+            let inner = self.run_engine(&sql, &params, &order)?;
+            let mat = Mat {
+                columns: datapath::BODY_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                oids: datapath::BODY_OIDS.to_vec(),
+                rows: vec![datapath::body_row(&inner.columns, &inner.rows)],
+                tag: "SELECT 1".to_string(),
+                has_rows: true,
+            };
+            self.portals.get_mut(portal).unwrap().materialized = Some(mat);
+            return Ok(());
+        }
 
         let mat = match self.inspect(&sql) {
             Canned::Rows {

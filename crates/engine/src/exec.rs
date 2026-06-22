@@ -443,7 +443,9 @@ pub fn run_select(
     }
 
     order_matched(sel, schema, &mut matched, params)?;
-    apply_offset_limit(&mut matched, sel);
+    let limit = eval_count(&sel.limit, params)?;
+    let offset = eval_count(&sel.offset, params)?;
+    apply_offset_limit(&mut matched, limit, offset);
     project(sel, schema, &matched, params)
 }
 
@@ -473,13 +475,34 @@ fn expr_has_aggregate(e: &Expr) -> bool {
     }
 }
 
-/// Drop the first `OFFSET` rows, then keep at most `LIMIT` (both clamped at 0).
-fn apply_offset_limit(matched: &mut Vec<&Vec<Value>>, sel: &SelectStmt) {
-    if let Some(off) = sel.offset {
-        let off = off.max(0) as usize;
-        matched.drain(..off.min(matched.len()));
+/// Evaluate a LIMIT / OFFSET count expression (an integer literal or a `?`
+/// parameter) to a number; `None` means the clause was absent or NULL.
+fn eval_count(opt: &Option<Expr>, params: &[Value]) -> Result<Option<i64>> {
+    let Some(e) = opt else { return Ok(None) };
+    let ctx = EvalCtx::root(params);
+    match eval(e, &ctx)? {
+        Value::Null => Ok(None),
+        Value::Int(n) => Ok(Some(n)),
+        Value::Real(r) => Ok(Some(r as i64)),
+        Value::Text(s) => s
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| EngineError::sql("LIMIT/OFFSET must be an integer")),
+        other => Err(EngineError::sql(format!(
+            "LIMIT/OFFSET must be an integer, found {}",
+            other.type_name()
+        ))),
     }
-    if let Some(limit) = sel.limit {
+}
+
+/// Drop the first `offset` rows, then keep at most `limit` (both clamped at 0).
+fn apply_offset_limit(matched: &mut Vec<&Vec<Value>>, limit: Option<i64>, offset: Option<i64>) {
+    if let Some(off) = offset {
+        let off = (off.max(0) as usize).min(matched.len());
+        matched.drain(..off);
+    }
+    if let Some(limit) = limit {
         matched.truncate(limit.max(0) as usize);
     }
 }
@@ -631,9 +654,10 @@ struct KnnPlan<'a> {
 }
 
 /// Recognize a top-k nearest-neighbour query, independent of whether an index
-/// exists (the executor checks that next).
-fn knn_plan(sel: &SelectStmt) -> Option<KnnPlan<'_>> {
-    let limit = sel.limit?;
+/// exists (the executor checks that next). `limit` is the already-evaluated
+/// LIMIT count (KNN requires a non-negative LIMIT).
+fn knn_plan(sel: &SelectStmt, limit: Option<i64>) -> Option<KnnPlan<'_>> {
+    let limit = limit?;
     if limit < 0 || sel.order_by.len() != 1 {
         return None;
     }
@@ -667,7 +691,8 @@ fn knn_select(
     writer: Option<u64>,
     params: &[Value],
 ) -> Result<Option<ResultSet>> {
-    let Some(plan) = knn_plan(sel) else {
+    let limit = eval_count(&sel.limit, params)?;
+    let Some(plan) = knn_plan(sel, limit) else {
         return Ok(None);
     };
     if plan.limit == 0 {
@@ -894,11 +919,11 @@ fn grouped_select(
 
     let mut rows: Vec<Vec<Value>> = out_rows.into_iter().map(|(o, _)| o).collect();
     // OFFSET / LIMIT over the produced group rows.
-    if let Some(off) = sel.offset {
+    if let Some(off) = eval_count(&sel.offset, params)? {
         let off = (off.max(0) as usize).min(rows.len());
         rows.drain(..off);
     }
-    if let Some(limit) = sel.limit {
+    if let Some(limit) = eval_count(&sel.limit, params)? {
         rows.truncate(limit.max(0) as usize);
     }
     Ok(ResultSet {
