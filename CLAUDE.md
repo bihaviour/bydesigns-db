@@ -10,7 +10,7 @@ the *same* engine runs either purely embedded (`file://`) or storage-disaggregat
 on object storage (`s3://`/`r2://`/`gs://`). The full design lives as an HTML spec
 site under `pages/specs/` (start at `pages/specs/13-roadmap.html` for the phased plan).
 
-**Phases 1, 2, 3, 4, and 5 are implemented.** Phase 1 is the embedded library
+**Phases 1, 2, 3, 4, 5, and 6 are implemented.** Phase 1 is the embedded library
 (`file://`); Phase 2 adds the disaggregated `ObjectStorage` backend
 (`s3://`/`r2://`/`gs://`) — an LSM page store + CAS commit log over a pluggable
 object-client seam — selected purely by connection string, with the engine and C
@@ -24,10 +24,23 @@ lifecycle controller (scale-to-zero + keep-warm). Phase 5 adds the in-core
 (`CREATE INDEX … USING hnsw`), the distance operators `<->`/`<=>`/`<#>`, and a
 top-k nearest-neighbour query — riding the *same* WAL/replay path the rows do, so
 it branches and scales-to-zero with the database (`ENGINE_ABI_VERSION` 3;
-`STORAGE_TRAIT_VERSION` stays 2, the storage seam is untouched). Everything stays
-*additive* because the storage seam never moves. See the per-phase implementation
-maps under `pages/specs/phase-1-embedded.html`–`pages/specs/phase-5-capabilities.html`
-for the implementation maps and the deliberate scope decisions.
+`STORAGE_TRAIT_VERSION` stays 2, the storage seam is untouched). Phase 6 is **SQL
+surface completeness** — pure frontend growth of `sql.rs`→`exec.rs` (with
+`catalog.rs`/`conn.rs`/`wal.rs` for the stateful items), shipped as five additive
+stages: 6A expression & single-table (`CASE`, `IN`/`BETWEEN`, `||`, `NULLS
+FIRST/LAST`, `RETURNING`, upsert, `INSERT … SELECT`); 6B multi-table (joins,
+qualified names, `DISTINCT`, set ops, derived tables/CTEs, non-correlated
+subqueries, grouped aggregation); 6C the scalar function library (string / math /
+date-time / uuid / JSON, in `datetime.rs`+`json.rs`); 6D constraints & schema
+evolution (`DEFAULT`/`CHECK`/`UNIQUE`/composite-PK/`AUTOINCREMENT`, `ALTER TABLE`,
+`SAVEPOINT`); 6E dialect shims (`$1`/`:name` placeholders, backtick quoting,
+`LIKE`/`ILIKE` split, `SET`/`SHOW`/`PRAGMA`/`EXPLAIN`). The seam never moved
+(`STORAGE_TRAIT_VERSION` stays 2, `ENGINE_ABI_VERSION` stays 3); the only WAL
+growth is backward-compatible additive catalog facts. Everything stays *additive*
+because the storage seam never moves. See the per-phase implementation maps under
+`pages/specs/phase-1-embedded.html`–`pages/specs/phase-5-capabilities.html` and the
+SQL gap map in `pages/specs/16-sql-compatibility.html` for the deliberate scope
+decisions.
 
 ## Layout
 

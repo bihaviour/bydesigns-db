@@ -228,7 +228,7 @@ const rows = await sql`select 1 as n`;</code></pre>
 </section>
 
 <section>
-<h2>Phase 6 — SQL surface completeness</h2>
+<h2>Phase 6 — SQL surface completeness <span class="badge badge-status status-review">Implemented (6A–6E)</span></h2>
 <p><span class="pill blue">frontend only</span> <span class="pill green">seam unchanged</span> With the core platform shipped, grow the hand-written SQL frontend (<code>sql.rs</code> → <code>exec.rs</code>) to cover the common, OLTP-shaped majority of the PostgreSQL and SQLite surface — so the SQL an application actually issues against an OLTP database parses and runs the same on Twill. This is surface-completeness work, <em>not</em> a PostgreSQL re-implementation and not byte-for-byte dialect parity. Every change is additive frontend work (lexer/parser, AST, executor, with <code>catalog.rs</code> and <code>conn.rs</code> for the few stateful items), so the storage seam never moves.</p>
 <h3>Invariants every stage preserves</h3>
 <ul class="reqs">
