@@ -277,8 +277,10 @@ fn replay(storage: &dyn Storage, store: &mut Store) -> Result<()> {
     }
     // `group` non-empty here would be an incomplete trailing txn: discard.
     // Build every vector index from the recovered rows — this is the index's
-    // cold-start "warm" (spec 12): no graph is stored, it is replayed.
+    // cold-start "warm" (spec 12): no graph is stored, it is replayed. The
+    // autoincrement counters are likewise rebuilt from the recovered rows.
     store.rebuild_indexes();
+    store.rebuild_autoinc();
     Ok(())
 }
 
@@ -296,7 +298,32 @@ fn apply_replay(store: &mut Store, op: WalOp, commit_lsn: u64) {
         WalOp::DropIndex { name } => {
             store.drop_index(&name);
         }
+        // Schema-evolution ops reshape the catalog and rows (stage 6D).
+        op @ (WalOp::AlterAddColumn { .. }
+        | WalOp::AlterDropColumn { .. }
+        | WalOp::AlterRenameColumn { .. }
+        | WalOp::AlterRenameTable { .. }) => apply_alter(store, &op),
         WalOp::Commit => {}
+    }
+}
+
+/// Apply an `ALTER TABLE` WAL op to the in-memory store — shared by the live DDL
+/// path and replay (stage 6D). A newly added column backfills existing rows with
+/// its `DEFAULT` (evaluated as a constant) or NULL.
+pub(crate) fn apply_alter(store: &mut Store, op: &WalOp) {
+    match op {
+        WalOp::AlterAddColumn { table, column } => {
+            let fill = column
+                .default_sql
+                .as_deref()
+                .and_then(|s| crate::exec::eval_const_sql(s).ok())
+                .unwrap_or(crate::value::Value::Null);
+            store.add_column(table, column.clone(), fill);
+        }
+        WalOp::AlterDropColumn { table, column } => store.drop_column(table, column),
+        WalOp::AlterRenameColumn { table, from, to } => store.rename_column(table, from, to),
+        WalOp::AlterRenameTable { table, to } => store.rename_table(table, to),
+        _ => {}
     }
 }
 

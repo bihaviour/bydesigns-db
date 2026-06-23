@@ -22,10 +22,12 @@
 //! `ObjectStorage` arrives in Phase 2.
 
 mod catalog;
+mod datetime;
 mod db;
 mod error;
 mod exec;
 mod group_commit;
+mod json;
 mod lex;
 mod sql;
 mod store;

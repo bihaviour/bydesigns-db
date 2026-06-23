@@ -17,8 +17,8 @@
 <header class="page-header">
 <div class="spec-meta">
 <span class="badge badge-id">16</span>
-<span class="badge badge-status status-draft">Draft · Proposed</span>
-<span class="spec-date">Phase 6 (proposed)</span>
+<span class="badge badge-status status-review">Phase 6 · Implemented (6A–6E)</span>
+<span class="spec-date">Phase 6</span>
 </div>
 <h1>SQL Compatibility &amp; Mapping — PostgreSQL / SQLite → Twill DB</h1>
 <p class="lede">A complete, honest map of the PostgreSQL and SQLite SQL surface onto Twill DB: what the hand-written frontend (<code>sql.rs</code> → <code>exec.rs</code>) accepts <em>today</em>, what is mappable by rewrite, what is <em>proposed</em> for a Phase&nbsp;6 surface-completeness effort, and what stays out of scope by design. Then a concrete implementation spec for the gaps — <strong>all of it parser + executor work; the storage seam never moves</strong> (<code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>).</p>
@@ -76,8 +76,8 @@
 <tr><td><code>BYTEA</code> / SQLite <code>BLOB</code></td><td><code>Blob</code></td><td>✅</td><td>Rendered base64 over the string-only C ABI; bound back via the same.</td></tr>
 <tr><td><code>BOOLEAN</code> / <code>true</code>/<code>false</code></td><td><code>Integer</code> 0/1</td><td>◑</td><td>Literals <code>true</code>/<code>false</code> parse to <code>1</code>/<code>0</code>. No distinct boolean class; server mode must report the column as <code>bool</code> for round-trip — <strong>⊕ 6E</strong> (dialect shim).</td></tr>
 <tr><td><code>vector(N)</code> (pgvector)</td><td><code>Vector</code></td><td>✅</td><td>Phase 5. Dimension declared and enforced; literals <code>[1,2,3]</code> / <code>'[1,2,3]'</code>.</td></tr>
-<tr><td><code>DATE</code>/<code>TIME</code>/<code>TIMESTAMP[TZ]</code>/<code>INTERVAL</code></td><td><code>Text</code>/<code>Integer</code></td><td>⊕ 6C</td><td>No native temporal type. Map to ISO-8601 <code>Text</code> or epoch <code>Integer</code> + a date/time function pack (SQLite's <code>date()</code>/<code>strftime()</code> model). See functions.</td></tr>
-<tr><td><code>JSON</code>/<code>JSONB</code></td><td><code>Text</code></td><td>⊕ 6C / ✗</td><td>Stored as <code>Text</code>; a minimal accessor pack (<code>json_extract</code>, <code>-></code>/<code>-&gt;&gt;</code>) is ⊕ 6C. Full <code>JSONB</code> indexing/operators are ✗.</td></tr>
+<tr><td><code>DATE</code>/<code>TIME</code>/<code>TIMESTAMP[TZ]</code>/<code>INTERVAL</code></td><td><code>Text</code>/<code>Integer</code></td><td>◑ (6C)</td><td>No native temporal type, but the 6C date/time function pack (ISO-8601 <code>Text</code> / epoch <code>Integer</code>, SQLite <code>date()</code>/<code>strftime()</code> model) is shipped. <code>INTERVAL</code> arithmetic stays out.</td></tr>
+<tr><td><code>JSON</code>/<code>JSONB</code></td><td><code>Text</code></td><td>◑ (6C) / ✗</td><td>Stored as <code>Text</code>; the minimal accessor pack (<code>json_extract</code>, <code>-></code>/<code>-&gt;&gt;</code>, <code>json_array</code>) shipped in 6C. Full <code>JSONB</code> indexing/operators stay ✗.</td></tr>
 <tr><td><code>uuid</code></td><td><code>Text</code>/<code>Blob</code></td><td>↻</td><td>Store as <code>Text</code>; <code>gen_random_uuid()</code> is a ⊕ 6C function.</td></tr>
 <tr><td>Arrays <code>int[]</code>, composite types, ranges, <code>enum</code>, <code>hstore</code>, geometric, network types</td><td>—</td><td>✗</td><td>PostgreSQL extensible/structured types; out of scope for an OLTP core (store as <code>Text</code>/<code>Blob</code> + app-side encode if needed).</td></tr>
 </tbody>
@@ -91,15 +91,15 @@
 <tbody>
 <tr><td><code>CREATE TABLE [IF NOT EXISTS]</code> with typed columns</td><td>✅</td><td>Autocommit only (<code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code>) — intentional, spec 02.</td></tr>
 <tr><td><code>PRIMARY KEY</code> (single column), <code>NOT NULL</code>, <code>NULL</code></td><td>✅</td><td>PK implies <code>NOT NULL</code> + uniqueness (enforced via <code>pk_keys</code>).</td></tr>
-<tr><td><code>UNIQUE</code> (non-PK column / constraint)</td><td>◑ → ⊕ 6D</td><td>Parsed today but <strong>only the PK is enforced</strong>. Real secondary uniqueness is ⊕ 6D.</td></tr>
-<tr><td>Composite <code>PRIMARY KEY (a,b)</code>, table-level constraints</td><td>⊕ 6D</td><td>Parser accepts only column-level PK today.</td></tr>
-<tr><td><code>DEFAULT</code>, <code>CHECK</code>, <code>FOREIGN KEY</code>/<code>REFERENCES</code>, <code>GENERATED</code>/<code>AUTOINCREMENT</code></td><td>⊕ 6D</td><td>Not parsed today. <code>DEFAULT</code> and <code>CHECK</code> are tractable (catalog + insert/update path). FK enforcement and cascades are heavier — <code>CHECK</code>/<code>DEFAULT</code> in 6D, FK a documented stretch.</td></tr>
+<tr><td><code>UNIQUE</code> (non-PK column / constraint)</td><td>✅ (6D)</td><td>Single &amp; composite, enforced on insert/update (NULLs distinct). Not separately checked during an <code>ON CONFLICT</code> upsert.</td></tr>
+<tr><td>Composite <code>PRIMARY KEY (a,b)</code>, table-level constraints</td><td>✅ (6D)</td><td>Table-level <code>PRIMARY KEY</code>/<code>UNIQUE</code>/<code>CHECK</code> all captured and enforced.</td></tr>
+<tr><td><code>DEFAULT</code>, <code>CHECK</code>, <code>AUTOINCREMENT</code>/<code>SERIAL</code>; <code>FOREIGN KEY</code>/<code>REFERENCES</code></td><td>✅ (6D) / ◑</td><td><code>DEFAULT</code>/<code>CHECK</code>/<code>AUTOINCREMENT</code> shipped (6D). FK is tracked metadata (reflected to clients), not enforced; <code>GENERATED</code> stays ✗.</td></tr>
 <tr><td><code>DROP TABLE [IF EXISTS]</code></td><td>✅</td><td>Autocommit only.</td></tr>
 <tr><td><code>CREATE INDEX … USING hnsw</code>, <code>DROP INDEX</code></td><td>✅</td><td>Phase 5 vector index.</td></tr>
 <tr><td><code>CREATE INDEX</code> (B-tree, scalar columns)</td><td>↻ / ⊕ 6D</td><td>Accepted-and-no-op today is <em>not</em> offered (only HNSW parses). Scalar secondary indexes are a real planner feature — ⊕ 6D (optional; the engine is in-memory MVCC so a full scan is the current plan).</td></tr>
-<tr><td><code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code>, <code>RENAME TO</code></td><td>⊕ 6D</td><td>Common migration DDL; ⊕ 6D. Column add/drop is a catalog + row-reshape operation over the WAL.</td></tr>
+<tr><td><code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code>, <code>RENAME TO</code></td><td>✅ (6D)</td><td>Catalog + row-reshape over new WAL ops; ADD backfills the column's default.</td></tr>
 <tr><td><code>CREATE VIEW</code></td><td>⊕ 6D</td><td>Storable as a named, re-parsed <code>SelectStmt</code> in the catalog; depends on 6B (joins/subqueries) to be useful.</td></tr>
-<tr><td><code>CREATE SEQUENCE</code>, <code>SERIAL</code>/<code>BIGSERIAL</code></td><td>↻ / ⊕ 6D</td><td>Map to an auto-increment integer PK (6D <code>AUTOINCREMENT</code>) or app-side IDs. Standalone sequences are ✗ for now.</td></tr>
+<tr><td><code>CREATE SEQUENCE</code>, <code>SERIAL</code>/<code>BIGSERIAL</code></td><td>✅ (6D) / ✗</td><td><code>SERIAL</code> is an auto-increment integer column (6D). Standalone <code>CREATE SEQUENCE</code> stays ✗.</td></tr>
 <tr><td><code>CREATE TRIGGER</code>, <code>CREATE FUNCTION</code>/PL&#47;pgSQL, <code>CREATE EXTENSION</code>, <code>CREATE SCHEMA</code>, roles/<code>GRANT</code></td><td>✗</td><td>Procedural / server-admin / extensibility surface. Out of scope for the engine core (auth is composed around, spec 12).</td></tr>
 </tbody>
 </table>
@@ -111,12 +111,12 @@
 <thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
 <tbody>
 <tr><td><code>INSERT INTO t [(cols)] VALUES (…)[, (…)]</code></td><td>✅</td><td>Multi-row supported. Fully transactional.</td></tr>
-<tr><td><code>INSERT … DEFAULT VALUES</code></td><td>⊕ 6D</td><td>Needs <code>DEFAULT</code> support.</td></tr>
-<tr><td><code>INSERT INTO t SELECT …</code></td><td>⊕ 6A</td><td>Replace the <code>VALUES</code>-only source with "rows from a query" — reuses the executor's result rows as the insert source.</td></tr>
+<tr><td><code>INSERT … DEFAULT VALUES</code> / <code>DEFAULT</code> as a value</td><td>✅ (6D)</td><td>Each defaulted column takes its <code>DEFAULT</code>/autoincrement.</td></tr>
+<tr><td><code>INSERT INTO t SELECT …</code></td><td>✅ (6A)</td><td>The <code>VALUES</code> source generalized to "rows from a query" — the executor's result rows feed the same staging loop.</td></tr>
 <tr><td><code>UPDATE … SET … [WHERE]</code>, <code>DELETE … [WHERE]</code></td><td>✅</td><td>Fully transactional; first-committer-wins conflict checks.</td></tr>
-<tr><td><code>UPDATE … FROM …</code>, <code>DELETE … USING …</code></td><td>⊕ 6B</td><td>Join-driven DML; depends on the join machinery.</td></tr>
-<tr><td><code>… RETURNING *</code> / column list (PG; SQLite 3.35+)</td><td>⊕ 6A</td><td>Project the affected new row versions through a result set on the existing exec path. High value, low risk.</td></tr>
-<tr><td>Upsert: PG <code>INSERT … ON CONFLICT (…) DO UPDATE/NOTHING</code>, SQLite <code>INSERT … ON CONFLICT …</code> / <code>OR REPLACE</code>/<code>OR IGNORE</code></td><td>◑ → ⊕ 6A</td><td><strong>Hazard today:</strong> <code>OR REPLACE</code>/<code>OR IGNORE</code> are parsed and <em>silently ignored</em>, so they fall through to plain insert (and can fail PK). 6A implements true conflict actions and tightens the silent-ignore.</td></tr>
+<tr><td><code>UPDATE … FROM …</code>, <code>DELETE … USING …</code></td><td>⊕</td><td>Join-driven DML; deferred (the join machinery exists, but the write path is not yet wired to it).</td></tr>
+<tr><td><code>… RETURNING *</code> / column list (PG; SQLite 3.35+)</td><td>✅ (6A)</td><td>Projects the affected row versions (new for INSERT/UPDATE, old for DELETE) through a result set on the existing exec path.</td></tr>
+<tr><td>Upsert: PG <code>INSERT … ON CONFLICT (…) DO UPDATE/NOTHING</code>, SQLite <code>INSERT … ON CONFLICT …</code> / <code>OR REPLACE</code>/<code>OR IGNORE</code></td><td>✅ (6A)</td><td>True conflict actions, with <code>excluded.*</code> in <code>DO UPDATE</code>. The earlier silent-ignore hazard for <code>OR REPLACE</code>/<code>OR IGNORE</code> is closed — they now skip/replace as documented.</td></tr>
 <tr><td><code>TRUNCATE</code></td><td>↻</td><td><code>DELETE FROM t</code> with no <code>WHERE</code> (already supported); a native fast-path is ✗.</td></tr>
 <tr><td><code>MERGE</code></td><td>✗</td><td>Covered functionally by upsert (6A).</td></tr>
 <tr><td><code>COPY</code> (bulk load)</td><td>↻</td><td>Use batched multi-row <code>INSERT</code> from the client. Native <code>COPY</code> wire support is a server-mode concern (spec 07), not core SQL.</td></tr>
@@ -130,18 +130,18 @@
 <thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
 <tbody>
 <tr><td>Projection: <code>*</code>, expressions, <code>AS</code> alias</td><td>✅</td><td>—</td></tr>
-<tr><td><code>FROM</code> single table; <code>SELECT</code> with no <code>FROM</code> (constants)</td><td>✅</td><td>—</td></tr>
+<tr><td><code>FROM</code> single table / multi-source (joins, derived tables); <code>SELECT</code> with no <code>FROM</code> (constants)</td><td>✅</td><td>Multi-source shipped in 6B.</td></tr>
 <tr><td><code>WHERE</code></td><td>✅</td><td>Full expression predicate, three-valued logic.</td></tr>
-<tr><td><code>ORDER BY expr [ASC|DESC]</code> (multi-key)</td><td>✅</td><td>Ranks by <em>expressions</em>, not output aliases or ordinals. <code>NULLS FIRST/LAST</code> ⊕ 6A (NULLs sort first today).</td></tr>
+<tr><td><code>ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]</code> (multi-key)</td><td>✅</td><td>Ranks by expressions; an alias resolves to its select item. <code>NULLS FIRST/LAST</code> shipped in 6A (default: NULLs first on ASC, last on DESC).</td></tr>
 <tr><td><code>LIMIT n</code></td><td>✅</td><td>Integer literal only.</td></tr>
-<tr><td><code>OFFSET n</code>, <code>LIMIT … OFFSET …</code>, <code>FETCH FIRST</code></td><td>⊕ 6A</td><td>Trivial parser + slice addition.</td></tr>
+<tr><td><code>OFFSET n</code>, <code>LIMIT … OFFSET …</code></td><td>✅ (6A)</td><td>Integer literal or parameter; <code>FETCH FIRST</code> remains out.</td></tr>
 <tr><td>Aggregates <code>COUNT/SUM/MIN/MAX/AVG</code> (whole-table)</td><td>◑</td><td>Work only when <em>all</em> select items are aggregates; cannot mix with plain columns (no grouping).</td></tr>
-<tr><td><code>GROUP BY</code> / <code>HAVING</code></td><td>⊕ 6B</td><td>Reserved as keywords today but unimplemented. The big aggregation gap.</td></tr>
-<tr><td><code>DISTINCT</code>, <code>COUNT(DISTINCT x)</code></td><td>◑ → ⊕ 6B</td><td><code>SELECT DISTINCT</code> is explicitly rejected today; implement with grouping.</td></tr>
-<tr><td><code>JOIN</code> (<code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code>), <code>ON</code>/<code>USING</code>, table aliases, multi-table <code>FROM</code></td><td>⊕ 6B</td><td>The single largest item. Requires multi-source <code>FROM</code>, qualified <code>table.col</code> resolution (today the table qualifier is parsed then dropped), and a nested-loop join. INNER + LEFT first; RIGHT/FULL after.</td></tr>
-<tr><td>Subqueries: scalar, <code>IN (SELECT …)</code>, <code>EXISTS</code>, derived tables <code>FROM (SELECT …)</code>, correlated</td><td>⊕ 6B</td><td>AST already boxes expressions; add a <code>Expr::Subquery</code> + derived-table source. Correlated last.</td></tr>
-<tr><td>CTEs <code>WITH … AS (…)</code>, recursive CTEs</td><td>⊕ 6B / ✗</td><td>Non-recursive CTEs map to derived tables (6B). Recursive CTEs are ✗ for the OLTP core.</td></tr>
-<tr><td>Set ops <code>UNION [ALL]</code> / <code>INTERSECT</code> / <code>EXCEPT</code></td><td>⊕ 6B</td><td>Compose two result sets; column-count/type compatibility checked.</td></tr>
+<tr><td><code>GROUP BY</code> / <code>HAVING</code></td><td>✅ (6B)</td><td>Per-group aggregation; <code>HAVING</code> filters whole groups; works over joins.</td></tr>
+<tr><td><code>DISTINCT</code>, <code>COUNT(DISTINCT x)</code></td><td>✅ (6B)</td><td>Output-row de-duplication and distinct aggregation.</td></tr>
+<tr><td><code>JOIN</code> (<code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code>), <code>ON</code>/<code>USING</code>, table aliases, multi-table <code>FROM</code></td><td>✅ (6B)</td><td>Nested-loop join over a materialized column namespace; qualified <code>alias.col</code> resolved (ambiguous/unknown rejected).</td></tr>
+<tr><td>Subqueries: scalar, <code>IN (SELECT …)</code>, <code>EXISTS</code>, derived tables <code>FROM (SELECT …)</code>, correlated</td><td>✅ / ✗</td><td>Non-correlated scalar/<code>IN</code>/<code>EXISTS</code> and derived tables shipped (6B). Correlated expression subqueries stay ✗.</td></tr>
+<tr><td>CTEs <code>WITH … AS (…)</code>, recursive CTEs</td><td>✅ / ✗</td><td>Non-recursive <code>WITH</code> materialized as derived tables (6B). Recursive CTEs are ✗.</td></tr>
+<tr><td>Set ops <code>UNION [ALL]</code> / <code>INTERSECT</code> / <code>EXCEPT</code></td><td>✅ (6B)</td><td>Combine two result sets (arity checked); <code>ALL</code> keeps multiset semantics.</td></tr>
 <tr><td>Window functions <code>OVER (…)</code></td><td>✗</td><td>OLAP-shaped; out of scope for the core (compose DuckDB, spec 12).</td></tr>
 <tr><td><code>LATERAL</code>, <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>TABLESAMPLE</code></td><td>✗</td><td>Out of scope.</td></tr>
 </tbody>
@@ -157,15 +157,15 @@
 <tr><td>Comparison <code>= &lt;&gt; != &lt; &lt;= &gt; &gt;=</code>, logical <code>AND/OR/NOT</code>, three-valued logic</td><td>✅</td><td>—</td></tr>
 <tr><td>Arithmetic <code>+ - * / %</code>, unary <code>-</code>/<code>+</code></td><td>✅</td><td>Int overflow promotes to real; integer <code>/</code> and <code>%</code> by zero → NULL (SQLite-ish).</td></tr>
 <tr><td><code>IS [NOT] NULL</code></td><td>✅</td><td>—</td></tr>
-<tr><td><code>[NOT] LIKE</code></td><td>◑</td><td><code>%</code>/<code>_</code> wildcards, <strong>ASCII case-insensitive</strong> (PG <code>LIKE</code> is case-sensitive; this matches PG <code>ILIKE</code>). <code>ESCAPE</code> clause ⊕ 6A. Add case-sensitive <code>LIKE</code> + <code>ILIKE</code> split in 6E (dialect).</td></tr>
+<tr><td><code>[NOT] LIKE</code> / <code>ILIKE</code> / <code>… ESCAPE c</code></td><td>◑ (6A)</td><td><code>%</code>/<code>_</code> wildcards, <strong>ASCII case-insensitive</strong>. <code>ESCAPE</code> and <code>ILIKE</code> parse (6A); the case-sensitive <code>LIKE</code> vs <code>ILIKE</code> split is deferred to 6E.</td></tr>
 <tr><td>Vector distance <code>&lt;-&gt;</code> / <code>&lt;=&gt;</code> / <code>&lt;#&gt;</code></td><td>✅</td><td>Phase 5.</td></tr>
-<tr><td>String concat <code>||</code></td><td>⊕ 6A</td><td>One lexer token + one <code>BinOp</code>; high value.</td></tr>
-<tr><td><code>BETWEEN … AND …</code>, <code>IN (list)</code>, <code>NOT IN</code></td><td>⊕ 6A</td><td>Desugar <code>BETWEEN</code> to <code>&gt;= AND &lt;=</code>; <code>IN (list)</code> to an OR-chain / set test.</td></tr>
-<tr><td><code>CASE WHEN … THEN … ELSE … END</code> (searched + simple)</td><td>⊕ 6A</td><td>New <code>Expr::Case</code>; pure evaluator addition.</td></tr>
-<tr><td><code>CAST(x AS type)</code> / PG <code>x::type</code></td><td>⊕ 6A</td><td>New <code>Expr::Cast</code> over the existing affinity-coercion machinery (<code>ColumnType::coerce</code>).</td></tr>
-<tr><td><code>COALESCE</code>/<code>NULLIF</code>/<code>GREATEST</code>/<code>LEAST</code></td><td>⊕ 6A</td><td>Variadic scalar built-ins (see functions).</td></tr>
-<tr><td><code>x LIKE … ESCAPE c</code>, <code>SIMILAR TO</code>, POSIX regex <code>~</code>/<code>~*</code></td><td>⊕ 6A / ✗</td><td><code>ESCAPE</code> 6A. <code>SIMILAR TO</code>/regex are ✗ (no regex engine; keep deps minimal).</td></tr>
-<tr><td>Parameters: <code>?</code> positional</td><td>✅</td><td>PG <code>$1</code> and named <code>:name</code> → ⊕ 6E (dialect shim; server mode already speaks the extended protocol).</td></tr>
+<tr><td>String concat <code>||</code></td><td>✅ (6A)</td><td>NULL-propagating; binds looser than <code>+</code>/<code>-</code>, tighter than comparison.</td></tr>
+<tr><td><code>BETWEEN … AND …</code>, <code>IN (list)</code>, <code>NOT IN</code></td><td>✅ (6A)</td><td>Three-valued logic preserved; <code>IN (SELECT …)</code> waits for 6B.</td></tr>
+<tr><td><code>CASE WHEN … THEN … ELSE … END</code> (searched + simple)</td><td>✅ (6A)</td><td><code>Expr::Case</code>, short-circuiting at the first matching branch.</td></tr>
+<tr><td><code>CAST(x AS type)</code> / PG <code>x::type</code></td><td>✅ (6A)</td><td><code>Expr::Cast</code> over the affinity-coercion machinery (<code>ColumnType::coerce</code>).</td></tr>
+<tr><td><code>COALESCE</code>/<code>NULLIF</code>/<code>GREATEST</code>/<code>LEAST</code></td><td>✅ (6A)</td><td>Plus <code>ifnull</code>/<code>iif</code>; <code>GREATEST</code>/<code>LEAST</code> skip NULLs.</td></tr>
+<tr><td><code>x LIKE … ESCAPE c</code>, <code>SIMILAR TO</code>, POSIX regex <code>~</code>/<code>~*</code></td><td>✅ / ✗</td><td><code>ESCAPE</code> shipped (6A). <code>SIMILAR TO</code>/regex are ✗ (no regex engine; keep deps minimal).</td></tr>
+<tr><td>Parameters: <code>?</code> positional, <code>$1</code> numbered, <code>:name</code> named</td><td>✅ (6E)</td><td>All three normalize to the 1-based bind model.</td></tr>
 </tbody>
 </table>
 </div>
@@ -177,13 +177,13 @@
 <thead><tr><th>Function group</th><th>Examples</th><th>Status</th></tr></thead>
 <tbody>
 <tr><td>Aggregates (whole-table)</td><td><code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code></td><td>✅</td></tr>
-<tr><td>Aggregates (grouped + more)</td><td>the above per-group, <code>group_concat</code>/<code>string_agg</code>, <code>total</code></td><td>⊕ 6B</td></tr>
-<tr><td>String</td><td><code>length</code>, <code>lower</code>, <code>upper</code>, <code>substr/substring</code>, <code>trim</code>/<code>ltrim</code>/<code>rtrim</code>, <code>replace</code>, <code>coalesce</code>, <code>concat</code>, <code>instr</code>/<code>position</code>, <code>like</code></td><td>⊕ 6C</td></tr>
-<tr><td>Numeric / math</td><td><code>abs</code>, <code>round</code>, <code>ceil</code>, <code>floor</code>, <code>mod</code>, <code>power</code>, <code>sqrt</code>, <code>min</code>/<code>max</code> scalar, <code>random</code></td><td>⊕ 6C</td></tr>
-<tr><td>Conditional / null</td><td><code>coalesce</code>, <code>nullif</code>, <code>ifnull</code>, <code>greatest</code>, <code>least</code>, <code>iif</code></td><td>⊕ 6A</td></tr>
-<tr><td>Date / time</td><td><code>now</code>/<code>current_timestamp</code>, <code>date</code>, <code>time</code>, <code>datetime</code>, <code>strftime</code>, <code>extract</code>, <code>date_trunc</code></td><td>⊕ 6C</td></tr>
-<tr><td>UUID / misc</td><td><code>gen_random_uuid</code>, <code>typeof</code>, <code>hex</code>, <code>cast</code></td><td>⊕ 6C</td></tr>
-<tr><td>JSON</td><td><code>json_extract</code>, <code>json_array</code>, <code>json_object</code>, <code>-&gt;</code>/<code>-&gt;&gt;</code></td><td>⊕ 6C (minimal)</td></tr>
+<tr><td>Aggregates (grouped + more)</td><td>the above per-group, <code>group_concat</code>/<code>string_agg</code>, <code>count(distinct)</code></td><td>✅ (6B)</td></tr>
+<tr><td>String</td><td><code>length</code>, <code>lower</code>, <code>upper</code>, <code>substr/substring</code>, <code>trim</code>/<code>ltrim</code>/<code>rtrim</code>, <code>replace</code>, <code>coalesce</code>, <code>concat</code>, <code>instr</code>/<code>strpos</code>, <code>repeat</code>, <code>reverse</code>, <code>left</code>/<code>right</code>, <code>lpad</code>/<code>rpad</code></td><td>✅ (6C)</td></tr>
+<tr><td>Numeric / math</td><td><code>abs</code>, <code>round</code>, <code>ceil</code>, <code>floor</code>, <code>mod</code>, <code>power</code>, <code>sqrt</code>, <code>sign</code>, <code>trunc</code>, <code>exp</code>/<code>ln</code>/<code>log</code>, <code>random</code></td><td>✅ (6C)</td></tr>
+<tr><td>Conditional / null</td><td><code>coalesce</code>, <code>nullif</code>, <code>ifnull</code>, <code>greatest</code>, <code>least</code>, <code>iif</code></td><td>✅ (6A)</td></tr>
+<tr><td>Date / time</td><td><code>now</code>/<code>current_timestamp</code>, <code>current_date/time</code>, <code>date</code>, <code>time</code>, <code>datetime</code>, <code>strftime</code>, <code>extract</code>, <code>date_trunc</code>, <code>unixepoch</code></td><td>✅ (6C)</td></tr>
+<tr><td>UUID / misc</td><td><code>gen_random_uuid</code>, <code>typeof</code>, <code>hex</code>, <code>cast</code></td><td>✅ (6C)</td></tr>
+<tr><td>JSON</td><td><code>json_extract</code>, <code>json_array</code>, <code>-&gt;</code>/<code>-&gt;&gt;</code></td><td>✅ (6C, minimal)</td></tr>
 <tr><td>Vector</td><td>distance operators; <code>vector_dims</code>, <code>l2_distance</code> etc.</td><td>✅ ops / ⊕ 6C named forms</td></tr>
 <tr><td>Server-administrative / system</td><td><code>pg_*</code>, <code>current_setting</code>, <code>nextval</code>, full-text <code>to_tsvector</code></td><td>✗</td></tr>
 </tbody>
@@ -198,11 +198,11 @@
 <tr><td><code>BEGIN [TRANSACTION|WORK|DEFERRED]</code>, <code>START TRANSACTION</code></td><td>✅</td><td>—</td></tr>
 <tr><td><code>COMMIT</code>, <code>ROLLBACK</code> (<code>[TRANSACTION|WORK]</code>)</td><td>✅</td><td>—</td></tr>
 <tr><td>Snapshot isolation (the only level)</td><td>✅</td><td>Single-writer, first-committer-wins; equivalent to PG <code>REPEATABLE READ</code>/SI.</td></tr>
-<tr><td><code>SET TRANSACTION ISOLATION LEVEL …</code></td><td>↻ 6E</td><td>Accept-and-pin-to-SI (PG <code>SERIALIZABLE</code>/<code>REPEATABLE READ</code> map to SI; weaker levels are upgraded). Parsed-and-honoured-as-SI shim.</td></tr>
-<tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>⊕ 6D</td><td>Partial rollback within a txn over the pending-version set in <code>conn.rs</code>/<code>store.rs</code>.</td></tr>
-<tr><td><code>SET</code>/<code>SHOW</code> (GUCs), <code>SET search_path</code>, <code>PRAGMA</code> (SQLite)</td><td>↻ 6E</td><td>Accept-and-ignore the common no-op session settings on the server boundary so real clients/ORMs connect; reject unknown ones.</td></tr>
-<tr><td><code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code></td><td>⊕ 6E</td><td>Emit a single-plan textual description (the engine has one strategy per shape); useful for client compatibility.</td></tr>
-<tr><td><code>VACUUM</code>, <code>ANALYZE</code>, <code>ATTACH</code>/<code>DETACH</code> (SQLite), <code>LISTEN</code>/<code>NOTIFY</code> (PG)</td><td>✗ / ↻</td><td><code>VACUUM</code>/<code>ANALYZE</code> accept-and-no-op (6E). <code>ATTACH</code> conflicts with the URL-scheme backend model; <code>LISTEN/NOTIFY</code> out of scope.</td></tr>
+<tr><td><code>SET TRANSACTION ISOLATION LEVEL …</code></td><td>✅ (6E)</td><td>Accepted no-op (the engine runs one snapshot-isolation mode).</td></tr>
+<tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>✅ (6D)</td><td>Partial rollback over the in-flight writer's pending set (and buffered WAL); no durable change.</td></tr>
+<tr><td><code>SET</code>/<code>SHOW</code> (GUCs), <code>SET search_path</code>, <code>PRAGMA</code> (SQLite)</td><td>✅ (6E)</td><td><code>SET</code>/<code>PRAGMA</code> accepted no-ops; <code>SHOW name</code> returns a one-row result.</td></tr>
+<tr><td><code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code></td><td>✅ (6E)</td><td>Returns a single-line plan description (one strategy per shape).</td></tr>
+<tr><td><code>VACUUM</code>, <code>ANALYZE</code>, <code>ATTACH</code>/<code>DETACH</code> (SQLite), <code>LISTEN</code>/<code>NOTIFY</code> (PG)</td><td>✅ / ✗</td><td><code>VACUUM</code>/<code>ANALYZE</code> accepted no-ops (6E). <code>ATTACH</code> conflicts with the URL-scheme backend model; <code>LISTEN/NOTIFY</code> out of scope.</td></tr>
 </tbody>
 </table>
 </div>
@@ -213,12 +213,12 @@
 <thead><tr><th>Area</th><th>PostgreSQL</th><th>SQLite</th><th>Twill resolution</th></tr></thead>
 <tbody>
 <tr><td>Typing</td><td>Strict, static</td><td>Dynamic affinity</td><td>Twill is dynamic-affinity (SQLite model); server mode reports affinity-derived OIDs. ⊕ 6E.</td></tr>
-<tr><td>Identifier quoting</td><td><code>"x"</code></td><td><code>"x"</code> or <code>[x]</code> or <code>`x`</code></td><td><code>"x"</code> supported; <code>[x]</code>/<code>`x`</code> ⊕ 6E.</td></tr>
+<tr><td>Identifier quoting</td><td><code>"x"</code></td><td><code>"x"</code> or <code>[x]</code> or <code>`x`</code></td><td><code>"x"</code> and <code>`x`</code> shipped (6E); <code>[x]</code> stays a vector literal.</td></tr>
 <tr><td>String concat</td><td><code>||</code></td><td><code>||</code></td><td>⊕ 6A.</td></tr>
-<tr><td><code>LIKE</code> case</td><td>case-sensitive (+<code>ILIKE</code>)</td><td>case-insensitive (ASCII)</td><td>Today = SQLite (insensitive). Split <code>LIKE</code>/<code>ILIKE</code> ⊕ 6E.</td></tr>
+<tr><td><code>LIKE</code> case</td><td>case-sensitive (+<code>ILIKE</code>)</td><td>case-insensitive (ASCII)</td><td>Split shipped (6E): <code>LIKE</code> case-sensitive, <code>ILIKE</code> folds ASCII case.</td></tr>
 <tr><td>Boolean</td><td>real <code>bool</code></td><td>0/1 integer</td><td>0/1 integer; report as <code>bool</code> on the wire ⊕ 6E.</td></tr>
-<tr><td>Auto IDs</td><td><code>SERIAL</code>/<code>IDENTITY</code></td><td><code>INTEGER PRIMARY KEY [AUTOINCREMENT]</code> / <code>rowid</code></td><td><code>AUTOINCREMENT</code>-style integer PK ⊕ 6D; expose a <code>rowid</code> alias optionally.</td></tr>
-<tr><td>Placeholders</td><td><code>$1</code></td><td><code>?</code>, <code>?NNN</code>, <code>:name</code></td><td><code>?</code> today; <code>$1</code>/<code>:name</code> ⊕ 6E.</td></tr>
+<tr><td>Auto IDs</td><td><code>SERIAL</code>/<code>IDENTITY</code></td><td><code>INTEGER PRIMARY KEY [AUTOINCREMENT]</code> / <code>rowid</code></td><td><code>AUTOINCREMENT</code>/<code>SERIAL</code> integer column shipped (6D).</td></tr>
+<tr><td>Placeholders</td><td><code>$1</code></td><td><code>?</code>, <code>?NNN</code>, <code>:name</code></td><td><code>?</code> / <code>$1</code> / <code>:name</code> all shipped (6E).</td></tr>
 </tbody>
 </table>
 </div>
@@ -228,8 +228,12 @@
 <h2>Implementation spec</h2>
 <p>The gaps cluster into five stages, ordered by value/risk. They are <strong>additive frontend changes</strong>: each grows the <code>Stmt</code>/<code>Expr</code> AST (<code>sql.rs</code>), the parser, and the executor (<code>exec.rs</code>), plus the catalog (<code>catalog.rs</code>) and transaction manager (<code>conn.rs</code>) for the few stateful items. None touches <code>trait Storage</code>; the WAL op set (<code>wal.rs</code>) only grows if a stage adds a new durable catalog fact (called out). Proposed as <strong>Phase 6 — SQL Surface Completeness</strong> in the roadmap (spec <a href="13-roadmap.html">13</a>); ship the stages as independent, individually-testable increments.</p>
 
-<h3>Stage 6A — Expression &amp; single-table completeness (low risk, high value)</h3>
+<h3>Stage 6A — Expression &amp; single-table completeness (low risk, high value) <span class="badge badge-status status-review">Implemented</span></h3>
 <p>The cheapest, highest-coverage wins; no new execution model, only richer expressions and result shapes over the existing single-table scan.</p>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>Delivered: <code>||</code> concat, <code>CASE</code> (searched + simple), <code>CAST(x AS t)</code> alongside <code>::</code>, <code>IN (list)</code>/<code>NOT IN</code>, <code>BETWEEN</code>/<code>NOT BETWEEN</code>, <code>NULLS FIRST/LAST</code>, <code>LIKE … ESCAPE</code> and <code>ILIKE</code> (parsed; case-fold pending the 6E split), the conditional/null group (<code>ifnull</code>, <code>iif</code>, <code>greatest</code>, <code>least</code>), <code>RETURNING</code> on INSERT/UPDATE/DELETE, upsert (<code>ON CONFLICT DO NOTHING|UPDATE</code> with <code>excluded.*</code>, plus SQLite <code>OR IGNORE</code>/<code>OR REPLACE</code> — the silent-ignore hazard is closed), and <code>INSERT … SELECT</code>. <code>ENGINE_ABI_VERSION</code> stays <code>3</code>; <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>. Tests: <code>crates/engine/tests/expr_6a.rs</code>, plus a <code>RETURNING</code> case in <code>tests/ffi.rs</code>.</p>
+</div>
 <ul>
 <li><strong>Lexer:</strong> add <code>||</code> (concat) and <code>::</code> (cast) tokens; keep the existing <code>&lt;</code>-disambiguation discipline (vector ops bind first) in <code>lex_lt</code>.</li>
 <li><strong>AST / parser:</strong> <code>Expr::Case</code>, <code>Expr::Cast{expr, ty}</code>, <code>Expr::InList{expr, list, negated}</code>, <code>Expr::Between{expr, lo, hi, negated}</code>, <code>Expr::Call{name, args}</code>, and <code>BinOp::Concat</code>. Add <code>SelectStmt.offset: Option&lt;i64&gt;</code> and per-key <code>NULLS FIRST/LAST</code>. Add <code>LIKE … ESCAPE</code>.</li>
@@ -241,8 +245,12 @@
 <li><strong>Versions:</strong> <code>ENGINE_ABI_VERSION</code> stays <code>3</code>; <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>.</li>
 </ul>
 
-<h3>Stage 6B — Multi-table &amp; aggregation (the big one)</h3>
+<h3>Stage 6B — Multi-table &amp; aggregation (the big one) <span class="badge badge-status status-review">Implemented</span></h3>
 <p>The structural jump: more than one row source, qualified names, grouping. This is where the executor gains a small relational layer above the per-table scan, staying brute-force (nested-loop, hash-group) — appropriate for an in-memory MVCC OLTP store.</p>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>A relational executor (<code>exec.rs</code> nested <code>mod relational</code>) materializes the <code>FROM</code> into a single column namespace, then runs the same filter/group/project/order pipeline resolving names against it. Delivered: <code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code> joins with <code>ON</code>/<code>USING</code> and the comma form; table aliases and qualified <code>alias.col</code> resolution (ambiguous/unknown → <code>ENGINE_ERR_SQL</code>); derived tables and non-recursive <code>WITH</code> CTEs; <code>DISTINCT</code> and <code>COUNT(DISTINCT)</code>; <code>group_concat</code>/<code>string_agg</code>; set operations <code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT [ALL]</code>; and non-correlated scalar / <code>IN</code> / <code>EXISTS</code> subqueries (folded to literals before the scan). Joins resolve MVCC visibility per base row exactly as the single-table path does. The single-table fast path (and its HNSW KNN shortcut) is unchanged. Deferred (clean rejection): correlated subqueries, <code>CREATE VIEW</code>, <code>UPDATE … FROM</code>/<code>DELETE … USING</code>, recursive CTEs. <code>ENGINE_ABI_VERSION</code> stays <code>3</code>; <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>. Tests: <code>crates/engine/tests/relational_6b.rs</code>.</p>
+</div>
 <ul>
 <li><strong>AST:</strong> generalize <code>SelectStmt.from</code> from <code>Option&lt;String&gt;</code> to a <code>FromClause</code> tree: base tables with aliases, <code>JOIN</code> nodes (<code>Inner/Left/Right/Full/Cross</code>) with <code>ON</code>/<code>USING</code>, and derived tables (<code>(SELECT …) AS a</code>). Add <code>group_by: Vec&lt;Expr&gt;</code>, <code>having: Option&lt;Expr&gt;</code>, <code>distinct: bool</code>, and a <code>set_op</code> wrapper (<code>UNION/INTERSECT/EXCEPT [ALL]</code>). Add <code>Expr::Subquery</code> (scalar) and <code>Expr::Exists</code>/<code>Expr::InSubquery</code>.</li>
 <li><strong>Name resolution:</strong> replace the "drop the table qualifier, keep the column" shortcut in <code>primary()</code> with a real binder: resolve <code>alias.col</code> against the active <code>FromClause</code>'s column namespace; raise <code>ENGINE_ERR_SQL</code> on ambiguous/unknown.</li>
@@ -253,7 +261,11 @@
 <li><strong>Versions:</strong> <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>. <code>ENGINE_ABI_VERSION</code> stays <code>3</code> (still text-in/result-out). The <code>CreateView</code>/(optional) catalog WAL ops are additive WAL records, replayed like any other.</li>
 </ul>
 
-<h3>Stage 6C — Function library</h3>
+<h3>Stage 6C — Function library <span class="badge badge-status status-review">Implemented</span></h3>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>The scalar dispatch table now carries the string (<code>substr</code>, <code>replace</code>, <code>instr</code>/<code>strpos</code>, <code>repeat</code>, <code>reverse</code>, <code>left</code>/<code>right</code>, <code>lpad</code>/<code>rpad</code>, …), numeric (<code>ceil</code>/<code>floor</code>, <code>sqrt</code>, <code>power</code>, <code>mod</code>, <code>sign</code>, <code>trunc</code>, <code>round(x,n)</code>, <code>exp</code>/<code>ln</code>/<code>log</code>, <code>pi</code>), date/time (<code>now</code>, <code>current_date/time/timestamp</code>, <code>date</code>/<code>time</code>/<code>datetime</code>, <code>date_trunc</code>, <code>extract(field FROM …)</code>, <code>strftime</code>, <code>unixepoch</code>), UUID/misc (<code>gen_random_uuid</code>, <code>random</code>, <code>typeof</code>, <code>hex</code>), and JSON (<code>-&gt;</code>, <code>-&gt;&gt;</code>, <code>json_extract</code>, <code>json_array</code>) groups. Date/time is the SQLite text/epoch model in two small dependency-free modules (<code>datetime.rs</code>, <code>json.rs</code>); non-deterministic functions evaluate once so the concrete value lands in the WAL (replay-stable). Tests: <code>crates/engine/tests/functions_6c.rs</code> + module unit tests.</p>
+</div>
 <ul>
 <li>Populate the 6A scalar-dispatch table with the string, numeric/math, date/time, UUID, and minimal-JSON groups from the functions table. Date/time follows the SQLite model (text/epoch + <code>strftime</code>/<code>date</code>), avoiding a native temporal type and keeping the value model unchanged.</li>
 <li><strong>Determinism &amp; durability:</strong> non-deterministic functions (<code>now()</code>, <code>random()</code>, <code>gen_random_uuid()</code>) are evaluated <em>once at execution time</em> and the resulting concrete value is what lands in the <code>WalOp</code> — so replay reproduces the stored value exactly (never re-rolls). This is the same discipline that keeps the vector index replay-deterministic.</li>
@@ -261,7 +273,11 @@
 <li><strong>Tests:</strong> per-function unit coverage; an explicit replay-determinism test for the non-deterministic functions.</li>
 </ul>
 
-<h3>Stage 6D — Constraints, schema evolution &amp; savepoints</h3>
+<h3>Stage 6D — Constraints, schema evolution &amp; savepoints <span class="badge badge-status status-review">Implemented</span></h3>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>Catalog and WAL grew additive facts (backward-compatible <code>CreateTable</code> extras + new <code>ALTER</code> ops): column <code>DEFAULT</code> (re-parsed from stored text), <code>CHECK</code> (column &amp; table level), single &amp; composite <code>UNIQUE</code>, composite/table-level <code>PRIMARY KEY</code>, and <code>AUTOINCREMENT</code>/<code>SERIAL</code> (a per-table counter rebuilt from the rows on replay — the assigned value is concrete in the WAL). <code>DEFAULT</code> as an <code>INSERT</code> value and <code>DEFAULT VALUES</code> are supported. <code>ALTER TABLE ADD</code>/<code>DROP</code>/<code>RENAME COLUMN</code> and <code>RENAME TO</code> reshape the catalog and row versions over new WAL ops. <code>SAVEPOINT</code>/<code>RELEASE</code>/<code>ROLLBACK TO</code> snapshot and restore the in-flight writer's pending set (and truncate its buffered WAL) — no durable change. DDL stays autocommit-only. Tests: <code>crates/engine/tests/constraints_6d.rs</code>. (Scalar B-tree indexes and FK enforcement remain out; secondary <code>UNIQUE</code> during an <code>ON CONFLICT</code> upsert is not separately checked.)</p>
+</div>
 <ul>
 <li><strong>Catalog:</strong> store <code>DEFAULT</code> expressions, <code>CHECK</code> predicates, secondary <code>UNIQUE</code>, and composite/table-level <code>PRIMARY KEY</code> in <code>TableSchema</code>. Enforce in the insert/update validation pass (which already validates fully before mutating — atomic per statement). Secondary UNIQUE reuses the <code>pk_keys</code> machinery generalized to N key sets.</li>
 <li><strong><code>AUTOINCREMENT</code>/<code>SERIAL</code>:</strong> a monotonic per-table counter in the catalog, advanced and WAL-logged on insert (a new durable fact → additive WAL op).</li>
@@ -271,8 +287,12 @@
 <li><strong>Versions:</strong> new WAL ops are additive; <code>STORAGE_TRAIT_VERSION</code> unchanged. DDL remains autocommit-only (spec 02 boundary preserved).</li>
 </ul>
 
-<h3>Stage 6E — Dialect shims (compatibility surface)</h3>
+<h3>Stage 6E — Dialect shims (compatibility surface) <span class="badge badge-status status-review">Implemented</span></h3>
 <p>Make real PostgreSQL/SQLite clients and ORMs connect without surprises, concentrated at the boundary so the core stays one dialect.</p>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>Placeholder forms <code>$1</code> (numbered) and <code>:name</code> (named) join positional <code>?</code>, all normalized to the engine's 1-based bind model (a repeated <code>$1</code> reuses its slot; distinct <code>:name</code>s get sequential slots). Backtick <code>`x`</code> identifier quoting joins <code>"x"</code> (<code>[x]</code> stays a vector literal). <code>LIKE</code> is now case-sensitive and <code>ILIKE</code> case-folds (the dialect split). <code>SET</code>/<code>SET TRANSACTION ISOLATION LEVEL</code>/<code>PRAGMA</code>/<code>VACUUM</code>/<code>ANALYZE</code>/<code>RESET</code>/<code>DISCARD</code> are accepted no-ops; <code>SHOW name</code> returns a one-row result; <code>EXPLAIN [ANALYZE] …</code> returns a one-line plan. Implemented in the engine lexer/parser/exec so both the embedded and pgwire paths inherit it. Tests: <code>crates/engine/tests/dialect_6e.rs</code>.</p>
+</div>
 <ul>
 <li>Placeholder forms <code>$1</code> and <code>:name</code> (normalize to the existing positional model); identifier quoting <code>[x]</code>/<code>`x`</code>; <code>LIKE</code> vs <code>ILIKE</code> split (case-sensitive default for PG mode); boolean reported as <code>bool</code> on the wire.</li>
 <li>Accept-and-pin <code>SET TRANSACTION ISOLATION LEVEL</code> to SI; accept-and-no-op the common session <code>SET</code>/<code>SHOW</code>/<code>PRAGMA</code>/<code>VACUUM</code>/<code>ANALYZE</code> that ORMs emit on connect, rejecting unknown ones (never silently swallow semantics-bearing statements).</li>

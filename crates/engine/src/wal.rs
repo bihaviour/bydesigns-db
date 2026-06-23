@@ -36,6 +36,27 @@ pub enum WalOp {
     DropIndex {
         name: String,
     },
+    /// `ALTER TABLE … ADD COLUMN` (stage 6D).
+    AlterAddColumn {
+        table: String,
+        column: Column,
+    },
+    /// `ALTER TABLE … DROP COLUMN` (stage 6D).
+    AlterDropColumn {
+        table: String,
+        column: String,
+    },
+    /// `ALTER TABLE … RENAME COLUMN` (stage 6D).
+    AlterRenameColumn {
+        table: String,
+        from: String,
+        to: String,
+    },
+    /// `ALTER TABLE … RENAME TO` (stage 6D).
+    AlterRenameTable {
+        table: String,
+        to: String,
+    },
     Commit,
 }
 
@@ -46,6 +67,10 @@ const OP_DELETE: u8 = 4;
 const OP_COMMIT: u8 = 5;
 const OP_CREATE_INDEX: u8 = 6;
 const OP_DROP_INDEX: u8 = 7;
+const OP_ALTER_ADD: u8 = 8;
+const OP_ALTER_DROP: u8 = 9;
+const OP_ALTER_RENAME_COL: u8 = 10;
+const OP_ALTER_RENAME_TABLE: u8 = 11;
 
 impl WalOp {
     pub fn encode(&self) -> WalRecord {
@@ -65,6 +90,12 @@ impl WalOp {
                     if c.not_null {
                         flags |= 2;
                     }
+                    if c.unique {
+                        flags |= 4;
+                    }
+                    if c.autoincrement {
+                        flags |= 8;
+                    }
                     b.push(flags);
                 }
                 // Foreign keys follow the columns. Records written before FK
@@ -81,6 +112,31 @@ impl WalOp {
                     put_u32(&mut b, fk.foreign_columns.len() as u32);
                     for c in &fk.foreign_columns {
                         put_str(&mut b, c);
+                    }
+                }
+                // Stage-6D extras follow the FK section: per-column DEFAULT text,
+                // then table CHECK predicates and composite UNIQUE sets. A record
+                // written before 6D ends after the FKs (decode treats an exhausted
+                // cursor as "no extras"), so this stays backward-compatible.
+                put_u32(&mut b, schema.columns.len() as u32);
+                for c in &schema.columns {
+                    match &c.default_sql {
+                        Some(s) => {
+                            b.push(1);
+                            put_str(&mut b, s);
+                        }
+                        None => b.push(0),
+                    }
+                }
+                put_u32(&mut b, schema.checks.len() as u32);
+                for chk in &schema.checks {
+                    put_str(&mut b, chk);
+                }
+                put_u32(&mut b, schema.uniques.len() as u32);
+                for u in &schema.uniques {
+                    put_u32(&mut b, u.len() as u32);
+                    for col in u {
+                        put_str(&mut b, col);
                     }
                 }
             }
@@ -116,6 +172,55 @@ impl WalOp {
                 put_str(&mut b, table);
                 put_u64(&mut b, *vid);
             }
+            WalOp::AlterAddColumn { table, column } => {
+                b.push(OP_ALTER_ADD);
+                put_str(&mut b, table);
+                // Reuse the column-list + extras framing (a single column) so the
+                // decoder shares decode_columns / decode_table_extras.
+                put_u32(&mut b, 1);
+                put_str(&mut b, &column.name);
+                put_coltype(&mut b, column.ty);
+                let mut flags = 0u8;
+                if column.primary_key {
+                    flags |= 1;
+                }
+                if column.not_null {
+                    flags |= 2;
+                }
+                if column.unique {
+                    flags |= 4;
+                }
+                if column.autoincrement {
+                    flags |= 8;
+                }
+                b.push(flags);
+                put_u32(&mut b, 1); // extras: one default entry
+                match &column.default_sql {
+                    Some(s) => {
+                        b.push(1);
+                        put_str(&mut b, s);
+                    }
+                    None => b.push(0),
+                }
+                put_u32(&mut b, 0); // no checks
+                put_u32(&mut b, 0); // no uniques
+            }
+            WalOp::AlterDropColumn { table, column } => {
+                b.push(OP_ALTER_DROP);
+                put_str(&mut b, table);
+                put_str(&mut b, column);
+            }
+            WalOp::AlterRenameColumn { table, from, to } => {
+                b.push(OP_ALTER_RENAME_COL);
+                put_str(&mut b, table);
+                put_str(&mut b, from);
+                put_str(&mut b, to);
+            }
+            WalOp::AlterRenameTable { table, to } => {
+                b.push(OP_ALTER_RENAME_TABLE);
+                put_str(&mut b, table);
+                put_str(&mut b, to);
+            }
             WalOp::Commit => b.push(OP_COMMIT),
         }
         WalRecord::new(b)
@@ -125,52 +230,25 @@ impl WalOp {
         let mut c = Cursor { b: bytes, p: 0 };
         let tag = c.u8()?;
         let op = match tag {
-            OP_CREATE => {
-                let name = c.str()?;
-                let columns = decode_columns(&mut c)?;
-                let foreign_keys = decode_foreign_keys(&mut c)?;
-                WalOp::CreateTable {
-                    schema: TableSchema {
-                        name,
-                        columns,
-                        foreign_keys,
-                    },
-                }
-            }
+            OP_CREATE => decode_create(&mut c)?,
+            OP_ALTER_ADD => decode_alter_add(&mut c)?,
+            OP_ALTER_DROP => WalOp::AlterDropColumn {
+                table: c.str()?,
+                column: c.str()?,
+            },
+            OP_ALTER_RENAME_COL => WalOp::AlterRenameColumn {
+                table: c.str()?,
+                from: c.str()?,
+                to: c.str()?,
+            },
+            OP_ALTER_RENAME_TABLE => WalOp::AlterRenameTable {
+                table: c.str()?,
+                to: c.str()?,
+            },
             OP_DROP => WalOp::DropTable { name: c.str()? },
-            OP_CREATE_INDEX => {
-                let name = c.str()?;
-                let table = c.str()?;
-                let column = c.str()?;
-                let m = c.u32()? as usize;
-                let ef_construction = c.u32()? as usize;
-                let ef_search = c.u32()? as usize;
-                let metric = Metric::from_tag(c.u8()?);
-                WalOp::CreateIndex {
-                    def: IndexDef {
-                        name,
-                        table,
-                        column,
-                        params: IndexParams {
-                            m,
-                            ef_construction,
-                            ef_search,
-                            metric,
-                        },
-                    },
-                }
-            }
+            OP_CREATE_INDEX => decode_create_index(&mut c)?,
             OP_DROP_INDEX => WalOp::DropIndex { name: c.str()? },
-            OP_INSERT => {
-                let table = c.str()?;
-                let vid = c.u64()?;
-                let n = c.u32()? as usize;
-                let mut values = Vec::with_capacity(n);
-                for _ in 0..n {
-                    values.push(c.value()?);
-                }
-                WalOp::Insert { table, vid, values }
-            }
+            OP_INSERT => decode_insert(&mut c)?,
             OP_DELETE => WalOp::Delete {
                 table: c.str()?,
                 vid: c.u64()?,
@@ -180,6 +258,72 @@ impl WalOp {
         };
         Ok(op)
     }
+}
+
+/// Decode a `CreateTable` op body (name + columns + FKs + checks/uniques).
+fn decode_create(c: &mut Cursor) -> Result<WalOp> {
+    let name = c.str()?;
+    let mut columns = decode_columns(c)?;
+    let foreign_keys = decode_foreign_keys(c)?;
+    let (checks, uniques) = decode_table_extras(c, &mut columns)?;
+    Ok(WalOp::CreateTable {
+        schema: TableSchema {
+            name,
+            columns,
+            foreign_keys,
+            checks,
+            uniques,
+        },
+    })
+}
+
+/// Decode an `AlterAddColumn` op body (one column, sharing the column codec).
+fn decode_alter_add(c: &mut Cursor) -> Result<WalOp> {
+    let table = c.str()?;
+    let mut cols = decode_columns(c)?;
+    let _ = decode_table_extras(c, &mut cols)?;
+    Ok(WalOp::AlterAddColumn {
+        table,
+        column: cols
+            .pop()
+            .ok_or_else(|| EngineError::internal("ALTER ADD COLUMN record has no column"))?,
+    })
+}
+
+/// Decode a `CreateIndex` op body (name/table/column + HNSW params).
+fn decode_create_index(c: &mut Cursor) -> Result<WalOp> {
+    let name = c.str()?;
+    let table = c.str()?;
+    let column = c.str()?;
+    let m = c.u32()? as usize;
+    let ef_construction = c.u32()? as usize;
+    let ef_search = c.u32()? as usize;
+    let metric = Metric::from_tag(c.u8()?);
+    Ok(WalOp::CreateIndex {
+        def: IndexDef {
+            name,
+            table,
+            column,
+            params: IndexParams {
+                m,
+                ef_construction,
+                ef_search,
+                metric,
+            },
+        },
+    })
+}
+
+/// Decode an `Insert` op body (table + vid + count-prefixed values).
+fn decode_insert(c: &mut Cursor) -> Result<WalOp> {
+    let table = c.str()?;
+    let vid = c.u64()?;
+    let n = c.u32()? as usize;
+    let mut values = Vec::with_capacity(n);
+    for _ in 0..n {
+        values.push(c.value()?);
+    }
+    Ok(WalOp::Insert { table, vid, values })
 }
 
 /// Decode a `CreateTable`'s column list (count-prefixed).
@@ -195,9 +339,40 @@ fn decode_columns(c: &mut Cursor) -> Result<Vec<Column>> {
             ty,
             primary_key: flags & 1 != 0,
             not_null: flags & 2 != 0,
+            unique: flags & 4 != 0,
+            autoincrement: flags & 8 != 0,
+            default_sql: None,
         });
     }
     Ok(columns)
+}
+
+/// Decode the stage-6D extras section (per-column DEFAULT text, table CHECK
+/// predicates, composite UNIQUE sets), filling `columns` defaults in place. A
+/// record written before 6D is exhausted here, yielding empty extras.
+fn decode_table_extras(
+    c: &mut Cursor,
+    columns: &mut [Column],
+) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    if c.at_end() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let ncols = c.u32()? as usize;
+    for i in 0..ncols {
+        if c.u8()? == 1 {
+            let s = c.str()?;
+            if let Some(col) = columns.get_mut(i) {
+                col.default_sql = Some(s);
+            }
+        }
+    }
+    let checks = decode_str_list(c)?;
+    let nuniq = c.u32()? as usize;
+    let mut uniques = Vec::with_capacity(nuniq);
+    for _ in 0..nuniq {
+        uniques.push(decode_str_list(c)?);
+    }
+    Ok((checks, uniques))
 }
 
 /// Decode the foreign-key section, if present. A record written before FK support

@@ -21,7 +21,7 @@
 <span class="spec-date">Reference</span>
 </div>
 <h1>SQL reference</h1>
-<p class="lede">Twill DB speaks a deliberately small, hand-parsed SQL subset: DDL, row DML, single-table queries with aggregates, and transaction control. Everything on this page is what the parser actually accepts — anything outside it is rejected with <code>ENGINE_ERR_SQL</code> rather than silently mis-parsed.</p>
+<p class="lede">Twill DB speaks a focused, hand-parsed SQL surface covering the common OLTP majority of PostgreSQL and SQLite: DDL, row DML (with upsert and <code>RETURNING</code>), multi-table queries with joins, aggregation, subqueries and set operations, a curated function library, and transaction control. Everything on this page is what the parser actually accepts — anything outside it is rejected with <code>ENGINE_ERR_SQL</code> rather than silently mis-parsed.</p>
 </header>
 
 <section>
@@ -32,6 +32,7 @@
 <thead><tr><th>Statement</th><th>Purpose</th><th>In a transaction?</th></tr></thead>
 <tbody>
 <tr><td><code>CREATE TABLE</code></td><td>Define a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
+<tr><td><code>ALTER TABLE</code></td><td>Add/drop/rename a column, rename a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
 <tr><td><code>DROP TABLE</code></td><td>Remove a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
 <tr><td><code>CREATE INDEX … USING hnsw</code></td><td>Build a vector index</td><td>Autocommit only — see <a href="#vector-search">Vector search</a></td></tr>
 <tr><td><code>DROP INDEX</code></td><td>Remove a vector index</td><td>Autocommit only</td></tr>
@@ -52,26 +53,49 @@
 <section>
 <h2>Data definition (DDL)</h2>
 <h3>CREATE TABLE</h3>
-<p>Define a table with one or more columns. Each column may carry a type name and the constraints <code>PRIMARY KEY</code> and/or <code>NOT NULL</code>. <code>IF NOT EXISTS</code> makes creation idempotent.</p>
+<p>Define a table with one or more columns and constraints. <code>IF NOT EXISTS</code> makes creation idempotent.</p>
 <pre data-lang="sql"><code>CREATE TABLE notes (
-  id    INTEGER PRIMARY KEY,
-  title TEXT NOT NULL,
-  body  TEXT,
-  score REAL,
-  data  BLOB
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  title   TEXT NOT NULL,
+  email   TEXT UNIQUE,
+  status  TEXT DEFAULT 'draft',
+  score   REAL CHECK (score >= 0),
+  data    BLOB
 );
 
-CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT);</code></pre>
-<ul class="reqs">
-<li><span class="req-tag must">MUST</span> declare at least one column; an empty column list is a parse error.</li>
-<li><span class="req-tag may">MAY</span> omit a column's type name — an untyped column defaults to <code>TEXT</code> affinity.</li>
-<li><span class="req-tag may">MAY</span> write a parenthesised size such as <code>VARCHAR(64)</code> or <code>DECIMAL(10,2)</code> — the size is parsed and ignored; only the storage class matters.</li>
-<li><span class="req-tag may">MAY</span> mark a column <code>UNIQUE</code> or explicitly <code>NULL</code> — these are accepted as constraint markers (uniqueness is enforced for the primary key).</li>
-</ul>
-<div class="callout note">
-<p class="callout-title">PRIMARY KEY implies NOT NULL</p>
-<p>Declaring a column <code>PRIMARY KEY</code> also makes it <code>NOT NULL</code>.</p>
+-- table-level constraints (composite PRIMARY KEY / UNIQUE / CHECK)
+CREATE TABLE membership (
+  org  INTEGER,
+  usr  INTEGER,
+  role TEXT DEFAULT 'member',
+  PRIMARY KEY (org, usr),
+  UNIQUE (usr, role)
+);</code></pre>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Constraint</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>PRIMARY KEY</code> (single or composite)</td><td>Unique + implicitly <code>NOT NULL</code>; the upsert conflict target</td></tr>
+<tr><td><code>NOT NULL</code> / <code>NULL</code></td><td>Rejects / allows NULLs</td></tr>
+<tr><td><code>UNIQUE</code> (column or <code>UNIQUE (cols)</code>)</td><td>Enforced on insert/update; multiple NULLs allowed (NULLs are distinct)</td></tr>
+<tr><td><code>DEFAULT expr</code></td><td>Fills an omitted column or a <code>DEFAULT</code> value cell</td></tr>
+<tr><td><code>CHECK (expr)</code> (column or table)</td><td>Row rejected when the predicate is false (NULL passes)</td></tr>
+<tr><td><code>AUTOINCREMENT</code> / <code>SERIAL</code></td><td>Fills an omitted integer column from a monotonic per-table counter</td></tr>
+<tr><td><code>REFERENCES</code> / <code>FOREIGN KEY</code></td><td>Tracked as metadata (reflected to clients); not enforced this phase</td></tr>
+</tbody>
+</table>
 </div>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> omit a column's type name — an untyped column defaults to <code>TEXT</code> affinity.</li>
+<li><span class="req-tag may">MAY</span> write a parenthesised size such as <code>VARCHAR(64)</code> — parsed and ignored; only the storage class matters.</li>
+</ul>
+
+<h3>ALTER TABLE</h3>
+<p>Migrate a table's shape (autocommit only). Adding a column backfills existing rows with its <code>DEFAULT</code> (or NULL).</p>
+<pre data-lang="sql"><code>ALTER TABLE notes ADD COLUMN pinned INTEGER DEFAULT 0;
+ALTER TABLE notes DROP COLUMN data;
+ALTER TABLE notes RENAME COLUMN title TO heading;
+ALTER TABLE notes RENAME TO memos;</code></pre>
 
 <h3>DROP TABLE</h3>
 <p>Remove a table. <code>IF EXISTS</code> suppresses the error when the table is absent.</p>
@@ -82,64 +106,105 @@ DROP TABLE IF EXISTS notes;</code></pre>
 <section>
 <h2>Data manipulation (DML)</h2>
 <h3>INSERT</h3>
-<p>Insert one or more rows. The column list is optional; when given, values bind to those columns by position. Multiple parenthesised tuples insert several rows in one statement. <code>OR REPLACE</code> / <code>OR IGNORE</code> are accepted after <code>INSERT</code> and ignored.</p>
+<p>Insert one or more rows. The column list is optional; when given, values bind to those columns by position. Multiple parenthesised tuples insert several rows in one statement, and the row source may be a query (<code>INSERT … SELECT</code>). A clashing primary key is resolved by an explicit <code>ON CONFLICT</code> action or by SQLite's <code>OR IGNORE</code> / <code>OR REPLACE</code>. <code>RETURNING</code> projects the inserted rows back as a result set.</p>
 <pre data-lang="sql"><code>INSERT INTO notes (id, title, body) VALUES (1, 'first', 'hello');
 
 INSERT INTO notes (id, title) VALUES (2, 'two'), (3, 'three');
 
 INSERT INTO notes VALUES (4, 'four', NULL, 9.5, NULL);
 
--- with parameters
-INSERT INTO notes (id, title) VALUES (?, ?);</code></pre>
+-- copy rows from a query
+INSERT INTO archive (id, title) SELECT id, title FROM notes WHERE score IS NULL;
+
+-- upsert: do nothing, or update using the proposed row via `excluded`
+INSERT INTO notes (id, title) VALUES (1, 'dup') ON CONFLICT (id) DO NOTHING;
+INSERT INTO notes (id, title) VALUES (1, 'new')
+  ON CONFLICT (id) DO UPDATE SET title = excluded.title;
+
+-- SQLite resolutions
+INSERT OR IGNORE  INTO notes (id, title) VALUES (1, 'skip');
+INSERT OR REPLACE INTO notes (id, title) VALUES (1, 'replace whole row');
+
+-- return the inserted rows
+INSERT INTO notes (id, title) VALUES (?, ?) RETURNING id, title;</code></pre>
 
 <h3>UPDATE</h3>
-<p>Assign one or more columns, optionally filtered by a <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is updated. The number of rows changed is reported by <code>engine_changes()</code>.</p>
+<p>Assign one or more columns, optionally filtered by a <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is updated. The number of rows changed is reported by <code>engine_changes()</code>; <code>RETURNING</code> projects the new row versions.</p>
 <pre data-lang="sql"><code>UPDATE notes SET title = 'renamed', score = score + 1 WHERE id = 1;
-UPDATE notes SET body = NULL;</code></pre>
+UPDATE notes SET body = NULL;
+UPDATE notes SET score = score + 1 WHERE id = 1 RETURNING id, score;</code></pre>
 
 <h3>DELETE</h3>
-<p>Remove rows matching an optional <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is deleted.</p>
+<p>Remove rows matching an optional <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is deleted. <code>RETURNING</code> projects the deleted rows.</p>
 <pre data-lang="sql"><code>DELETE FROM notes WHERE score IS NULL;
-DELETE FROM notes;</code></pre>
+DELETE FROM notes;
+DELETE FROM notes WHERE id = 9 RETURNING id, title;</code></pre>
 </section>
 
 <section>
 <h2>Queries (SELECT)</h2>
-<p>A query reads from a single table (or no table, for bare expressions) under snapshot isolation. The full shape is:</p>
-<pre data-lang="sql"><code>SELECT items
-  FROM table
+<p>A query reads under snapshot isolation. The full shape is:</p>
+<pre data-lang="sql"><code>[WITH cte AS (query), ...]
+SELECT [DISTINCT] items
+  FROM source [JOIN source ON ... | USING (...)] ...
  WHERE predicate
  GROUP BY expr, ...
 HAVING predicate
- ORDER BY expr [ASC | DESC], ...
+ [UNION | INTERSECT | EXCEPT [ALL] SELECT ...]
+ ORDER BY expr [ASC | DESC] [NULLS FIRST | LAST], ...
  LIMIT n OFFSET m</code></pre>
-<p>Clauses are optional and parsed in this order. <code>SELECT ALL</code> is accepted (it is the default); <code>SELECT DISTINCT</code> is rejected. Queries still read from a single table — there is no <code>JOIN</code> or subquery.</p>
+<p>Clauses are optional. <code>SELECT ALL</code> is the default; <code>SELECT DISTINCT</code> de-duplicates output rows.</p>
+
+<h3>Sources and joins</h3>
+<p>A <code>FROM</code> source is a table (optionally aliased <code>t a</code> / <code>t AS a</code>), a derived table <code>(SELECT …) AS a</code>, or a join. Qualified references <code>alias.col</code> resolve against the active sources; an ambiguous or unknown name is a parse-time <code>ENGINE_ERR_SQL</code>. Joins are nested-loop and evaluated over the MVCC snapshot.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Join</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>[INNER] JOIN … ON</code> / <code>USING (cols)</code></td><td>Matching pairs only</td></tr>
+<tr><td><code>LEFT JOIN</code></td><td>All left rows; unmatched right side is NULL</td></tr>
+<tr><td><code>RIGHT JOIN</code> / <code>FULL JOIN</code></td><td>Symmetric / both-side null-extension</td></tr>
+<tr><td><code>CROSS JOIN</code>, or comma <code>FROM a, b</code></td><td>Cartesian product (filter with <code>WHERE</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<pre data-lang="sql"><code>SELECT a.name, b.title
+  FROM authors a JOIN books b ON a.id = b.author_id
+ ORDER BY a.name;
+
+SELECT a.name, count(*) AS n
+  FROM authors a LEFT JOIN books b ON a.id = b.author_id
+ GROUP BY a.name;</code></pre>
 
 <h3>Select items</h3>
 <div class="table-wrap">
 <table>
 <thead><tr><th>Item</th><th>Meaning</th></tr></thead>
 <tbody>
-<tr><td><code>*</code></td><td>All columns of the table, in declared order</td></tr>
-<tr><td><code>expr</code></td><td>Any expression — a column, literal, function call, or computed value</td></tr>
+<tr><td><code>*</code> / <code>alias.*</code></td><td>All columns (of all sources, or of one source)</td></tr>
+<tr><td><code>expr</code></td><td>Any expression — a column, <code>alias.col</code>, literal, function call, or computed value</td></tr>
 <tr><td><code>expr AS alias</code></td><td>Name the output column (the <code>AS</code> keyword is optional)</td></tr>
-<tr><td><code>COUNT</code> / <code>SUM</code> / <code>MIN</code> / <code>MAX</code> / <code>AVG</code> / <code>JSON_AGG</code></td><td>Aggregate over <code>*</code> or an expression (whole-table, or per group with <code>GROUP BY</code>)</td></tr>
+<tr><td><code>COUNT</code>/<code>SUM</code>/<code>MIN</code>/<code>MAX</code>/<code>AVG</code>, <code>COUNT(DISTINCT x)</code>, <code>group_concat</code>/<code>string_agg</code>, <code>JSON_AGG</code></td><td>Aggregate over <code>*</code> or an expression (whole-table, or per group with <code>GROUP BY</code>)</td></tr>
 </tbody>
 </table>
 </div>
-<pre data-lang="sql"><code>SELECT * FROM notes;
-SELECT id, title AS heading FROM notes WHERE score >= 5 ORDER BY score DESC LIMIT 10 OFFSET 20;
-SELECT COUNT(*), AVG(score), MAX(score) FROM notes;
-SELECT author, COUNT(*) AS n FROM notes GROUP BY author HAVING COUNT(*) > 1 ORDER BY n DESC;
-SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 
 <h3>Aggregates and GROUP BY</h3>
-<p><code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, <code>AVG</code>, and <code>JSON_AGG</code> compute over the filtered rows. Without <code>GROUP BY</code> they fold the whole (filtered) table into one row; with <code>GROUP BY</code> they fold each group, and you may project the grouped expressions alongside the aggregates. <code>HAVING</code> filters whole groups. Aggregates nest inside scalar expressions, so result-wrapping shapes like <code>coalesce(json_agg(title), '[]')</code> work.</p>
+<p>Aggregates compute over the filtered rows. Without <code>GROUP BY</code> they fold the whole (filtered) result into one row; with <code>GROUP BY</code> they fold each group, and you may project the grouped expressions alongside the aggregates. <code>HAVING</code> filters whole groups. <code>COUNT(DISTINCT x)</code> counts distinct non-NULL values; <code>group_concat(x[, sep])</code> / <code>string_agg(x, sep)</code> join a group's values. Aggregates nest inside scalar expressions, so shapes like <code>coalesce(json_agg(title), '[]')</code> work.</p>
+
+<h3>CTEs, subqueries and set operations</h3>
+<p>A leading <code>WITH name AS (query), …</code> defines non-recursive common table expressions usable as <code>FROM</code> sources. A parenthesized subquery may appear as a derived table in <code>FROM</code>, as a scalar value <code>(SELECT …)</code>, or in <code>x IN (SELECT …)</code> / <code>EXISTS (SELECT …)</code> — these expression subqueries must be <strong>non-correlated</strong> (they may not reference the outer query's columns). <code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code> (with optional <code>ALL</code>) combine two result sets of matching arity; a trailing <code>ORDER BY</code>/<code>LIMIT</code> applies to the combined result and references output columns.</p>
+<pre data-lang="sql"><code>WITH counts AS (SELECT author_id, count(*) AS n FROM books GROUP BY author_id)
+SELECT a.name, c.n FROM authors a JOIN counts c ON a.id = c.author_id;
+
+SELECT name FROM authors WHERE id IN (SELECT author_id FROM books);
+
+SELECT n FROM a UNION SELECT n FROM b ORDER BY n;</code></pre>
 
 <h3>ORDER BY, LIMIT and OFFSET</h3>
 <ul class="reqs">
-<li><span class="req-tag may">MAY</span> sort by one or more expressions, each independently <code>ASC</code> (default) or <code>DESC</code>; an <code>ORDER BY</code> key may name a select-list alias.</li>
-<li><span class="req-tag must">MUST</span> give <code>LIMIT</code> / <code>OFFSET</code> an integer literal (<code>LIMIT ALL</code> means no limit) — a non-integer is a parse error.</li>
+<li><span class="req-tag may">MAY</span> sort by one or more expressions, each independently <code>ASC</code> (default) or <code>DESC</code>, with optional <code>NULLS FIRST</code> / <code>NULLS LAST</code>; an <code>ORDER BY</code> key may name a select-list alias.</li>
+<li><span class="req-tag must">MUST</span> give <code>LIMIT</code> / <code>OFFSET</code> an integer literal or a parameter (<code>LIMIT ALL</code> means no limit) — a non-integer is a parse error.</li>
 </ul>
 </section>
 
@@ -155,11 +220,13 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>String literal</td><td><code>'hello'</code> (use <code>''</code> for a literal quote)</td></tr>
 <tr><td><code>NULL</code></td><td><code>NULL</code></td></tr>
 <tr><td>Boolean keyword</td><td><code>TRUE</code> → <code>1</code>, <code>FALSE</code> → <code>0</code></td></tr>
-<tr><td>Column reference</td><td><code>title</code>, <code>notes.title</code> (table qualifier accepted, only the column part is used)</td></tr>
-<tr><td>Parameter</td><td><code>?</code> (positional, bound 1-based)</td></tr>
+<tr><td>Column reference</td><td><code>title</code>, <code>notes.title</code> / <code>alias.title</code> (qualifier resolves against the active sources)</td></tr>
+<tr><td>Parameter</td><td><code>?</code> positional, <code>$1</code> numbered, or <code>:name</code> named (bound 1-based)</td></tr>
 <tr><td>Parenthesised</td><td><code>(score + 1) * 2</code></td></tr>
 <tr><td>Function call</td><td><code>lower(title)</code>, <code>coalesce(x, 0)</code></td></tr>
-<tr><td>Type cast</td><td><code>x::int</code>, <code>'42'::integer</code>, <code>count(*)::int</code> (Postgres <code>::</code>)</td></tr>
+<tr><td>Type cast</td><td><code>x::int</code>, <code>'42'::integer</code>, <code>CAST(x AS int)</code>, <code>count(*)::int</code></td></tr>
+<tr><td><code>CASE</code></td><td><code>CASE WHEN c &gt; 0 THEN 'pos' ELSE 'neg' END</code>, simple <code>CASE x WHEN 1 THEN … END</code></td></tr>
+<tr><td>Membership / range</td><td><code>x IN (1, 2, 3)</code>, <code>x NOT IN (…)</code>, <code>x BETWEEN 1 AND 10</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -170,16 +237,18 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <table>
 <thead><tr><th>Group</th><th>Functions</th></tr></thead>
 <tbody>
-<tr><td>Null handling</td><td><code>coalesce(...)</code>, <code>nullif(a, b)</code></td></tr>
-<tr><td>String</td><td><code>lower</code>, <code>upper</code>, <code>trim</code>/<code>btrim</code>, <code>ltrim</code>, <code>rtrim</code>, <code>length</code>/<code>char_length</code>, <code>concat</code></td></tr>
-<tr><td>Numeric</td><td><code>abs</code>, <code>round</code></td></tr>
-<tr><td>JSON</td><td><code>to_json</code>, <code>json_build_object(k, v, ...)</code>, and the <code>json_agg</code> aggregate</td></tr>
+<tr><td>Null / conditional</td><td><code>coalesce(...)</code>, <code>nullif(a, b)</code>, <code>ifnull(a, b)</code>, <code>iif(c, a, b)</code>, <code>greatest(...)</code>, <code>least(...)</code></td></tr>
+<tr><td>String</td><td><code>lower</code>, <code>upper</code>, <code>trim</code>/<code>btrim</code>/<code>ltrim</code>/<code>rtrim</code>, <code>length</code>/<code>char_length</code>, <code>concat</code>, <code>substr</code>/<code>substring</code>, <code>replace</code>, <code>instr</code>/<code>strpos</code>, <code>repeat</code>, <code>reverse</code>, <code>left</code>/<code>right</code>, <code>lpad</code>/<code>rpad</code></td></tr>
+<tr><td>Numeric</td><td><code>abs</code>, <code>round(x[, n])</code>, <code>ceil</code>/<code>floor</code>, <code>sqrt</code>, <code>power</code>/<code>pow</code>, <code>mod</code>, <code>sign</code>, <code>trunc</code>, <code>exp</code>, <code>ln</code>, <code>log</code>, <code>pi</code></td></tr>
+<tr><td>Date / time</td><td><code>now</code>/<code>current_timestamp</code>, <code>current_date</code>, <code>current_time</code>, <code>date</code>, <code>time</code>, <code>datetime</code>, <code>date_trunc(unit, ts)</code>, <code>extract(field FROM ts)</code>, <code>strftime(fmt, ts)</code>, <code>unixepoch</code></td></tr>
+<tr><td>UUID / misc</td><td><code>gen_random_uuid</code>, <code>random</code>, <code>typeof</code>, <code>hex</code></td></tr>
+<tr><td>JSON</td><td><code>-&gt;</code>, <code>-&gt;&gt;</code>, <code>json_extract(json, '$.path')</code>, <code>json_array</code>, <code>to_json</code>, <code>json_build_object(k, v, ...)</code>, and the <code>json_agg</code> aggregate</td></tr>
 </tbody>
 </table>
 </div>
 <div class="callout note">
-<p class="callout-title">JSON is best-effort text</p>
-<p>The engine has no native <code>json</code> type, so JSON functions produce JSON-encoded <em>text</em>. This covers result-wrapping shapes such as <code>coalesce(json_agg(title), '[]')</code>; faithful nested/record JSON (e.g. <code>row_to_json</code> over a join) is part of the in-progress PostgREST embedding work.</p>
+<p class="callout-title">JSON and time are text</p>
+<p>The engine has no native <code>json</code> or temporal type. JSON functions parse and produce JSON-encoded <em>text</em> (the <code>-&gt;</code>/<code>-&gt;&gt;</code> accessors navigate it); timestamps are ISO-8601 <code>Text</code> or epoch <code>Integer</code>, all UTC. Non-deterministic functions (<code>now()</code>, <code>random()</code>, <code>gen_random_uuid()</code>) are evaluated once at execution, so the concrete value stored is exactly what replay reproduces.</p>
 </div>
 
 <h3>Operators</h3>
@@ -193,8 +262,10 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>Logical NOT</td><td><code>NOT</code></td><td>Prefix</td></tr>
 <tr><td>Comparison</td><td><code>=</code>, <code>&lt;&gt;</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td><code>&lt;&gt;</code> and <code>!=</code> are both inequality</td></tr>
 <tr><td>Null test</td><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td></td></tr>
-<tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code></td><td>Pattern match against a string expression</td></tr>
+<tr><td>Membership / range</td><td><code>IN (…)</code>, <code>NOT IN (…)</code>, <code>BETWEEN … AND …</code>, <code>NOT BETWEEN …</code></td><td>Three-valued logic over a value list / range</td></tr>
+<tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code>, <code>ILIKE</code>, <code>… ESCAPE c</code></td><td><code>LIKE</code> is case-sensitive, <code>ILIKE</code> folds ASCII case; <code>ESCAPE</code> sets the escape char</td></tr>
 <tr><td>Vector distance</td><td><code>&lt;-&gt;</code>, <code>&lt;=&gt;</code>, <code>&lt;#&gt;</code></td><td>L2 / cosine / inner-product distance — see <a href="#vector-search">Vector search</a></td></tr>
+<tr><td>Concatenation</td><td><code>||</code></td><td>String concat (NULL-propagating); binds looser than <code>+</code></td></tr>
 <tr><td>Additive</td><td><code>+</code>, <code>-</code></td><td></td></tr>
 <tr><td>Multiplicative</td><td><code>*</code>, <code>/</code>, <code>%</code></td><td>Multiply, divide, modulo</td></tr>
 <tr><td>Unary</td><td><code>-</code>, <code>+</code></td><td>Negation / identity prefix</td></tr>
@@ -271,9 +342,10 @@ DROP INDEX IF EXISTS mem_e;</code></pre>
 
 <section>
 <h2>Parameters</h2>
-<p>Use a positional <code>?</code> placeholder anywhere an expression is allowed, then bind by 1-based index. Binding goes through the prepared-statement path of the C ABI.</p>
+<p>Bind placeholders by 1-based index through the prepared-statement path. Three placeholder spellings are accepted: positional <code>?</code> (SQLite), numbered <code>$1</code> (PostgreSQL), and named <code>:name</code> (SQLite). A repeated <code>$1</code> reuses one slot; distinct <code>:name</code>s are assigned sequential slots in first-seen order.</p>
 <pre data-lang="sql"><code>INSERT INTO notes (id, title) VALUES (?, ?);
-SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
+SELECT * FROM notes WHERE id = $1 OR title ILIKE $2;
+SELECT * FROM notes WHERE author = :who;</code></pre>
 <p>Each bound value is a NUL-terminated <em>typed literal</em>: a one-character tag followed by the encoded value. This is how the string-only ABI carries a typed argument.</p>
 <div class="table-wrap">
 <table>
@@ -304,6 +376,7 @@ SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
 <tr><td><code>BEGIN</code></td><td>Start an explicit transaction (<code>BEGIN TRANSACTION</code> / <code>START TRANSACTION</code> also accepted)</td></tr>
 <tr><td><code>COMMIT</code></td><td>Publish the transaction — blocks until the WAL is durable</td></tr>
 <tr><td><code>ROLLBACK</code></td><td>Discard the transaction's pending changes</td></tr>
+<tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>Mark a point, release it, or undo changes back to it within a transaction</td></tr>
 </tbody>
 </table>
 </div>
@@ -318,13 +391,23 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 </section>
 
 <section>
+<h2>Dialect &amp; session compatibility</h2>
+<p>To let real PostgreSQL/SQLite clients and ORMs connect without surprises, the engine accepts a few dialect spellings and the session statements clients emit on connect.</p>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> quote identifiers with double quotes <code>"x"</code> or backticks <code>`x`</code>. (Square brackets denote vector literals here, so <code>[x]</code> is not an identifier quote.)</li>
+<li><span class="req-tag may">MAY</span> issue <code>SET</code>, <code>SET TRANSACTION ISOLATION LEVEL …</code>, <code>PRAGMA</code>, <code>VACUUM</code>, <code>ANALYZE</code>, <code>RESET</code>, <code>DISCARD</code> — accepted as no-ops (the engine runs one snapshot-isolation mode).</li>
+<li><span class="req-tag may">MAY</span> issue <code>SHOW name</code> (returns a one-row result) and <code>EXPLAIN [ANALYZE] …</code> (returns a one-line plan; the engine has one strategy per shape).</li>
+</ul>
+</section>
+
+<section>
 <h2>Out of scope</h2>
 <p>These are deliberate boundaries, not bugs. Each parses to a clear <code>ENGINE_ERR_SQL</code> rather than a wrong result.</p>
 <ul class="reqs">
-<li><span class="req-tag must-not">MUST NOT</span> use <code>JOIN</code> — queries read from a single table.</li>
-<li><span class="req-tag must-not">MUST NOT</span> use subqueries or CTEs (<code>WITH</code>).</li>
-<li><span class="req-tag must-not">MUST NOT</span> use <code>SELECT DISTINCT</code>.</li>
-<li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>); general secondary/B-tree indexes are not exposed as SQL.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use <strong>correlated</strong> subqueries (an expression subquery referencing the outer query's columns); only non-correlated scalar/<code>IN</code>/<code>EXISTS</code> subqueries are supported.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use OLAP-shaped features — window functions (<code>OVER</code>), <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>LATERAL</code>, or recursive CTEs (compose DuckDB).</li>
+<li><span class="req-tag must-not">MUST NOT</span> use views or stored secondary/B-tree indexes. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>); a scalar <code>UNIQUE</code> is enforced by full scan, not a stored index.</li>
+<li><span class="req-tag must-not">MUST NOT</span> rely on procedural/extensibility surface — <code>CREATE FUNCTION</code>/<code>TRIGGER</code>/<code>EXTENSION</code>, roles/<code>GRANT</code>, <code>LISTEN</code>/<code>NOTIFY</code>.</li>
 </ul>
 <div class="callout note">
 <p class="callout-title">Unsupported syntax fails fast</p>

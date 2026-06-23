@@ -10,7 +10,9 @@ pub(crate) enum Tok {
     Int(i64),
     Real(f64),
     Str(String),
-    Param,
+    Param,              // `?` positional placeholder
+    NumParam(usize),    // `$1` numbered placeholder (Postgres)
+    NamedParam(String), // `:name` named placeholder (SQLite)
     LParen,
     RParen,
     LBracket,
@@ -30,6 +32,9 @@ pub(crate) enum Tok {
     Minus,
     Slash,
     Percent,
+    Concat,    // `||` string concatenation
+    Arrow,     // `->`  JSON: get element/field as JSON
+    ArrowText, // `->>` JSON: get element/field as text
     VecL2,     // <->
     VecCosine, // <=>
     VecIp,     // <#>
@@ -53,6 +58,17 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Tok>> {
             }
             continue;
         }
+        // JSON arrow operators: `->>` (text) and `->` (json), before plain `-`.
+        if c == b'-' && b.get(i + 1) == Some(&b'>') {
+            if b.get(i + 2) == Some(&b'>') {
+                out.push(Tok::ArrowText);
+                i += 3;
+            } else {
+                out.push(Tok::Arrow);
+                i += 2;
+            }
+            continue;
+        }
         if let Some(tok) = simple_token(c) {
             out.push(tok);
             i += 1;
@@ -60,9 +76,12 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Tok>> {
         }
         let (tok, next) = match c {
             b'<' | b'>' | b'!' => lex_operator(b, i)?,
+            b'|' => lex_pipe(b, i)?,
             b':' => lex_colon(b, i)?,
+            b'$' => lex_numparam(b, i)?,
             b'\'' => lex_string(b, i)?,
             b'"' => lex_quoted_ident(b, i)?,
+            b'`' => lex_backtick_ident(b, i)?,
             _ if c.is_ascii_digit() => lex_number(b, i)?,
             _ if c == b'_' || c.is_ascii_alphabetic() => lex_word(b, i),
             other => {
@@ -118,14 +137,68 @@ fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize)> {
     })
 }
 
-/// `::` is the only colon form the engine accepts (the Postgres type cast); a
-/// lone `:` is not valid SQL here.
+/// `||` is the string-concatenation operator; a lone `|` (bitwise OR) is out of
+/// scope and rejected rather than mis-parsed.
+fn lex_pipe(b: &[u8], i: usize) -> Result<(Tok, usize)> {
+    if b.get(i + 1) == Some(&b'|') {
+        Ok((Tok::Concat, i + 2))
+    } else {
+        Err(EngineError::sql(
+            "unexpected '|' (bitwise OR is unsupported)",
+        ))
+    }
+}
+
+/// `::` is the Postgres type cast; `:name` is a named placeholder (stage 6E).
 fn lex_colon(b: &[u8], i: usize) -> Result<(Tok, usize)> {
     if b.get(i + 1) == Some(&b':') {
-        Ok((Tok::DColon, i + 2))
+        return Ok((Tok::DColon, i + 2));
+    }
+    // `:name` — a named bind parameter.
+    let mut j = i + 1;
+    while j < b.len() && (b[j] == b'_' || b[j].is_ascii_alphanumeric()) {
+        j += 1;
+    }
+    if j > i + 1 {
+        let name = std::str::from_utf8(&b[i + 1..j]).unwrap().to_string();
+        Ok((Tok::NamedParam(name), j))
     } else {
         Err(EngineError::sql("unexpected ':'"))
     }
+}
+
+/// `$1` numbered placeholder (Postgres, stage 6E). Dollar-quoting (`$tag$…$tag$`)
+/// is out of scope.
+fn lex_numparam(b: &[u8], i: usize) -> Result<(Tok, usize)> {
+    let mut j = i + 1;
+    while j < b.len() && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == i + 1 {
+        return Err(EngineError::sql(
+            "unexpected '$' (expected a parameter number)",
+        ));
+    }
+    let n: usize = std::str::from_utf8(&b[i + 1..j])
+        .unwrap()
+        .parse()
+        .map_err(|_| EngineError::sql("invalid parameter number"))?;
+    Ok((Tok::NumParam(n), j))
+}
+
+/// Backtick-quoted identifier (SQLite/MySQL style, stage 6E). `i` points at the
+/// opening backtick.
+fn lex_backtick_ident(b: &[u8], mut i: usize) -> Result<(Tok, usize)> {
+    i += 1;
+    let start = i;
+    while i < b.len() && b[i] != b'`' {
+        i += 1;
+    }
+    if i >= b.len() {
+        return Err(EngineError::sql("unterminated backtick identifier"));
+    }
+    let ident = std::str::from_utf8(&b[start..i]).unwrap().to_string();
+    Ok((Tok::Word(ident), i + 1))
 }
 
 /// Disambiguate `<`: the three-char distance operators bind first, then `<=` /

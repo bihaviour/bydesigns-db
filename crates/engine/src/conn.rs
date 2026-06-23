@@ -5,7 +5,7 @@
 
 use crate::db::{commit_error, Database};
 use crate::error::{EngineError, Result};
-use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet};
+use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet, WriteCtx};
 use crate::sql::{self, Stmt};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexDef, IndexParams};
@@ -26,6 +26,19 @@ struct Txn {
     /// group commit can publish/discard exactly this transaction's changes even
     /// while another commit is in flight (see [`crate::group_commit`]).
     owner: u64,
+    /// Savepoint stack (stage 6D): each entry records the writer's pending state
+    /// (inserted / deleted vids) when the savepoint was set, so `ROLLBACK TO`
+    /// can restore it.
+    savepoints: Vec<Savepoint>,
+}
+
+struct Savepoint {
+    name: String,
+    inserted: std::collections::HashSet<u64>,
+    deleted: std::collections::HashSet<u64>,
+    /// Length of the buffered WAL op list at savepoint time — `ROLLBACK TO`
+    /// truncates back to it so rolled-back ops never reach the durable commit.
+    wal_len: usize,
 }
 
 pub struct Connection {
@@ -63,6 +76,44 @@ pub struct CatalogColumn {
     pub primary_key: bool,
     /// 1-based ordinal position in the table.
     pub position: i32,
+}
+
+/// Build the one-row result a `SHOW <name>` returns (stage 6E). The column is
+/// named after the setting; the value is a best-effort default (the snapshot-
+/// isolation level for the isolation GUCs, otherwise empty).
+fn show_result(name: &str) -> ResultSet {
+    let key = name.to_ascii_lowercase();
+    let value = match key.as_str() {
+        "transaction_isolation" | "default_transaction_isolation" => "repeatable read",
+        "transaction isolation level" => "repeatable read",
+        _ => "",
+    };
+    ResultSet {
+        columns: vec![if key.is_empty() {
+            "setting".to_string()
+        } else {
+            name.to_string()
+        }],
+        types: vec![ColumnType::Text],
+        rows: vec![vec![Value::Text(value.to_string())]],
+    }
+}
+
+/// Build the one-row plan text an `EXPLAIN` returns (stage 6E). The engine has a
+/// single strategy per statement shape, so this is a terse description.
+fn explain_result(stmt: &Stmt) -> ResultSet {
+    let plan = match stmt {
+        Stmt::Select(_) => "Query plan: scan / nested-loop join over the MVCC snapshot",
+        Stmt::Insert { .. } => "Insert",
+        Stmt::Update { .. } => "Update (scan + supersede)",
+        Stmt::Delete { .. } => "Delete (scan + supersede)",
+        _ => "Utility statement",
+    };
+    ResultSet {
+        columns: vec!["QUERY PLAN".to_string()],
+        types: vec![ColumnType::Text],
+        rows: vec![vec![Value::Text(plan.to_string())]],
+    }
 }
 
 /// Map an engine storage class to the Postgres type name clients introspect.
@@ -204,6 +255,18 @@ impl Connection {
                 self.rollback()?;
                 Ok(ResultSet::default())
             }
+            Stmt::Savepoint(name) => {
+                self.savepoint(name)?;
+                Ok(ResultSet::default())
+            }
+            Stmt::ReleaseSavepoint(name) => {
+                self.release_savepoint(name)?;
+                Ok(ResultSet::default())
+            }
+            Stmt::RollbackTo(name) => {
+                self.rollback_to(name)?;
+                Ok(ResultSet::default())
+            }
             Stmt::Select(sel) => {
                 let (snapshot, writer) = self.read_snapshot();
                 let store = self.db.store.read().unwrap();
@@ -214,14 +277,18 @@ impl Connection {
             Stmt::CreateTable { .. }
             | Stmt::DropTable { .. }
             | Stmt::CreateIndex { .. }
-            | Stmt::DropIndex { .. } => {
+            | Stmt::DropIndex { .. }
+            | Stmt::AlterTable { .. } => {
                 self.exec_ddl(stmt)?;
                 Ok(ResultSet::default())
             }
             Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } => {
-                self.exec_dml(stmt, params)?;
-                Ok(ResultSet::default())
+                self.exec_dml(stmt, params)
             }
+            // Accepted-and-ignored session statements (stage 6E).
+            Stmt::Noop => Ok(ResultSet::default()),
+            Stmt::Show(name) => Ok(show_result(name)),
+            Stmt::Explain(inner) => Ok(explain_result(inner)),
         }
     }
 
@@ -236,6 +303,7 @@ impl Connection {
             writer: false,
             wal_ops: Vec::new(),
             owner: crate::db::next_owner(),
+            savepoints: Vec::new(),
         });
         Ok(())
     }
@@ -257,6 +325,66 @@ impl Connection {
             self.db.store.write().unwrap().rollback_owner(txn.owner);
             self.db.lane.release();
         }
+        Ok(())
+    }
+
+    /// `SAVEPOINT name` (stage 6D): record the writer's current pending state so
+    /// a later `ROLLBACK TO` can restore it. A redefined name shadows the old one.
+    pub fn savepoint(&mut self, name: &str) -> Result<()> {
+        let txn = self
+            .txn
+            .as_mut()
+            .ok_or_else(|| EngineError::txn("SAVEPOINT requires an active transaction"))?;
+        let (inserted, deleted) = self.db.store.read().unwrap().pending_snapshot(txn.owner);
+        let wal_len = txn.wal_ops.len();
+        txn.savepoints.push(Savepoint {
+            name: name.to_string(),
+            inserted,
+            deleted,
+            wal_len,
+        });
+        Ok(())
+    }
+
+    /// `RELEASE [SAVEPOINT] name`: drop the named savepoint and any set after it
+    /// (their effects remain part of the transaction).
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let txn = self
+            .txn
+            .as_mut()
+            .ok_or_else(|| EngineError::txn("RELEASE requires an active transaction"))?;
+        let at = txn
+            .savepoints
+            .iter()
+            .rposition(|s| s.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| EngineError::txn(format!("no such savepoint: {name}")))?;
+        txn.savepoints.truncate(at);
+        Ok(())
+    }
+
+    /// `ROLLBACK TO [SAVEPOINT] name`: undo pending changes since the savepoint
+    /// (keeping the savepoint itself, per SQL), discarding any later savepoints.
+    pub fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let txn = self
+            .txn
+            .as_mut()
+            .ok_or_else(|| EngineError::txn("ROLLBACK TO requires an active transaction"))?;
+        let at = txn
+            .savepoints
+            .iter()
+            .rposition(|s| s.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| EngineError::txn(format!("no such savepoint: {name}")))?;
+        if txn.writer {
+            let sp = &txn.savepoints[at];
+            self.db.store.write().unwrap().rollback_to_savepoint(
+                txn.owner,
+                &sp.inserted,
+                &sp.deleted,
+            );
+        }
+        let wal_len = txn.savepoints[at].wal_len;
+        txn.wal_ops.truncate(wal_len);
+        txn.savepoints.truncate(at + 1);
         Ok(())
     }
 
@@ -290,7 +418,7 @@ impl Connection {
 
     // ---- DML ------------------------------------------------------------
 
-    fn exec_dml(&mut self, stmt: &Stmt, params: &[Value]) -> Result<()> {
+    fn exec_dml(&mut self, stmt: &Stmt, params: &[Value]) -> Result<ResultSet> {
         let implicit = self.txn.is_none();
         if implicit {
             self.txn = Some(Txn {
@@ -298,11 +426,15 @@ impl Connection {
                 writer: false,
                 wal_ops: Vec::new(),
                 owner: crate::db::next_owner(),
+                savepoints: Vec::new(),
             });
         }
         self.ensure_writer();
-        let snapshot = self.txn.as_ref().unwrap().snapshot;
-        let owner = self.txn.as_ref().unwrap().owner;
+        let wc = WriteCtx {
+            snapshot: self.txn.as_ref().unwrap().snapshot,
+            owner: self.txn.as_ref().unwrap().owner,
+            params,
+        };
 
         let result = {
             let mut store = self.db.store.write().unwrap();
@@ -310,29 +442,42 @@ impl Connection {
                 Stmt::Insert {
                     table,
                     columns,
-                    rows,
-                } => run_insert(&mut store, table, columns, rows, owner, params),
+                    source,
+                    on_conflict,
+                    returning,
+                } => run_insert(
+                    &mut store,
+                    table,
+                    columns,
+                    source,
+                    on_conflict,
+                    returning.as_deref(),
+                    &wc,
+                ),
                 Stmt::Update {
                     table,
                     sets,
                     filter,
-                } => run_update(&mut store, table, sets, filter, snapshot, owner, params),
-                Stmt::Delete { table, filter } => {
-                    run_delete(&mut store, table, filter, snapshot, owner, params)
-                }
+                    returning,
+                } => run_update(&mut store, table, sets, filter, returning.as_deref(), &wc),
+                Stmt::Delete {
+                    table,
+                    filter,
+                    returning,
+                } => run_delete(&mut store, table, filter, returning.as_deref(), &wc),
                 _ => unreachable!(),
             }
         };
 
         match result {
-            Ok((wal_ops, changes)) => {
-                self.txn.as_mut().unwrap().wal_ops.extend(wal_ops);
-                self.last_changes = changes;
+            Ok(mutation) => {
+                self.txn.as_mut().unwrap().wal_ops.extend(mutation.wal);
+                self.last_changes = mutation.changes;
                 if implicit {
                     let txn = self.txn.take().unwrap();
                     self.finish_commit(txn)?;
                 }
-                Ok(())
+                Ok(mutation.result.unwrap_or_default())
             }
             Err(e) => {
                 // The statement is atomic (store untouched on failure). For an
@@ -441,6 +586,9 @@ impl Connection {
                 name,
                 columns,
                 foreign_keys,
+                primary_key,
+                uniques,
+                checks,
                 if_not_exists,
             } => {
                 if self.db.store.read().unwrap().has_table(name) {
@@ -449,25 +597,37 @@ impl Connection {
                     }
                     return Err(EngineError::sql(format!("table {name} already exists")));
                 }
-                let cols: Vec<crate::catalog::Column> = columns
+                let mut cols: Vec<crate::catalog::Column> = columns
                     .iter()
                     .map(|c| crate::catalog::Column {
                         name: c.name.clone(),
                         ty: c.ty,
                         primary_key: c.primary_key,
                         not_null: c.not_null,
+                        unique: c.unique,
+                        autoincrement: c.autoincrement,
+                        default_sql: c.default_sql.clone(),
                     })
                     .collect();
-                if cols.iter().filter(|c| c.primary_key).count() > 1 {
-                    return Err(EngineError::sql(
-                        "composite PRIMARY KEY is not supported in Phase 1",
-                    ));
+                // Fold a table-level PRIMARY KEY (cols) into the columns (a column
+                // listed there is primary-key and implicitly NOT NULL).
+                for pk in primary_key {
+                    let idx = cols
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(pk))
+                        .ok_or_else(|| {
+                            EngineError::sql(format!("PRIMARY KEY references unknown column {pk}"))
+                        })?;
+                    cols[idx].primary_key = true;
+                    cols[idx].not_null = true;
                 }
                 let fks = self.resolve_foreign_keys(name, &cols, foreign_keys)?;
                 let schema = crate::catalog::TableSchema {
                     name: name.clone(),
                     columns: cols,
                     foreign_keys: fks,
+                    checks: checks.clone(),
+                    uniques: uniques.clone(),
                 };
                 let records = vec![
                     WalOp::CreateTable {
@@ -483,6 +643,7 @@ impl Connection {
                 store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
                 Ok(Some(commit_lsn.0))
             }
+            Stmt::AlterTable { table, action } => self.do_alter(table, action),
             Stmt::DropTable { name, if_exists } => {
                 if !self.db.store.read().unwrap().has_table(name) {
                     if *if_exists {
@@ -581,6 +742,80 @@ impl Connection {
             block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
         let mut store = self.db.store.write().unwrap();
         store.drop_index(name);
+        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        Ok(Some(commit_lsn.0))
+    }
+
+    /// `ALTER TABLE` (stage 6D): durably log the schema mutation, then apply it
+    /// to the in-memory store (reshaping row versions for column add/drop).
+    fn do_alter(&self, table: &str, action: &crate::sql::AlterAction) -> Result<Option<u64>> {
+        use crate::sql::AlterAction;
+        if !self.db.store.read().unwrap().has_table(table) {
+            return Err(EngineError::sql(format!("no such table: {table}")));
+        }
+        let op = match action {
+            AlterAction::AddColumn(spec) => {
+                if self
+                    .db
+                    .store
+                    .read()
+                    .unwrap()
+                    .table(table)
+                    .is_some_and(|t| t.schema.column_index(&spec.name).is_some())
+                {
+                    return Err(EngineError::sql(format!(
+                        "column {} already exists in {table}",
+                        spec.name
+                    )));
+                }
+                WalOp::AlterAddColumn {
+                    table: table.to_string(),
+                    column: crate::catalog::Column {
+                        name: spec.name.clone(),
+                        ty: spec.ty,
+                        // A freshly added column cannot be the primary key.
+                        primary_key: false,
+                        not_null: spec.not_null,
+                        unique: spec.unique,
+                        autoincrement: spec.autoincrement,
+                        default_sql: spec.default_sql.clone(),
+                    },
+                }
+            }
+            AlterAction::DropColumn { name, if_exists } => {
+                let exists = self
+                    .db
+                    .store
+                    .read()
+                    .unwrap()
+                    .table(table)
+                    .is_some_and(|t| t.schema.column_index(name).is_some());
+                if !exists {
+                    if *if_exists {
+                        return Ok(None);
+                    }
+                    return Err(EngineError::sql(format!("no such column: {table}.{name}")));
+                }
+                WalOp::AlterDropColumn {
+                    table: table.to_string(),
+                    column: name.clone(),
+                }
+            }
+            AlterAction::RenameColumn { from, to } => WalOp::AlterRenameColumn {
+                table: table.to_string(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            AlterAction::RenameTable { to } => WalOp::AlterRenameTable {
+                table: table.to_string(),
+                to: to.clone(),
+            },
+        };
+        let records = vec![op.encode(), WalOp::Commit.encode()];
+        let commit_lsn =
+            block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
+        let mut store = self.db.store.write().unwrap();
+        crate::db::apply_alter(&mut store, &op);
         store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
         Ok(Some(commit_lsn.0))
     }

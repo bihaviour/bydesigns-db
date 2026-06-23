@@ -70,6 +70,9 @@ pub struct Table {
     pub schema: TableSchema,
     pub rows: Vec<RowVersion>,
     pub next_vid: u64,
+    /// Next value an `AUTOINCREMENT`/`SERIAL` column will be assigned (max seen
+    /// + 1; rebuilt from the rows on replay). Stage 6D.
+    pub next_autoinc: i64,
 }
 
 impl Table {
@@ -78,6 +81,7 @@ impl Table {
             schema,
             rows: Vec::new(),
             next_vid: 1,
+            next_autoinc: 1,
         }
     }
 
@@ -285,6 +289,70 @@ impl Store {
         }
     }
 
+    // ---- schema evolution (stage 6D) ------------------------------------
+
+    /// Append a column to a table's schema, extending every existing row version
+    /// with `fill` (its default, or NULL). Used by both the live DDL path and
+    /// replay.
+    pub fn add_column(&mut self, table: &str, column: crate::catalog::Column, fill: Value) {
+        if let Some(t) = self.table_mut(table) {
+            t.schema.columns.push(column);
+            for r in &mut t.rows {
+                r.values.push(fill.clone());
+            }
+        }
+    }
+
+    /// Drop a column by name, removing it from the schema and every row version.
+    pub fn drop_column(&mut self, table: &str, name: &str) {
+        if let Some(t) = self.table_mut(table) {
+            if let Some(idx) = t.schema.column_index(name) {
+                t.schema.columns.remove(idx);
+                for r in &mut t.rows {
+                    if idx < r.values.len() {
+                        r.values.remove(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rename a column in the schema (rows are positional, so unchanged).
+    pub fn rename_column(&mut self, table: &str, from: &str, to: &str) {
+        if let Some(t) = self.table_mut(table) {
+            if let Some(idx) = t.schema.column_index(from) {
+                t.schema.columns[idx].name = to.to_string();
+            }
+        }
+    }
+
+    /// Rename a table, re-keying it in the registry and updating `schema.name`.
+    pub fn rename_table(&mut self, from: &str, to: &str) {
+        if let Some(mut t) = self.tables.remove(&Self::key(from)) {
+            t.schema.name = to.to_string();
+            // Indexes/FKs keep referring to the old table name by string; the
+            // common ALTER … RENAME case is rare enough to leave them as-is.
+            self.tables.insert(Self::key(to), t);
+        }
+    }
+
+    /// Rebuild every table's autoincrement counter from its rows (replay path):
+    /// the next value is one past the largest existing value in the column.
+    pub fn rebuild_autoinc(&mut self) {
+        for t in self.tables.values_mut() {
+            let Some(col) = t.schema.columns.iter().position(|c| c.autoincrement) else {
+                continue;
+            };
+            let mut max = 0i64;
+            for r in &t.rows {
+                if let Some(Value::Int(i)) = r.values.get(col) {
+                    max = max.max(*i);
+                }
+            }
+            t.next_autoinc = max + 1;
+        }
+    }
+
     // ---- commit / rollback ----------------------------------------------
 
     /// Publish one in-flight writer's pending versions at `commit_lsn`
@@ -306,6 +374,71 @@ impl Store {
                     r.delete_lsn = commit_lsn;
                 }
                 r.owner = 0;
+            }
+        }
+    }
+
+    /// Snapshot one writer's pending state for a SAVEPOINT (stage 6D): the vids
+    /// it has pending-inserted and pending-deleted right now.
+    pub fn pending_snapshot(
+        &self,
+        owner: u64,
+    ) -> (
+        std::collections::HashSet<u64>,
+        std::collections::HashSet<u64>,
+    ) {
+        let mut inserted = std::collections::HashSet::new();
+        let mut deleted = std::collections::HashSet::new();
+        for t in self.tables.values() {
+            for r in &t.rows {
+                if r.owner != owner {
+                    continue;
+                }
+                if r.create_lsn == PENDING {
+                    inserted.insert(r.vid);
+                }
+                if r.delete_lsn == PENDING {
+                    deleted.insert(r.vid);
+                }
+            }
+        }
+        (inserted, deleted)
+    }
+
+    /// Roll one writer's pending state back to a saved snapshot (`ROLLBACK TO`):
+    /// remove pending inserts created since the savepoint, and clear pending
+    /// deletes applied since it — restoring the exact pending set at savepoint
+    /// time. Any insert removed here is also tombstoned out of the indexes.
+    pub fn rollback_to_savepoint(
+        &mut self,
+        owner: u64,
+        inserted: &std::collections::HashSet<u64>,
+        deleted: &std::collections::HashSet<u64>,
+    ) {
+        let mut discarded: Vec<u64> = Vec::new();
+        for t in self.tables.values_mut() {
+            for r in &t.rows {
+                if r.owner == owner && r.create_lsn == PENDING && !inserted.contains(&r.vid) {
+                    discarded.push(r.vid);
+                }
+            }
+            t.rows.retain(|r| {
+                !(r.owner == owner && r.create_lsn == PENDING && !inserted.contains(&r.vid))
+            });
+            for r in &mut t.rows {
+                if r.owner == owner && r.delete_lsn == PENDING && !deleted.contains(&r.vid) {
+                    r.delete_lsn = 0;
+                    // The version reverts to committed-live; clear its owner only
+                    // if it carries no remaining pending create.
+                    if r.create_lsn != PENDING {
+                        r.owner = 0;
+                    }
+                }
+            }
+        }
+        for ix in self.indexes.values_mut() {
+            for &vid in &discarded {
+                ix.remove(vid);
             }
         }
     }

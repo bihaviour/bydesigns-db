@@ -145,6 +145,44 @@ fn c_abi_roundtrip() {
 }
 
 #[test]
+fn returning_flows_through_query_abi() {
+    // Stage 6A: `INSERT … RETURNING` surfaces rows through the same result-set
+    // channel `engine_query` already exposes — no new C symbol (ABI stays v3).
+    let p = db_path();
+    let url = cs(&format!("file://{}", p.display()));
+    let h = engine_open(url.as_ptr());
+    assert!(!h.is_null());
+    assert_eq!(
+        engine_exec(
+            h,
+            cs("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").as_ptr()
+        ),
+        0
+    );
+
+    let mut out: *mut EngineResult = ptr::null_mut();
+    assert_eq!(
+        engine_query(
+            h,
+            cs("INSERT INTO t VALUES (1, 10), (2, 20) RETURNING id, n").as_ptr(),
+            &mut out
+        ),
+        0
+    );
+    assert!(!out.is_null());
+    assert_eq!(engine_result_rows(out), 2);
+    assert_eq!(rd(engine_result_colname(out, 0)).as_deref(), Some("id"));
+    assert_eq!(rd(engine_result_value(out, 1, 1)).as_deref(), Some("20"));
+    engine_result_free(out);
+
+    // The ABI version is unchanged by the new statement shapes.
+    assert_eq!(engine_abi_version(), 3);
+
+    engine_close(h);
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
 fn vector_search_via_c_abi() {
     // Phase 5: the vector type, an HNSW index, and a top-k query drive through the
     // same C ABI bun:ffi binds — vectors flow as their `[..]` text literal and as
