@@ -1312,17 +1312,33 @@ impl Parser {
         Ok(left)
     }
 
-    /// String concatenation `||`, between the distance and additive levels
-    /// (Postgres puts `||` looser than `+`/`-`, tighter than comparison).
+    /// String concatenation `||` and the JSON arrow accessors `->` / `->>`,
+    /// between the distance and additive levels (Postgres puts these "other
+    /// operators" looser than `+`/`-`, tighter than comparison). The arrows
+    /// desugar to the `json_get` / `json_get_text` scalar functions.
     fn concat_expr(&mut self) -> Result<Expr> {
         let mut left = self.add_expr()?;
-        while self.peek() == &Tok::Concat {
+        loop {
+            let func = match self.peek() {
+                Tok::Concat => {
+                    self.bump();
+                    let right = self.add_expr()?;
+                    left = Expr::Binary {
+                        op: BinOp::Concat,
+                        l: Box::new(left),
+                        r: Box::new(right),
+                    };
+                    continue;
+                }
+                Tok::Arrow => "json_get",
+                Tok::ArrowText => "json_get_text",
+                _ => break,
+            };
             self.bump();
             let right = self.add_expr()?;
-            left = Expr::Binary {
-                op: BinOp::Concat,
-                l: Box::new(left),
-                r: Box::new(right),
+            left = Expr::Func {
+                name: func.to_string(),
+                args: vec![left, right],
             };
         }
         Ok(left)
@@ -1497,6 +1513,21 @@ impl Parser {
         })
     }
 
+    /// `EXTRACT ( field FROM expr )` — desugars to `extract('<field>', expr)` so
+    /// it dispatches through the ordinary scalar-function table.
+    fn extract_call(&mut self) -> Result<Expr> {
+        self.bump(); // EXTRACT
+        self.expect(Tok::LParen)?;
+        let field = self.ident()?;
+        self.expect_kw("from")?;
+        let source = self.expr()?;
+        self.expect(Tok::RParen)?;
+        Ok(Expr::Func {
+            name: "extract".to_string(),
+            args: vec![Expr::Str(field.to_ascii_lowercase()), source],
+        })
+    }
+
     /// `CASE [operand] WHEN cond THEN result … [ELSE result] END`.
     fn case_expr(&mut self) -> Result<Expr> {
         self.expect_kw("case")?;
@@ -1570,6 +1601,8 @@ impl Parser {
                     self.case_expr()
                 } else if w.eq_ignore_ascii_case("cast") && self.next_is_lparen() {
                     self.cast_call()
+                } else if w.eq_ignore_ascii_case("extract") && self.next_is_lparen() {
+                    self.extract_call()
                 } else {
                     self.bump();
                     if self.peek() == &Tok::LParen {

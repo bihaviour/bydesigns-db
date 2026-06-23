@@ -187,15 +187,17 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <thead><tr><th>Group</th><th>Functions</th></tr></thead>
 <tbody>
 <tr><td>Null / conditional</td><td><code>coalesce(...)</code>, <code>nullif(a, b)</code>, <code>ifnull(a, b)</code>, <code>iif(c, a, b)</code>, <code>greatest(...)</code>, <code>least(...)</code></td></tr>
-<tr><td>String</td><td><code>lower</code>, <code>upper</code>, <code>trim</code>/<code>btrim</code>, <code>ltrim</code>, <code>rtrim</code>, <code>length</code>/<code>char_length</code>, <code>concat</code></td></tr>
-<tr><td>Numeric</td><td><code>abs</code>, <code>round</code></td></tr>
-<tr><td>JSON</td><td><code>to_json</code>, <code>json_build_object(k, v, ...)</code>, and the <code>json_agg</code> aggregate</td></tr>
+<tr><td>String</td><td><code>lower</code>, <code>upper</code>, <code>trim</code>/<code>btrim</code>/<code>ltrim</code>/<code>rtrim</code>, <code>length</code>/<code>char_length</code>, <code>concat</code>, <code>substr</code>/<code>substring</code>, <code>replace</code>, <code>instr</code>/<code>strpos</code>, <code>repeat</code>, <code>reverse</code>, <code>left</code>/<code>right</code>, <code>lpad</code>/<code>rpad</code></td></tr>
+<tr><td>Numeric</td><td><code>abs</code>, <code>round(x[, n])</code>, <code>ceil</code>/<code>floor</code>, <code>sqrt</code>, <code>power</code>/<code>pow</code>, <code>mod</code>, <code>sign</code>, <code>trunc</code>, <code>exp</code>, <code>ln</code>, <code>log</code>, <code>pi</code></td></tr>
+<tr><td>Date / time</td><td><code>now</code>/<code>current_timestamp</code>, <code>current_date</code>, <code>current_time</code>, <code>date</code>, <code>time</code>, <code>datetime</code>, <code>date_trunc(unit, ts)</code>, <code>extract(field FROM ts)</code>, <code>strftime(fmt, ts)</code>, <code>unixepoch</code></td></tr>
+<tr><td>UUID / misc</td><td><code>gen_random_uuid</code>, <code>random</code>, <code>typeof</code>, <code>hex</code></td></tr>
+<tr><td>JSON</td><td><code>-&gt;</code>, <code>-&gt;&gt;</code>, <code>json_extract(json, '$.path')</code>, <code>json_array</code>, <code>to_json</code>, <code>json_build_object(k, v, ...)</code>, and the <code>json_agg</code> aggregate</td></tr>
 </tbody>
 </table>
 </div>
 <div class="callout note">
-<p class="callout-title">JSON is best-effort text</p>
-<p>The engine has no native <code>json</code> type, so JSON functions produce JSON-encoded <em>text</em>. This covers result-wrapping shapes such as <code>coalesce(json_agg(title), '[]')</code>; faithful nested/record JSON (e.g. <code>row_to_json</code> over a join) is part of the in-progress PostgREST embedding work.</p>
+<p class="callout-title">JSON and time are text</p>
+<p>The engine has no native <code>json</code> or temporal type. JSON functions parse and produce JSON-encoded <em>text</em> (the <code>-&gt;</code>/<code>-&gt;&gt;</code> accessors navigate it); timestamps are ISO-8601 <code>Text</code> or epoch <code>Integer</code>, all UTC. Non-deterministic functions (<code>now()</code>, <code>random()</code>, <code>gen_random_uuid()</code>) are evaluated once at execution, so the concrete value stored is exactly what replay reproduces.</p>
 </div>
 
 <h3>Operators</h3>

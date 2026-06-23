@@ -31,6 +31,8 @@ pub(crate) enum Tok {
     Slash,
     Percent,
     Concat,    // `||` string concatenation
+    Arrow,     // `->`  JSON: get element/field as JSON
+    ArrowText, // `->>` JSON: get element/field as text
     VecL2,     // <->
     VecCosine, // <=>
     VecIp,     // <#>
@@ -51,6 +53,17 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Tok>> {
         if c == b'-' && b.get(i + 1) == Some(&b'-') {
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
+            }
+            continue;
+        }
+        // JSON arrow operators: `->>` (text) and `->` (json), before plain `-`.
+        if c == b'-' && b.get(i + 1) == Some(&b'>') {
+            if b.get(i + 2) == Some(&b'>') {
+                out.push(Tok::ArrowText);
+                i += 3;
+            } else {
+                out.push(Tok::Arrow);
+                i += 2;
             }
             continue;
         }

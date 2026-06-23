@@ -7,6 +7,7 @@
 //! transaction manager's job (see [`crate::conn`]).
 
 use crate::catalog::TableSchema;
+use crate::datetime;
 use crate::error::{EngineError, Result};
 use crate::sql::{
     AggArg, AggFunc, BinOp, CastTarget, Expr, InsertSource, OnConflict, OrderKey, SelItem,
@@ -971,8 +972,10 @@ fn expr_type(expr: &Expr, schema: Option<&TableSchema>) -> ColumnType {
 /// Best-effort result type of a scalar function (for column-OID reporting).
 fn func_type(name: &str) -> ColumnType {
     match name.to_ascii_lowercase().as_str() {
-        "length" | "char_length" | "character_length" | "abs" | "round" | "ceil" | "ceiling"
-        | "floor" => ColumnType::Integer,
+        "length" | "char_length" | "character_length" | "abs" | "instr" | "strpos" | "sign"
+        | "extract" | "unixepoch" => ColumnType::Integer,
+        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "pi" | "random" | "ceil"
+        | "ceiling" | "floor" | "trunc" | "round" => ColumnType::Real,
         _ => ColumnType::Text,
     }
 }
@@ -1389,17 +1392,98 @@ fn call_func(name: &str, args: Vec<Value>) -> Result<Value> {
             Some(Value::Null) | None => Value::Null,
             Some(other) => return Err(EngineError::sql(format!("abs() of {}", other.type_name()))),
         }),
-        "round" => Ok(match args.into_iter().next() {
-            Some(Value::Int(i)) => Value::Int(i),
-            Some(Value::Real(r)) => Value::Int(r.round() as i64),
-            Some(Value::Null) | None => Value::Null,
-            Some(other) => {
-                return Err(EngineError::sql(format!(
-                    "round() of {}",
-                    other.type_name()
-                )))
+        // round(x) → integer; round(x, n) → real to n decimal places.
+        "round" => round_func(&args),
+        "substr" | "substring" => Ok(substr_func(&args)),
+        "replace" => Ok(match (args.first(), args.get(1), args.get(2)) {
+            (Some(s), Some(f), Some(t)) if !s.is_null() && !f.is_null() && !t.is_null() => {
+                Value::Text(text_of(s).replace(&text_of(f), &text_of(t)))
             }
+            _ => Value::Null,
         }),
+        // 1-based index of `needle` in `haystack`, 0 if absent (SQLite instr /
+        // Postgres strpos with the argument order each expects).
+        "instr" => Ok(instr_func(args.first(), args.get(1))),
+        "strpos" => Ok(instr_func(args.first(), args.get(1))),
+        "repeat" => Ok(match (args.first(), num_arg(&args, 1)) {
+            (Some(s), Some(n)) if !s.is_null() => {
+                Value::Text(text_of(s).repeat((n as i64).max(0) as usize))
+            }
+            _ => Value::Null,
+        }),
+        "reverse" => Ok(map_text(args, |s| s.chars().rev().collect())),
+        "left" => Ok(side_func(&args, true)),
+        "right" => Ok(side_func(&args, false)),
+        "lpad" => Ok(pad_func(&args, true)),
+        "rpad" => Ok(pad_func(&args, false)),
+        // Math (each propagates NULL; non-numeric is an error).
+        "ceil" | "ceiling" => unary_real(&args, "ceil", f64::ceil),
+        "floor" => unary_real(&args, "floor", f64::floor),
+        "sqrt" => unary_real(&args, "sqrt", f64::sqrt),
+        "exp" => unary_real(&args, "exp", f64::exp),
+        "ln" => unary_real(&args, "ln", f64::ln),
+        "log" | "log10" => unary_real(&args, "log", f64::log10),
+        "sign" => Ok(match num_arg(&args, 0) {
+            Some(n) => Value::Int(n.partial_cmp(&0.0).map_or(0, |o| o as i64)),
+            None => Value::Null,
+        }),
+        "trunc" => Ok(match num_arg(&args, 0) {
+            Some(n) => Value::Real(n.trunc()),
+            None => Value::Null,
+        }),
+        "power" | "pow" => Ok(match (num_arg(&args, 0), num_arg(&args, 1)) {
+            (Some(a), Some(b)) => Value::Real(a.powf(b)),
+            _ => Value::Null,
+        }),
+        "mod" => Ok(match (num_arg(&args, 0), num_arg(&args, 1)) {
+            (Some(_), Some(0.0)) => Value::Null,
+            (Some(a), Some(b)) => Value::Int((a as i64) % (b as i64)),
+            _ => Value::Null,
+        }),
+        "pi" => Ok(Value::Real(std::f64::consts::PI)),
+        // Date / time (UTC; SQLite text/epoch model — see [`crate::datetime`]).
+        "now"
+        | "current_timestamp"
+        | "transaction_timestamp"
+        | "statement_timestamp"
+        | "clock_timestamp"
+        | "localtimestamp" => Ok(Value::Text(datetime::format_timestamp(
+            datetime::now_epoch(),
+        ))),
+        "current_date" => Ok(Value::Text(datetime::format_date(datetime::now_epoch()))),
+        "current_time" | "localtime" => {
+            Ok(Value::Text(datetime::format_time(datetime::now_epoch())))
+        }
+        "date" => Ok(map_epoch(args.first(), datetime::format_date)),
+        "datetime" => Ok(map_epoch(args.first(), datetime::format_timestamp)),
+        "time" => Ok(map_epoch(args.first(), datetime::format_time)),
+        "unixepoch" => Ok(match value_to_epoch(args.first()) {
+            Some(e) => Value::Int(e),
+            None => Value::Null,
+        }),
+        "date_trunc" => date_trunc_func(&args),
+        "extract" => Ok(extract_func(&args)),
+        "strftime" => Ok(strftime_func(&args)),
+        // UUID / misc.
+        "gen_random_uuid" | "uuid_generate_v4" => Ok(Value::Text(gen_uuid_v4())),
+        "random" => Ok(Value::Real((rng_u64() >> 11) as f64 / (1u64 << 53) as f64)),
+        "typeof" => Ok(Value::Text(match args.first() {
+            Some(v) => v.type_name().to_ascii_lowercase(),
+            None => "null".to_string(),
+        })),
+        "hex" => Ok(match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(Value::Blob(b)) => Value::Text(to_hex(b)),
+            Some(v) => Value::Text(to_hex(text_of(v).as_bytes())),
+        }),
+        // JSON accessors (the engine stores JSON as text — see [`crate::json`]).
+        "json_get" => Ok(json_get(args.first(), args.get(1), false)),
+        "json_get_text" => Ok(json_get(args.first(), args.get(1), true)),
+        "json_extract" => Ok(json_extract_func(args.first(), args.get(1))),
+        "json_array" | "json_build_array" | "jsonb_build_array" => Ok(Value::Text(format!(
+            "[{}]",
+            args.iter().map(value_to_json).collect::<Vec<_>>().join(",")
+        ))),
         // JSON builders (best-effort; the engine has no native json type, so the
         // result is JSON-encoded text — see [`value_to_json`]).
         "to_json" | "to_jsonb" => Ok(Value::Text(value_to_json(
@@ -1408,6 +1492,340 @@ fn call_func(name: &str, args: Vec<Value>) -> Result<Value> {
         "json_build_object" | "jsonb_build_object" => json_build_object(&args),
         other => Err(EngineError::sql(format!("unknown function: {other}"))),
     }
+}
+
+/// A numeric argument as `f64` (Int/Real, or numeric text); `None` for NULL,
+/// missing, or non-numeric.
+fn num_arg(args: &[Value], i: usize) -> Option<f64> {
+    match args.get(i) {
+        Some(Value::Int(n)) => Some(*n as f64),
+        Some(Value::Real(r)) => Some(*r),
+        Some(Value::Text(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Apply a unary real math function, propagating NULL and erroring on non-numeric.
+fn unary_real(args: &[Value], name: &str, f: impl Fn(f64) -> f64) -> Result<Value> {
+    match args.first() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(Value::Int(n)) => Ok(Value::Real(f(*n as f64))),
+        Some(Value::Real(r)) => Ok(Value::Real(f(*r))),
+        Some(other) => Err(EngineError::sql(format!(
+            "{name}() of {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `round(x)` → nearest integer; `round(x, n)` → real to `n` decimal places.
+fn round_func(args: &[Value]) -> Result<Value> {
+    let x = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Int(i)) if args.len() < 2 => return Ok(Value::Int(*i)),
+        Some(Value::Int(i)) => *i as f64,
+        Some(Value::Real(r)) => *r,
+        Some(other) => {
+            return Err(EngineError::sql(format!(
+                "round() of {}",
+                other.type_name()
+            )))
+        }
+    };
+    match num_arg(args, 1) {
+        Some(n) => {
+            let f = 10f64.powi(n as i32);
+            Ok(Value::Real((x * f).round() / f))
+        }
+        None => Ok(Value::Int(x.round() as i64)),
+    }
+}
+
+/// `substr(s, start [, len])` — 1-based, negative `start` counts from the end
+/// (SQLite semantics). NULL propagates.
+fn substr_func(args: &[Value]) -> Value {
+    let s = match args.first() {
+        Some(Value::Null) | None => return Value::Null,
+        Some(v) => text_of(v),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let Some(start) = num_arg(args, 1).map(|f| f as i64) else {
+        return Value::Null;
+    };
+    let from1 = if start < 0 { n + start + 1 } else { start };
+    let begin = (from1 - 1).clamp(0, n) as usize;
+    let end = match args.get(2) {
+        Some(Value::Null) => return Value::Null,
+        Some(_) => {
+            let len = num_arg(args, 2).unwrap_or(0.0) as i64;
+            ((from1 - 1 + len).clamp(0, n)) as usize
+        }
+        None => chars.len(),
+    };
+    let end = end.max(begin);
+    Value::Text(chars[begin..end].iter().collect())
+}
+
+/// 1-based index of `needle` in `haystack` (0 = absent); NULL propagates.
+fn instr_func(haystack: Option<&Value>, needle: Option<&Value>) -> Value {
+    match (haystack, needle) {
+        (Some(h), Some(n)) if !h.is_null() && !n.is_null() => {
+            let hs = text_of(h);
+            let nd = text_of(n);
+            match hs.find(&nd) {
+                Some(byte_idx) => Value::Int(hs[..byte_idx].chars().count() as i64 + 1),
+                None => Value::Int(0),
+            }
+        }
+        _ => Value::Null,
+    }
+}
+
+/// `left(s, n)` / `right(s, n)` — first/last `n` characters (negative `n` drops
+/// from the far end, Postgres-style). NULL propagates.
+fn side_func(args: &[Value], left: bool) -> Value {
+    let s = match args.first() {
+        Some(Value::Null) | None => return Value::Null,
+        Some(v) => text_of(v),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let Some(k) = num_arg(args, 1).map(|f| f as i64) else {
+        return Value::Null;
+    };
+    let take = if k >= 0 { k.min(n) } else { (n + k).max(0) } as usize;
+    let slice: String = if left {
+        chars[..take].iter().collect()
+    } else {
+        chars[n as usize - take..].iter().collect()
+    };
+    Value::Text(slice)
+}
+
+/// `lpad`/`rpad(s, len [, fill])` to `len` characters with `fill` (default space).
+fn pad_func(args: &[Value], left: bool) -> Value {
+    let s = match args.first() {
+        Some(Value::Null) | None => return Value::Null,
+        Some(v) => text_of(v),
+    };
+    let Some(len) = num_arg(args, 1).map(|f| f as i64) else {
+        return Value::Null;
+    };
+    let len = len.max(0) as usize;
+    let fill = match args.get(2) {
+        Some(v) if !v.is_null() => text_of(v),
+        _ => " ".to_string(),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= len || fill.is_empty() {
+        return Value::Text(chars.into_iter().take(len).collect());
+    }
+    let fill_chars: Vec<char> = fill.chars().collect();
+    let pad: String = (0..len - chars.len())
+        .map(|i| fill_chars[i % fill_chars.len()])
+        .collect();
+    Value::Text(if left {
+        format!("{pad}{s}")
+    } else {
+        format!("{s}{pad}")
+    })
+}
+
+/// A timestamp value (Int epoch, or ISO-8601 / `'now'` text) as epoch seconds.
+fn value_to_epoch(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Int(i)) => Some(*i),
+        Some(Value::Real(r)) => Some(*r as i64),
+        Some(Value::Text(s)) => {
+            let t = s.trim();
+            if t.eq_ignore_ascii_case("now") {
+                Some(datetime::now_epoch())
+            } else {
+                datetime::parse_epoch_secs(t).or_else(|| t.parse::<i64>().ok())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Map a timestamp argument through a formatter, propagating NULL/parse failure.
+fn map_epoch(v: Option<&Value>, f: impl Fn(i64) -> String) -> Value {
+    match value_to_epoch(v) {
+        Some(e) => Value::Text(f(e)),
+        None => Value::Null,
+    }
+}
+
+fn date_trunc_func(args: &[Value]) -> Result<Value> {
+    let unit = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(v) => text_of(v),
+    };
+    let Some(e) = value_to_epoch(args.get(1)) else {
+        return Ok(Value::Null);
+    };
+    match datetime::date_trunc(&unit, e) {
+        Some(t) => Ok(Value::Text(datetime::format_timestamp(t))),
+        None => Err(EngineError::sql(format!("unknown date_trunc unit: {unit}"))),
+    }
+}
+
+/// `extract('field', ts)` (desugared from `EXTRACT(field FROM ts)`).
+fn extract_func(args: &[Value]) -> Value {
+    let field = match args.first() {
+        Some(v) if !v.is_null() => text_of(v).to_ascii_lowercase(),
+        _ => return Value::Null,
+    };
+    let Some(e) = value_to_epoch(args.get(1)) else {
+        return Value::Null;
+    };
+    let (y, m, d, hh, mm, ss) = datetime::parts(e);
+    Value::Int(match field.as_str() {
+        "year" => y,
+        "month" => m,
+        "day" => d,
+        "hour" => hh,
+        "minute" => mm,
+        "second" => ss,
+        "dow" => datetime::day_of_week(e),
+        "doy" => datetime::day_of_year(e),
+        "quarter" => (m - 1) / 3 + 1,
+        "epoch" => e,
+        _ => return Value::Null,
+    })
+}
+
+/// A small `strftime` subset over the UTC timestamp.
+fn strftime_func(args: &[Value]) -> Value {
+    let fmt = match args.first() {
+        Some(v) if !v.is_null() => text_of(v),
+        _ => return Value::Null,
+    };
+    let Some(e) = value_to_epoch(args.get(1)) else {
+        return Value::Null;
+    };
+    let (y, m, d, hh, mm, ss) = datetime::parts(e);
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{y:04}")),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('H') => out.push_str(&format!("{hh:02}")),
+            Some('M') => out.push_str(&format!("{mm:02}")),
+            Some('S') => out.push_str(&format!("{ss:02}")),
+            Some('s') => out.push_str(&e.to_string()),
+            Some('j') => out.push_str(&format!("{:03}", datetime::day_of_year(e))),
+            Some('w') => out.push_str(&datetime::day_of_week(e).to_string()),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    Value::Text(out)
+}
+
+/// `json -> key` / `json ->> key`: navigate JSON text by string key (object) or
+/// integer index (array); `as_text` selects the `->>` (text) vs `->` (json) form.
+fn json_get(doc: Option<&Value>, key: Option<&Value>, as_text: bool) -> Value {
+    let (Some(doc), Some(key)) = (doc, key) else {
+        return Value::Null;
+    };
+    if doc.is_null() || key.is_null() {
+        return Value::Null;
+    }
+    let Some(parsed) = crate::json::Json::parse(&text_of(doc)) else {
+        return Value::Null;
+    };
+    let sub = match key {
+        Value::Int(i) => parsed.get_index(*i),
+        v => parsed.get_key(&text_of(v)),
+    };
+    match sub {
+        None => Value::Null,
+        Some(j) if as_text => j.as_text().map(Value::Text).unwrap_or(Value::Null),
+        Some(j) => Value::Text(j.to_json_text()),
+    }
+}
+
+/// `json_extract(json, path)` — navigate an SQLite-style `$.a.b[0]` path and
+/// return the value scalar-typed (string→text, number→int/real, bool→0/1).
+fn json_extract_func(doc: Option<&Value>, path: Option<&Value>) -> Value {
+    let (Some(doc), Some(path)) = (doc, path) else {
+        return Value::Null;
+    };
+    if doc.is_null() || path.is_null() {
+        return Value::Null;
+    }
+    let Some(parsed) = crate::json::Json::parse(&text_of(doc)) else {
+        return Value::Null;
+    };
+    match parsed.extract_path(&text_of(path)) {
+        None | Some(crate::json::Json::Null) => Value::Null,
+        Some(crate::json::Json::Bool(b)) => Value::Int(*b as i64),
+        Some(crate::json::Json::Num(n)) => {
+            if n.fract() == 0.0 && n.is_finite() && n.abs() < 1e15 {
+                Value::Int(*n as i64)
+            } else {
+                Value::Real(*n)
+            }
+        }
+        Some(crate::json::Json::Str(s)) => Value::Text(s.clone()),
+        Some(other) => Value::Text(other.to_json_text()),
+    }
+}
+
+/// Uppercase hex of a byte slice (SQLite `hex`).
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02X}"));
+    }
+    out
+}
+
+/// A non-cryptographic 64-bit random draw — a splitmix64 of a per-call counter,
+/// the wall clock, and the pid. Used by `random()`/`gen_random_uuid()`; the
+/// concrete drawn value is what lands in the WAL, so replay never re-rolls.
+fn rng_u64() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let c = CTR.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let mut x = nanos ^ c.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((std::process::id() as u64) << 40);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// A random RFC-4122 v4 UUID string.
+fn gen_uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&rng_u64().to_le_bytes());
+    b[8..].copy_from_slice(&rng_u64().to_le_bytes());
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4
+    b[8] = (b[8] & 0x3F) | 0x80; // variant 10
+    let h = to_hex(&b).to_lowercase();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// Reduce arguments to the one comparing `want` (Greatest/Least), skipping NULLs
