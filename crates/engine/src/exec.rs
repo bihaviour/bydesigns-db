@@ -3213,6 +3213,12 @@ mod relational {
     ) -> Result<ResultSet> {
         let rel = build_from(store, sel.from.as_ref(), snapshot, writer, params, ctes)?;
         let cols = &rel.cols;
+        let scan = Scan {
+            store,
+            snapshot,
+            writer,
+            params,
+        };
 
         // A non-aggregated query with a correlated subquery folds those subqueries
         // per outer row (binding the outer reference); everything else pre-folds
@@ -3221,93 +3227,22 @@ mod relational {
         let correlated =
             !aggregated && select_has_correlated(sel, store, snapshot, writer, params, cols)?;
 
-        let (filter, items, group_by, having) = if correlated {
-            (
-                sel.filter.clone(),
-                sel.items.clone(),
-                sel.group_by.clone(),
-                sel.having.clone(),
-            )
-        } else {
-            (
-                resolve_opt(&sel.filter, store, snapshot, writer, params)?,
-                resolve_items(&sel.items, store, snapshot, writer, params)?,
-                resolve_list(&sel.group_by, store, snapshot, writer, params)?,
-                resolve_opt(&sel.having, store, snapshot, writer, params)?,
-            )
-        };
-
-        // WHERE.
-        let mut kept: Vec<usize> = Vec::new();
-        if correlated {
-            for (i, row) in rel.rows.iter().enumerate() {
-                let f = fold_corr_opt(&filter, store, snapshot, writer, params, row, cols)?;
-                let ctx = EvalCtx::rel(row, cols, params);
-                if predicate(&f, &ctx)? {
-                    kept.push(i);
-                }
-            }
-        } else {
-            for (i, row) in rel.rows.iter().enumerate() {
-                let ctx = EvalCtx::rel(row, cols, params);
-                if predicate(&filter, &ctx)? {
-                    kept.push(i);
-                }
-            }
-        }
-
-        // Output columns + types.
+        let (filter, items, group_by, having) = resolve_clauses(&scan, sel, correlated)?;
+        let kept = collect_kept(&scan, &rel.rows, cols, &filter, correlated)?;
         let (columns, types) = output_columns(&items, cols);
 
-        // Build (output row, group member indices) entries.
-        let entries = if aggregated {
-            grouped_entries(&items, &group_by, &having, cols, &rel.rows, &kept, params)?
-        } else if correlated {
-            let mut e = Vec::with_capacity(kept.len());
-            for &i in &kept {
-                let row = &rel.rows[i];
-                let ctx = EvalCtx::rel(row, cols, params);
-                let mut out = Vec::new();
-                for item in &items {
-                    let folded = match item {
-                        SelItem::Expr { expr, alias } => SelItem::Expr {
-                            expr: fold_corr(expr, store, snapshot, writer, params, row, cols)?,
-                            alias: alias.clone(),
-                        },
-                        other => other.clone(),
-                    };
-                    project_item(&folded, &ctx, cols, row, &mut out)?;
-                }
-                e.push((out, vec![i]));
-            }
-            e
-        } else {
-            let mut e = Vec::with_capacity(kept.len());
-            for &i in &kept {
-                let ctx = EvalCtx::rel(&rel.rows[i], cols, params);
-                let mut out = Vec::new();
-                for item in &items {
-                    project_item(item, &ctx, cols, &rel.rows[i], &mut out)?;
-                }
-                e.push((out, vec![i]));
-            }
-            e
+        let plan = CorePlan {
+            aggregated,
+            correlated,
+            items: &items,
+            group_by: &group_by,
+            having: &having,
         };
+        let entries = build_entries(&scan, &plan, cols, &rel.rows, &kept)?;
 
         // ORDER BY (apply_tail) over the group-aware context, then DISTINCT, then
         // OFFSET/LIMIT.
-        let order_keys = if apply_tail {
-            sel.order_by
-                .iter()
-                .map(|k| OrderKey {
-                    expr: resolve_alias_rel(&items, &k.expr),
-                    asc: k.asc,
-                    nulls_first: k.nulls_first,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let order_keys = order_keys_for(sel, &items, apply_tail);
         let mut rows = order_and_collect(entries, &order_keys, cols, &rel.rows, params)?;
 
         if sel.distinct {
@@ -3323,6 +3258,160 @@ mod relational {
             types,
             rows,
         })
+    }
+
+    /// The store + snapshot + params a relational scan reads against, bundled so
+    /// the per-clause helpers stay within the parameter budget.
+    struct Scan<'a> {
+        store: &'a Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &'a [Value],
+    }
+
+    /// The resolved projection/grouping a core's entries are built from.
+    struct CorePlan<'a> {
+        aggregated: bool,
+        correlated: bool,
+        items: &'a [SelItem],
+        group_by: &'a [Expr],
+        having: &'a Option<Expr>,
+    }
+
+    /// Resolve the WHERE/projection/group/having clauses: a correlated query keeps
+    /// them raw (folded per row later), otherwise non-correlated subqueries fold
+    /// to literals once here.
+    #[allow(clippy::type_complexity)]
+    fn resolve_clauses(
+        scan: &Scan,
+        sel: &SelectStmt,
+        correlated: bool,
+    ) -> Result<(Option<Expr>, Vec<SelItem>, Vec<Expr>, Option<Expr>)> {
+        if correlated {
+            return Ok((
+                sel.filter.clone(),
+                sel.items.clone(),
+                sel.group_by.clone(),
+                sel.having.clone(),
+            ));
+        }
+        let (s, sn, w, p) = (scan.store, scan.snapshot, scan.writer, scan.params);
+        Ok((
+            resolve_opt(&sel.filter, s, sn, w, p)?,
+            resolve_items(&sel.items, s, sn, w, p)?,
+            resolve_list(&sel.group_by, s, sn, w, p)?,
+            resolve_opt(&sel.having, s, sn, w, p)?,
+        ))
+    }
+
+    /// Apply WHERE, returning the indices of the kept rows. A correlated filter is
+    /// folded against each row before evaluation.
+    fn collect_kept(
+        scan: &Scan,
+        rows: &[Vec<Value>],
+        cols: &[RelCol],
+        filter: &Option<Expr>,
+        correlated: bool,
+    ) -> Result<Vec<usize>> {
+        let mut kept = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let ctx = EvalCtx::rel(row, cols, scan.params);
+            let pass = if correlated {
+                let f = fold_corr_opt(
+                    filter,
+                    scan.store,
+                    scan.snapshot,
+                    scan.writer,
+                    scan.params,
+                    row,
+                    cols,
+                )?;
+                predicate(&f, &ctx)?
+            } else {
+                predicate(filter, &ctx)?
+            };
+            if pass {
+                kept.push(i);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Build the (output row, group-member indices) entries: grouped aggregation,
+    /// or one entry per kept row (folding correlated subqueries per row).
+    fn build_entries(
+        scan: &Scan,
+        plan: &CorePlan,
+        cols: &[RelCol],
+        rows: &[Vec<Value>],
+        kept: &[usize],
+    ) -> Result<Vec<(Vec<Value>, Vec<usize>)>> {
+        if plan.aggregated {
+            return grouped_entries(
+                plan.items,
+                plan.group_by,
+                plan.having,
+                cols,
+                rows,
+                kept,
+                scan.params,
+            );
+        }
+        let mut e = Vec::with_capacity(kept.len());
+        for &i in kept {
+            let row = &rows[i];
+            let ctx = EvalCtx::rel(row, cols, scan.params);
+            let mut out = Vec::new();
+            for item in plan.items {
+                if plan.correlated {
+                    let folded = fold_corr_item(scan, item, row, cols)?;
+                    project_item(&folded, &ctx, cols, row, &mut out)?;
+                } else {
+                    project_item(item, &ctx, cols, row, &mut out)?;
+                }
+            }
+            e.push((out, vec![i]));
+        }
+        Ok(e)
+    }
+
+    /// Fold the correlated subqueries inside one projection item for `row`.
+    fn fold_corr_item(
+        scan: &Scan,
+        item: &SelItem,
+        row: &[Value],
+        cols: &[RelCol],
+    ) -> Result<SelItem> {
+        Ok(match item {
+            SelItem::Expr { expr, alias } => SelItem::Expr {
+                expr: fold_corr(
+                    expr,
+                    scan.store,
+                    scan.snapshot,
+                    scan.writer,
+                    scan.params,
+                    row,
+                    cols,
+                )?,
+                alias: alias.clone(),
+            },
+            other => other.clone(),
+        })
+    }
+
+    /// The resolved ORDER BY keys for a core (empty unless its tail applies).
+    fn order_keys_for(sel: &SelectStmt, items: &[SelItem], apply_tail: bool) -> Vec<OrderKey> {
+        if !apply_tail {
+            return Vec::new();
+        }
+        sel.order_by
+            .iter()
+            .map(|k| OrderKey {
+                expr: resolve_alias_rel(items, &k.expr),
+                asc: k.asc,
+                nulls_first: k.nulls_first,
+            })
+            .collect()
     }
 
     /// Materialize a `FROM` clause into a single relation.
@@ -4552,26 +4641,44 @@ mod relational {
     }
 
     /// Rebuild a composite expression with `f` applied to each child (leaves and
-    /// nodes the caller handles specially are cloned unchanged).
+    /// nodes the caller handles specially are cloned unchanged). The multi-child
+    /// variants live in [`map_children_compound`] to keep each branch count low.
     fn map_children(e: &Expr, f: &dyn Fn(&Expr) -> Result<Expr>) -> Result<Expr> {
-        let bx = |x: &Expr| -> Result<Box<Expr>> { Ok(Box::new(f(x)?)) };
-        let opt = |x: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>> {
-            match x {
-                Some(e) => Ok(Some(Box::new(f(e)?))),
-                None => Ok(None),
-            }
-        };
         Ok(match e {
             Expr::Binary { op, l, r } => Expr::Binary {
                 op: *op,
-                l: bx(l)?,
-                r: bx(r)?,
+                l: map_box(l, f)?,
+                r: map_box(r, f)?,
             },
-            Expr::Unary { op, e } => Expr::Unary { op: *op, e: bx(e)? },
+            Expr::Unary { op, e } => Expr::Unary {
+                op: *op,
+                e: map_box(e, f)?,
+            },
             Expr::IsNull { e, negated } => Expr::IsNull {
-                e: bx(e)?,
+                e: map_box(e, f)?,
                 negated: *negated,
             },
+            Expr::InList { e, list, negated } => Expr::InList {
+                e: map_box(e, f)?,
+                list: list.iter().map(f).collect::<Result<_>>()?,
+                negated: *negated,
+            },
+            Expr::Cast { e, target } => Expr::Cast {
+                e: map_box(e, f)?,
+                target: *target,
+            },
+            Expr::Func { name, args } => Expr::Func {
+                name: name.clone(),
+                args: args.iter().map(f).collect::<Result<_>>()?,
+            },
+            _ => map_children_compound(e, f)?,
+        })
+    }
+
+    /// The multi-child / optional-child expression variants (split out of
+    /// [`map_children`]); leaves and already-handled nodes clone unchanged.
+    fn map_children_compound(e: &Expr, f: &dyn Fn(&Expr) -> Result<Expr>) -> Result<Expr> {
+        Ok(match e {
             Expr::Like {
                 e,
                 pattern,
@@ -4579,21 +4686,16 @@ mod relational {
                 negated,
                 insensitive,
             } => Expr::Like {
-                e: bx(e)?,
-                pattern: bx(pattern)?,
-                escape: opt(escape)?,
+                e: map_box(e, f)?,
+                pattern: map_box(pattern, f)?,
+                escape: map_box_opt(escape, f)?,
                 negated: *negated,
                 insensitive: *insensitive,
             },
-            Expr::InList { e, list, negated } => Expr::InList {
-                e: bx(e)?,
-                list: list.iter().map(f).collect::<Result<_>>()?,
-                negated: *negated,
-            },
             Expr::Between { e, lo, hi, negated } => Expr::Between {
-                e: bx(e)?,
-                lo: bx(lo)?,
-                hi: bx(hi)?,
+                e: map_box(e, f)?,
+                lo: map_box(lo, f)?,
+                hi: map_box(hi, f)?,
                 negated: *negated,
             },
             Expr::Case {
@@ -4601,20 +4703,12 @@ mod relational {
                 whens,
                 els,
             } => Expr::Case {
-                operand: opt(operand)?,
+                operand: map_box_opt(operand, f)?,
                 whens: whens
                     .iter()
                     .map(|(c, r)| Ok((f(c)?, f(r)?)))
                     .collect::<Result<_>>()?,
-                els: opt(els)?,
-            },
-            Expr::Cast { e, target } => Expr::Cast {
-                e: bx(e)?,
-                target: *target,
-            },
-            Expr::Func { name, args } => Expr::Func {
-                name: name.clone(),
-                args: args.iter().map(f).collect::<Result<_>>()?,
+                els: map_box_opt(els, f)?,
             },
             Expr::Aggregate {
                 func,
@@ -4628,9 +4722,25 @@ mod relational {
                     AggArg::Expr(x) => AggArg::Expr(Box::new(f(x)?)),
                 },
                 distinct: *distinct,
-                sep: opt(sep)?,
+                sep: map_box_opt(sep, f)?,
             },
             other => other.clone(),
         })
+    }
+
+    /// Apply `f` to a boxed child expression.
+    fn map_box(x: &Expr, f: &dyn Fn(&Expr) -> Result<Expr>) -> Result<Box<Expr>> {
+        Ok(Box::new(f(x)?))
+    }
+
+    /// Apply `f` to an optional boxed child expression (`None` stays `None`).
+    fn map_box_opt(
+        x: &Option<Box<Expr>>,
+        f: &dyn Fn(&Expr) -> Result<Expr>,
+    ) -> Result<Option<Box<Expr>>> {
+        match x {
+            Some(e) => Ok(Some(Box::new(f(e)?))),
+            None => Ok(None),
+        }
     }
 }
