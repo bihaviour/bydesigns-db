@@ -58,11 +58,17 @@ pub enum Stmt {
     Update {
         table: String,
         sets: Vec<(String, Expr)>,
+        /// `UPDATE … FROM <sources>` — extra row sources joined to the target via
+        /// the `WHERE` clause (Postgres). `None` for a plain single-table update.
+        from: Option<FromClause>,
         filter: Option<Expr>,
         returning: Option<Vec<SelItem>>,
     },
     Delete {
         table: String,
+        /// `DELETE … USING <sources>` — extra row sources joined to the target via
+        /// the `WHERE` clause (Postgres). `None` for a plain single-table delete.
+        using: Option<FromClause>,
         filter: Option<Expr>,
         returning: Option<Vec<SelItem>>,
     },
@@ -1654,6 +1660,13 @@ impl Parser {
         let table = self.ident()?;
         self.expect_kw("set")?;
         let sets = self.assignment_list()?;
+        // `UPDATE … FROM <sources>` (Postgres) — extra row sources correlated to
+        // the target through the WHERE clause.
+        let from = if self.eat_kw("from") {
+            Some(self.parse_from()?)
+        } else {
+            None
+        };
         let filter = if self.eat_kw("where") {
             Some(self.expr()?)
         } else {
@@ -1663,6 +1676,7 @@ impl Parser {
         Ok(Stmt::Update {
             table,
             sets,
+            from,
             filter,
             returning,
         })
@@ -1672,6 +1686,13 @@ impl Parser {
         self.expect_kw("delete")?;
         self.expect_kw("from")?;
         let table = self.ident()?;
+        // `DELETE … USING <sources>` (Postgres) — extra row sources correlated to
+        // the target through the WHERE clause.
+        let using = if self.eat_kw("using") {
+            Some(self.parse_from()?)
+        } else {
+            None
+        };
         let filter = if self.eat_kw("where") {
             Some(self.expr()?)
         } else {
@@ -1680,6 +1701,7 @@ impl Parser {
         let returning = self.opt_returning()?;
         Ok(Stmt::Delete {
             table,
+            using,
             filter,
             returning,
         })

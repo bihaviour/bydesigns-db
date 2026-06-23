@@ -304,3 +304,74 @@ fn join_respects_mvcc_snapshot() {
     assert_eq!(cell(&after, 0, 0).as_deref(), Some("4"));
     let _ = fs::remove_file(&p);
 }
+
+// ---- join-driven DML: UPDATE … FROM / DELETE … USING (deferred 6B item) ----
+
+#[test]
+fn update_from_join_applies_correlated_values() {
+    let p = db_path("upd-from");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        .unwrap();
+    db.exec("CREATE TABLE deltas (id INTEGER, amount INTEGER)")
+        .unwrap();
+    db.exec("INSERT INTO accounts VALUES (1,100),(2,200),(3,300)")
+        .unwrap();
+    db.exec("INSERT INTO deltas VALUES (1,10),(2,-5)").unwrap();
+
+    // Correlate the target to the source through WHERE (Postgres UPDATE … FROM).
+    db.exec(
+        "UPDATE accounts SET balance = balance + d.amount \
+         FROM deltas d WHERE accounts.id = d.id",
+    )
+    .unwrap();
+    assert_eq!(db.last_changes, 2, "only the two correlated rows update");
+
+    let rs = db
+        .query("SELECT balance FROM accounts ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        col(&rs, 0),
+        vec![
+            Some("110".into()),
+            Some("195".into()),
+            Some("300".into()), // id 3 has no delta → untouched
+        ]
+    );
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn update_from_join_returning_projects_target() {
+    let p = db_path("upd-from-ret");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    db.exec("CREATE TABLE src (id INTEGER, tag TEXT)").unwrap();
+    db.exec("INSERT INTO t VALUES (1,'a'),(2,'b')").unwrap();
+    db.exec("INSERT INTO src VALUES (1,'X'),(2,'Y')").unwrap();
+    let rs = db
+        .query(
+            "UPDATE t SET tag = s.tag FROM src s WHERE t.id = s.id \
+             RETURNING id, tag",
+        )
+        .unwrap();
+    assert_eq!(rs.columns, vec!["id", "tag"]);
+    assert_eq!(rs.rows.len(), 2);
+    // RETURNING projects the post-update target row.
+    let tags = col(&rs, 1);
+    assert!(tags.contains(&Some("X".into())) && tags.contains(&Some("Y".into())));
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn delete_using_join_removes_correlated_rows() {
+    let (mut db, p) = library();
+    // Delete every book whose author is 'Ada' (id 1 → books 10, 11).
+    db.exec("DELETE FROM books USING authors a WHERE books.author_id = a.id AND a.name = 'Ada'")
+        .unwrap();
+    assert_eq!(db.last_changes, 2);
+    let rs = db.query("SELECT id FROM books ORDER BY id").unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("12".into())]);
+    let _ = fs::remove_file(&p);
+}

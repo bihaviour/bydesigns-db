@@ -2730,6 +2730,7 @@ fn check_vector_dims(schema: &TableSchema, vals: &[Value], table: &str) -> Resul
 pub fn run_delete(
     store: &mut Store,
     table: &str,
+    using: Option<&FromClause>,
     filter: &Option<Expr>,
     returning: Option<&[SelItem]>,
     wc: &WriteCtx,
@@ -2739,23 +2740,13 @@ pub fn run_delete(
         .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?
         .schema
         .clone();
-    let t = store.table(table).unwrap();
-    let mut victims = Vec::new();
-    // RETURNING projects the deleted (old) row values.
-    let mut affected: Vec<Vec<Value>> = Vec::new();
-    for v in &t.rows {
-        if !v.visible_to_writer(wc.snapshot, wc.owner) {
-            continue;
+    let want_returning = returning.is_some();
+    let (victims, affected) = match using {
+        None => collect_delete_victims(store, &schema, table, filter, want_returning, wc)?,
+        Some(u) => {
+            collect_delete_victims_join(store, &schema, table, u, filter, want_returning, wc)?
         }
-        let ctx = EvalCtx::row(&v.values, &schema, wc.params);
-        if predicate(filter, &ctx)? {
-            check_no_conflict(v, wc.snapshot, wc.owner)?;
-            victims.push(v.vid);
-            if returning.is_some() {
-                affected.push(v.values.clone());
-            }
-        }
-    }
+    };
     let mut wal = Vec::with_capacity(victims.len());
     for vid in &victims {
         supersede(store, table, *vid, wc.owner, &mut wal);
@@ -2772,10 +2763,81 @@ pub fn run_delete(
     })
 }
 
+/// Collect the visible target rows a single-table DELETE removes — their vids and
+/// (when RETURNING) their old values.
+fn collect_delete_victims(
+    store: &Store,
+    schema: &TableSchema,
+    table: &str,
+    filter: &Option<Expr>,
+    want_returning: bool,
+    wc: &WriteCtx,
+) -> Result<(Vec<u64>, Vec<Vec<Value>>)> {
+    let t = store.table(table).unwrap();
+    let mut victims = Vec::new();
+    let mut affected: Vec<Vec<Value>> = Vec::new();
+    for v in &t.rows {
+        if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        let ctx = EvalCtx::row(&v.values, schema, wc.params);
+        if predicate(filter, &ctx)? {
+            check_no_conflict(v, wc.snapshot, wc.owner)?;
+            victims.push(v.vid);
+            if want_returning {
+                affected.push(v.values.clone());
+            }
+        }
+    }
+    Ok((victims, affected))
+}
+
+/// Collect the target rows a join-driven `DELETE … USING` removes: the target is
+/// nested-loop-joined against the materialized `USING` sources and a target row
+/// is a victim if any combination satisfies `WHERE` (over `[target | sources]`).
+fn collect_delete_victims_join(
+    store: &Store,
+    schema: &TableSchema,
+    table: &str,
+    using: &FromClause,
+    filter: &Option<Expr>,
+    want_returning: bool,
+    wc: &WriteCtx,
+) -> Result<(Vec<u64>, Vec<Vec<Value>>)> {
+    let (from_cols, from_rows) =
+        relational::materialize(store, using, wc.snapshot, Some(wc.owner), wc.params)?;
+    let mut cols = target_rel_cols(schema, table);
+    cols.extend(from_cols);
+
+    let t = store.table(table).unwrap();
+    let mut victims = Vec::new();
+    let mut affected: Vec<Vec<Value>> = Vec::new();
+    for v in &t.rows {
+        if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        for frow in &from_rows {
+            let mut combined = v.values.clone();
+            combined.extend(frow.iter().cloned());
+            let ctx = EvalCtx::rel(&combined, &cols, wc.params);
+            if predicate(filter, &ctx)? {
+                check_no_conflict(v, wc.snapshot, wc.owner)?;
+                victims.push(v.vid);
+                if want_returning {
+                    affected.push(v.values.clone());
+                }
+                break;
+            }
+        }
+    }
+    Ok((victims, affected))
+}
+
 pub fn run_update(
     store: &mut Store,
     table: &str,
     sets: &[(String, Expr)],
+    from: Option<&FromClause>,
     filter: &Option<Expr>,
     returning: Option<&[SelItem]>,
     wc: &WriteCtx,
@@ -2785,9 +2847,86 @@ pub fn run_update(
         .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?
         .schema
         .clone();
-    let updates = compute_updates(store, &schema, table, sets, filter, wc)?;
+    let updates = match from {
+        None => compute_updates(store, &schema, table, sets, filter, wc)?,
+        Some(from) => compute_updates_join(store, &schema, table, sets, from, filter, wc)?,
+    };
     check_update_uniques(store, &schema, table, &updates, wc.owner)?;
     apply_updates(store, &schema, table, updates, returning, wc)
+}
+
+/// The target table's columns as a relational namespace qualified by the table
+/// name — the left side of a join-driven `UPDATE … FROM` / `DELETE … USING`.
+fn target_rel_cols(schema: &TableSchema, table: &str) -> Vec<RelCol> {
+    schema
+        .columns
+        .iter()
+        .map(|c| RelCol {
+            table: Some(table.to_string()),
+            name: c.name.clone(),
+            ty: c.ty,
+        })
+        .collect()
+}
+
+/// Compute `(old_vid, new_values)` for a join-driven `UPDATE … FROM`. The target
+/// rows are nested-loop-joined against the materialized `FROM` sources; the
+/// `WHERE` predicate (the only correlation) is evaluated over the combined
+/// namespace `[target | sources]`. A target row updates at most once — the first
+/// matching combination wins (the multi-match result is unspecified, as in PG).
+fn compute_updates_join(
+    store: &Store,
+    schema: &TableSchema,
+    table: &str,
+    sets: &[(String, Expr)],
+    from: &FromClause,
+    filter: &Option<Expr>,
+    wc: &WriteCtx,
+) -> Result<Vec<(u64, Vec<Value>)>> {
+    let mut targets = Vec::with_capacity(sets.len());
+    for (col, expr) in sets {
+        let idx = schema
+            .column_index(col)
+            .ok_or_else(|| EngineError::sql(format!("no such column: {col}")))?;
+        targets.push((idx, expr));
+    }
+    let check_exprs: Vec<Expr> = schema
+        .checks
+        .iter()
+        .map(|s| crate::sql::parse_expr(s))
+        .collect::<Result<_>>()?;
+
+    let (from_cols, from_rows) =
+        relational::materialize(store, from, wc.snapshot, Some(wc.owner), wc.params)?;
+    let mut cols = target_rel_cols(schema, table);
+    cols.extend(from_cols);
+
+    let t = store.table(table).unwrap();
+    let mut updates: Vec<(u64, Vec<Value>)> = Vec::new();
+    for v in &t.rows {
+        if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        for frow in &from_rows {
+            let mut combined = v.values.clone();
+            combined.extend(frow.iter().cloned());
+            let ctx = EvalCtx::rel(&combined, &cols, wc.params);
+            if !predicate(filter, &ctx)? {
+                continue;
+            }
+            check_no_conflict(v, wc.snapshot, wc.owner)?;
+            let mut nv = v.values.clone();
+            for (idx, expr) in &targets {
+                nv[*idx] = schema.columns[*idx].ty.coerce(eval(expr, &ctx)?);
+            }
+            check_not_null(schema, &nv, table)?;
+            check_vector_dims(schema, &nv, table)?;
+            check_row_constraints(&check_exprs, schema, &nv)?;
+            updates.push((v.vid, nv));
+            break; // one update per target row (first match wins)
+        }
+    }
+    Ok(updates)
 }
 
 /// Compute `(old_vid, new_values)` for every row matching the UPDATE filter,
@@ -3022,6 +3161,21 @@ mod relational {
         }
         apply_output_order_limit(&mut acc, sel, params)?;
         Ok(acc)
+    }
+
+    /// Materialize a `FROM` clause (no CTEs in scope) into a flat column
+    /// namespace + value rows — the right-hand row source for join-driven DML
+    /// (`UPDATE … FROM` / `DELETE … USING`). The target table is prepended by the
+    /// caller; here we only build the extra sources.
+    pub(super) fn materialize(
+        store: &Store,
+        from: &FromClause,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<(Vec<RelCol>, Vec<Vec<Value>>)> {
+        let rel = build_from(store, Some(from), snapshot, writer, params, &HashMap::new())?;
+        Ok((rel.cols, rel.rows))
     }
 
     fn relation_from_result(alias: &str, rs: ResultSet) -> Relation {

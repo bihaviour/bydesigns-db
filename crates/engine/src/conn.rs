@@ -457,14 +457,31 @@ impl Connection {
                 Stmt::Update {
                     table,
                     sets,
+                    from,
                     filter,
                     returning,
-                } => run_update(&mut store, table, sets, filter, returning.as_deref(), &wc),
+                } => run_update(
+                    &mut store,
+                    table,
+                    sets,
+                    from.as_ref(),
+                    filter,
+                    returning.as_deref(),
+                    &wc,
+                ),
                 Stmt::Delete {
                     table,
+                    using,
                     filter,
                     returning,
-                } => run_delete(&mut store, table, filter, returning.as_deref(), &wc),
+                } => run_delete(
+                    &mut store,
+                    table,
+                    using.as_ref(),
+                    filter,
+                    returning.as_deref(),
+                    &wc,
+                ),
                 _ => unreachable!(),
             }
         };
