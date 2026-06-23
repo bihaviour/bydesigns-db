@@ -230,32 +230,8 @@ impl WalOp {
         let mut c = Cursor { b: bytes, p: 0 };
         let tag = c.u8()?;
         let op = match tag {
-            OP_CREATE => {
-                let name = c.str()?;
-                let mut columns = decode_columns(&mut c)?;
-                let foreign_keys = decode_foreign_keys(&mut c)?;
-                let (checks, uniques) = decode_table_extras(&mut c, &mut columns)?;
-                WalOp::CreateTable {
-                    schema: TableSchema {
-                        name,
-                        columns,
-                        foreign_keys,
-                        checks,
-                        uniques,
-                    },
-                }
-            }
-            OP_ALTER_ADD => {
-                let table = c.str()?;
-                let mut cols = decode_columns(&mut c)?;
-                let _ = decode_table_extras(&mut c, &mut cols)?;
-                WalOp::AlterAddColumn {
-                    table,
-                    column: cols.pop().ok_or_else(|| {
-                        EngineError::internal("ALTER ADD COLUMN record has no column")
-                    })?,
-                }
-            }
+            OP_CREATE => decode_create(&mut c)?,
+            OP_ALTER_ADD => decode_alter_add(&mut c)?,
             OP_ALTER_DROP => WalOp::AlterDropColumn {
                 table: c.str()?,
                 column: c.str()?,
@@ -270,39 +246,9 @@ impl WalOp {
                 to: c.str()?,
             },
             OP_DROP => WalOp::DropTable { name: c.str()? },
-            OP_CREATE_INDEX => {
-                let name = c.str()?;
-                let table = c.str()?;
-                let column = c.str()?;
-                let m = c.u32()? as usize;
-                let ef_construction = c.u32()? as usize;
-                let ef_search = c.u32()? as usize;
-                let metric = Metric::from_tag(c.u8()?);
-                WalOp::CreateIndex {
-                    def: IndexDef {
-                        name,
-                        table,
-                        column,
-                        params: IndexParams {
-                            m,
-                            ef_construction,
-                            ef_search,
-                            metric,
-                        },
-                    },
-                }
-            }
+            OP_CREATE_INDEX => decode_create_index(&mut c)?,
             OP_DROP_INDEX => WalOp::DropIndex { name: c.str()? },
-            OP_INSERT => {
-                let table = c.str()?;
-                let vid = c.u64()?;
-                let n = c.u32()? as usize;
-                let mut values = Vec::with_capacity(n);
-                for _ in 0..n {
-                    values.push(c.value()?);
-                }
-                WalOp::Insert { table, vid, values }
-            }
+            OP_INSERT => decode_insert(&mut c)?,
             OP_DELETE => WalOp::Delete {
                 table: c.str()?,
                 vid: c.u64()?,
@@ -312,6 +258,72 @@ impl WalOp {
         };
         Ok(op)
     }
+}
+
+/// Decode a `CreateTable` op body (name + columns + FKs + checks/uniques).
+fn decode_create(c: &mut Cursor) -> Result<WalOp> {
+    let name = c.str()?;
+    let mut columns = decode_columns(c)?;
+    let foreign_keys = decode_foreign_keys(c)?;
+    let (checks, uniques) = decode_table_extras(c, &mut columns)?;
+    Ok(WalOp::CreateTable {
+        schema: TableSchema {
+            name,
+            columns,
+            foreign_keys,
+            checks,
+            uniques,
+        },
+    })
+}
+
+/// Decode an `AlterAddColumn` op body (one column, sharing the column codec).
+fn decode_alter_add(c: &mut Cursor) -> Result<WalOp> {
+    let table = c.str()?;
+    let mut cols = decode_columns(c)?;
+    let _ = decode_table_extras(c, &mut cols)?;
+    Ok(WalOp::AlterAddColumn {
+        table,
+        column: cols
+            .pop()
+            .ok_or_else(|| EngineError::internal("ALTER ADD COLUMN record has no column"))?,
+    })
+}
+
+/// Decode a `CreateIndex` op body (name/table/column + HNSW params).
+fn decode_create_index(c: &mut Cursor) -> Result<WalOp> {
+    let name = c.str()?;
+    let table = c.str()?;
+    let column = c.str()?;
+    let m = c.u32()? as usize;
+    let ef_construction = c.u32()? as usize;
+    let ef_search = c.u32()? as usize;
+    let metric = Metric::from_tag(c.u8()?);
+    Ok(WalOp::CreateIndex {
+        def: IndexDef {
+            name,
+            table,
+            column,
+            params: IndexParams {
+                m,
+                ef_construction,
+                ef_search,
+                metric,
+            },
+        },
+    })
+}
+
+/// Decode an `Insert` op body (table + vid + count-prefixed values).
+fn decode_insert(c: &mut Cursor) -> Result<WalOp> {
+    let table = c.str()?;
+    let vid = c.u64()?;
+    let n = c.u32()? as usize;
+    let mut values = Vec::with_capacity(n);
+    for _ in 0..n {
+        values.push(c.value()?);
+    }
+    Ok(WalOp::Insert { table, vid, values })
 }
 
 /// Decode a `CreateTable`'s column list (count-prefixed).

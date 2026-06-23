@@ -5,7 +5,7 @@
 
 use crate::db::{commit_error, Database};
 use crate::error::{EngineError, Result};
-use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet};
+use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet, WriteCtx};
 use crate::sql::{self, Stmt};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexDef, IndexParams};
@@ -430,8 +430,11 @@ impl Connection {
             });
         }
         self.ensure_writer();
-        let snapshot = self.txn.as_ref().unwrap().snapshot;
-        let owner = self.txn.as_ref().unwrap().owner;
+        let wc = WriteCtx {
+            snapshot: self.txn.as_ref().unwrap().snapshot,
+            owner: self.txn.as_ref().unwrap().owner,
+            params,
+        };
 
         let result = {
             let mut store = self.db.store.write().unwrap();
@@ -449,38 +452,19 @@ impl Connection {
                     source,
                     on_conflict,
                     returning.as_deref(),
-                    snapshot,
-                    owner,
-                    params,
+                    &wc,
                 ),
                 Stmt::Update {
                     table,
                     sets,
                     filter,
                     returning,
-                } => run_update(
-                    &mut store,
-                    table,
-                    sets,
-                    filter,
-                    returning.as_deref(),
-                    snapshot,
-                    owner,
-                    params,
-                ),
+                } => run_update(&mut store, table, sets, filter, returning.as_deref(), &wc),
                 Stmt::Delete {
                     table,
                     filter,
                     returning,
-                } => run_delete(
-                    &mut store,
-                    table,
-                    filter,
-                    returning.as_deref(),
-                    snapshot,
-                    owner,
-                    params,
-                ),
+                } => run_delete(&mut store, table, filter, returning.as_deref(), &wc),
                 _ => unreachable!(),
             }
         };

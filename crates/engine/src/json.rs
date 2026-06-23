@@ -147,10 +147,10 @@ fn fmt_num(n: f64) -> String {
 
 fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
+    out.push('\"');
     for c in s.chars() {
         match c {
-            '"' => out.push_str("\\\""),
+            '\"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
@@ -159,7 +159,7 @@ fn quote(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out.push('"');
+    out.push('\"');
     out
 }
 

@@ -631,33 +631,6 @@ impl Parser {
             }
         } else if self.is_kw("alter") {
             self.alter_table()
-        } else if self.is_kw("explain") {
-            self.bump();
-            let _ = self.eat_kw("analyze");
-            let _ = self.eat_kw("verbose");
-            if self.peek() == &Tok::LParen {
-                self.skip_parens(); // EXPLAIN (options) — accepted, ignored
-            }
-            Ok(Stmt::Explain(Box::new(self.statement()?)))
-        } else if self.is_kw("show") {
-            self.bump();
-            // `SHOW name` / `SHOW TRANSACTION ISOLATION LEVEL` / `SHOW ALL`.
-            let mut parts = Vec::new();
-            while let Some(w) = self.peek_word() {
-                parts.push(w.to_string());
-                self.bump();
-            }
-            Ok(Stmt::Show(parts.join(" ")))
-        } else if self.is_kw("set")
-            || self.is_kw("pragma")
-            || self.is_kw("vacuum")
-            || self.is_kw("analyze")
-            || self.is_kw("reset")
-            || self.is_kw("discard")
-        {
-            // Accepted-and-ignored session statements (stage 6E).
-            self.skip_to_end();
-            Ok(Stmt::Noop)
         } else if self.is_kw("insert") {
             self.insert()
         } else if self.is_kw("select") || self.is_kw("with") {
@@ -666,7 +639,60 @@ impl Parser {
             self.update()
         } else if self.is_kw("delete") {
             self.delete()
-        } else if self.eat_kw("begin") {
+        } else if let Some(stmt) = self.utility_stmt()? {
+            stmt
+        } else if let Some(stmt) = self.transaction_stmt()? {
+            stmt
+        } else {
+            Err(EngineError::sql(format!(
+                "unsupported statement starting at {:?}",
+                self.peek()
+            )))
+        }
+    }
+
+    /// `EXPLAIN` / `SHOW` plus the accepted-and-ignored session statements
+    /// (`SET`/`PRAGMA`/`VACUUM`/`ANALYZE`/`RESET`/`DISCARD`); `None` if the next
+    /// token starts none of them. (Stage 6E — these only peek, never consume on a
+    /// miss, so the caller can fall through to the next group.)
+    fn utility_stmt(&mut self) -> Result<Option<Result<Stmt>>> {
+        if self.is_kw("explain") {
+            self.bump();
+            let _ = self.eat_kw("analyze");
+            let _ = self.eat_kw("verbose");
+            if self.peek() == &Tok::LParen {
+                self.skip_parens(); // EXPLAIN (options) — accepted, ignored
+            }
+            Ok(Some(self.statement().map(|s| Stmt::Explain(Box::new(s)))))
+        } else if self.is_kw("show") {
+            self.bump();
+            // `SHOW name` / `SHOW TRANSACTION ISOLATION LEVEL` / `SHOW ALL`.
+            let mut parts = Vec::new();
+            while let Some(w) = self.peek_word() {
+                parts.push(w.to_string());
+                self.bump();
+            }
+            Ok(Some(Ok(Stmt::Show(parts.join(" ")))))
+        } else if self.is_kw("set")
+            || self.is_kw("pragma")
+            || self.is_kw("vacuum")
+            || self.is_kw("analyze")
+            || self.is_kw("reset")
+            || self.is_kw("discard")
+        {
+            self.skip_to_end();
+            Ok(Some(Ok(Stmt::Noop)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Transaction-control statements (`BEGIN`/`START`, `COMMIT`/`END`,
+    /// `SAVEPOINT`/`RELEASE`, `ROLLBACK`/`ABORT [TO]`); `None` if the next token
+    /// starts none of them. `eat_kw` only consumes on a match, so a miss leaves
+    /// the cursor untouched.
+    fn transaction_stmt(&mut self) -> Result<Option<Result<Stmt>>> {
+        let stmt = if self.eat_kw("begin") {
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             self.eat_transaction_modes();
             Ok(Stmt::Begin)
@@ -679,26 +705,24 @@ impl Parser {
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             Ok(Stmt::Commit)
         } else if self.eat_kw("savepoint") {
-            Ok(Stmt::Savepoint(self.ident()?))
+            self.ident().map(Stmt::Savepoint)
         } else if self.eat_kw("release") {
             let _ = self.eat_kw("savepoint");
-            Ok(Stmt::ReleaseSavepoint(self.ident()?))
+            self.ident().map(Stmt::ReleaseSavepoint)
         } else if self.eat_kw("rollback") || self.eat_kw("abort") {
             // ABORT [WORK|TRANSACTION] is a ROLLBACK synonym (PostgREST uses it).
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             // `ROLLBACK TO [SAVEPOINT] name` rolls back to a savepoint.
             if self.eat_kw("to") {
                 let _ = self.eat_kw("savepoint");
-                Ok(Stmt::RollbackTo(self.ident()?))
+                self.ident().map(Stmt::RollbackTo)
             } else {
                 Ok(Stmt::Rollback)
             }
         } else {
-            Err(EngineError::sql(format!(
-                "unsupported statement starting at {:?}",
-                self.peek()
-            )))
-        }
+            return Ok(None);
+        };
+        Ok(Some(stmt))
     }
 
     /// Consume the optional transaction-mode list after BEGIN / START
