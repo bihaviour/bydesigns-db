@@ -91,15 +91,15 @@
 <tbody>
 <tr><td><code>CREATE TABLE [IF NOT EXISTS]</code> with typed columns</td><td>✅</td><td>Autocommit only (<code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code>) — intentional, spec 02.</td></tr>
 <tr><td><code>PRIMARY KEY</code> (single column), <code>NOT NULL</code>, <code>NULL</code></td><td>✅</td><td>PK implies <code>NOT NULL</code> + uniqueness (enforced via <code>pk_keys</code>).</td></tr>
-<tr><td><code>UNIQUE</code> (non-PK column / constraint)</td><td>◑ → ⊕ 6D</td><td>Parsed today but <strong>only the PK is enforced</strong>. Real secondary uniqueness is ⊕ 6D.</td></tr>
-<tr><td>Composite <code>PRIMARY KEY (a,b)</code>, table-level constraints</td><td>⊕ 6D</td><td>Parser accepts only column-level PK today.</td></tr>
-<tr><td><code>DEFAULT</code>, <code>CHECK</code>, <code>FOREIGN KEY</code>/<code>REFERENCES</code>, <code>GENERATED</code>/<code>AUTOINCREMENT</code></td><td>⊕ 6D</td><td>Not parsed today. <code>DEFAULT</code> and <code>CHECK</code> are tractable (catalog + insert/update path). FK enforcement and cascades are heavier — <code>CHECK</code>/<code>DEFAULT</code> in 6D, FK a documented stretch.</td></tr>
+<tr><td><code>UNIQUE</code> (non-PK column / constraint)</td><td>✅ (6D)</td><td>Single &amp; composite, enforced on insert/update (NULLs distinct). Not separately checked during an <code>ON CONFLICT</code> upsert.</td></tr>
+<tr><td>Composite <code>PRIMARY KEY (a,b)</code>, table-level constraints</td><td>✅ (6D)</td><td>Table-level <code>PRIMARY KEY</code>/<code>UNIQUE</code>/<code>CHECK</code> all captured and enforced.</td></tr>
+<tr><td><code>DEFAULT</code>, <code>CHECK</code>, <code>AUTOINCREMENT</code>/<code>SERIAL</code>; <code>FOREIGN KEY</code>/<code>REFERENCES</code></td><td>✅ (6D) / ◑</td><td><code>DEFAULT</code>/<code>CHECK</code>/<code>AUTOINCREMENT</code> shipped (6D). FK is tracked metadata (reflected to clients), not enforced; <code>GENERATED</code> stays ✗.</td></tr>
 <tr><td><code>DROP TABLE [IF EXISTS]</code></td><td>✅</td><td>Autocommit only.</td></tr>
 <tr><td><code>CREATE INDEX … USING hnsw</code>, <code>DROP INDEX</code></td><td>✅</td><td>Phase 5 vector index.</td></tr>
 <tr><td><code>CREATE INDEX</code> (B-tree, scalar columns)</td><td>↻ / ⊕ 6D</td><td>Accepted-and-no-op today is <em>not</em> offered (only HNSW parses). Scalar secondary indexes are a real planner feature — ⊕ 6D (optional; the engine is in-memory MVCC so a full scan is the current plan).</td></tr>
-<tr><td><code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code>, <code>RENAME TO</code></td><td>⊕ 6D</td><td>Common migration DDL; ⊕ 6D. Column add/drop is a catalog + row-reshape operation over the WAL.</td></tr>
+<tr><td><code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code>, <code>RENAME TO</code></td><td>✅ (6D)</td><td>Catalog + row-reshape over new WAL ops; ADD backfills the column's default.</td></tr>
 <tr><td><code>CREATE VIEW</code></td><td>⊕ 6D</td><td>Storable as a named, re-parsed <code>SelectStmt</code> in the catalog; depends on 6B (joins/subqueries) to be useful.</td></tr>
-<tr><td><code>CREATE SEQUENCE</code>, <code>SERIAL</code>/<code>BIGSERIAL</code></td><td>↻ / ⊕ 6D</td><td>Map to an auto-increment integer PK (6D <code>AUTOINCREMENT</code>) or app-side IDs. Standalone sequences are ✗ for now.</td></tr>
+<tr><td><code>CREATE SEQUENCE</code>, <code>SERIAL</code>/<code>BIGSERIAL</code></td><td>✅ (6D) / ✗</td><td><code>SERIAL</code> is an auto-increment integer column (6D). Standalone <code>CREATE SEQUENCE</code> stays ✗.</td></tr>
 <tr><td><code>CREATE TRIGGER</code>, <code>CREATE FUNCTION</code>/PL&#47;pgSQL, <code>CREATE EXTENSION</code>, <code>CREATE SCHEMA</code>, roles/<code>GRANT</code></td><td>✗</td><td>Procedural / server-admin / extensibility surface. Out of scope for the engine core (auth is composed around, spec 12).</td></tr>
 </tbody>
 </table>
@@ -111,7 +111,7 @@
 <thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
 <tbody>
 <tr><td><code>INSERT INTO t [(cols)] VALUES (…)[, (…)]</code></td><td>✅</td><td>Multi-row supported. Fully transactional.</td></tr>
-<tr><td><code>INSERT … DEFAULT VALUES</code></td><td>⊕ 6D</td><td>Needs <code>DEFAULT</code> support.</td></tr>
+<tr><td><code>INSERT … DEFAULT VALUES</code> / <code>DEFAULT</code> as a value</td><td>✅ (6D)</td><td>Each defaulted column takes its <code>DEFAULT</code>/autoincrement.</td></tr>
 <tr><td><code>INSERT INTO t SELECT …</code></td><td>✅ (6A)</td><td>The <code>VALUES</code> source generalized to "rows from a query" — the executor's result rows feed the same staging loop.</td></tr>
 <tr><td><code>UPDATE … SET … [WHERE]</code>, <code>DELETE … [WHERE]</code></td><td>✅</td><td>Fully transactional; first-committer-wins conflict checks.</td></tr>
 <tr><td><code>UPDATE … FROM …</code>, <code>DELETE … USING …</code></td><td>⊕</td><td>Join-driven DML; deferred (the join machinery exists, but the write path is not yet wired to it).</td></tr>
@@ -199,7 +199,7 @@
 <tr><td><code>COMMIT</code>, <code>ROLLBACK</code> (<code>[TRANSACTION|WORK]</code>)</td><td>✅</td><td>—</td></tr>
 <tr><td>Snapshot isolation (the only level)</td><td>✅</td><td>Single-writer, first-committer-wins; equivalent to PG <code>REPEATABLE READ</code>/SI.</td></tr>
 <tr><td><code>SET TRANSACTION ISOLATION LEVEL …</code></td><td>↻ 6E</td><td>Accept-and-pin-to-SI (PG <code>SERIALIZABLE</code>/<code>REPEATABLE READ</code> map to SI; weaker levels are upgraded). Parsed-and-honoured-as-SI shim.</td></tr>
-<tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>⊕ 6D</td><td>Partial rollback within a txn over the pending-version set in <code>conn.rs</code>/<code>store.rs</code>.</td></tr>
+<tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>✅ (6D)</td><td>Partial rollback over the in-flight writer's pending set (and buffered WAL); no durable change.</td></tr>
 <tr><td><code>SET</code>/<code>SHOW</code> (GUCs), <code>SET search_path</code>, <code>PRAGMA</code> (SQLite)</td><td>↻ 6E</td><td>Accept-and-ignore the common no-op session settings on the server boundary so real clients/ORMs connect; reject unknown ones.</td></tr>
 <tr><td><code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code></td><td>⊕ 6E</td><td>Emit a single-plan textual description (the engine has one strategy per shape); useful for client compatibility.</td></tr>
 <tr><td><code>VACUUM</code>, <code>ANALYZE</code>, <code>ATTACH</code>/<code>DETACH</code> (SQLite), <code>LISTEN</code>/<code>NOTIFY</code> (PG)</td><td>✗ / ↻</td><td><code>VACUUM</code>/<code>ANALYZE</code> accept-and-no-op (6E). <code>ATTACH</code> conflicts with the URL-scheme backend model; <code>LISTEN/NOTIFY</code> out of scope.</td></tr>
@@ -217,7 +217,7 @@
 <tr><td>String concat</td><td><code>||</code></td><td><code>||</code></td><td>⊕ 6A.</td></tr>
 <tr><td><code>LIKE</code> case</td><td>case-sensitive (+<code>ILIKE</code>)</td><td>case-insensitive (ASCII)</td><td>Today = SQLite (insensitive). Split <code>LIKE</code>/<code>ILIKE</code> ⊕ 6E.</td></tr>
 <tr><td>Boolean</td><td>real <code>bool</code></td><td>0/1 integer</td><td>0/1 integer; report as <code>bool</code> on the wire ⊕ 6E.</td></tr>
-<tr><td>Auto IDs</td><td><code>SERIAL</code>/<code>IDENTITY</code></td><td><code>INTEGER PRIMARY KEY [AUTOINCREMENT]</code> / <code>rowid</code></td><td><code>AUTOINCREMENT</code>-style integer PK ⊕ 6D; expose a <code>rowid</code> alias optionally.</td></tr>
+<tr><td>Auto IDs</td><td><code>SERIAL</code>/<code>IDENTITY</code></td><td><code>INTEGER PRIMARY KEY [AUTOINCREMENT]</code> / <code>rowid</code></td><td><code>AUTOINCREMENT</code>/<code>SERIAL</code> integer column shipped (6D).</td></tr>
 <tr><td>Placeholders</td><td><code>$1</code></td><td><code>?</code>, <code>?NNN</code>, <code>:name</code></td><td><code>?</code> today; <code>$1</code>/<code>:name</code> ⊕ 6E.</td></tr>
 </tbody>
 </table>
@@ -273,7 +273,11 @@
 <li><strong>Tests:</strong> per-function unit coverage; an explicit replay-determinism test for the non-deterministic functions.</li>
 </ul>
 
-<h3>Stage 6D — Constraints, schema evolution &amp; savepoints</h3>
+<h3>Stage 6D — Constraints, schema evolution &amp; savepoints <span class="badge badge-status status-review">Implemented</span></h3>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>Catalog and WAL grew additive facts (backward-compatible <code>CreateTable</code> extras + new <code>ALTER</code> ops): column <code>DEFAULT</code> (re-parsed from stored text), <code>CHECK</code> (column &amp; table level), single &amp; composite <code>UNIQUE</code>, composite/table-level <code>PRIMARY KEY</code>, and <code>AUTOINCREMENT</code>/<code>SERIAL</code> (a per-table counter rebuilt from the rows on replay — the assigned value is concrete in the WAL). <code>DEFAULT</code> as an <code>INSERT</code> value and <code>DEFAULT VALUES</code> are supported. <code>ALTER TABLE ADD</code>/<code>DROP</code>/<code>RENAME COLUMN</code> and <code>RENAME TO</code> reshape the catalog and row versions over new WAL ops. <code>SAVEPOINT</code>/<code>RELEASE</code>/<code>ROLLBACK TO</code> snapshot and restore the in-flight writer's pending set (and truncate its buffered WAL) — no durable change. DDL stays autocommit-only. Tests: <code>crates/engine/tests/constraints_6d.rs</code>. (Scalar B-tree indexes and FK enforcement remain out; secondary <code>UNIQUE</code> during an <code>ON CONFLICT</code> upsert is not separately checked.)</p>
+</div>
 <ul>
 <li><strong>Catalog:</strong> store <code>DEFAULT</code> expressions, <code>CHECK</code> predicates, secondary <code>UNIQUE</code>, and composite/table-level <code>PRIMARY KEY</code> in <code>TableSchema</code>. Enforce in the insert/update validation pass (which already validates fully before mutating — atomic per statement). Secondary UNIQUE reuses the <code>pk_keys</code> machinery generalized to N key sets.</li>
 <li><strong><code>AUTOINCREMENT</code>/<code>SERIAL</code>:</strong> a monotonic per-table counter in the catalog, advanced and WAL-logged on insert (a new durable fact → additive WAL op).</li>

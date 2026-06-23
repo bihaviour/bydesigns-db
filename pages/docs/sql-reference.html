@@ -32,6 +32,7 @@
 <thead><tr><th>Statement</th><th>Purpose</th><th>In a transaction?</th></tr></thead>
 <tbody>
 <tr><td><code>CREATE TABLE</code></td><td>Define a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
+<tr><td><code>ALTER TABLE</code></td><td>Add/drop/rename a column, rename a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
 <tr><td><code>DROP TABLE</code></td><td>Remove a table</td><td>Autocommit only — <code>ENGINE_ERR_TXN</code> inside <code>BEGIN</code></td></tr>
 <tr><td><code>CREATE INDEX … USING hnsw</code></td><td>Build a vector index</td><td>Autocommit only — see <a href="#vector-search">Vector search</a></td></tr>
 <tr><td><code>DROP INDEX</code></td><td>Remove a vector index</td><td>Autocommit only</td></tr>
@@ -52,26 +53,49 @@
 <section>
 <h2>Data definition (DDL)</h2>
 <h3>CREATE TABLE</h3>
-<p>Define a table with one or more columns. Each column may carry a type name and the constraints <code>PRIMARY KEY</code> and/or <code>NOT NULL</code>. <code>IF NOT EXISTS</code> makes creation idempotent.</p>
+<p>Define a table with one or more columns and constraints. <code>IF NOT EXISTS</code> makes creation idempotent.</p>
 <pre data-lang="sql"><code>CREATE TABLE notes (
-  id    INTEGER PRIMARY KEY,
-  title TEXT NOT NULL,
-  body  TEXT,
-  score REAL,
-  data  BLOB
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  title   TEXT NOT NULL,
+  email   TEXT UNIQUE,
+  status  TEXT DEFAULT 'draft',
+  score   REAL CHECK (score >= 0),
+  data    BLOB
 );
 
-CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT);</code></pre>
-<ul class="reqs">
-<li><span class="req-tag must">MUST</span> declare at least one column; an empty column list is a parse error.</li>
-<li><span class="req-tag may">MAY</span> omit a column's type name — an untyped column defaults to <code>TEXT</code> affinity.</li>
-<li><span class="req-tag may">MAY</span> write a parenthesised size such as <code>VARCHAR(64)</code> or <code>DECIMAL(10,2)</code> — the size is parsed and ignored; only the storage class matters.</li>
-<li><span class="req-tag may">MAY</span> mark a column <code>UNIQUE</code> or explicitly <code>NULL</code> — these are accepted as constraint markers (uniqueness is enforced for the primary key).</li>
-</ul>
-<div class="callout note">
-<p class="callout-title">PRIMARY KEY implies NOT NULL</p>
-<p>Declaring a column <code>PRIMARY KEY</code> also makes it <code>NOT NULL</code>.</p>
+-- table-level constraints (composite PRIMARY KEY / UNIQUE / CHECK)
+CREATE TABLE membership (
+  org  INTEGER,
+  usr  INTEGER,
+  role TEXT DEFAULT 'member',
+  PRIMARY KEY (org, usr),
+  UNIQUE (usr, role)
+);</code></pre>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Constraint</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>PRIMARY KEY</code> (single or composite)</td><td>Unique + implicitly <code>NOT NULL</code>; the upsert conflict target</td></tr>
+<tr><td><code>NOT NULL</code> / <code>NULL</code></td><td>Rejects / allows NULLs</td></tr>
+<tr><td><code>UNIQUE</code> (column or <code>UNIQUE (cols)</code>)</td><td>Enforced on insert/update; multiple NULLs allowed (NULLs are distinct)</td></tr>
+<tr><td><code>DEFAULT expr</code></td><td>Fills an omitted column or a <code>DEFAULT</code> value cell</td></tr>
+<tr><td><code>CHECK (expr)</code> (column or table)</td><td>Row rejected when the predicate is false (NULL passes)</td></tr>
+<tr><td><code>AUTOINCREMENT</code> / <code>SERIAL</code></td><td>Fills an omitted integer column from a monotonic per-table counter</td></tr>
+<tr><td><code>REFERENCES</code> / <code>FOREIGN KEY</code></td><td>Tracked as metadata (reflected to clients); not enforced this phase</td></tr>
+</tbody>
+</table>
 </div>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> omit a column's type name — an untyped column defaults to <code>TEXT</code> affinity.</li>
+<li><span class="req-tag may">MAY</span> write a parenthesised size such as <code>VARCHAR(64)</code> — parsed and ignored; only the storage class matters.</li>
+</ul>
+
+<h3>ALTER TABLE</h3>
+<p>Migrate a table's shape (autocommit only). Adding a column backfills existing rows with its <code>DEFAULT</code> (or NULL).</p>
+<pre data-lang="sql"><code>ALTER TABLE notes ADD COLUMN pinned INTEGER DEFAULT 0;
+ALTER TABLE notes DROP COLUMN data;
+ALTER TABLE notes RENAME COLUMN title TO heading;
+ALTER TABLE notes RENAME TO memos;</code></pre>
 
 <h3>DROP TABLE</h3>
 <p>Remove a table. <code>IF EXISTS</code> suppresses the error when the table is absent.</p>
@@ -351,6 +375,7 @@ SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
 <tr><td><code>BEGIN</code></td><td>Start an explicit transaction (<code>BEGIN TRANSACTION</code> / <code>START TRANSACTION</code> also accepted)</td></tr>
 <tr><td><code>COMMIT</code></td><td>Publish the transaction — blocks until the WAL is durable</td></tr>
 <tr><td><code>ROLLBACK</code></td><td>Discard the transaction's pending changes</td></tr>
+<tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>Mark a point, release it, or undo changes back to it within a transaction</td></tr>
 </tbody>
 </table>
 </div>
@@ -370,7 +395,7 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 <ul class="reqs">
 <li><span class="req-tag must-not">MUST NOT</span> use <strong>correlated</strong> subqueries (an expression subquery referencing the outer query's columns); only non-correlated scalar/<code>IN</code>/<code>EXISTS</code> subqueries are supported.</li>
 <li><span class="req-tag must-not">MUST NOT</span> use OLAP-shaped features — window functions (<code>OVER</code>), <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>LATERAL</code>, or recursive CTEs (compose DuckDB).</li>
-<li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>); general secondary/B-tree indexes are not exposed as SQL.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use views or stored secondary/B-tree indexes. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>); a scalar <code>UNIQUE</code> is enforced by full scan, not a stored index.</li>
 <li><span class="req-tag must-not">MUST NOT</span> rely on procedural/extensibility surface — <code>CREATE FUNCTION</code>/<code>TRIGGER</code>/<code>EXTENSION</code>, roles/<code>GRANT</code>, <code>LISTEN</code>/<code>NOTIFY</code>.</li>
 </ul>
 <div class="callout note">

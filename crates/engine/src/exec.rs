@@ -201,6 +201,7 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
             whens,
             els,
         } => eval_case(operand, whens, els, ctx),
+        Expr::Default => Err(EngineError::sql("DEFAULT is only valid as an INSERT value")),
         Expr::Excluded(name) => {
             let row = ctx.excluded.ok_or_else(|| {
                 EngineError::sql("excluded.* is only valid in ON CONFLICT DO UPDATE")
@@ -1845,6 +1846,73 @@ fn pad_func(args: &[Value], left: bool) -> Value {
     })
 }
 
+/// Evaluate a standalone constant expression from SQL text — used for stored
+/// `DEFAULT` clauses backfilled by `ALTER TABLE ADD COLUMN` (stage 6D).
+pub(crate) fn eval_const_sql(sql: &str) -> Result<Value> {
+    let expr = crate::sql::parse_expr(sql)?;
+    eval(&expr, &EvalCtx::root(&[]))
+}
+
+/// A composite key string for a tuple of columns (NULL-distinct uniqueness
+/// keying), reusing the per-value [`value_key`] encoding.
+fn composite_key(vals: &[Value], cols: &[usize]) -> String {
+    let mut k = String::new();
+    for &c in cols {
+        k.push_str(&value_key(&vals[c]));
+        k.push('\u{1}');
+    }
+    k
+}
+
+/// Enforce every non-primary-key `UNIQUE` set against the rows being written:
+/// each `new_row` must not collide with a committed row (other than the
+/// `exclude`d vids it is replacing) or with another `new_row`. A set with any
+/// NULL key column is exempt (SQL treats NULLs as distinct).
+fn check_secondary_uniques(
+    store: &Store,
+    table: &str,
+    schema: &TableSchema,
+    new_rows: &[&[Value]],
+    exclude: &[u64],
+    owner: u64,
+) -> Result<()> {
+    let pk = schema.primary_key_indices();
+    for set in schema.unique_sets() {
+        if set == pk {
+            continue; // the primary key is enforced on its own path
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Some(t) = store.table(table) {
+            for v in &t.rows {
+                if exclude.contains(&v.vid) || !v.visible_to_writer(store.committed_lsn, owner) {
+                    continue;
+                }
+                if set.iter().any(|&i| v.values[i].is_null()) {
+                    continue;
+                }
+                seen.insert(composite_key(&v.values, &set));
+            }
+        }
+        for row in new_rows {
+            if set.iter().any(|&i| row[i].is_null()) {
+                continue;
+            }
+            if !seen.insert(composite_key(row, &set)) {
+                let names: Vec<&str> = set
+                    .iter()
+                    .map(|&i| schema.columns[i].name.as_str())
+                    .collect();
+                return Err(EngineError::constraint(format!(
+                    "UNIQUE constraint failed: {}.{}",
+                    table,
+                    names.join(",")
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A timestamp value (Int epoch, or ISO-8601 / `'now'` text) as epoch seconds.
 fn value_to_epoch(v: Option<&Value>) -> Option<i64> {
     match v {
@@ -2184,6 +2252,21 @@ fn project_returning(
     })
 }
 
+/// Enforce parsed `CHECK` predicates against a fully-formed row. A predicate
+/// fails only when it evaluates to false; NULL/unknown passes (SQL semantics).
+fn check_row_constraints(checks: &[Expr], schema: &TableSchema, vals: &[Value]) -> Result<()> {
+    for c in checks {
+        let ctx = EvalCtx::row(vals, schema, &[]);
+        if eval(c, &ctx)?.as_bool() == Some(false) {
+            return Err(EngineError::constraint(format!(
+                "CHECK constraint failed: {}",
+                schema.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// NOT NULL enforcement over a fully-formed row (insert/update validation pass).
 fn check_not_null(schema: &TableSchema, vals: &[Value], table: &str) -> Result<()> {
     for (i, c) in schema.columns.iter().enumerate() {
@@ -2235,13 +2318,14 @@ fn append_version(
     vid
 }
 
-/// For a table with primary-key column `pk`: keys live in committed state mapped
-/// to their row vid (the rows an upsert may replace/update), plus the keys a
-/// concurrent in-flight writer is inserting (a clash there is retryable).
+/// For a table with primary-key columns `pk` (possibly composite): composite
+/// keys live in committed state mapped to their row vid (the rows an upsert may
+/// replace/update), plus the keys a concurrent in-flight writer is inserting (a
+/// clash there is retryable).
 fn pk_index(
     store: &Store,
     table: &str,
-    pk: usize,
+    pk: &[usize],
     me: u64,
 ) -> (HashMap<String, u64>, HashSet<String>) {
     let mut committed = HashMap::new();
@@ -2249,9 +2333,9 @@ fn pk_index(
     if let Some(t) = store.table(table) {
         for v in &t.rows {
             if v.visible_to_writer(store.committed_lsn, me) {
-                committed.insert(value_key(&v.values[pk]), v.vid);
+                committed.insert(composite_key(&v.values, pk), v.vid);
             } else if v.create_lsn == PENDING && v.owner != me && v.delete_lsn == 0 {
-                pending.insert(value_key(&v.values[pk]));
+                pending.insert(composite_key(&v.values, pk));
             }
         }
     }
@@ -2277,52 +2361,113 @@ pub fn run_insert(
         .clone();
     let ncols = schema.columns.len();
 
-    // 1) Evaluate the row source (literal VALUES or a query) into value rows.
-    let source_rows: Vec<Vec<Value>> = match source {
+    // The columns the source values map to (all, in order, when no list given).
+    let targets: Vec<usize> = match columns {
+        Some(cols) => cols
+            .iter()
+            .map(|c| {
+                schema
+                    .column_index(c)
+                    .ok_or_else(|| EngineError::sql(format!("no such column: {c}")))
+            })
+            .collect::<Result<_>>()?,
+        None => (0..ncols).collect(),
+    };
+
+    // 1) Build per-row column slots; `None` means "use the column's default"
+    //    (a DEFAULT keyword, an omitted column, or `DEFAULT VALUES`).
+    let mut slots: Vec<Vec<Option<Value>>> = Vec::new();
+    match source {
         InsertSource::Values(rows) => {
             let ctx = EvalCtx::root(params);
-            let mut out = Vec::with_capacity(rows.len());
             for exprs in rows {
-                out.push(exprs.iter().map(|e| eval(e, &ctx)).collect::<Result<_>>()?);
+                let mut slot: Vec<Option<Value>> = vec![None; ncols];
+                if !(exprs.is_empty() && columns.is_none()) {
+                    if exprs.len() != targets.len() {
+                        return Err(EngineError::sql(format!(
+                            "INSERT has {} target column(s) but {} value(s)",
+                            targets.len(),
+                            exprs.len()
+                        )));
+                    }
+                    for (&idx, e) in targets.iter().zip(exprs) {
+                        slot[idx] = match e {
+                            Expr::Default => None,
+                            _ => Some(eval(e, &ctx)?),
+                        };
+                    }
+                }
+                slots.push(slot);
             }
-            out
         }
         // INSERT … SELECT: the query sees this writer's snapshot (committed +
         // its own pending), feeding its result rows into the same staging loop.
-        InsertSource::Select(sel) => run_select(store, sel, snapshot, Some(owner), params)?.rows,
-    };
-
-    // 2) Map provided values onto full column vectors, coerce, and validate.
-    let mut staged: Vec<Vec<Value>> = Vec::with_capacity(source_rows.len());
-    for src in &source_rows {
-        let mut vals = vec![Value::Null; ncols];
-        match columns {
-            Some(cols) => {
-                if cols.len() != src.len() {
-                    return Err(EngineError::sql("INSERT column/value count mismatch"));
-                }
-                for (c, v) in cols.iter().zip(src) {
-                    let idx = schema
-                        .column_index(c)
-                        .ok_or_else(|| EngineError::sql(format!("no such column: {c}")))?;
-                    vals[idx] = schema.columns[idx].ty.coerce(v.clone());
-                }
-            }
-            None => {
-                if src.len() != ncols {
+        InsertSource::Select(sel) => {
+            for r in run_select(store, sel, snapshot, Some(owner), params)?.rows {
+                if r.len() != targets.len() {
                     return Err(EngineError::sql(format!(
-                        "table {table} has {ncols} columns but {} values supplied",
-                        src.len()
+                        "INSERT … SELECT produced {} column(s) for {} target(s)",
+                        r.len(),
+                        targets.len()
                     )));
                 }
-                for (i, v) in src.iter().enumerate() {
-                    vals[i] = schema.columns[i].ty.coerce(v.clone());
+                let mut slot: Vec<Option<Value>> = vec![None; ncols];
+                for (&idx, v) in targets.iter().zip(r) {
+                    slot[idx] = Some(v);
                 }
+                slots.push(slot);
             }
+        }
+    }
+
+    // 2) Finalize each row: fill defaults / autoincrement, coerce, and validate
+    //    (NOT NULL, vector dims, CHECK).
+    let check_exprs: Vec<Expr> = schema
+        .checks
+        .iter()
+        .map(|s| crate::sql::parse_expr(s))
+        .collect::<Result<_>>()?;
+    let mut autoinc = store.table(table).map(|t| t.next_autoinc).unwrap_or(1);
+    let mut staged: Vec<Vec<Value>> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let mut vals = vec![Value::Null; ncols];
+        for (i, c) in schema.columns.iter().enumerate() {
+            vals[i] = match &slot[i] {
+                Some(v) => {
+                    let v = c.ty.coerce(v.clone());
+                    if c.autoincrement {
+                        if let Value::Int(n) = &v {
+                            autoinc = autoinc.max(n + 1);
+                        }
+                    }
+                    v
+                }
+                None if c.autoincrement => {
+                    let a = autoinc;
+                    autoinc += 1;
+                    Value::Int(a)
+                }
+                None => match &c.default_sql {
+                    Some(d) => c.ty.coerce(eval_const_sql(d)?),
+                    None => Value::Null,
+                },
+            };
         }
         check_not_null(&schema, &vals, table)?;
         check_vector_dims(&schema, &vals, table)?;
+        check_row_constraints(&check_exprs, &schema, &vals)?;
         staged.push(vals);
+    }
+    // Persist the advanced autoincrement counter (single-writer, so no race).
+    if let Some(t) = store.table_mut(table) {
+        t.next_autoinc = autoinc;
+    }
+
+    // Secondary UNIQUE constraints are enforced for plain inserts (the upsert
+    // paths resolve on the primary key).
+    if matches!(on_conflict, OnConflict::Error) {
+        let rows: Vec<&[Value]> = staged.iter().map(|v| v.as_slice()).collect();
+        check_secondary_uniques(store, table, &schema, &rows, &[], owner)?;
     }
 
     // 3) Resolve the primary-key conflict action and apply.
@@ -2331,104 +2476,102 @@ pub fn run_insert(
     let mut affected: Vec<Vec<Value>> = Vec::new();
     let mut new_index_rows: Vec<(u64, Vec<Value>)> = Vec::new();
 
-    match schema.primary_key_index() {
+    let pk_cols = schema.primary_key_indices();
+    if pk_cols.is_empty() {
         // No primary key → no conflict is possible; straight inserts.
-        None => {
-            for vals in staged {
+        for vals in staged {
+            let vid = append_version(store, table, &vals, owner, &mut wal);
+            if maintain {
+                new_index_rows.push((vid, vals.clone()));
+            }
+            affected.push(vals);
+        }
+    } else {
+        let pk_name = pk_cols
+            .iter()
+            .map(|&i| schema.columns[i].name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let (mut live_vid, pending) = pk_index(store, table, &pk_cols, owner);
+        for vals in staged {
+            let key = composite_key(&vals, &pk_cols);
+            if pending.contains(&key) {
+                return Err(EngineError::new(
+                    crate::error::EngineStatus::ErrConflict,
+                    format!(
+                        "write conflict: {table}.{pk_name} is being inserted by a concurrent transaction"
+                    ),
+                ));
+            }
+            let Some(&old_vid) = live_vid.get(&key) else {
+                // No clash: ordinary insert.
                 let vid = append_version(store, table, &vals, owner, &mut wal);
+                live_vid.insert(key, vid);
                 if maintain {
                     new_index_rows.push((vid, vals.clone()));
                 }
                 affected.push(vals);
-            }
-        }
-        Some(pk) => {
-            let (mut live_vid, pending) = pk_index(store, table, pk, owner);
-            for vals in staged {
-                let key = value_key(&vals[pk]);
-                if pending.contains(&key) {
-                    return Err(EngineError::new(
-                        crate::error::EngineStatus::ErrConflict,
-                        format!(
-                            "write conflict: {}.{} is being inserted by a concurrent transaction",
-                            table, schema.columns[pk].name
-                        ),
-                    ));
+                continue;
+            };
+            // A clash with a key already live (committed or inserted earlier
+            // in this batch) — apply the conflict action.
+            match on_conflict {
+                OnConflict::Error => {
+                    return Err(EngineError::constraint(format!(
+                        "UNIQUE constraint failed: {table}.{pk_name}"
+                    )));
                 }
-                let Some(&old_vid) = live_vid.get(&key) else {
-                    // No clash: ordinary insert.
+                OnConflict::Nothing => continue,
+                OnConflict::Replace => {
+                    supersede(store, table, old_vid, owner, &mut wal);
                     let vid = append_version(store, table, &vals, owner, &mut wal);
                     live_vid.insert(key, vid);
                     if maintain {
                         new_index_rows.push((vid, vals.clone()));
                     }
                     affected.push(vals);
-                    continue;
-                };
-                // A clash with a key already live (committed or inserted earlier
-                // in this batch) — apply the conflict action.
-                match on_conflict {
-                    OnConflict::Error => {
-                        return Err(EngineError::constraint(format!(
-                            "UNIQUE constraint failed: {}.{}",
-                            table, schema.columns[pk].name
-                        )));
+                }
+                OnConflict::Update { sets, filter } => {
+                    let existing = store
+                        .table(table)
+                        .and_then(|t| t.version(old_vid))
+                        .map(|r| r.values.clone())
+                        .ok_or_else(|| {
+                            EngineError::sql("ON CONFLICT DO UPDATE cannot affect one row twice")
+                        })?;
+                    let ctx = EvalCtx {
+                        row: Some(&existing),
+                        schema: Some(&schema),
+                        params,
+                        group: None,
+                        excluded: Some(&vals),
+                        cols: None,
+                    };
+                    if let Some(f) = filter {
+                        if !eval(f, &ctx)?.as_bool().unwrap_or(false) {
+                            continue;
+                        }
                     }
-                    OnConflict::Nothing => continue,
-                    OnConflict::Replace => {
-                        supersede(store, table, old_vid, owner, &mut wal);
-                        let vid = append_version(store, table, &vals, owner, &mut wal);
-                        live_vid.insert(key, vid);
-                        if maintain {
-                            new_index_rows.push((vid, vals.clone()));
-                        }
-                        affected.push(vals);
+                    let mut nv = existing.clone();
+                    for (col, expr) in sets {
+                        let idx = schema
+                            .column_index(col)
+                            .ok_or_else(|| EngineError::sql(format!("no such column: {col}")))?;
+                        nv[idx] = schema.columns[idx].ty.coerce(eval(expr, &ctx)?);
                     }
-                    OnConflict::Update { sets, filter } => {
-                        let existing = store
-                            .table(table)
-                            .and_then(|t| t.version(old_vid))
-                            .map(|r| r.values.clone())
-                            .ok_or_else(|| {
-                                EngineError::sql(
-                                    "ON CONFLICT DO UPDATE cannot affect one row twice",
-                                )
-                            })?;
-                        let ctx = EvalCtx {
-                            row: Some(&existing),
-                            schema: Some(&schema),
-                            params,
-                            group: None,
-                            excluded: Some(&vals),
-                            cols: None,
-                        };
-                        if let Some(f) = filter {
-                            if !eval(f, &ctx)?.as_bool().unwrap_or(false) {
-                                continue;
-                            }
-                        }
-                        let mut nv = existing.clone();
-                        for (col, expr) in sets {
-                            let idx = schema.column_index(col).ok_or_else(|| {
-                                EngineError::sql(format!("no such column: {col}"))
-                            })?;
-                            nv[idx] = schema.columns[idx].ty.coerce(eval(expr, &ctx)?);
-                        }
-                        check_not_null(&schema, &nv, table)?;
-                        check_vector_dims(&schema, &nv, table)?;
-                        supersede(store, table, old_vid, owner, &mut wal);
-                        let vid = append_version(store, table, &nv, owner, &mut wal);
-                        live_vid.insert(key, vid);
-                        if maintain {
-                            new_index_rows.push((vid, nv.clone()));
-                        }
-                        affected.push(nv);
+                    check_not_null(&schema, &nv, table)?;
+                    check_vector_dims(&schema, &nv, table)?;
+                    supersede(store, table, old_vid, owner, &mut wal);
+                    let vid = append_version(store, table, &nv, owner, &mut wal);
+                    live_vid.insert(key, vid);
+                    if maintain {
+                        new_index_rows.push((vid, nv.clone()));
                     }
+                    affected.push(nv);
                 }
             }
         }
     }
-
     for (vid, vals) in &new_index_rows {
         store.index_row_inserted(table, *vid, vals);
     }
@@ -2549,6 +2692,11 @@ pub fn run_update(
             .ok_or_else(|| EngineError::sql(format!("no such column: {col}")))?;
         targets.push((idx, expr));
     }
+    let check_exprs: Vec<Expr> = schema
+        .checks
+        .iter()
+        .map(|s| crate::sql::parse_expr(s))
+        .collect::<Result<_>>()?;
 
     // Compute (old_vid, new_values) for every matching row (no mutation yet).
     let t = store.table(table).unwrap();
@@ -2568,33 +2716,43 @@ pub fn run_update(
         }
         check_not_null(&schema, &nv, table)?;
         check_vector_dims(&schema, &nv, table)?;
+        check_row_constraints(&check_exprs, &schema, &nv)?;
         updates.push((v.vid, nv));
     }
 
     // PRIMARY KEY uniqueness for changed keys (vs other rows, concurrent pending
     // inserts, and within this statement).
-    if let Some(pk) = schema.primary_key_index() {
+    let pk_cols = schema.primary_key_indices();
+    if !pk_cols.is_empty() {
         let updated_vids: Vec<u64> = updates.iter().map(|(vid, _)| *vid).collect();
-        let (mut committed, pending) = pk_keys(store, table, pk, owner, &updated_vids);
+        let (mut committed, pending) = pk_keys(store, table, &pk_cols, owner, &updated_vids);
+        let pk_name = pk_cols
+            .iter()
+            .map(|&i| schema.columns[i].name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         for (_, nv) in &updates {
-            let key = value_key(&nv[pk]);
+            let key = composite_key(nv, &pk_cols);
             if pending.contains(&key) {
                 return Err(EngineError::new(
                     crate::error::EngineStatus::ErrConflict,
                     format!(
-                        "write conflict: {}.{} is being written by a concurrent transaction",
-                        table, schema.columns[pk].name
+                        "write conflict: {table}.{pk_name} is being written by a concurrent transaction"
                     ),
                 ));
             }
             if !committed.insert(key) {
                 return Err(EngineError::constraint(format!(
-                    "UNIQUE constraint failed: {}.{}",
-                    table, schema.columns[pk].name
+                    "UNIQUE constraint failed: {table}.{pk_name}"
                 )));
             }
         }
     }
+
+    // Secondary UNIQUE constraints, excluding the rows being rewritten.
+    let updated_vids: Vec<u64> = updates.iter().map(|(vid, _)| *vid).collect();
+    let new_rows: Vec<&[Value]> = updates.iter().map(|(_, nv)| nv.as_slice()).collect();
+    check_secondary_uniques(store, table, &schema, &new_rows, &updated_vids, owner)?;
 
     // Apply: supersede each old version, append the new one.
     let maintain = store.table_has_index(table);
@@ -2638,7 +2796,7 @@ pub fn run_update(
 fn pk_keys(
     store: &Store,
     table: &str,
-    pk: usize,
+    pk: &[usize],
     me: u64,
     exclude: &[u64],
 ) -> (HashSet<String>, HashSet<String>) {
@@ -2650,10 +2808,10 @@ fn pk_keys(
                 continue;
             }
             if v.visible_to_writer(store.committed_lsn, me) {
-                committed.insert(value_key(&v.values[pk]));
+                committed.insert(composite_key(&v.values, pk));
             } else if v.create_lsn == PENDING && v.owner != me && v.delete_lsn == 0 {
                 // A live pending insert owned by a concurrent in-flight writer.
-                pending.insert(value_key(&v.values[pk]));
+                pending.insert(composite_key(&v.values, pk));
             }
         }
     }

@@ -17,7 +17,18 @@ pub enum Stmt {
         name: String,
         columns: Vec<ColumnSpec>,
         foreign_keys: Vec<ForeignKeySpec>,
+        /// Table-level / composite `PRIMARY KEY (cols)` columns (stage 6D).
+        primary_key: Vec<String>,
+        /// Table-level / composite `UNIQUE (cols)` constraints (stage 6D).
+        uniques: Vec<Vec<String>>,
+        /// `CHECK (expr)` predicate texts (column- and table-level, stage 6D).
+        checks: Vec<String>,
         if_not_exists: bool,
+    },
+    /// `ALTER TABLE … <action>` (stage 6D).
+    AlterTable {
+        table: String,
+        action: AlterAction,
     },
     DropTable {
         name: String,
@@ -58,6 +69,12 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    /// `SAVEPOINT name` (stage 6D).
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] name` (stage 6D).
+    ReleaseSavepoint(String),
+    /// `ROLLBACK TO [SAVEPOINT] name` (stage 6D).
+    RollbackTo(String),
 }
 
 /// Where an `INSERT` gets its rows: literal `VALUES` tuples or the result of a
@@ -93,9 +110,24 @@ pub struct ColumnSpec {
     pub ty: ColumnType,
     pub primary_key: bool,
     pub not_null: bool,
+    pub unique: bool,
+    pub autoincrement: bool,
+    /// `DEFAULT <expr>` text, captured for re-parsing on insert (stage 6D).
+    pub default_sql: Option<String>,
+    /// `CHECK (<expr>)` text declared inline on the column (stage 6D).
+    pub check_sql: Option<String>,
     /// An inline `REFERENCES <table>[(<col>)]` constraint: the referenced table
     /// and, optionally, the referenced column (defaulting to its primary key).
     pub references: Option<(String, Option<String>)>,
+}
+
+/// One `ALTER TABLE` action (stage 6D). DDL stays autocommit-only.
+#[derive(Debug)]
+pub enum AlterAction {
+    AddColumn(ColumnSpec),
+    DropColumn { name: String, if_exists: bool },
+    RenameColumn { from: String, to: String },
+    RenameTable { to: String },
 }
 
 /// A foreign key as parsed from `CREATE TABLE` (inline or table-level). The
@@ -281,6 +313,9 @@ pub enum Expr {
     /// `excluded.<col>` inside an `ON CONFLICT DO UPDATE` — the proposed-insert
     /// value for that column (resolved from the upsert's excluded row).
     Excluded(String),
+    /// The `DEFAULT` keyword used as an `INSERT … VALUES` cell — substituted with
+    /// the column's default (or autoincrement) during insert staging (stage 6D).
+    Default,
     /// Postgres `expr::type` cast — coerces the inner value to `target`.
     Cast {
         e: Box<Expr>,
@@ -413,6 +448,22 @@ pub fn parse(sql: &str) -> Result<(Stmt, usize)> {
     Ok((stmt, p.next_param - 1))
 }
 
+/// Parse a standalone expression (used to re-parse stored `DEFAULT`/`CHECK`
+/// texts at insert/update time, stage 6D). Parameters are not expected here.
+pub fn parse_expr(sql: &str) -> Result<Expr> {
+    let toks = lex(sql)?;
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        next_param: 1,
+    };
+    let e = p.expr()?;
+    if p.peek() != &Tok::Eof {
+        return Err(EngineError::sql("trailing tokens after expression"));
+    }
+    Ok(e)
+}
+
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
@@ -506,6 +557,8 @@ impl Parser {
             } else {
                 self.drop_table()
             }
+        } else if self.is_kw("alter") {
+            self.alter_table()
         } else if self.is_kw("insert") {
             self.insert()
         } else if self.is_kw("select") || self.is_kw("with") {
@@ -526,10 +579,21 @@ impl Parser {
             // END [WORK|TRANSACTION] is a COMMIT synonym.
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
             Ok(Stmt::Commit)
+        } else if self.eat_kw("savepoint") {
+            Ok(Stmt::Savepoint(self.ident()?))
+        } else if self.eat_kw("release") {
+            let _ = self.eat_kw("savepoint");
+            Ok(Stmt::ReleaseSavepoint(self.ident()?))
         } else if self.eat_kw("rollback") || self.eat_kw("abort") {
             // ABORT [WORK|TRANSACTION] is a ROLLBACK synonym (PostgREST uses it).
             let _ = self.eat_kw("transaction") || self.eat_kw("work");
-            Ok(Stmt::Rollback)
+            // `ROLLBACK TO [SAVEPOINT] name` rolls back to a savepoint.
+            if self.eat_kw("to") {
+                let _ = self.eat_kw("savepoint");
+                Ok(Stmt::RollbackTo(self.ident()?))
+            } else {
+                Ok(Stmt::Rollback)
+            }
         } else {
             Err(EngineError::sql(format!(
                 "unsupported statement starting at {:?}",
@@ -582,16 +646,19 @@ impl Parser {
         self.expect(Tok::LParen)?;
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();
+        let mut primary_key: Vec<String> = Vec::new();
+        let mut uniques: Vec<Vec<String>> = Vec::new();
+        let mut checks: Vec<String> = Vec::new();
         loop {
             // A table-level constraint (`[CONSTRAINT n] PRIMARY KEY/UNIQUE/FOREIGN
-            // KEY/CHECK …`) rather than a column definition. Only FOREIGN KEY is
-            // captured; PRIMARY KEY/UNIQUE/CHECK are consumed and ignored, as
-            // composite keys are out of Phase-1 scope (a single-column key is
-            // declared inline on its column instead).
+            // KEY/CHECK …`) rather than a column definition.
             if self.peek_table_constraint() {
-                if let Some(fk) = self.table_constraint()? {
-                    foreign_keys.push(fk);
-                }
+                self.table_constraint(
+                    &mut foreign_keys,
+                    &mut primary_key,
+                    &mut uniques,
+                    &mut checks,
+                )?;
             } else {
                 let col = self.column_spec()?;
                 if let Some((ft, fc)) = col.references.clone() {
@@ -601,6 +668,9 @@ impl Parser {
                         foreign_table: ft,
                         foreign_columns: fc.into_iter().collect(),
                     });
+                }
+                if let Some(c) = &col.check_sql {
+                    checks.push(c.clone());
                 }
                 columns.push(col);
             }
@@ -617,38 +687,101 @@ impl Parser {
             name,
             columns,
             foreign_keys,
+            primary_key,
+            uniques,
+            checks,
             if_not_exists,
         })
     }
 
+    /// `ALTER TABLE name <action>`: ADD/DROP/RENAME COLUMN or RENAME TO.
+    fn alter_table(&mut self) -> Result<Stmt> {
+        self.expect_kw("alter")?;
+        self.expect_kw("table")?;
+        let _ = self.eat_kw("if") && self.eat_kw("exists");
+        let table = self.ident()?;
+        let action = if self.eat_kw("add") {
+            let _ = self.eat_kw("column");
+            AlterAction::AddColumn(self.column_spec()?)
+        } else if self.eat_kw("drop") {
+            let _ = self.eat_kw("column");
+            let if_exists = self.eat_kw("if") && self.eat_kw("exists");
+            AlterAction::DropColumn {
+                name: self.ident()?,
+                if_exists,
+            }
+        } else if self.eat_kw("rename") {
+            if self.eat_kw("to") {
+                AlterAction::RenameTable { to: self.ident()? }
+            } else {
+                let _ = self.eat_kw("column");
+                let from = self.ident()?;
+                self.expect_kw("to")?;
+                AlterAction::RenameColumn {
+                    from,
+                    to: self.ident()?,
+                }
+            }
+        } else {
+            return Err(EngineError::sql(
+                "unsupported ALTER TABLE action (expected ADD/DROP/RENAME)",
+            ));
+        };
+        Ok(Stmt::AlterTable { table, action })
+    }
+
     fn column_spec(&mut self) -> Result<ColumnSpec> {
         let name = self.ident()?;
-        // Optional type name (one or more words, optional (n) / (n,m)).
+        // Optional type name (one or more words, optional (n) / (n,m)). SERIAL
+        // family declares an integer autoincrement column.
         let mut ty = ColumnType::Text;
+        let mut autoincrement = false;
         if let Some(w) = self.peek_word() {
             if !is_constraint_kw(w) {
                 let tyname = self.ident()?;
-                ty = ColumnType::from_sql(&tyname);
+                if is_serial_type(&tyname) {
+                    ty = ColumnType::Integer;
+                    autoincrement = true;
+                } else {
+                    ty = ColumnType::from_sql(&tyname);
+                }
                 ty = self.parse_type_size(ty)?;
             }
         }
         let mut primary_key = false;
         let mut not_null = false;
+        let mut unique = false;
         let mut references = None;
+        let mut default_sql = None;
+        let mut check_sql = None;
         loop {
             if self.eat_kw("primary") {
                 self.expect_kw("key")?;
                 primary_key = true;
                 not_null = true;
+                // SQLite spells `INTEGER PRIMARY KEY AUTOINCREMENT`.
+                if self.eat_kw("autoincrement") {
+                    autoincrement = true;
+                }
             } else if self.eat_kw("not") {
                 self.expect_kw("null")?;
                 not_null = true;
             } else if self.eat_kw("null") {
                 // explicit nullable
             } else if self.eat_kw("unique") {
-                // treated like a constraint marker; uniqueness enforced for PK only in P1
+                unique = true;
+            } else if self.eat_kw("autoincrement") {
+                autoincrement = true;
+            } else if self.eat_kw("default") {
+                default_sql = Some(self.capture_expr_sql()?);
+            } else if self.eat_kw("check") {
+                check_sql = Some(self.capture_paren_expr_sql()?);
             } else if self.eat_kw("references") {
                 references = Some(self.references_target()?);
+            } else if self.eat_kw("collate") {
+                let _ = self.ident()?; // collation name accepted and ignored
+            } else if self.eat_kw("generated") {
+                return Err(EngineError::sql("GENERATED columns are not supported"));
             } else {
                 break;
             }
@@ -658,8 +791,30 @@ impl Parser {
             ty,
             primary_key,
             not_null,
+            unique,
+            autoincrement,
+            default_sql,
+            check_sql,
             references,
         })
+    }
+
+    /// Capture a `DEFAULT` expression's source by parsing it and re-stringifying
+    /// the tokens it consumed (re-parseable on replay).
+    fn capture_expr_sql(&mut self) -> Result<String> {
+        let start = self.pos;
+        let _ = self.expr()?;
+        Ok(render_tokens(&self.toks[start..self.pos]))
+    }
+
+    /// Capture a parenthesized `CHECK (expr)` body's source.
+    fn capture_paren_expr_sql(&mut self) -> Result<String> {
+        self.expect(Tok::LParen)?;
+        let start = self.pos;
+        let _ = self.expr()?;
+        let text = render_tokens(&self.toks[start..self.pos]);
+        self.expect(Tok::RParen)?;
+        Ok(text)
     }
 
     /// The `<table>[(<col>)]` after a `REFERENCES` keyword.
@@ -684,9 +839,15 @@ impl Parser {
         })
     }
 
-    /// Parse a table-level constraint, returning a foreign key when it declares
-    /// one. `PRIMARY KEY`/`UNIQUE`/`CHECK` are consumed and ignored (`None`).
-    fn table_constraint(&mut self) -> Result<Option<ForeignKeySpec>> {
+    /// Parse a table-level constraint into the right collection: `FOREIGN KEY`,
+    /// composite `PRIMARY KEY (cols)`, `UNIQUE (cols)`, or `CHECK (expr)`.
+    fn table_constraint(
+        &mut self,
+        fks: &mut Vec<ForeignKeySpec>,
+        pks: &mut Vec<String>,
+        uniques: &mut Vec<Vec<String>>,
+        checks: &mut Vec<String>,
+    ) -> Result<()> {
         let mut name = None;
         if self.eat_kw("constraint") {
             name = Some(self.ident()?);
@@ -701,20 +862,23 @@ impl Parser {
             } else {
                 Vec::new()
             };
-            return Ok(Some(ForeignKeySpec {
+            fks.push(ForeignKeySpec {
                 name,
                 columns,
                 foreign_table,
                 foreign_columns,
-            }));
+            });
+            return Ok(());
         }
-        // PRIMARY KEY (cols) / UNIQUE (cols) / CHECK (…): consume and ignore.
-        let _ = self.eat_kw("primary") && self.eat_kw("key");
-        let _ = self.eat_kw("unique") || self.eat_kw("check");
-        if self.peek() == &Tok::LParen {
-            self.skip_balanced_parens()?;
+        if self.eat_kw("primary") {
+            self.expect_kw("key")?;
+            pks.extend(self.paren_ident_list()?);
+        } else if self.eat_kw("unique") {
+            uniques.push(self.paren_ident_list()?);
+        } else if self.eat_kw("check") {
+            checks.push(self.capture_paren_expr_sql()?);
         }
-        Ok(None)
+        Ok(())
     }
 
     /// A parenthesized, comma-separated identifier list: `(a, b, c)`.
@@ -730,21 +894,6 @@ impl Parser {
         }
         self.expect(Tok::RParen)?;
         Ok(cols)
-    }
-
-    /// Consume a balanced `( … )` group (for constraint bodies we don't model).
-    fn skip_balanced_parens(&mut self) -> Result<()> {
-        self.expect(Tok::LParen)?;
-        let mut depth = 1;
-        while depth > 0 {
-            match self.bump() {
-                Tok::LParen => depth += 1,
-                Tok::RParen => depth -= 1,
-                Tok::Eof => return Err(EngineError::sql("unterminated constraint")),
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     /// Parse an optional `(n)` / `(p,s)` type suffix. For a vector type the first
@@ -932,10 +1081,15 @@ impl Parser {
         })
     }
 
-    /// The row source after `INSERT … [(cols)]`: `VALUES (…)[, …]` or a `SELECT`.
+    /// The row source after `INSERT … [(cols)]`: `VALUES (…)[, …]`, a `SELECT`,
+    /// or `DEFAULT VALUES` (one all-defaults row, encoded as an empty value row).
     fn insert_source(&mut self) -> Result<InsertSource> {
-        if self.is_kw("select") {
+        if self.is_kw("select") || self.is_kw("with") {
             return Ok(InsertSource::Select(Box::new(self.select()?)));
+        }
+        if self.eat_kw("default") {
+            self.expect_kw("values")?;
+            return Ok(InsertSource::Values(vec![Vec::new()]));
         }
         self.expect_kw("values")?;
         let mut rows = Vec::new();
@@ -1912,6 +2066,9 @@ impl Parser {
                 } else if w.eq_ignore_ascii_case("false") {
                     self.bump();
                     Ok(Expr::Int(0))
+                } else if w.eq_ignore_ascii_case("default") {
+                    self.bump();
+                    Ok(Expr::Default)
                 } else if w.eq_ignore_ascii_case("case") {
                     self.case_expr()
                 } else if w.eq_ignore_ascii_case("cast") && self.next_is_lparen() {
@@ -2008,9 +2165,80 @@ fn agg_func(w: &str) -> Option<AggFunc> {
 }
 
 fn is_constraint_kw(w: &str) -> bool {
-    ["primary", "not", "null", "unique", "references"]
-        .iter()
-        .any(|k| w.eq_ignore_ascii_case(k))
+    [
+        "primary",
+        "not",
+        "null",
+        "unique",
+        "references",
+        "default",
+        "check",
+        "autoincrement",
+        "collate",
+        "generated",
+    ]
+    .iter()
+    .any(|k| w.eq_ignore_ascii_case(k))
+}
+
+/// Whether a type name is a SERIAL-family auto-increment integer alias.
+fn is_serial_type(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "serial" | "bigserial" | "smallserial" | "serial4" | "serial8" | "serial2"
+    )
+}
+
+/// Re-stringify a token slice into a re-parseable SQL fragment (whitespace
+/// normalized). Used to capture `DEFAULT`/`CHECK` expression source.
+fn render_tokens(toks: &[Tok]) -> String {
+    let mut out = String::new();
+    for (i, t) in toks.iter().enumerate() {
+        if i > 0
+            && !matches!(t, Tok::Comma | Tok::RParen | Tok::DColon)
+            && !matches!(toks[i - 1], Tok::LParen | Tok::DColon)
+        {
+            out.push(' ');
+        }
+        out.push_str(&render_token(t));
+    }
+    out
+}
+
+fn render_token(t: &Tok) -> String {
+    match t {
+        Tok::Word(w) => w.clone(),
+        Tok::Int(n) => n.to_string(),
+        Tok::Real(r) => format!("{r}"),
+        Tok::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Tok::Param => "?".to_string(),
+        Tok::LParen => "(".to_string(),
+        Tok::RParen => ")".to_string(),
+        Tok::LBracket => "[".to_string(),
+        Tok::RBracket => "]".to_string(),
+        Tok::Comma => ",".to_string(),
+        Tok::Semi => ";".to_string(),
+        Tok::DColon => "::".to_string(),
+        Tok::Dot => ".".to_string(),
+        Tok::Star => "*".to_string(),
+        Tok::Eq => "=".to_string(),
+        Tok::Ne => "<>".to_string(),
+        Tok::Lt => "<".to_string(),
+        Tok::Le => "<=".to_string(),
+        Tok::Gt => ">".to_string(),
+        Tok::Ge => ">=".to_string(),
+        Tok::Plus => "+".to_string(),
+        Tok::Minus => "-".to_string(),
+        Tok::Slash => "/".to_string(),
+        Tok::Percent => "%".to_string(),
+        Tok::Concat => "||".to_string(),
+        Tok::Arrow => "->".to_string(),
+        Tok::ArrowText => "->>".to_string(),
+        Tok::VecL2 => "<->".to_string(),
+        Tok::VecCosine => "<=>".to_string(),
+        Tok::VecIp => "<#>".to_string(),
+        Tok::Eof => String::new(),
+    }
 }
 
 fn is_clause_kw(w: &str) -> bool {
