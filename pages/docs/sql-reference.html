@@ -221,7 +221,7 @@ SELECT n FROM a UNION SELECT n FROM b ORDER BY n;</code></pre>
 <tr><td><code>NULL</code></td><td><code>NULL</code></td></tr>
 <tr><td>Boolean keyword</td><td><code>TRUE</code> → <code>1</code>, <code>FALSE</code> → <code>0</code></td></tr>
 <tr><td>Column reference</td><td><code>title</code>, <code>notes.title</code> / <code>alias.title</code> (qualifier resolves against the active sources)</td></tr>
-<tr><td>Parameter</td><td><code>?</code> (positional, bound 1-based)</td></tr>
+<tr><td>Parameter</td><td><code>?</code> positional, <code>$1</code> numbered, or <code>:name</code> named (bound 1-based)</td></tr>
 <tr><td>Parenthesised</td><td><code>(score + 1) * 2</code></td></tr>
 <tr><td>Function call</td><td><code>lower(title)</code>, <code>coalesce(x, 0)</code></td></tr>
 <tr><td>Type cast</td><td><code>x::int</code>, <code>'42'::integer</code>, <code>CAST(x AS int)</code>, <code>count(*)::int</code></td></tr>
@@ -263,7 +263,7 @@ SELECT n FROM a UNION SELECT n FROM b ORDER BY n;</code></pre>
 <tr><td>Comparison</td><td><code>=</code>, <code>&lt;&gt;</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td><code>&lt;&gt;</code> and <code>!=</code> are both inequality</td></tr>
 <tr><td>Null test</td><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td></td></tr>
 <tr><td>Membership / range</td><td><code>IN (…)</code>, <code>NOT IN (…)</code>, <code>BETWEEN … AND …</code>, <code>NOT BETWEEN …</code></td><td>Three-valued logic over a value list / range</td></tr>
-<tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code>, <code>ILIKE</code>, <code>… ESCAPE c</code></td><td>Match against a string expression; <code>ESCAPE</code> sets the escape char</td></tr>
+<tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code>, <code>ILIKE</code>, <code>… ESCAPE c</code></td><td><code>LIKE</code> is case-sensitive, <code>ILIKE</code> folds ASCII case; <code>ESCAPE</code> sets the escape char</td></tr>
 <tr><td>Vector distance</td><td><code>&lt;-&gt;</code>, <code>&lt;=&gt;</code>, <code>&lt;#&gt;</code></td><td>L2 / cosine / inner-product distance — see <a href="#vector-search">Vector search</a></td></tr>
 <tr><td>Concatenation</td><td><code>||</code></td><td>String concat (NULL-propagating); binds looser than <code>+</code></td></tr>
 <tr><td>Additive</td><td><code>+</code>, <code>-</code></td><td></td></tr>
@@ -342,9 +342,10 @@ DROP INDEX IF EXISTS mem_e;</code></pre>
 
 <section>
 <h2>Parameters</h2>
-<p>Use a positional <code>?</code> placeholder anywhere an expression is allowed, then bind by 1-based index. Binding goes through the prepared-statement path of the C ABI.</p>
+<p>Bind placeholders by 1-based index through the prepared-statement path. Three placeholder spellings are accepted: positional <code>?</code> (SQLite), numbered <code>$1</code> (PostgreSQL), and named <code>:name</code> (SQLite). A repeated <code>$1</code> reuses one slot; distinct <code>:name</code>s are assigned sequential slots in first-seen order.</p>
 <pre data-lang="sql"><code>INSERT INTO notes (id, title) VALUES (?, ?);
-SELECT * FROM notes WHERE id = ? OR title LIKE ?;</code></pre>
+SELECT * FROM notes WHERE id = $1 OR title ILIKE $2;
+SELECT * FROM notes WHERE author = :who;</code></pre>
 <p>Each bound value is a NUL-terminated <em>typed literal</em>: a one-character tag followed by the encoded value. This is how the string-only ABI carries a typed argument.</p>
 <div class="table-wrap">
 <table>
@@ -386,6 +387,16 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 <ul class="reqs">
 <li><span class="req-tag must">MUST</span> keep schema changes out of an explicit transaction — DDL inside <code>BEGIN</code> returns <code>ENGINE_ERR_TXN</code>.</li>
 <li><span class="req-tag should">SHOULD</span> retry a transaction that fails with <code>ENGINE_ERR_CONFLICT</code> — a first-committer-wins check rejects conflicting concurrent writers.</li>
+</ul>
+</section>
+
+<section>
+<h2>Dialect &amp; session compatibility</h2>
+<p>To let real PostgreSQL/SQLite clients and ORMs connect without surprises, the engine accepts a few dialect spellings and the session statements clients emit on connect.</p>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> quote identifiers with double quotes <code>"x"</code> or backticks <code>`x`</code>. (Square brackets denote vector literals here, so <code>[x]</code> is not an identifier quote.)</li>
+<li><span class="req-tag may">MAY</span> issue <code>SET</code>, <code>SET TRANSACTION ISOLATION LEVEL …</code>, <code>PRAGMA</code>, <code>VACUUM</code>, <code>ANALYZE</code>, <code>RESET</code>, <code>DISCARD</code> — accepted as no-ops (the engine runs one snapshot-isolation mode).</li>
+<li><span class="req-tag may">MAY</span> issue <code>SHOW name</code> (returns a one-row result) and <code>EXPLAIN [ANALYZE] …</code> (returns a one-line plan; the engine has one strategy per shape).</li>
 </ul>
 </section>
 

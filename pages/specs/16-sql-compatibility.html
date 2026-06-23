@@ -17,8 +17,8 @@
 <header class="page-header">
 <div class="spec-meta">
 <span class="badge badge-id">16</span>
-<span class="badge badge-status status-draft">Draft · Proposed</span>
-<span class="spec-date">Phase 6 (proposed)</span>
+<span class="badge badge-status status-review">Phase 6 · Implemented (6A–6E)</span>
+<span class="spec-date">Phase 6</span>
 </div>
 <h1>SQL Compatibility &amp; Mapping — PostgreSQL / SQLite → Twill DB</h1>
 <p class="lede">A complete, honest map of the PostgreSQL and SQLite SQL surface onto Twill DB: what the hand-written frontend (<code>sql.rs</code> → <code>exec.rs</code>) accepts <em>today</em>, what is mappable by rewrite, what is <em>proposed</em> for a Phase&nbsp;6 surface-completeness effort, and what stays out of scope by design. Then a concrete implementation spec for the gaps — <strong>all of it parser + executor work; the storage seam never moves</strong> (<code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>).</p>
@@ -165,7 +165,7 @@
 <tr><td><code>CAST(x AS type)</code> / PG <code>x::type</code></td><td>✅ (6A)</td><td><code>Expr::Cast</code> over the affinity-coercion machinery (<code>ColumnType::coerce</code>).</td></tr>
 <tr><td><code>COALESCE</code>/<code>NULLIF</code>/<code>GREATEST</code>/<code>LEAST</code></td><td>✅ (6A)</td><td>Plus <code>ifnull</code>/<code>iif</code>; <code>GREATEST</code>/<code>LEAST</code> skip NULLs.</td></tr>
 <tr><td><code>x LIKE … ESCAPE c</code>, <code>SIMILAR TO</code>, POSIX regex <code>~</code>/<code>~*</code></td><td>✅ / ✗</td><td><code>ESCAPE</code> shipped (6A). <code>SIMILAR TO</code>/regex are ✗ (no regex engine; keep deps minimal).</td></tr>
-<tr><td>Parameters: <code>?</code> positional</td><td>✅</td><td>PG <code>$1</code> and named <code>:name</code> → ⊕ 6E (dialect shim; server mode already speaks the extended protocol).</td></tr>
+<tr><td>Parameters: <code>?</code> positional, <code>$1</code> numbered, <code>:name</code> named</td><td>✅ (6E)</td><td>All three normalize to the 1-based bind model.</td></tr>
 </tbody>
 </table>
 </div>
@@ -198,11 +198,11 @@
 <tr><td><code>BEGIN [TRANSACTION|WORK|DEFERRED]</code>, <code>START TRANSACTION</code></td><td>✅</td><td>—</td></tr>
 <tr><td><code>COMMIT</code>, <code>ROLLBACK</code> (<code>[TRANSACTION|WORK]</code>)</td><td>✅</td><td>—</td></tr>
 <tr><td>Snapshot isolation (the only level)</td><td>✅</td><td>Single-writer, first-committer-wins; equivalent to PG <code>REPEATABLE READ</code>/SI.</td></tr>
-<tr><td><code>SET TRANSACTION ISOLATION LEVEL …</code></td><td>↻ 6E</td><td>Accept-and-pin-to-SI (PG <code>SERIALIZABLE</code>/<code>REPEATABLE READ</code> map to SI; weaker levels are upgraded). Parsed-and-honoured-as-SI shim.</td></tr>
+<tr><td><code>SET TRANSACTION ISOLATION LEVEL …</code></td><td>✅ (6E)</td><td>Accepted no-op (the engine runs one snapshot-isolation mode).</td></tr>
 <tr><td><code>SAVEPOINT</code> / <code>RELEASE</code> / <code>ROLLBACK TO</code></td><td>✅ (6D)</td><td>Partial rollback over the in-flight writer's pending set (and buffered WAL); no durable change.</td></tr>
-<tr><td><code>SET</code>/<code>SHOW</code> (GUCs), <code>SET search_path</code>, <code>PRAGMA</code> (SQLite)</td><td>↻ 6E</td><td>Accept-and-ignore the common no-op session settings on the server boundary so real clients/ORMs connect; reject unknown ones.</td></tr>
-<tr><td><code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code></td><td>⊕ 6E</td><td>Emit a single-plan textual description (the engine has one strategy per shape); useful for client compatibility.</td></tr>
-<tr><td><code>VACUUM</code>, <code>ANALYZE</code>, <code>ATTACH</code>/<code>DETACH</code> (SQLite), <code>LISTEN</code>/<code>NOTIFY</code> (PG)</td><td>✗ / ↻</td><td><code>VACUUM</code>/<code>ANALYZE</code> accept-and-no-op (6E). <code>ATTACH</code> conflicts with the URL-scheme backend model; <code>LISTEN/NOTIFY</code> out of scope.</td></tr>
+<tr><td><code>SET</code>/<code>SHOW</code> (GUCs), <code>SET search_path</code>, <code>PRAGMA</code> (SQLite)</td><td>✅ (6E)</td><td><code>SET</code>/<code>PRAGMA</code> accepted no-ops; <code>SHOW name</code> returns a one-row result.</td></tr>
+<tr><td><code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code></td><td>✅ (6E)</td><td>Returns a single-line plan description (one strategy per shape).</td></tr>
+<tr><td><code>VACUUM</code>, <code>ANALYZE</code>, <code>ATTACH</code>/<code>DETACH</code> (SQLite), <code>LISTEN</code>/<code>NOTIFY</code> (PG)</td><td>✅ / ✗</td><td><code>VACUUM</code>/<code>ANALYZE</code> accepted no-ops (6E). <code>ATTACH</code> conflicts with the URL-scheme backend model; <code>LISTEN/NOTIFY</code> out of scope.</td></tr>
 </tbody>
 </table>
 </div>
@@ -213,12 +213,12 @@
 <thead><tr><th>Area</th><th>PostgreSQL</th><th>SQLite</th><th>Twill resolution</th></tr></thead>
 <tbody>
 <tr><td>Typing</td><td>Strict, static</td><td>Dynamic affinity</td><td>Twill is dynamic-affinity (SQLite model); server mode reports affinity-derived OIDs. ⊕ 6E.</td></tr>
-<tr><td>Identifier quoting</td><td><code>"x"</code></td><td><code>"x"</code> or <code>[x]</code> or <code>`x`</code></td><td><code>"x"</code> supported; <code>[x]</code>/<code>`x`</code> ⊕ 6E.</td></tr>
+<tr><td>Identifier quoting</td><td><code>"x"</code></td><td><code>"x"</code> or <code>[x]</code> or <code>`x`</code></td><td><code>"x"</code> and <code>`x`</code> shipped (6E); <code>[x]</code> stays a vector literal.</td></tr>
 <tr><td>String concat</td><td><code>||</code></td><td><code>||</code></td><td>⊕ 6A.</td></tr>
-<tr><td><code>LIKE</code> case</td><td>case-sensitive (+<code>ILIKE</code>)</td><td>case-insensitive (ASCII)</td><td>Today = SQLite (insensitive). Split <code>LIKE</code>/<code>ILIKE</code> ⊕ 6E.</td></tr>
+<tr><td><code>LIKE</code> case</td><td>case-sensitive (+<code>ILIKE</code>)</td><td>case-insensitive (ASCII)</td><td>Split shipped (6E): <code>LIKE</code> case-sensitive, <code>ILIKE</code> folds ASCII case.</td></tr>
 <tr><td>Boolean</td><td>real <code>bool</code></td><td>0/1 integer</td><td>0/1 integer; report as <code>bool</code> on the wire ⊕ 6E.</td></tr>
 <tr><td>Auto IDs</td><td><code>SERIAL</code>/<code>IDENTITY</code></td><td><code>INTEGER PRIMARY KEY [AUTOINCREMENT]</code> / <code>rowid</code></td><td><code>AUTOINCREMENT</code>/<code>SERIAL</code> integer column shipped (6D).</td></tr>
-<tr><td>Placeholders</td><td><code>$1</code></td><td><code>?</code>, <code>?NNN</code>, <code>:name</code></td><td><code>?</code> today; <code>$1</code>/<code>:name</code> ⊕ 6E.</td></tr>
+<tr><td>Placeholders</td><td><code>$1</code></td><td><code>?</code>, <code>?NNN</code>, <code>:name</code></td><td><code>?</code> / <code>$1</code> / <code>:name</code> all shipped (6E).</td></tr>
 </tbody>
 </table>
 </div>
@@ -287,8 +287,12 @@
 <li><strong>Versions:</strong> new WAL ops are additive; <code>STORAGE_TRAIT_VERSION</code> unchanged. DDL remains autocommit-only (spec 02 boundary preserved).</li>
 </ul>
 
-<h3>Stage 6E — Dialect shims (compatibility surface)</h3>
+<h3>Stage 6E — Dialect shims (compatibility surface) <span class="badge badge-status status-review">Implemented</span></h3>
 <p>Make real PostgreSQL/SQLite clients and ORMs connect without surprises, concentrated at the boundary so the core stays one dialect.</p>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>Placeholder forms <code>$1</code> (numbered) and <code>:name</code> (named) join positional <code>?</code>, all normalized to the engine's 1-based bind model (a repeated <code>$1</code> reuses its slot; distinct <code>:name</code>s get sequential slots). Backtick <code>`x`</code> identifier quoting joins <code>"x"</code> (<code>[x]</code> stays a vector literal). <code>LIKE</code> is now case-sensitive and <code>ILIKE</code> case-folds (the dialect split). <code>SET</code>/<code>SET TRANSACTION ISOLATION LEVEL</code>/<code>PRAGMA</code>/<code>VACUUM</code>/<code>ANALYZE</code>/<code>RESET</code>/<code>DISCARD</code> are accepted no-ops; <code>SHOW name</code> returns a one-row result; <code>EXPLAIN [ANALYZE] …</code> returns a one-line plan. Implemented in the engine lexer/parser/exec so both the embedded and pgwire paths inherit it. Tests: <code>crates/engine/tests/dialect_6e.rs</code>.</p>
+</div>
 <ul>
 <li>Placeholder forms <code>$1</code> and <code>:name</code> (normalize to the existing positional model); identifier quoting <code>[x]</code>/<code>`x`</code>; <code>LIKE</code> vs <code>ILIKE</code> split (case-sensitive default for PG mode); boolean reported as <code>bool</code> on the wire.</li>
 <li>Accept-and-pin <code>SET TRANSACTION ISOLATION LEVEL</code> to SI; accept-and-no-op the common session <code>SET</code>/<code>SHOW</code>/<code>PRAGMA</code>/<code>VACUUM</code>/<code>ANALYZE</code> that ORMs emit on connect, rejecting unknown ones (never silently swallow semantics-bearing statements).</li>

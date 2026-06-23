@@ -78,6 +78,44 @@ pub struct CatalogColumn {
     pub position: i32,
 }
 
+/// Build the one-row result a `SHOW <name>` returns (stage 6E). The column is
+/// named after the setting; the value is a best-effort default (the snapshot-
+/// isolation level for the isolation GUCs, otherwise empty).
+fn show_result(name: &str) -> ResultSet {
+    let key = name.to_ascii_lowercase();
+    let value = match key.as_str() {
+        "transaction_isolation" | "default_transaction_isolation" => "repeatable read",
+        "transaction isolation level" => "repeatable read",
+        _ => "",
+    };
+    ResultSet {
+        columns: vec![if key.is_empty() {
+            "setting".to_string()
+        } else {
+            name.to_string()
+        }],
+        types: vec![ColumnType::Text],
+        rows: vec![vec![Value::Text(value.to_string())]],
+    }
+}
+
+/// Build the one-row plan text an `EXPLAIN` returns (stage 6E). The engine has a
+/// single strategy per statement shape, so this is a terse description.
+fn explain_result(stmt: &Stmt) -> ResultSet {
+    let plan = match stmt {
+        Stmt::Select(_) => "Query plan: scan / nested-loop join over the MVCC snapshot",
+        Stmt::Insert { .. } => "Insert",
+        Stmt::Update { .. } => "Update (scan + supersede)",
+        Stmt::Delete { .. } => "Delete (scan + supersede)",
+        _ => "Utility statement",
+    };
+    ResultSet {
+        columns: vec!["QUERY PLAN".to_string()],
+        types: vec![ColumnType::Text],
+        rows: vec![vec![Value::Text(plan.to_string())]],
+    }
+}
+
 /// Map an engine storage class to the Postgres type name clients introspect.
 fn pg_type_name(ty: ColumnType) -> &'static str {
     match ty {
@@ -247,6 +285,10 @@ impl Connection {
             Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } => {
                 self.exec_dml(stmt, params)
             }
+            // Accepted-and-ignored session statements (stage 6E).
+            Stmt::Noop => Ok(ResultSet::default()),
+            Stmt::Show(name) => Ok(show_result(name)),
+            Stmt::Explain(inner) => Ok(explain_result(inner)),
         }
     }
 

@@ -75,6 +75,13 @@ pub enum Stmt {
     ReleaseSavepoint(String),
     /// `ROLLBACK TO [SAVEPOINT] name` (stage 6D).
     RollbackTo(String),
+    /// An accepted-and-ignored session statement — `SET`/`PRAGMA`/`VACUUM`/
+    /// `ANALYZE`/`RESET`/`DISCARD` (stage 6E dialect shim).
+    Noop,
+    /// `SHOW name` — returns a one-row result for the setting (stage 6E).
+    Show(String),
+    /// `EXPLAIN [ANALYZE] <statement>` — returns a one-line plan (stage 6E).
+    Explain(Box<Stmt>),
 }
 
 /// Where an `INSERT` gets its rows: literal `VALUES` tuples or the result of a
@@ -432,31 +439,24 @@ pub enum UnOp {
 
 // ---- parser ---------------------------------------------------------------
 
-/// Parse a single SQL statement, returning it plus the number of `?` parameters.
+/// Parse a single SQL statement, returning it plus the parameter count (the
+/// highest placeholder index seen across `?` / `$n` / `:name` forms).
 pub fn parse(sql: &str) -> Result<(Stmt, usize)> {
     let toks = lex(sql)?;
-    let mut p = Parser {
-        toks,
-        pos: 0,
-        next_param: 1,
-    };
+    let mut p = Parser::new(toks);
     let stmt = p.statement()?;
     p.skip(Tok::Semi);
     if p.peek() != &Tok::Eof {
         return Err(EngineError::sql("trailing tokens after statement"));
     }
-    Ok((stmt, p.next_param - 1))
+    Ok((stmt, p.max_param))
 }
 
 /// Parse a standalone expression (used to re-parse stored `DEFAULT`/`CHECK`
 /// texts at insert/update time, stage 6D). Parameters are not expected here.
 pub fn parse_expr(sql: &str) -> Result<Expr> {
     let toks = lex(sql)?;
-    let mut p = Parser {
-        toks,
-        pos: 0,
-        next_param: 1,
-    };
+    let mut p = Parser::new(toks);
     let e = p.expr()?;
     if p.peek() != &Tok::Eof {
         return Err(EngineError::sql("trailing tokens after expression"));
@@ -467,10 +467,50 @@ pub fn parse_expr(sql: &str) -> Result<Expr> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Next sequential index assigned to a `?` / new `:name` placeholder.
     next_param: usize,
+    /// Highest placeholder index seen (drives the reported parameter count).
+    max_param: usize,
+    /// Index assigned to each `:name`, so a repeated name reuses its slot.
+    named_params: std::collections::HashMap<String, usize>,
 }
 
 impl Parser {
+    fn new(toks: Vec<Tok>) -> Parser {
+        Parser {
+            toks,
+            pos: 0,
+            next_param: 1,
+            max_param: 0,
+            named_params: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Resolve a placeholder token to its 1-based index, allocating a sequential
+    /// slot for `?` and `:name` and honouring the explicit number of `$n`.
+    fn param_index(&mut self, tok: &Tok) -> usize {
+        let idx = match tok {
+            Tok::NumParam(n) => *n,
+            Tok::NamedParam(name) => {
+                if let Some(&i) = self.named_params.get(name) {
+                    i
+                } else {
+                    let i = self.next_param;
+                    self.next_param += 1;
+                    self.named_params.insert(name.clone(), i);
+                    i
+                }
+            }
+            _ => {
+                let i = self.next_param;
+                self.next_param += 1;
+                i
+            }
+        };
+        self.max_param = self.max_param.max(idx);
+        idx
+    }
+
     fn peek(&self) -> &Tok {
         &self.toks[self.pos]
     }
@@ -544,6 +584,38 @@ impl Parser {
         matches!(self.toks.get(self.pos + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case(kw))
     }
 
+    /// Consume tokens up to (not including) a statement terminator — for the
+    /// accepted-and-ignored session statements (stage 6E).
+    fn skip_to_end(&mut self) {
+        while !matches!(self.peek(), Tok::Semi | Tok::Eof) {
+            self.bump();
+        }
+    }
+
+    /// Consume a balanced `( … )` group (e.g. an `EXPLAIN (options)` list).
+    fn skip_parens(&mut self) {
+        if self.peek() != &Tok::LParen {
+            return;
+        }
+        let mut depth = 0;
+        loop {
+            match self.peek() {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 {
+                        return;
+                    }
+                    continue;
+                }
+                Tok::Eof => return,
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
     fn statement(&mut self) -> Result<Stmt> {
         if self.is_kw("create") {
             if self.next_is_kw("index") {
@@ -559,6 +631,33 @@ impl Parser {
             }
         } else if self.is_kw("alter") {
             self.alter_table()
+        } else if self.is_kw("explain") {
+            self.bump();
+            let _ = self.eat_kw("analyze");
+            let _ = self.eat_kw("verbose");
+            if self.peek() == &Tok::LParen {
+                self.skip_parens(); // EXPLAIN (options) — accepted, ignored
+            }
+            Ok(Stmt::Explain(Box::new(self.statement()?)))
+        } else if self.is_kw("show") {
+            self.bump();
+            // `SHOW name` / `SHOW TRANSACTION ISOLATION LEVEL` / `SHOW ALL`.
+            let mut parts = Vec::new();
+            while let Some(w) = self.peek_word() {
+                parts.push(w.to_string());
+                self.bump();
+            }
+            Ok(Stmt::Show(parts.join(" ")))
+        } else if self.is_kw("set")
+            || self.is_kw("pragma")
+            || self.is_kw("vacuum")
+            || self.is_kw("analyze")
+            || self.is_kw("reset")
+            || self.is_kw("discard")
+        {
+            // Accepted-and-ignored session statements (stage 6E).
+            self.skip_to_end();
+            Ok(Stmt::Noop)
         } else if self.is_kw("insert") {
             self.insert()
         } else if self.is_kw("select") || self.is_kw("with") {
@@ -1469,13 +1568,15 @@ impl Parser {
         Ok((limit, offset))
     }
 
-    /// A LIMIT / OFFSET count: an integer literal (optionally negated) or a `?`
-    /// parameter (PostgREST parameterizes pagination), resolved at execution.
+    /// A LIMIT / OFFSET count: an integer literal (optionally negated) or a
+    /// placeholder (PostgREST parameterizes pagination), resolved at execution.
     fn limit_value(&mut self, what: &str) -> Result<Expr> {
-        if self.peek() == &Tok::Param {
-            self.bump();
-            let idx = self.next_param;
-            self.next_param += 1;
+        if matches!(
+            self.peek(),
+            Tok::Param | Tok::NumParam(_) | Tok::NamedParam(_)
+        ) {
+            let tok = self.bump();
+            let idx = self.param_index(&tok);
             return Ok(Expr::Param(idx));
         }
         let neg = self.skip(Tok::Minus);
@@ -2036,10 +2137,9 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Str(s))
             }
-            Tok::Param => {
-                self.bump();
-                let idx = self.next_param;
-                self.next_param += 1;
+            Tok::Param | Tok::NumParam(_) | Tok::NamedParam(_) => {
+                let tok = self.bump();
+                let idx = self.param_index(&tok);
                 Ok(Expr::Param(idx))
             }
             Tok::LParen => {
@@ -2212,6 +2312,8 @@ fn render_token(t: &Tok) -> String {
         Tok::Real(r) => format!("{r}"),
         Tok::Str(s) => format!("'{}'", s.replace('\'', "''")),
         Tok::Param => "?".to_string(),
+        Tok::NumParam(n) => format!("${n}"),
+        Tok::NamedParam(name) => format!(":{name}"),
         Tok::LParen => "(".to_string(),
         Tok::RParen => ")".to_string(),
         Tok::LBracket => "[".to_string(),

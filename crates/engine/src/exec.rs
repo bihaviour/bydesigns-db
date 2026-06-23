@@ -572,10 +572,14 @@ fn num(v: &Value) -> Result<f64> {
 /// `insensitive` (or the engine's default `LIKE`) folds ASCII case before
 /// matching. The pattern is pre-tokenized into "literal char" vs "wildcard".
 fn like_match(s: &str, pattern: &str, escape: Option<char>, insensitive: bool) -> bool {
-    // The engine's historical LIKE is case-insensitive; the LIKE/ILIKE split is
-    // a stage-6E dialect concern, so for now both fold case.
-    let _ = insensitive;
-    let fold = |c: char| c.to_ascii_lowercase();
+    // `LIKE` is case-sensitive; `ILIKE` folds ASCII case (stage 6E dialect split).
+    let fold = |c: char| {
+        if insensitive {
+            c.to_ascii_lowercase()
+        } else {
+            c
+        }
+    };
     let s: Vec<char> = s.chars().map(fold).collect();
 
     // Tokens: '%' (any run), '_' (one char), or a literal char.
