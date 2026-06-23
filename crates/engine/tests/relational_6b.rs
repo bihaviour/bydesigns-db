@@ -375,3 +375,91 @@ fn delete_using_join_removes_correlated_rows() {
     assert_eq!(col(&rs, 0), vec![Some("12".into())]);
     let _ = fs::remove_file(&p);
 }
+
+// ---- CREATE VIEW / DROP VIEW (deferred 6B item) ----------------------------
+
+#[test]
+fn create_view_resolves_and_drops() {
+    let (mut db, p) = library();
+    db.exec(
+        "CREATE VIEW author_books AS \
+         SELECT a.name AS author, b.title AS title \
+         FROM authors a JOIN books b ON a.id = b.author_id",
+    )
+    .unwrap();
+    // The view resolves as a derived table — projection, filter, and aggregation
+    // over it all work.
+    let rs = db
+        .query("SELECT author, title FROM author_books ORDER BY title")
+        .unwrap();
+    assert_eq!(rs.rows.len(), 3);
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("Ada"));
+    let n = db
+        .query("SELECT count(*) FROM author_books WHERE author = 'Ada'")
+        .unwrap();
+    assert_eq!(cell(&n, 0, 0).as_deref(), Some("2"));
+
+    db.exec("DROP VIEW author_books").unwrap();
+    assert!(db.query("SELECT * FROM author_books").is_err());
+    // DROP VIEW IF EXISTS on a missing view is a no-op.
+    db.exec("DROP VIEW IF EXISTS author_books").unwrap();
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn view_over_view_composes() {
+    let p = db_path("view-chain");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE nums (n INTEGER)").unwrap();
+    db.exec("INSERT INTO nums VALUES (1),(2),(3),(4)").unwrap();
+    db.exec("CREATE VIEW evens AS SELECT n FROM nums WHERE n % 2 = 0")
+        .unwrap();
+    db.exec("CREATE VIEW evens_plus AS SELECT n + 10 AS m FROM evens")
+        .unwrap();
+    let rs = db.query("SELECT m FROM evens_plus ORDER BY m").unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("12".into()), Some("14".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn view_persists_across_restart() {
+    let p = db_path("view-persist");
+    let url = format!("file://{}", p.display());
+    {
+        let mut db = Connection::open(&url).unwrap();
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        db.exec("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
+        db.exec("CREATE VIEW big AS SELECT id FROM t WHERE v >= 20")
+            .unwrap();
+    }
+    // Reopen → the view is rebuilt from the durable WAL (re-parsed on replay).
+    let mut db = Connection::open(&url).unwrap();
+    let rs = db.query("SELECT id FROM big ORDER BY id").unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("2".into()), Some("3".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn recursive_views_are_rejected() {
+    let p = db_path("view-cycle");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    // Direct self-reference.
+    assert!(db
+        .exec("CREATE VIEW vs AS SELECT 1 WHERE 1 IN (SELECT 1 FROM vs)")
+        .is_err());
+    // Mutual recursion: va is fine (vb not yet a view), vb closes the cycle.
+    db.exec("CREATE VIEW va AS SELECT * FROM vb").unwrap();
+    assert!(db.exec("CREATE VIEW vb AS SELECT * FROM va").is_err());
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn view_name_conflicting_with_table_is_rejected() {
+    let p = db_path("view-conflict");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER)").unwrap();
+    assert!(db.exec("CREATE VIEW t AS SELECT 1").is_err());
+    let _ = fs::remove_file(&p);
+}

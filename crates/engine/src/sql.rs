@@ -88,6 +88,22 @@ pub enum Stmt {
     Show(String),
     /// `EXPLAIN [ANALYZE] <statement>` — returns a one-line plan (stage 6E).
     Explain(Box<Stmt>),
+    /// `CREATE [OR REPLACE] VIEW name [(cols)] AS <select>` (deferred 6B item).
+    /// `sql` is the full statement text, stored verbatim so the view can be
+    /// re-parsed on WAL replay (a new additive durable catalog fact). DDL stays
+    /// autocommit-only.
+    CreateView {
+        name: String,
+        query: Box<SelectStmt>,
+        sql: String,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    /// `DROP VIEW [IF EXISTS] name`.
+    DropView {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 /// Where an `INSERT` gets its rows: literal `VALUES` tuples or the result of a
@@ -450,6 +466,7 @@ pub enum UnOp {
 pub fn parse(sql: &str) -> Result<(Stmt, usize)> {
     let toks = lex(sql)?;
     let mut p = Parser::new(toks);
+    p.src = sql.to_string();
     let stmt = p.statement()?;
     p.skip(Tok::Semi);
     if p.peek() != &Tok::Eof {
@@ -470,8 +487,140 @@ pub fn parse_expr(sql: &str) -> Result<Expr> {
     Ok(e)
 }
 
+/// Collect the base-relation names a query references in any `FROM` position
+/// (recursively through joins, derived tables, set operations, CTE bodies, and
+/// expression subqueries), excluding the names bound by this query's own `WITH`.
+/// Used to reject view-definition cycles at `CREATE VIEW` time.
+pub fn referenced_relations(sel: &SelectStmt) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_select_refs(sel, &mut out);
+    let local: Vec<String> = sel
+        .with
+        .iter()
+        .map(|c| c.name.to_ascii_lowercase())
+        .collect();
+    out.retain(|n| !local.contains(&n.to_ascii_lowercase()));
+    out
+}
+
+fn collect_select_refs(sel: &SelectStmt, out: &mut Vec<String>) {
+    for cte in &sel.with {
+        collect_select_refs(&cte.query, out);
+    }
+    if let Some(f) = &sel.from {
+        collect_from_refs(f, out);
+    }
+    for item in &sel.items {
+        if let SelItem::Expr { expr, .. } = item {
+            collect_expr_refs(expr, out);
+        }
+    }
+    if let Some(e) = &sel.filter {
+        collect_expr_refs(e, out);
+    }
+    for e in &sel.group_by {
+        collect_expr_refs(e, out);
+    }
+    if let Some(e) = &sel.having {
+        collect_expr_refs(e, out);
+    }
+    for k in &sel.order_by {
+        collect_expr_refs(&k.expr, out);
+    }
+    for part in &sel.set_ops {
+        collect_select_refs(&part.query, out);
+    }
+}
+
+fn collect_from_refs(f: &FromClause, out: &mut Vec<String>) {
+    match f {
+        FromClause::Table { name, .. } => out.push(name.clone()),
+        FromClause::Derived { query, .. } => collect_select_refs(query, out),
+        FromClause::Join {
+            left, right, on, ..
+        } => {
+            collect_from_refs(left, out);
+            collect_from_refs(right, out);
+            if let Some(e) = on {
+                collect_expr_refs(e, out);
+            }
+        }
+    }
+}
+
+fn collect_expr_refs(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::ScalarSubquery(q) => collect_select_refs(q, out),
+        Expr::Exists { query, .. } => collect_select_refs(query, out),
+        Expr::InSubquery { e, query, .. } => {
+            collect_expr_refs(e, out);
+            collect_select_refs(query, out);
+        }
+        Expr::Binary { l, r, .. } => {
+            collect_expr_refs(l, out);
+            collect_expr_refs(r, out);
+        }
+        Expr::Unary { e, .. } | Expr::IsNull { e, .. } | Expr::Cast { e, .. } => {
+            collect_expr_refs(e, out)
+        }
+        Expr::Like {
+            e, pattern, escape, ..
+        } => {
+            collect_expr_refs(e, out);
+            collect_expr_refs(pattern, out);
+            if let Some(x) = escape {
+                collect_expr_refs(x, out);
+            }
+        }
+        Expr::InList { e, list, .. } => {
+            collect_expr_refs(e, out);
+            for x in list {
+                collect_expr_refs(x, out);
+            }
+        }
+        Expr::Between { e, lo, hi, .. } => {
+            collect_expr_refs(e, out);
+            collect_expr_refs(lo, out);
+            collect_expr_refs(hi, out);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_refs(o, out);
+            }
+            for (c, r) in whens {
+                collect_expr_refs(c, out);
+                collect_expr_refs(r, out);
+            }
+            if let Some(x) = els {
+                collect_expr_refs(x, out);
+            }
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_expr_refs(a, out);
+            }
+        }
+        Expr::Aggregate { arg, sep, .. } => {
+            if let AggArg::Expr(x) = arg {
+                collect_expr_refs(x, out);
+            }
+            if let Some(s) = sep {
+                collect_expr_refs(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 struct Parser {
     toks: Vec<Tok>,
+    /// The original statement text, kept so `CREATE VIEW` can store its body
+    /// verbatim (re-parsed on replay). Empty for the standalone-expression path.
+    src: String,
     pos: usize,
     /// Next sequential index assigned to a `?` / new `:name` placeholder.
     next_param: usize,
@@ -485,6 +634,7 @@ impl Parser {
     fn new(toks: Vec<Tok>) -> Parser {
         Parser {
             toks,
+            src: String::new(),
             pos: 0,
             next_param: 1,
             max_param: 0,
@@ -626,12 +776,16 @@ impl Parser {
         if self.is_kw("create") {
             if self.next_is_kw("index") {
                 self.create_index()
+            } else if self.create_is_view() {
+                self.create_view()
             } else {
                 self.create_table()
             }
         } else if self.is_kw("drop") {
             if self.next_is_kw("index") {
                 self.drop_index()
+            } else if self.next_is_kw("view") {
+                self.drop_view()
             } else {
                 self.drop_table()
             }
@@ -1171,6 +1325,68 @@ impl Parser {
         };
         let name = self.ident()?;
         Ok(Stmt::DropTable { name, if_exists })
+    }
+
+    /// Whether the `CREATE` at the cursor introduces a view: `CREATE [OR REPLACE]
+    /// [TEMP|TEMPORARY] VIEW …`. Peeks only; does not consume.
+    fn create_is_view(&self) -> bool {
+        let kw = |i: usize, w: &str| matches!(self.toks.get(i), Some(Tok::Word(s)) if s.eq_ignore_ascii_case(w));
+        let mut i = self.pos + 1; // past CREATE
+        if kw(i, "or") && kw(i + 1, "replace") {
+            i += 2;
+        }
+        if kw(i, "temp") || kw(i, "temporary") {
+            i += 1;
+        }
+        kw(i, "view")
+    }
+
+    fn create_view(&mut self) -> Result<Stmt> {
+        self.expect_kw("create")?;
+        let or_replace = if self.eat_kw("or") {
+            self.expect_kw("replace")?;
+            true
+        } else {
+            false
+        };
+        let _ = self.eat_kw("temp") || self.eat_kw("temporary");
+        self.expect_kw("view")?;
+        let if_not_exists = if self.eat_kw("if") {
+            self.expect_kw("not")?;
+            self.expect_kw("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        // An optional column-alias list `(a, b)` is accepted and ignored — the
+        // view's columns are the select's output names.
+        if self.peek() == &Tok::LParen {
+            let _ = self.paren_ident_list()?;
+        }
+        self.expect_kw("as")?;
+        let query = self.select()?;
+        let sql = self.src.trim().trim_end_matches(';').trim().to_string();
+        Ok(Stmt::CreateView {
+            name,
+            query: Box::new(query),
+            sql,
+            or_replace,
+            if_not_exists,
+        })
+    }
+
+    fn drop_view(&mut self) -> Result<Stmt> {
+        self.expect_kw("drop")?;
+        self.expect_kw("view")?;
+        let if_exists = if self.eat_kw("if") {
+            self.expect_kw("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        Ok(Stmt::DropView { name, if_exists })
     }
 
     fn insert(&mut self) -> Result<Stmt> {

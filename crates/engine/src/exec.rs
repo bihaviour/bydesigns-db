@@ -671,7 +671,11 @@ pub fn run_select(
     // shape directly; multi-source / set-op / DISTINCT / CTE / subquery queries
     // route to the relational executor.
     match &sel.from {
-        Some(FromClause::Table { name, .. }) if !needs_relational(sel) => {
+        // A view name has no base table, so it falls through to the relational
+        // path (which expands it as a derived table).
+        Some(FromClause::Table { name, .. })
+            if !needs_relational(sel) && store.table(name).is_some() =>
+        {
             single_table_select(store, sel, name, snapshot, writer, params)
         }
         None if !needs_relational(sel) => constant_select(sel, params),
@@ -3300,6 +3304,12 @@ mod relational {
                         cols,
                         rows: cte.rows.clone(),
                     });
+                }
+                // A view expands as a derived table over its stored query (the
+                // CREATE-time cycle check guarantees this recursion terminates).
+                if let Some(view_query) = store.view(name) {
+                    let rs = run_query(store, view_query, snapshot, writer, params)?;
+                    return Ok(relation_from_result(&src, rs));
                 }
                 let table = store
                     .table(name)

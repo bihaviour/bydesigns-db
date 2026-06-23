@@ -127,6 +127,30 @@ fn pg_type_name(ty: ColumnType) -> &'static str {
     }
 }
 
+/// Whether registering view `new_name` with body `query` would create a cycle in
+/// the view-dependency graph (direct or transitive self-reference). Every stored
+/// view is acyclic by this check, so query-time view expansion always terminates.
+fn view_would_cycle(
+    store: &crate::store::Store,
+    new_name: &str,
+    query: &crate::sql::SelectStmt,
+) -> bool {
+    let mut stack = sql::referenced_relations(query);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(n) = stack.pop() {
+        if n.eq_ignore_ascii_case(new_name) {
+            return true;
+        }
+        if !seen.insert(n.to_ascii_lowercase()) {
+            continue;
+        }
+        if let Some(view_query) = store.view(&n) {
+            stack.extend(sql::referenced_relations(view_query));
+        }
+    }
+    false
+}
+
 impl Connection {
     pub fn open(url: &str) -> Result<Connection> {
         Ok(Connection {
@@ -278,7 +302,9 @@ impl Connection {
             | Stmt::DropTable { .. }
             | Stmt::CreateIndex { .. }
             | Stmt::DropIndex { .. }
-            | Stmt::AlterTable { .. } => {
+            | Stmt::AlterTable { .. }
+            | Stmt::CreateView { .. }
+            | Stmt::DropView { .. } => {
                 self.exec_ddl(stmt)?;
                 Ok(ResultSet::default())
             }
@@ -687,8 +713,85 @@ impl Connection {
                 if_not_exists,
             } => self.do_create_index(name, table, column, *params, *if_not_exists),
             Stmt::DropIndex { name, if_exists } => self.do_drop_index(name, *if_exists),
+            Stmt::CreateView {
+                name,
+                query,
+                sql,
+                or_replace,
+                if_not_exists,
+            } => self.do_create_view(name, query, sql, *or_replace, *if_not_exists),
+            Stmt::DropView { name, if_exists } => self.do_drop_view(name, *if_exists),
             _ => unreachable!(),
         }
+    }
+
+    /// `CREATE [OR REPLACE] VIEW … AS <select>` (deferred 6B item): reject a name
+    /// that collides with a table or (without `OR REPLACE`) an existing view and
+    /// any definition cycle, durably log the statement text, then register the
+    /// parsed body. Autocommit, like `CREATE TABLE`.
+    fn do_create_view(
+        &self,
+        name: &str,
+        query: &crate::sql::SelectStmt,
+        sql: &str,
+        or_replace: bool,
+        if_not_exists: bool,
+    ) -> Result<Option<u64>> {
+        {
+            let store = self.db.store.read().unwrap();
+            if store.has_table(name) {
+                return Err(EngineError::sql(format!(
+                    "cannot create view {name}: a table with that name already exists"
+                )));
+            }
+            if store.has_view(name) && !or_replace {
+                if if_not_exists {
+                    return Ok(None);
+                }
+                return Err(EngineError::sql(format!("view {name} already exists")));
+            }
+            if view_would_cycle(&store, name, query) {
+                return Err(EngineError::sql(format!(
+                    "cannot create view {name}: the definition is recursive (unsupported)"
+                )));
+            }
+        }
+        let records = vec![
+            WalOp::CreateView {
+                name: name.to_string(),
+                sql: sql.to_string(),
+            }
+            .encode(),
+            WalOp::Commit.encode(),
+        ];
+        let commit_lsn =
+            block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
+        let mut store = self.db.store.write().unwrap();
+        store.insert_view(name.to_string(), query.clone());
+        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        Ok(Some(commit_lsn.0))
+    }
+
+    fn do_drop_view(&self, name: &str, if_exists: bool) -> Result<Option<u64>> {
+        if !self.db.store.read().unwrap().has_view(name) {
+            if if_exists {
+                return Ok(None);
+            }
+            return Err(EngineError::sql(format!("no such view: {name}")));
+        }
+        let records = vec![
+            WalOp::DropView {
+                name: name.to_string(),
+            }
+            .encode(),
+            WalOp::Commit.encode(),
+        ];
+        let commit_lsn =
+            block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
+        let mut store = self.db.store.write().unwrap();
+        store.drop_view(name);
+        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        Ok(Some(commit_lsn.0))
     }
 
     /// `CREATE INDEX … USING hnsw`: validate the target column is a vector,

@@ -303,6 +303,15 @@ fn apply_replay(store: &mut Store, op: WalOp, commit_lsn: u64) {
         | WalOp::AlterDropColumn { .. }
         | WalOp::AlterRenameColumn { .. }
         | WalOp::AlterRenameTable { .. }) => apply_alter(store, &op),
+        // A view is reconstructed by re-parsing its stored statement text (it
+        // parsed cleanly at CREATE time, so a malformed record is ignored rather
+        // than aborting recovery).
+        WalOp::CreateView { name, sql } => {
+            if let Ok((crate::sql::Stmt::CreateView { query, .. }, _)) = crate::sql::parse(&sql) {
+                store.replay_create_view(name, *query);
+            }
+        }
+        WalOp::DropView { name } => store.replay_drop_view(&name),
         WalOp::Commit => {}
     }
 }

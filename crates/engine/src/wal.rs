@@ -57,6 +57,17 @@ pub enum WalOp {
         table: String,
         to: String,
     },
+    /// `CREATE VIEW name AS …` (deferred 6B). Carries the full statement text,
+    /// re-parsed on replay to rebuild the view's parsed body (a derived catalog
+    /// fact, like an index — no rows of its own).
+    CreateView {
+        name: String,
+        sql: String,
+    },
+    /// `DROP VIEW name`.
+    DropView {
+        name: String,
+    },
     Commit,
 }
 
@@ -71,6 +82,8 @@ const OP_ALTER_ADD: u8 = 8;
 const OP_ALTER_DROP: u8 = 9;
 const OP_ALTER_RENAME_COL: u8 = 10;
 const OP_ALTER_RENAME_TABLE: u8 = 11;
+const OP_CREATE_VIEW: u8 = 12;
+const OP_DROP_VIEW: u8 = 13;
 
 impl WalOp {
     pub fn encode(&self) -> WalRecord {
@@ -221,6 +234,15 @@ impl WalOp {
                 put_str(&mut b, table);
                 put_str(&mut b, to);
             }
+            WalOp::CreateView { name, sql } => {
+                b.push(OP_CREATE_VIEW);
+                put_str(&mut b, name);
+                put_str(&mut b, sql);
+            }
+            WalOp::DropView { name } => {
+                b.push(OP_DROP_VIEW);
+                put_str(&mut b, name);
+            }
             WalOp::Commit => b.push(OP_COMMIT),
         }
         WalRecord::new(b)
@@ -245,6 +267,11 @@ impl WalOp {
                 table: c.str()?,
                 to: c.str()?,
             },
+            OP_CREATE_VIEW => WalOp::CreateView {
+                name: c.str()?,
+                sql: c.str()?,
+            },
+            OP_DROP_VIEW => WalOp::DropView { name: c.str()? },
             OP_DROP => WalOp::DropTable { name: c.str()? },
             OP_CREATE_INDEX => decode_create_index(&mut c)?,
             OP_DROP_INDEX => WalOp::DropIndex { name: c.str()? },
