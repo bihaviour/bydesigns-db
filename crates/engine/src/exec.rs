@@ -10,8 +10,8 @@ use crate::catalog::TableSchema;
 use crate::datetime;
 use crate::error::{EngineError, Result};
 use crate::sql::{
-    AggArg, AggFunc, BinOp, CastTarget, Expr, InsertSource, OnConflict, OrderKey, SelItem,
-    SelectStmt, UnOp,
+    AggArg, AggFunc, BinOp, CastTarget, Expr, FromClause, InsertSource, JoinKind, OnConflict,
+    OrderKey, SelItem, SelectStmt, SetOp, UnOp,
 };
 use crate::store::{RowVersion, Store, PENDING};
 use crate::value::{parse_vector, ColumnType, Value};
@@ -47,6 +47,9 @@ struct EvalCtx<'a> {
     /// The proposed-insert row backing `excluded.<col>` inside an
     /// `ON CONFLICT DO UPDATE`; `None` everywhere else.
     excluded: Option<&'a [Value]>,
+    /// Multi-source column namespace (joins / derived tables). When set,
+    /// `Column`/`Qualified` resolve against it instead of a single `schema`.
+    cols: Option<&'a [RelCol]>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -58,6 +61,7 @@ impl<'a> EvalCtx<'a> {
             params,
             group: None,
             excluded: None,
+            cols: None,
         }
     }
 
@@ -69,8 +73,58 @@ impl<'a> EvalCtx<'a> {
             params,
             group: None,
             excluded: None,
+            cols: None,
         }
     }
+
+    /// A per-row context over a multi-source column namespace (relational path).
+    fn rel(row: &'a [Value], cols: &'a [RelCol], params: &'a [Value]) -> Self {
+        EvalCtx {
+            row: Some(row),
+            schema: None,
+            params,
+            group: None,
+            excluded: None,
+            cols: Some(cols),
+        }
+    }
+}
+
+/// A column in a relational (multi-source) namespace: its originating source
+/// (table name or alias), column name, and declared type.
+#[derive(Clone)]
+pub(crate) struct RelCol {
+    table: Option<String>,
+    name: String,
+    ty: ColumnType,
+}
+
+/// Resolve a (optionally qualified) column reference against a namespace.
+fn resolve_col(cols: &[RelCol], table: Option<&str>, name: &str) -> Result<usize> {
+    let mut found = None;
+    for (i, c) in cols.iter().enumerate() {
+        let name_ok = c.name.eq_ignore_ascii_case(name);
+        let table_ok = match table {
+            None => true,
+            Some(t) => c
+                .table
+                .as_deref()
+                .is_some_and(|ct| ct.eq_ignore_ascii_case(t)),
+        };
+        if name_ok && table_ok {
+            if found.is_some() {
+                let q = table.map(|t| format!("{t}.")).unwrap_or_default();
+                return Err(EngineError::sql(format!(
+                    "ambiguous column reference: {q}{name}"
+                )));
+            }
+            found = Some(i);
+        }
+    }
+    found.ok_or_else(|| {
+        let q = table.map(|t| format!("{t}.")).unwrap_or_default();
+        EngineError::sql(format!("no such column: {q}{name}"))
+    })
 }
 
 // ---- expression evaluation ------------------------------------------------
@@ -82,23 +136,16 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::Real(r) => Ok(Value::Real(*r)),
         Expr::Str(s) => Ok(Value::Text(s.clone())),
         Expr::Vector(v) => Ok(Value::Vector(v.clone())),
+        Expr::Lit(v) => Ok(v.clone()),
         Expr::Param(idx) => ctx
             .params
             .get(idx - 1)
             .cloned()
             .ok_or_else(|| EngineError::misuse(format!("missing bound parameter ?{idx}"))),
-        Expr::Column(name) => {
-            let schema = ctx.schema.ok_or_else(|| {
-                EngineError::sql(format!("column {name} referenced with no table"))
-            })?;
-            let row = ctx
-                .row
-                .ok_or_else(|| EngineError::sql(format!("column {name} referenced with no row")))?;
-            let idx = schema
-                .column_index(name)
-                .ok_or_else(|| EngineError::sql(format!("no such column: {name}")))?;
-            Ok(row[idx].clone())
-        }
+        Expr::Column(name) => resolve_value(ctx, None, name),
+        // A qualified `table.col`. In the relational path the qualifier selects
+        // the source; the single-table path ignores it (resolves by name).
+        Expr::Qualified(table, name) => resolve_value(ctx, Some(table), name),
         Expr::Unary { op, e } => {
             let v = eval(e, ctx)?;
             match op {
@@ -179,16 +226,59 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let vals: Vec<Value> = args.iter().map(|a| eval(a, ctx)).collect::<Result<_>>()?;
             call_func(name, vals)
         }
-        Expr::Aggregate { func, arg } => {
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+            sep,
+        } => {
             let group = ctx.group.ok_or_else(|| {
                 EngineError::sql("aggregate function not allowed in this context")
             })?;
-            let schema = ctx
-                .schema
-                .ok_or_else(|| EngineError::sql("aggregate requires a table"))?;
-            compute_aggregate(*func, arg, schema, group, ctx.params)
+            let sep = match sep {
+                Some(e) => eval(e, ctx)?.render(),
+                None => None,
+            };
+            // Fold each group row in the same scope (schema or namespace) as ctx.
+            let eval_row = |e: &Expr, r: &[Value]| {
+                let rc = EvalCtx {
+                    row: Some(r),
+                    schema: ctx.schema,
+                    params: ctx.params,
+                    group: None,
+                    excluded: None,
+                    cols: ctx.cols,
+                };
+                eval(e, &rc)
+            };
+            compute_aggregate(*func, arg, *distinct, sep.as_deref(), group, &eval_row)
         }
+        // Subqueries are pre-resolved (replaced with literals) before evaluation
+        // in the relational path; reaching here means a subquery in a context
+        // that does not support it (e.g. a DML predicate).
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => Err(
+            EngineError::sql("subqueries are only supported in SELECT statements"),
+        ),
     }
+}
+
+/// Resolve a (optionally qualified) column reference to its value, in either the
+/// relational namespace (`cols`) or the single-table (`schema`) scope.
+fn resolve_value(ctx: &EvalCtx, table: Option<&str>, name: &str) -> Result<Value> {
+    let row = ctx
+        .row
+        .ok_or_else(|| EngineError::sql(format!("column {name} referenced with no row")))?;
+    if let Some(cols) = ctx.cols {
+        let idx = resolve_col(cols, table, name)?;
+        return Ok(row[idx].clone());
+    }
+    let schema = ctx
+        .schema
+        .ok_or_else(|| EngineError::sql(format!("column {name} referenced with no table")))?;
+    let idx = schema
+        .column_index(name)
+        .ok_or_else(|| EngineError::sql(format!("no such column: {name}")))?;
+    Ok(row[idx].clone())
 }
 
 /// Coerce a value to a `::type` cast target. NULL casts to NULL; unmodelled
@@ -560,10 +650,54 @@ pub fn run_select(
     writer: Option<u64>,
     params: &[Value],
 ) -> Result<ResultSet> {
-    let Some(table_name) = &sel.from else {
-        return constant_select(sel, params);
-    };
+    // The single-source fast path (and its KNN optimization) handles the common
+    // shape directly; multi-source / set-op / DISTINCT / CTE / subquery queries
+    // route to the relational executor.
+    match &sel.from {
+        Some(FromClause::Table { name, .. }) if !needs_relational(sel) => {
+            single_table_select(store, sel, name, snapshot, writer, params)
+        }
+        None if !needs_relational(sel) => constant_select(sel, params),
+        _ => relational::run_query(store, sel, snapshot, writer, params),
+    }
+}
 
+/// Whether a query needs the relational (multi-source) executor rather than the
+/// single-table fast path: a `WITH`/`DISTINCT`/set-op, a join or derived table,
+/// or any subquery expression (which must be pre-resolved).
+fn needs_relational(sel: &SelectStmt) -> bool {
+    !sel.with.is_empty()
+        || sel.distinct
+        || !sel.set_ops.is_empty()
+        || matches!(
+            sel.from,
+            Some(FromClause::Join { .. }) | Some(FromClause::Derived { .. })
+        )
+        || select_has_subquery(sel)
+}
+
+/// Whether any clause of `sel` contains a subquery expression.
+fn select_has_subquery(sel: &SelectStmt) -> bool {
+    let item_has = sel.items.iter().any(|i| match i {
+        SelItem::Expr { expr, .. } => expr_has_subquery(expr),
+        SelItem::Star { .. } => false,
+    });
+    item_has
+        || sel.filter.as_ref().is_some_and(expr_has_subquery)
+        || sel.group_by.iter().any(expr_has_subquery)
+        || sel.having.as_ref().is_some_and(expr_has_subquery)
+        || sel.order_by.iter().any(|k| expr_has_subquery(&k.expr))
+}
+
+/// The single-table fast path (preserves the original scan / KNN / group logic).
+fn single_table_select(
+    store: &Store,
+    sel: &SelectStmt,
+    table_name: &str,
+    snapshot: u64,
+    writer: Option<u64>,
+    params: &[Value],
+) -> Result<ResultSet> {
     let table = store
         .table(table_name)
         .ok_or_else(|| EngineError::sql(format!("no such table: {table_name}")))?;
@@ -599,6 +733,56 @@ pub fn run_select(
     project(sel, schema, &matched, params)
 }
 
+/// Whether an expression tree contains a subquery node anywhere.
+fn expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::Cast { e, .. } | Expr::Unary { e, .. } | Expr::IsNull { e, .. } => {
+            expr_has_subquery(e)
+        }
+        Expr::Binary { l, r, .. } => expr_has_subquery(l) || expr_has_subquery(r),
+        Expr::Like {
+            e, pattern, escape, ..
+        } => {
+            expr_has_subquery(e)
+                || expr_has_subquery(pattern)
+                || escape.as_deref().is_some_and(expr_has_subquery)
+        }
+        Expr::InList { e, list, .. } => expr_has_subquery(e) || list.iter().any(expr_has_subquery),
+        Expr::Between { e, lo, hi, .. } => {
+            expr_has_subquery(e) || expr_has_subquery(lo) || expr_has_subquery(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().is_some_and(expr_has_subquery)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
+                || els.as_deref().is_some_and(expr_has_subquery)
+        }
+        Expr::Func { args, .. } => args.iter().any(expr_has_subquery),
+        Expr::Aggregate { arg, sep, .. } => {
+            matches!(arg, AggArg::Expr(e) if expr_has_subquery(e))
+                || sep.as_deref().is_some_and(expr_has_subquery)
+        }
+        _ => false,
+    }
+}
+
+/// Best-effort column type of a pre-computed literal value.
+fn lit_type(v: &Value) -> ColumnType {
+    match v {
+        Value::Int(_) => ColumnType::Integer,
+        Value::Real(_) => ColumnType::Real,
+        Value::Blob(_) => ColumnType::Blob,
+        Value::Vector(x) => ColumnType::Vector(x.len() as u32),
+        _ => ColumnType::Text,
+    }
+}
+
 /// A query is aggregated if it has a `GROUP BY` / `HAVING`, or any projected
 /// expression folds an aggregate.
 fn is_aggregated(sel: &SelectStmt) -> bool {
@@ -607,7 +791,7 @@ fn is_aggregated(sel: &SelectStmt) -> bool {
     }
     sel.items.iter().any(|i| match i {
         SelItem::Expr { expr, .. } => expr_has_aggregate(expr),
-        SelItem::Star => false,
+        SelItem::Star { .. } => false,
     })
 }
 
@@ -808,7 +992,7 @@ fn project(
     let mut plan: Vec<ProjItem> = Vec::new();
     for item in &sel.items {
         match item {
-            SelItem::Star => {
+            SelItem::Star { .. } => {
                 for c in &schema.columns {
                     columns.push(c.name.clone());
                     types.push(c.ty);
@@ -950,6 +1134,7 @@ fn expr_type(expr: &Expr, schema: Option<&TableSchema>) -> ColumnType {
         Expr::Real(_) => ColumnType::Real,
         Expr::Str(_) => ColumnType::Text,
         Expr::Vector(v) => ColumnType::Vector(v.len() as u32),
+        Expr::Lit(v) => lit_type(v),
         // A distance operator yields a REAL distance.
         Expr::Binary { op, .. } if op.vec_metric().is_some() => ColumnType::Real,
         Expr::Column(name) => schema
@@ -960,11 +1145,14 @@ fn expr_type(expr: &Expr, schema: Option<&TableSchema>) -> ColumnType {
             CastTarget::Passthrough => expr_type(e, schema),
             other => cast_column_type(*other),
         },
-        Expr::Aggregate { func, arg } => match schema {
+        Expr::Aggregate { func, arg, .. } => match schema {
             Some(s) => agg_type(*func, arg, s),
             None => ColumnType::Text,
         },
         Expr::Func { name, .. } => func_type(name),
+        Expr::Qualified(_, name) => schema
+            .and_then(|s| s.column_index(name).map(|i| s.columns[i].ty))
+            .unwrap_or(ColumnType::Text),
         _ => ColumnType::Text,
     }
 }
@@ -994,7 +1182,7 @@ fn agg_type(func: AggFunc, arg: &AggArg, schema: &TableSchema) -> ColumnType {
     match func {
         AggFunc::Count => ColumnType::Integer,
         AggFunc::Avg => ColumnType::Real,
-        AggFunc::JsonAgg => ColumnType::Text, // JSON text
+        AggFunc::JsonAgg | AggFunc::GroupConcat => ColumnType::Text,
         AggFunc::Sum => match arg {
             AggArg::Expr(e) if matches!(expr_type(e, Some(schema)), ColumnType::Real) => {
                 ColumnType::Real
@@ -1011,7 +1199,9 @@ fn agg_type(func: AggFunc, arg: &AggArg, schema: &TableSchema) -> ColumnType {
 fn constant_select(sel: &SelectStmt, params: &[Value]) -> Result<ResultSet> {
     for item in &sel.items {
         match item {
-            SelItem::Star => return Err(EngineError::sql("SELECT * requires a FROM clause")),
+            SelItem::Star { .. } => {
+                return Err(EngineError::sql("SELECT * requires a FROM clause"))
+            }
             SelItem::Expr { expr, .. } if expr_has_aggregate(expr) => {
                 return Err(EngineError::sql("aggregate requires a FROM clause"))
             }
@@ -1073,7 +1263,7 @@ fn grouped_select(
     let mut types = Vec::new();
     for item in &sel.items {
         match item {
-            SelItem::Star => {
+            SelItem::Star { .. } => {
                 for c in &schema.columns {
                     columns.push(c.name.clone());
                     types.push(c.ty);
@@ -1097,6 +1287,7 @@ fn grouped_select(
             params,
             group: Some(&rows),
             excluded: None,
+            cols: None,
         };
         // HAVING filters whole groups.
         if let Some(h) = &sel.having {
@@ -1107,7 +1298,7 @@ fn grouped_select(
         let mut out = Vec::new();
         for item in &sel.items {
             match item {
-                SelItem::Star => {
+                SelItem::Star { .. } => {
                     let r = repr.ok_or_else(|| EngineError::sql("SELECT * over an empty group"))?;
                     out.extend(r.iter().cloned());
                 }
@@ -1179,6 +1370,7 @@ fn order_groups(
                 params,
                 group: Some(&a.1),
                 excluded: None,
+                cols: None,
             };
             let cb = EvalCtx {
                 row: b.1.first().copied(),
@@ -1186,6 +1378,7 @@ fn order_groups(
                 params,
                 group: Some(&b.1),
                 excluded: None,
+                cols: None,
             };
             let (va, vb) = match (eval(&key.expr, &ca), eval(&key.expr, &cb)) {
                 (Ok(x), Ok(y)) => (x, y),
@@ -1209,12 +1402,15 @@ fn order_groups(
 
 /// Fold an aggregate over the rows of a group (the group is empty only for a
 /// bare aggregate over an empty input, which yields the SQL identity element).
+/// `eval_row` evaluates the argument against one group row in the caller's scope
+/// (single-table `schema` or relational namespace), so this is scope-agnostic.
 fn compute_aggregate(
     func: AggFunc,
     arg: &AggArg,
-    schema: &TableSchema,
+    distinct: bool,
+    sep: Option<&str>,
     rows: &[&[Value]],
-    params: &[Value],
+    eval_row: &dyn Fn(&Expr, &[Value]) -> Result<Value>,
 ) -> Result<Value> {
     if let (AggFunc::Count, AggArg::Star) = (func, arg) {
         return Ok(Value::Int(rows.len() as i64));
@@ -1231,22 +1427,37 @@ fn compute_aggregate(
         }
         let mut parts = Vec::with_capacity(rows.len());
         for r in rows {
-            let ctx = EvalCtx::row(r, schema, params);
-            parts.push(value_to_json(&eval(expr, &ctx)?));
+            parts.push(value_to_json(&eval_row(expr, r)?));
         }
         return Ok(Value::Text(format!("[{}]", parts.join(","))));
     }
 
     let mut vals: Vec<Value> = Vec::new();
     for r in rows {
-        let ctx = EvalCtx::row(r, schema, params);
-        let v = eval(expr, &ctx)?;
+        let v = eval_row(expr, r)?;
         if !v.is_null() {
             vals.push(v);
         }
     }
+    // DISTINCT folds over the unique non-NULL values (e.g. COUNT(DISTINCT x)).
+    if distinct {
+        let mut seen: HashSet<String> = HashSet::new();
+        vals.retain(|v| seen.insert(value_key(v)));
+    }
+    if matches!(func, AggFunc::GroupConcat) {
+        if vals.is_empty() {
+            return Ok(Value::Null);
+        }
+        let sep = sep.unwrap_or(",");
+        let joined = vals
+            .iter()
+            .map(|v| v.render().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(sep);
+        return Ok(Value::Text(joined));
+    }
     Ok(match func {
-        AggFunc::JsonAgg => unreachable!("handled above"),
+        AggFunc::JsonAgg | AggFunc::GroupConcat => unreachable!("handled above"),
         AggFunc::Count => Value::Int(vals.len() as i64),
         AggFunc::Min => vals
             .into_iter()
@@ -1305,6 +1516,7 @@ fn agg_name(f: AggFunc) -> String {
         AggFunc::Max => "max",
         AggFunc::Avg => "avg",
         AggFunc::JsonAgg => "json_agg",
+        AggFunc::GroupConcat => "group_concat",
     }
     .to_string()
 }
@@ -1318,6 +1530,7 @@ fn column_name(expr: &Expr, alias: &Option<String>, idx: usize) -> String {
     }
     match expr {
         Expr::Column(c) => c.clone(),
+        Expr::Qualified(_, c) => c.clone(),
         Expr::Aggregate { func, .. } => agg_name(*func),
         Expr::Func { name, .. } => name.to_ascii_lowercase(),
         Expr::Cast { e, .. } => column_name(e, &None, idx),
@@ -1936,7 +2149,7 @@ fn project_returning(
     let mut plan: Vec<ProjItem> = Vec::new();
     for item in items {
         match item {
-            SelItem::Star => {
+            SelItem::Star { .. } => {
                 for c in &schema.columns {
                     columns.push(c.name.clone());
                     types.push(c.ty);
@@ -2187,6 +2400,7 @@ pub fn run_insert(
                             params,
                             group: None,
                             excluded: Some(&vals),
+                            cols: None,
                         };
                         if let Some(f) = filter {
                             if !eval(f, &ctx)?.as_bool().unwrap_or(false) {
@@ -2474,5 +2688,934 @@ fn value_key(v: &Value) -> String {
         Value::Text(s) => format!("t{s}"),
         Value::Blob(b) => format!("b{}", crate::value::base64_encode(b)),
         Value::Vector(_) => format!("v{}", crate::value::format_vector(v.as_vector().unwrap())),
+    }
+}
+
+/// The relational (multi-source) executor: joins, derived tables, CTEs, set
+/// operations, `DISTINCT`, and non-correlated subqueries. It materializes the
+/// `FROM` into a single [`Relation`] with a column namespace, then runs the same
+/// filter / group / project / order pipeline the single-table path does, but
+/// resolving column references against that namespace (spec 16 §6B). A nested
+/// module so it can reuse the parent's private evaluator helpers directly.
+mod relational {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A materialized intermediate: column metadata + value rows.
+    struct Relation {
+        cols: Vec<RelCol>,
+        rows: Vec<Vec<Value>>,
+    }
+
+    /// Run a full query: materialize CTEs, evaluate the leading core, fold in any
+    /// set-operation arms, then apply the outer `ORDER BY`/`LIMIT`/`OFFSET`.
+    pub(super) fn run_query(
+        store: &Store,
+        sel: &SelectStmt,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<ResultSet> {
+        let mut ctes: HashMap<String, Relation> = HashMap::new();
+        for cte in &sel.with {
+            let rs = run_query(store, &cte.query, snapshot, writer, params)?;
+            ctes.insert(
+                cte.name.to_ascii_lowercase(),
+                relation_from_result(&cte.name, rs),
+            );
+        }
+
+        if sel.set_ops.is_empty() {
+            return eval_core(store, sel, snapshot, writer, params, &ctes, true);
+        }
+
+        // Set-op chain: each core without its tail, combined, then ordered/limited.
+        let mut acc = eval_core(store, sel, snapshot, writer, params, &ctes, false)?;
+        for part in &sel.set_ops {
+            let rhs = eval_core(store, &part.query, snapshot, writer, params, &ctes, true)?;
+            acc = combine_set_op(acc, rhs, part.op, part.all)?;
+        }
+        apply_output_order_limit(&mut acc, sel, params)?;
+        Ok(acc)
+    }
+
+    fn relation_from_result(alias: &str, rs: ResultSet) -> Relation {
+        let cols = rs
+            .columns
+            .iter()
+            .zip(&rs.types)
+            .map(|(n, t)| RelCol {
+                table: Some(alias.to_string()),
+                name: n.clone(),
+                ty: *t,
+            })
+            .collect();
+        Relation {
+            cols,
+            rows: rs.rows,
+        }
+    }
+
+    /// Evaluate one select core (from/where/group/having/projection/distinct).
+    /// `apply_tail` controls whether this core's own ORDER BY/LIMIT/OFFSET apply
+    /// (false for the leading arm of a set-op chain — the outer clause wins).
+    fn eval_core(
+        store: &Store,
+        sel: &SelectStmt,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+        ctes: &HashMap<String, Relation>,
+        apply_tail: bool,
+    ) -> Result<ResultSet> {
+        let rel = build_from(store, sel.from.as_ref(), snapshot, writer, params, ctes)?;
+        let cols = &rel.cols;
+
+        // Fold non-correlated subqueries to literals before evaluating.
+        let filter = resolve_opt(&sel.filter, store, snapshot, writer, params)?;
+        let items = resolve_items(&sel.items, store, snapshot, writer, params)?;
+        let group_by = resolve_list(&sel.group_by, store, snapshot, writer, params)?;
+        let having = resolve_opt(&sel.having, store, snapshot, writer, params)?;
+
+        // WHERE.
+        let mut kept: Vec<usize> = Vec::new();
+        for (i, row) in rel.rows.iter().enumerate() {
+            let ctx = EvalCtx::rel(row, cols, params);
+            if predicate(&filter, &ctx)? {
+                kept.push(i);
+            }
+        }
+
+        // Output columns + types.
+        let (columns, types) = output_columns(&items, cols);
+
+        // Build (output row, group member indices) entries.
+        let aggregated = agg_query(&items, &group_by, &having);
+        let entries = if aggregated {
+            grouped_entries(&items, &group_by, &having, cols, &rel.rows, &kept, params)?
+        } else {
+            let mut e = Vec::with_capacity(kept.len());
+            for &i in &kept {
+                let ctx = EvalCtx::rel(&rel.rows[i], cols, params);
+                let mut out = Vec::new();
+                for item in &items {
+                    project_item(item, &ctx, cols, &rel.rows[i], &mut out)?;
+                }
+                e.push((out, vec![i]));
+            }
+            e
+        };
+
+        // ORDER BY (apply_tail) over the group-aware context, then DISTINCT, then
+        // OFFSET/LIMIT.
+        let order_keys = if apply_tail {
+            sel.order_by
+                .iter()
+                .map(|k| OrderKey {
+                    expr: resolve_alias_rel(&items, &k.expr),
+                    asc: k.asc,
+                    nulls_first: k.nulls_first,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut rows = order_and_collect(entries, &order_keys, cols, &rel.rows, params)?;
+
+        if sel.distinct {
+            dedup_rows(&mut rows);
+        }
+        if apply_tail {
+            let off = eval_count(&sel.offset, params)?;
+            let lim = eval_count(&sel.limit, params)?;
+            apply_offset_limit_owned(&mut rows, lim, off);
+        }
+        Ok(ResultSet {
+            columns,
+            types,
+            rows,
+        })
+    }
+
+    /// Materialize a `FROM` clause into a single relation.
+    fn build_from(
+        store: &Store,
+        from: Option<&FromClause>,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+        ctes: &HashMap<String, Relation>,
+    ) -> Result<Relation> {
+        match from {
+            // No FROM → a single empty row, so constant projections still produce
+            // one output row.
+            None => Ok(Relation {
+                cols: Vec::new(),
+                rows: vec![Vec::new()],
+            }),
+            Some(FromClause::Table { name, alias }) => {
+                let src = alias.clone().unwrap_or_else(|| name.clone());
+                if let Some(cte) = ctes.get(&name.to_ascii_lowercase()) {
+                    let cols = retag(&cte.cols, &src);
+                    return Ok(Relation {
+                        cols,
+                        rows: cte.rows.clone(),
+                    });
+                }
+                let table = store
+                    .table(name)
+                    .ok_or_else(|| EngineError::sql(format!("no such table: {name}")))?;
+                let cols = table
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|c| RelCol {
+                        table: Some(src.clone()),
+                        name: c.name.clone(),
+                        ty: c.ty,
+                    })
+                    .collect();
+                let rows = table
+                    .rows
+                    .iter()
+                    .filter(|v| row_visible(v, snapshot, writer))
+                    .map(|v| v.values.clone())
+                    .collect();
+                Ok(Relation { cols, rows })
+            }
+            Some(FromClause::Derived { query, alias }) => {
+                let rs = run_query(store, query, snapshot, writer, params)?;
+                Ok(relation_from_result(alias, rs))
+            }
+            Some(FromClause::Join {
+                left,
+                right,
+                kind,
+                on,
+                using,
+            }) => {
+                let l = build_from(store, Some(left), snapshot, writer, params, ctes)?;
+                let r = build_from(store, Some(right), snapshot, writer, params, ctes)?;
+                join(l, r, *kind, on.as_deref(), using, params)
+            }
+        }
+    }
+
+    fn retag(cols: &[RelCol], src: &str) -> Vec<RelCol> {
+        cols.iter()
+            .map(|c| RelCol {
+                table: Some(src.to_string()),
+                name: c.name.clone(),
+                ty: c.ty,
+            })
+            .collect()
+    }
+
+    /// Nested-loop join of two relations.
+    fn join(
+        l: Relation,
+        r: Relation,
+        kind: JoinKind,
+        on: Option<&Expr>,
+        using: &[String],
+        params: &[Value],
+    ) -> Result<Relation> {
+        let mut cols = l.cols.clone();
+        cols.extend(r.cols.clone());
+        let lw = l.cols.len();
+        let rw = r.cols.len();
+        let pairs: Vec<(usize, usize)> = using
+            .iter()
+            .map(|u| {
+                Ok((
+                    resolve_col(&l.cols, None, u)?,
+                    lw + resolve_col(&r.cols, None, u)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        let null_l = vec![Value::Null; lw];
+        let null_r = vec![Value::Null; rw];
+        let mut out: Vec<Vec<Value>> = Vec::new();
+
+        match kind {
+            JoinKind::Inner | JoinKind::Cross => {
+                for lr in &l.rows {
+                    for rr in &r.rows {
+                        let c = concat(lr, rr);
+                        if row_matches(&c, &cols, on, &pairs, params)? {
+                            out.push(c);
+                        }
+                    }
+                }
+            }
+            JoinKind::Left => {
+                for lr in &l.rows {
+                    let mut any = false;
+                    for rr in &r.rows {
+                        let c = concat(lr, rr);
+                        if row_matches(&c, &cols, on, &pairs, params)? {
+                            out.push(c);
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        out.push(concat(lr, &null_r));
+                    }
+                }
+            }
+            JoinKind::Right => {
+                for rr in &r.rows {
+                    let mut any = false;
+                    for lr in &l.rows {
+                        let c = concat(lr, rr);
+                        if row_matches(&c, &cols, on, &pairs, params)? {
+                            out.push(c);
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        out.push(concat(&null_l, rr));
+                    }
+                }
+            }
+            JoinKind::Full => {
+                let mut r_hit = vec![false; r.rows.len()];
+                for lr in &l.rows {
+                    let mut any = false;
+                    for (j, rr) in r.rows.iter().enumerate() {
+                        let c = concat(lr, rr);
+                        if row_matches(&c, &cols, on, &pairs, params)? {
+                            out.push(c);
+                            any = true;
+                            r_hit[j] = true;
+                        }
+                    }
+                    if !any {
+                        out.push(concat(lr, &null_r));
+                    }
+                }
+                for (j, rr) in r.rows.iter().enumerate() {
+                    if !r_hit[j] {
+                        out.push(concat(&null_l, rr));
+                    }
+                }
+            }
+        }
+        Ok(Relation { cols, rows: out })
+    }
+
+    fn concat(a: &[Value], b: &[Value]) -> Vec<Value> {
+        let mut c = Vec::with_capacity(a.len() + b.len());
+        c.extend_from_slice(a);
+        c.extend_from_slice(b);
+        c
+    }
+
+    /// Whether a combined row satisfies the join condition (USING equalities and
+    /// any ON predicate).
+    fn row_matches(
+        combined: &[Value],
+        cols: &[RelCol],
+        on: Option<&Expr>,
+        pairs: &[(usize, usize)],
+        params: &[Value],
+    ) -> Result<bool> {
+        for &(li, ri) in pairs {
+            if combined[li].sql_eq(&combined[ri]) != Some(true) {
+                return Ok(false);
+            }
+        }
+        match on {
+            Some(e) => {
+                let ctx = EvalCtx::rel(combined, cols, params);
+                Ok(eval(e, &ctx)?.as_bool().unwrap_or(false))
+            }
+            None => Ok(true),
+        }
+    }
+
+    /// Output column names + best-effort types from the select list.
+    fn output_columns(items: &[SelItem], cols: &[RelCol]) -> (Vec<String>, Vec<ColumnType>) {
+        let mut columns = Vec::new();
+        let mut types = Vec::new();
+        for item in items {
+            match item {
+                SelItem::Star { qualifier } => {
+                    for c in cols {
+                        if star_includes(qualifier, c) {
+                            columns.push(c.name.clone());
+                            types.push(c.ty);
+                        }
+                    }
+                }
+                SelItem::Expr { expr, alias } => {
+                    columns.push(column_name(expr, alias, columns.len()));
+                    types.push(expr_type_rel(expr, cols));
+                }
+            }
+        }
+        (columns, types)
+    }
+
+    fn star_includes(qualifier: &Option<String>, c: &RelCol) -> bool {
+        match qualifier {
+            None => true,
+            Some(q) => c
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(q)),
+        }
+    }
+
+    /// Project one select item into `out` for a single (non-grouped) row.
+    fn project_item(
+        item: &SelItem,
+        ctx: &EvalCtx,
+        cols: &[RelCol],
+        row: &[Value],
+        out: &mut Vec<Value>,
+    ) -> Result<()> {
+        match item {
+            SelItem::Star { qualifier } => {
+                for (i, c) in cols.iter().enumerate() {
+                    if star_includes(qualifier, c) {
+                        out.push(row[i].clone());
+                    }
+                }
+            }
+            SelItem::Expr { expr, .. } => out.push(eval(expr, ctx)?),
+        }
+        Ok(())
+    }
+
+    /// Group the kept rows and produce (output row, member indices) per surviving
+    /// group (after `HAVING`).
+    fn grouped_entries(
+        items: &[SelItem],
+        group_by: &[Expr],
+        having: &Option<Expr>,
+        cols: &[RelCol],
+        rows: &[Vec<Value>],
+        kept: &[usize],
+        params: &[Value],
+    ) -> Result<Vec<(Vec<Value>, Vec<usize>)>> {
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for &i in kept {
+            let ctx = EvalCtx::rel(&rows[i], cols, params);
+            let mut key = String::new();
+            for e in group_by {
+                key.push_str(&value_key(&eval(e, &ctx)?));
+                key.push('\u{1}');
+            }
+            groups.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                Vec::new()
+            });
+            groups.get_mut(&key).unwrap().push(i);
+        }
+        // With no GROUP BY, an empty input still yields one all-rows group.
+        if group_by.is_empty() && order.is_empty() {
+            order.push(String::new());
+            groups.insert(String::new(), Vec::new());
+        }
+
+        let mut entries = Vec::new();
+        for key in &order {
+            let members = groups.remove(key).unwrap();
+            let view: Vec<&[Value]> = members.iter().map(|&i| rows[i].as_slice()).collect();
+            let ctx = EvalCtx {
+                row: view.first().copied(),
+                schema: None,
+                params,
+                group: Some(&view),
+                excluded: None,
+                cols: Some(cols),
+            };
+            if let Some(h) = having {
+                if !eval(h, &ctx)?.as_bool().unwrap_or(false) {
+                    continue;
+                }
+            }
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    SelItem::Star { qualifier } => {
+                        let r = ctx
+                            .row
+                            .ok_or_else(|| EngineError::sql("SELECT * over an empty group"))?;
+                        for (i, c) in cols.iter().enumerate() {
+                            if star_includes(qualifier, c) {
+                                out.push(r[i].clone());
+                            }
+                        }
+                    }
+                    SelItem::Expr { expr, .. } => out.push(eval(expr, &ctx)?),
+                }
+            }
+            entries.push((out, members));
+        }
+        Ok(entries)
+    }
+
+    /// Sort entries by the order keys (evaluated in each entry's group-aware
+    /// context) and return just the output rows.
+    fn order_and_collect(
+        mut entries: Vec<(Vec<Value>, Vec<usize>)>,
+        keys: &[OrderKey],
+        cols: &[RelCol],
+        rows: &[Vec<Value>],
+        params: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        if !keys.is_empty() {
+            let mut err: Option<EngineError> = None;
+            entries.sort_by(|a, b| {
+                if err.is_some() {
+                    return Ordering::Equal;
+                }
+                for key in keys {
+                    let va = eval_in_group(&key.expr, &a.1, cols, rows, params);
+                    let vb = eval_in_group(&key.expr, &b.1, cols, rows, params);
+                    let (va, vb) = match (va, vb) {
+                        (Ok(x), Ok(y)) => (x, y),
+                        (Err(e), _) | (_, Err(e)) => {
+                            err = Some(e);
+                            return Ordering::Equal;
+                        }
+                    };
+                    let ord = order_cmp(&va, &vb, key.asc, key.nulls_first);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+        }
+        Ok(entries.into_iter().map(|(o, _)| o).collect())
+    }
+
+    fn eval_in_group(
+        expr: &Expr,
+        members: &[usize],
+        cols: &[RelCol],
+        rows: &[Vec<Value>],
+        params: &[Value],
+    ) -> Result<Value> {
+        let view: Vec<&[Value]> = members.iter().map(|&i| rows[i].as_slice()).collect();
+        let ctx = EvalCtx {
+            row: view.first().copied(),
+            schema: None,
+            params,
+            group: Some(&view),
+            excluded: None,
+            cols: Some(cols),
+        };
+        eval(expr, &ctx)
+    }
+
+    /// Resolve an ORDER BY key that names an output alias to that item's expr.
+    fn resolve_alias_rel(items: &[SelItem], expr: &Expr) -> Expr {
+        let name = match expr {
+            Expr::Column(n) => Some(n.as_str()),
+            _ => None,
+        };
+        if let Some(name) = name {
+            for item in items {
+                if let SelItem::Expr {
+                    expr: e,
+                    alias: Some(a),
+                } = item
+                {
+                    if a.eq_ignore_ascii_case(name) {
+                        return e.clone();
+                    }
+                }
+            }
+        }
+        expr.clone()
+    }
+
+    fn agg_query(items: &[SelItem], group_by: &[Expr], having: &Option<Expr>) -> bool {
+        !group_by.is_empty()
+            || having.is_some()
+            || items
+                .iter()
+                .any(|i| matches!(i, SelItem::Expr { expr, .. } if expr_has_aggregate(expr)))
+    }
+
+    /// Best-effort projected-expression type against the relation namespace.
+    fn expr_type_rel(expr: &Expr, cols: &[RelCol]) -> ColumnType {
+        match expr {
+            Expr::Column(n) => rel_type(cols, None, n).unwrap_or(ColumnType::Text),
+            Expr::Qualified(t, n) => rel_type(cols, Some(t), n).unwrap_or(ColumnType::Text),
+            Expr::Cast { e, target } => match target {
+                CastTarget::Passthrough => expr_type_rel(e, cols),
+                other => cast_column_type(*other),
+            },
+            Expr::Aggregate { func, arg, .. } => match func {
+                AggFunc::Count => ColumnType::Integer,
+                AggFunc::Avg => ColumnType::Real,
+                AggFunc::JsonAgg | AggFunc::GroupConcat => ColumnType::Text,
+                AggFunc::Sum | AggFunc::Min | AggFunc::Max => match arg {
+                    AggArg::Expr(e) => expr_type_rel(e, cols),
+                    AggArg::Star => ColumnType::Integer,
+                },
+            },
+            other => expr_type(other, None),
+        }
+    }
+
+    fn rel_type(cols: &[RelCol], table: Option<&str>, name: &str) -> Option<ColumnType> {
+        resolve_col(cols, table, name).ok().map(|i| cols[i].ty)
+    }
+
+    fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        rows.retain(|r| seen.insert(row_key(r)));
+    }
+
+    fn row_key(row: &[Value]) -> String {
+        let mut k = String::new();
+        for v in row {
+            k.push_str(&value_key(v));
+            k.push('\u{1}');
+        }
+        k
+    }
+
+    fn apply_offset_limit_owned(
+        rows: &mut Vec<Vec<Value>>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) {
+        if let Some(off) = offset {
+            let off = (off.max(0) as usize).min(rows.len());
+            rows.drain(..off);
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit.max(0) as usize);
+        }
+    }
+
+    // ---- set operations ----------------------------------------------------
+
+    fn combine_set_op(lhs: ResultSet, rhs: ResultSet, op: SetOp, all: bool) -> Result<ResultSet> {
+        if lhs.columns.len() != rhs.columns.len() {
+            return Err(EngineError::sql(
+                "each set-operation query must return the same number of columns",
+            ));
+        }
+        let columns = lhs.columns;
+        let types = lhs.types;
+        let l = lhs.rows;
+        let r = rhs.rows;
+        let rows = match op {
+            SetOp::Union => {
+                let mut out = l;
+                out.extend(r);
+                if !all {
+                    dedup_rows(&mut out);
+                }
+                out
+            }
+            SetOp::Intersect => {
+                let mut out = Vec::new();
+                if all {
+                    let mut counts: HashMap<String, usize> = HashMap::new();
+                    for row in &r {
+                        *counts.entry(row_key(row)).or_default() += 1;
+                    }
+                    for row in l {
+                        let k = row_key(&row);
+                        if let Some(c) = counts.get_mut(&k) {
+                            if *c > 0 {
+                                *c -= 1;
+                                out.push(row);
+                            }
+                        }
+                    }
+                } else {
+                    let rset: std::collections::HashSet<String> =
+                        r.iter().map(|x| row_key(x)).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    for row in l {
+                        let k = row_key(&row);
+                        if rset.contains(&k) && seen.insert(k) {
+                            out.push(row);
+                        }
+                    }
+                }
+                out
+            }
+            SetOp::Except => {
+                let mut out = Vec::new();
+                if all {
+                    let mut counts: HashMap<String, usize> = HashMap::new();
+                    for row in &r {
+                        *counts.entry(row_key(row)).or_default() += 1;
+                    }
+                    for row in l {
+                        let k = row_key(&row);
+                        match counts.get_mut(&k) {
+                            Some(c) if *c > 0 => *c -= 1,
+                            _ => out.push(row),
+                        }
+                    }
+                } else {
+                    let rset: std::collections::HashSet<String> =
+                        r.iter().map(|x| row_key(x)).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    for row in l {
+                        let k = row_key(&row);
+                        if !rset.contains(&k) && seen.insert(k) {
+                            out.push(row);
+                        }
+                    }
+                }
+                out
+            }
+        };
+        Ok(ResultSet {
+            columns,
+            types,
+            rows,
+        })
+    }
+
+    /// Apply the outer ORDER BY / LIMIT / OFFSET to a set-operation result. Order
+    /// keys must reference an output column (by name or 1-based ordinal).
+    fn apply_output_order_limit(
+        rs: &mut ResultSet,
+        sel: &SelectStmt,
+        params: &[Value],
+    ) -> Result<()> {
+        if !sel.order_by.is_empty() {
+            let mut keys: Vec<(usize, bool, bool)> = Vec::new();
+            for k in &sel.order_by {
+                let idx = match &k.expr {
+                    Expr::Int(n) => (*n as usize)
+                        .checked_sub(1)
+                        .filter(|i| *i < rs.columns.len())
+                        .ok_or_else(|| EngineError::sql("ORDER BY position out of range"))?,
+                    Expr::Column(name) | Expr::Qualified(_, name) => rs
+                        .columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| {
+                            EngineError::sql(format!("ORDER BY column not in result: {name}"))
+                        })?,
+                    _ => {
+                        return Err(EngineError::sql(
+                            "ORDER BY in a set operation must name an output column",
+                        ))
+                    }
+                };
+                keys.push((idx, k.asc, k.nulls_first));
+            }
+            rs.rows.sort_by(|a, b| {
+                for &(i, asc, nf) in &keys {
+                    let ord = order_cmp(&a[i], &b[i], asc, nf);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+        let off = eval_count(&sel.offset, params)?;
+        let lim = eval_count(&sel.limit, params)?;
+        apply_offset_limit_owned(&mut rs.rows, lim, off);
+        Ok(())
+    }
+
+    // ---- subquery folding (non-correlated) ---------------------------------
+
+    fn resolve_opt(
+        e: &Option<Expr>,
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<Option<Expr>> {
+        match e {
+            Some(e) => Ok(Some(resolve_sub(e, store, snapshot, writer, params)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn resolve_list(
+        list: &[Expr],
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<Vec<Expr>> {
+        list.iter()
+            .map(|e| resolve_sub(e, store, snapshot, writer, params))
+            .collect()
+    }
+
+    fn resolve_items(
+        items: &[SelItem],
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<Vec<SelItem>> {
+        items
+            .iter()
+            .map(|i| match i {
+                SelItem::Star { qualifier } => Ok(SelItem::Star {
+                    qualifier: qualifier.clone(),
+                }),
+                SelItem::Expr { expr, alias } => Ok(SelItem::Expr {
+                    expr: resolve_sub(expr, store, snapshot, writer, params)?,
+                    alias: alias.clone(),
+                }),
+            })
+            .collect()
+    }
+
+    /// Replace non-correlated subquery nodes with pre-computed literals. A
+    /// subquery that references an outer column fails to resolve here and is
+    /// surfaced as an error (correlated subqueries are out of scope). Outer CTEs
+    /// are not visible to expression subqueries — only to `FROM` references.
+    fn resolve_sub(
+        e: &Expr,
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<Expr> {
+        let rec = |x: &Expr| -> Result<Expr> { resolve_sub(x, store, snapshot, writer, params) };
+        let bx = |x: &Expr| -> Result<Box<Expr>> { Ok(Box::new(rec(x)?)) };
+        Ok(match e {
+            Expr::ScalarSubquery(q) => {
+                let rs = run_query(store, q, snapshot, writer, params)?;
+                if rs.columns.len() != 1 {
+                    return Err(EngineError::sql(
+                        "a scalar subquery must return exactly one column",
+                    ));
+                }
+                match rs.rows.len() {
+                    0 => Expr::Lit(Value::Null),
+                    1 => Expr::Lit(rs.rows.into_iter().next().unwrap().pop().unwrap()),
+                    _ => {
+                        return Err(EngineError::sql(
+                            "more than one row returned by a scalar subquery",
+                        ))
+                    }
+                }
+            }
+            Expr::Exists { query, negated } => {
+                let rs = run_query(store, query, snapshot, writer, params)?;
+                let present = !rs.rows.is_empty();
+                Expr::Lit(Value::Int((present ^ negated) as i64))
+            }
+            Expr::InSubquery { e, query, negated } => {
+                let rs = run_query(store, query, snapshot, writer, params)?;
+                if rs.columns.len() != 1 {
+                    return Err(EngineError::sql(
+                        "a subquery used with IN must return exactly one column",
+                    ));
+                }
+                let list = rs
+                    .rows
+                    .into_iter()
+                    .map(|mut r| Expr::Lit(r.pop().unwrap()))
+                    .collect();
+                Expr::InList {
+                    e: bx(e)?,
+                    list,
+                    negated: *negated,
+                }
+            }
+            // Recurse into composite nodes; leaves clone unchanged.
+            Expr::Binary { op, l, r } => Expr::Binary {
+                op: *op,
+                l: bx(l)?,
+                r: bx(r)?,
+            },
+            Expr::Unary { op, e } => Expr::Unary { op: *op, e: bx(e)? },
+            Expr::IsNull { e, negated } => Expr::IsNull {
+                e: bx(e)?,
+                negated: *negated,
+            },
+            Expr::Like {
+                e,
+                pattern,
+                escape,
+                negated,
+                insensitive,
+            } => Expr::Like {
+                e: bx(e)?,
+                pattern: bx(pattern)?,
+                escape: match escape {
+                    Some(x) => Some(bx(x)?),
+                    None => None,
+                },
+                negated: *negated,
+                insensitive: *insensitive,
+            },
+            Expr::InList { e, list, negated } => Expr::InList {
+                e: bx(e)?,
+                list: list.iter().map(&rec).collect::<Result<_>>()?,
+                negated: *negated,
+            },
+            Expr::Between { e, lo, hi, negated } => Expr::Between {
+                e: bx(e)?,
+                lo: bx(lo)?,
+                hi: bx(hi)?,
+                negated: *negated,
+            },
+            Expr::Case {
+                operand,
+                whens,
+                els,
+            } => Expr::Case {
+                operand: match operand {
+                    Some(x) => Some(bx(x)?),
+                    None => None,
+                },
+                whens: whens
+                    .iter()
+                    .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
+                    .collect::<Result<_>>()?,
+                els: match els {
+                    Some(x) => Some(bx(x)?),
+                    None => None,
+                },
+            },
+            Expr::Cast { e, target } => Expr::Cast {
+                e: bx(e)?,
+                target: *target,
+            },
+            Expr::Func { name, args } => Expr::Func {
+                name: name.clone(),
+                args: args.iter().map(&rec).collect::<Result<_>>()?,
+            },
+            Expr::Aggregate {
+                func,
+                arg,
+                distinct,
+                sep,
+            } => Expr::Aggregate {
+                func: *func,
+                arg: match arg {
+                    AggArg::Star => AggArg::Star,
+                    AggArg::Expr(e) => AggArg::Expr(bx(e)?),
+                },
+                distinct: *distinct,
+                sep: match sep {
+                    Some(x) => Some(bx(x)?),
+                    None => None,
+                },
+            },
+            other => other.clone(),
+        })
     }
 }

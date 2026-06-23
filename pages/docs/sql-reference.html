@@ -21,7 +21,7 @@
 <span class="spec-date">Reference</span>
 </div>
 <h1>SQL reference</h1>
-<p class="lede">Twill DB speaks a deliberately small, hand-parsed SQL subset: DDL, row DML, single-table queries with aggregates, and transaction control. Everything on this page is what the parser actually accepts — anything outside it is rejected with <code>ENGINE_ERR_SQL</code> rather than silently mis-parsed.</p>
+<p class="lede">Twill DB speaks a focused, hand-parsed SQL surface covering the common OLTP majority of PostgreSQL and SQLite: DDL, row DML (with upsert and <code>RETURNING</code>), multi-table queries with joins, aggregation, subqueries and set operations, a curated function library, and transaction control. Everything on this page is what the parser actually accepts — anything outside it is rejected with <code>ENGINE_ERR_SQL</code> rather than silently mis-parsed.</p>
 </header>
 
 <section>
@@ -119,36 +119,63 @@ DELETE FROM notes WHERE id = 9 RETURNING id, title;</code></pre>
 
 <section>
 <h2>Queries (SELECT)</h2>
-<p>A query reads from a single table (or no table, for bare expressions) under snapshot isolation. The full shape is:</p>
-<pre data-lang="sql"><code>SELECT items
-  FROM table
+<p>A query reads under snapshot isolation. The full shape is:</p>
+<pre data-lang="sql"><code>[WITH cte AS (query), ...]
+SELECT [DISTINCT] items
+  FROM source [JOIN source ON ... | USING (...)] ...
  WHERE predicate
  GROUP BY expr, ...
 HAVING predicate
- ORDER BY expr [ASC | DESC], ...
+ [UNION | INTERSECT | EXCEPT [ALL] SELECT ...]
+ ORDER BY expr [ASC | DESC] [NULLS FIRST | LAST], ...
  LIMIT n OFFSET m</code></pre>
-<p>Clauses are optional and parsed in this order. <code>SELECT ALL</code> is accepted (it is the default); <code>SELECT DISTINCT</code> is rejected. Queries still read from a single table — there is no <code>JOIN</code> or subquery.</p>
+<p>Clauses are optional. <code>SELECT ALL</code> is the default; <code>SELECT DISTINCT</code> de-duplicates output rows.</p>
+
+<h3>Sources and joins</h3>
+<p>A <code>FROM</code> source is a table (optionally aliased <code>t a</code> / <code>t AS a</code>), a derived table <code>(SELECT …) AS a</code>, or a join. Qualified references <code>alias.col</code> resolve against the active sources; an ambiguous or unknown name is a parse-time <code>ENGINE_ERR_SQL</code>. Joins are nested-loop and evaluated over the MVCC snapshot.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Join</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>[INNER] JOIN … ON</code> / <code>USING (cols)</code></td><td>Matching pairs only</td></tr>
+<tr><td><code>LEFT JOIN</code></td><td>All left rows; unmatched right side is NULL</td></tr>
+<tr><td><code>RIGHT JOIN</code> / <code>FULL JOIN</code></td><td>Symmetric / both-side null-extension</td></tr>
+<tr><td><code>CROSS JOIN</code>, or comma <code>FROM a, b</code></td><td>Cartesian product (filter with <code>WHERE</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<pre data-lang="sql"><code>SELECT a.name, b.title
+  FROM authors a JOIN books b ON a.id = b.author_id
+ ORDER BY a.name;
+
+SELECT a.name, count(*) AS n
+  FROM authors a LEFT JOIN books b ON a.id = b.author_id
+ GROUP BY a.name;</code></pre>
 
 <h3>Select items</h3>
 <div class="table-wrap">
 <table>
 <thead><tr><th>Item</th><th>Meaning</th></tr></thead>
 <tbody>
-<tr><td><code>*</code></td><td>All columns of the table, in declared order</td></tr>
-<tr><td><code>expr</code></td><td>Any expression — a column, literal, function call, or computed value</td></tr>
+<tr><td><code>*</code> / <code>alias.*</code></td><td>All columns (of all sources, or of one source)</td></tr>
+<tr><td><code>expr</code></td><td>Any expression — a column, <code>alias.col</code>, literal, function call, or computed value</td></tr>
 <tr><td><code>expr AS alias</code></td><td>Name the output column (the <code>AS</code> keyword is optional)</td></tr>
-<tr><td><code>COUNT</code> / <code>SUM</code> / <code>MIN</code> / <code>MAX</code> / <code>AVG</code> / <code>JSON_AGG</code></td><td>Aggregate over <code>*</code> or an expression (whole-table, or per group with <code>GROUP BY</code>)</td></tr>
+<tr><td><code>COUNT</code>/<code>SUM</code>/<code>MIN</code>/<code>MAX</code>/<code>AVG</code>, <code>COUNT(DISTINCT x)</code>, <code>group_concat</code>/<code>string_agg</code>, <code>JSON_AGG</code></td><td>Aggregate over <code>*</code> or an expression (whole-table, or per group with <code>GROUP BY</code>)</td></tr>
 </tbody>
 </table>
 </div>
-<pre data-lang="sql"><code>SELECT * FROM notes;
-SELECT id, title AS heading FROM notes WHERE score >= 5 ORDER BY score DESC LIMIT 10 OFFSET 20;
-SELECT COUNT(*), AVG(score), MAX(score) FROM notes;
-SELECT author, COUNT(*) AS n FROM notes GROUP BY author HAVING COUNT(*) > 1 ORDER BY n DESC;
-SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 
 <h3>Aggregates and GROUP BY</h3>
-<p><code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, <code>AVG</code>, and <code>JSON_AGG</code> compute over the filtered rows. Without <code>GROUP BY</code> they fold the whole (filtered) table into one row; with <code>GROUP BY</code> they fold each group, and you may project the grouped expressions alongside the aggregates. <code>HAVING</code> filters whole groups. Aggregates nest inside scalar expressions, so result-wrapping shapes like <code>coalesce(json_agg(title), '[]')</code> work.</p>
+<p>Aggregates compute over the filtered rows. Without <code>GROUP BY</code> they fold the whole (filtered) result into one row; with <code>GROUP BY</code> they fold each group, and you may project the grouped expressions alongside the aggregates. <code>HAVING</code> filters whole groups. <code>COUNT(DISTINCT x)</code> counts distinct non-NULL values; <code>group_concat(x[, sep])</code> / <code>string_agg(x, sep)</code> join a group's values. Aggregates nest inside scalar expressions, so shapes like <code>coalesce(json_agg(title), '[]')</code> work.</p>
+
+<h3>CTEs, subqueries and set operations</h3>
+<p>A leading <code>WITH name AS (query), …</code> defines non-recursive common table expressions usable as <code>FROM</code> sources. A parenthesized subquery may appear as a derived table in <code>FROM</code>, as a scalar value <code>(SELECT …)</code>, or in <code>x IN (SELECT …)</code> / <code>EXISTS (SELECT …)</code> — these expression subqueries must be <strong>non-correlated</strong> (they may not reference the outer query's columns). <code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code> (with optional <code>ALL</code>) combine two result sets of matching arity; a trailing <code>ORDER BY</code>/<code>LIMIT</code> applies to the combined result and references output columns.</p>
+<pre data-lang="sql"><code>WITH counts AS (SELECT author_id, count(*) AS n FROM books GROUP BY author_id)
+SELECT a.name, c.n FROM authors a JOIN counts c ON a.id = c.author_id;
+
+SELECT name FROM authors WHERE id IN (SELECT author_id FROM books);
+
+SELECT n FROM a UNION SELECT n FROM b ORDER BY n;</code></pre>
 
 <h3>ORDER BY, LIMIT and OFFSET</h3>
 <ul class="reqs">
@@ -169,7 +196,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>String literal</td><td><code>'hello'</code> (use <code>''</code> for a literal quote)</td></tr>
 <tr><td><code>NULL</code></td><td><code>NULL</code></td></tr>
 <tr><td>Boolean keyword</td><td><code>TRUE</code> → <code>1</code>, <code>FALSE</code> → <code>0</code></td></tr>
-<tr><td>Column reference</td><td><code>title</code>, <code>notes.title</code> (table qualifier accepted, only the column part is used)</td></tr>
+<tr><td>Column reference</td><td><code>title</code>, <code>notes.title</code> / <code>alias.title</code> (qualifier resolves against the active sources)</td></tr>
 <tr><td>Parameter</td><td><code>?</code> (positional, bound 1-based)</td></tr>
 <tr><td>Parenthesised</td><td><code>(score + 1) * 2</code></td></tr>
 <tr><td>Function call</td><td><code>lower(title)</code>, <code>coalesce(x, 0)</code></td></tr>
@@ -341,10 +368,10 @@ COMMIT;   -- returns only once the records are durable on the backend</code></pr
 <h2>Out of scope</h2>
 <p>These are deliberate boundaries, not bugs. Each parses to a clear <code>ENGINE_ERR_SQL</code> rather than a wrong result.</p>
 <ul class="reqs">
-<li><span class="req-tag must-not">MUST NOT</span> use <code>JOIN</code> — queries read from a single table.</li>
-<li><span class="req-tag must-not">MUST NOT</span> use subqueries or CTEs (<code>WITH</code>).</li>
-<li><span class="req-tag must-not">MUST NOT</span> use <code>SELECT DISTINCT</code>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use <strong>correlated</strong> subqueries (an expression subquery referencing the outer query's columns); only non-correlated scalar/<code>IN</code>/<code>EXISTS</code> subqueries are supported.</li>
+<li><span class="req-tag must-not">MUST NOT</span> use OLAP-shaped features — window functions (<code>OVER</code>), <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>LATERAL</code>, or recursive CTEs (compose DuckDB).</li>
 <li><span class="req-tag must-not">MUST NOT</span> use views or <code>ALTER TABLE</code>. The only <code>CREATE INDEX</code> supported is the HNSW vector index (<code>USING hnsw</code>); general secondary/B-tree indexes are not exposed as SQL.</li>
+<li><span class="req-tag must-not">MUST NOT</span> rely on procedural/extensibility surface — <code>CREATE FUNCTION</code>/<code>TRIGGER</code>/<code>EXTENSION</code>, roles/<code>GRANT</code>, <code>LISTEN</code>/<code>NOTIFY</code>.</li>
 </ul>
 <div class="callout note">
 <p class="callout-title">Unsupported syntax fails fast</p>

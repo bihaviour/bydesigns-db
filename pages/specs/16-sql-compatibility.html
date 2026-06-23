@@ -114,7 +114,7 @@
 <tr><td><code>INSERT … DEFAULT VALUES</code></td><td>⊕ 6D</td><td>Needs <code>DEFAULT</code> support.</td></tr>
 <tr><td><code>INSERT INTO t SELECT …</code></td><td>✅ (6A)</td><td>The <code>VALUES</code> source generalized to "rows from a query" — the executor's result rows feed the same staging loop.</td></tr>
 <tr><td><code>UPDATE … SET … [WHERE]</code>, <code>DELETE … [WHERE]</code></td><td>✅</td><td>Fully transactional; first-committer-wins conflict checks.</td></tr>
-<tr><td><code>UPDATE … FROM …</code>, <code>DELETE … USING …</code></td><td>⊕ 6B</td><td>Join-driven DML; depends on the join machinery.</td></tr>
+<tr><td><code>UPDATE … FROM …</code>, <code>DELETE … USING …</code></td><td>⊕</td><td>Join-driven DML; deferred (the join machinery exists, but the write path is not yet wired to it).</td></tr>
 <tr><td><code>… RETURNING *</code> / column list (PG; SQLite 3.35+)</td><td>✅ (6A)</td><td>Projects the affected row versions (new for INSERT/UPDATE, old for DELETE) through a result set on the existing exec path.</td></tr>
 <tr><td>Upsert: PG <code>INSERT … ON CONFLICT (…) DO UPDATE/NOTHING</code>, SQLite <code>INSERT … ON CONFLICT …</code> / <code>OR REPLACE</code>/<code>OR IGNORE</code></td><td>✅ (6A)</td><td>True conflict actions, with <code>excluded.*</code> in <code>DO UPDATE</code>. The earlier silent-ignore hazard for <code>OR REPLACE</code>/<code>OR IGNORE</code> is closed — they now skip/replace as documented.</td></tr>
 <tr><td><code>TRUNCATE</code></td><td>↻</td><td><code>DELETE FROM t</code> with no <code>WHERE</code> (already supported); a native fast-path is ✗.</td></tr>
@@ -130,18 +130,18 @@
 <thead><tr><th>Construct</th><th>Status</th><th>Mapping / notes</th></tr></thead>
 <tbody>
 <tr><td>Projection: <code>*</code>, expressions, <code>AS</code> alias</td><td>✅</td><td>—</td></tr>
-<tr><td><code>FROM</code> single table; <code>SELECT</code> with no <code>FROM</code> (constants)</td><td>✅</td><td>—</td></tr>
+<tr><td><code>FROM</code> single table / multi-source (joins, derived tables); <code>SELECT</code> with no <code>FROM</code> (constants)</td><td>✅</td><td>Multi-source shipped in 6B.</td></tr>
 <tr><td><code>WHERE</code></td><td>✅</td><td>Full expression predicate, three-valued logic.</td></tr>
 <tr><td><code>ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]</code> (multi-key)</td><td>✅</td><td>Ranks by expressions; an alias resolves to its select item. <code>NULLS FIRST/LAST</code> shipped in 6A (default: NULLs first on ASC, last on DESC).</td></tr>
 <tr><td><code>LIMIT n</code></td><td>✅</td><td>Integer literal only.</td></tr>
 <tr><td><code>OFFSET n</code>, <code>LIMIT … OFFSET …</code></td><td>✅ (6A)</td><td>Integer literal or parameter; <code>FETCH FIRST</code> remains out.</td></tr>
 <tr><td>Aggregates <code>COUNT/SUM/MIN/MAX/AVG</code> (whole-table)</td><td>◑</td><td>Work only when <em>all</em> select items are aggregates; cannot mix with plain columns (no grouping).</td></tr>
-<tr><td><code>GROUP BY</code> / <code>HAVING</code></td><td>⊕ 6B</td><td>Reserved as keywords today but unimplemented. The big aggregation gap.</td></tr>
-<tr><td><code>DISTINCT</code>, <code>COUNT(DISTINCT x)</code></td><td>◑ → ⊕ 6B</td><td><code>SELECT DISTINCT</code> is explicitly rejected today; implement with grouping.</td></tr>
-<tr><td><code>JOIN</code> (<code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code>), <code>ON</code>/<code>USING</code>, table aliases, multi-table <code>FROM</code></td><td>⊕ 6B</td><td>The single largest item. Requires multi-source <code>FROM</code>, qualified <code>table.col</code> resolution (today the table qualifier is parsed then dropped), and a nested-loop join. INNER + LEFT first; RIGHT/FULL after.</td></tr>
-<tr><td>Subqueries: scalar, <code>IN (SELECT …)</code>, <code>EXISTS</code>, derived tables <code>FROM (SELECT …)</code>, correlated</td><td>⊕ 6B</td><td>AST already boxes expressions; add a <code>Expr::Subquery</code> + derived-table source. Correlated last.</td></tr>
-<tr><td>CTEs <code>WITH … AS (…)</code>, recursive CTEs</td><td>⊕ 6B / ✗</td><td>Non-recursive CTEs map to derived tables (6B). Recursive CTEs are ✗ for the OLTP core.</td></tr>
-<tr><td>Set ops <code>UNION [ALL]</code> / <code>INTERSECT</code> / <code>EXCEPT</code></td><td>⊕ 6B</td><td>Compose two result sets; column-count/type compatibility checked.</td></tr>
+<tr><td><code>GROUP BY</code> / <code>HAVING</code></td><td>✅ (6B)</td><td>Per-group aggregation; <code>HAVING</code> filters whole groups; works over joins.</td></tr>
+<tr><td><code>DISTINCT</code>, <code>COUNT(DISTINCT x)</code></td><td>✅ (6B)</td><td>Output-row de-duplication and distinct aggregation.</td></tr>
+<tr><td><code>JOIN</code> (<code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code>), <code>ON</code>/<code>USING</code>, table aliases, multi-table <code>FROM</code></td><td>✅ (6B)</td><td>Nested-loop join over a materialized column namespace; qualified <code>alias.col</code> resolved (ambiguous/unknown rejected).</td></tr>
+<tr><td>Subqueries: scalar, <code>IN (SELECT …)</code>, <code>EXISTS</code>, derived tables <code>FROM (SELECT …)</code>, correlated</td><td>✅ / ✗</td><td>Non-correlated scalar/<code>IN</code>/<code>EXISTS</code> and derived tables shipped (6B). Correlated expression subqueries stay ✗.</td></tr>
+<tr><td>CTEs <code>WITH … AS (…)</code>, recursive CTEs</td><td>✅ / ✗</td><td>Non-recursive <code>WITH</code> materialized as derived tables (6B). Recursive CTEs are ✗.</td></tr>
+<tr><td>Set ops <code>UNION [ALL]</code> / <code>INTERSECT</code> / <code>EXCEPT</code></td><td>✅ (6B)</td><td>Combine two result sets (arity checked); <code>ALL</code> keeps multiset semantics.</td></tr>
 <tr><td>Window functions <code>OVER (…)</code></td><td>✗</td><td>OLAP-shaped; out of scope for the core (compose DuckDB, spec 12).</td></tr>
 <tr><td><code>LATERAL</code>, <code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code>, <code>TABLESAMPLE</code></td><td>✗</td><td>Out of scope.</td></tr>
 </tbody>
@@ -177,7 +177,7 @@
 <thead><tr><th>Function group</th><th>Examples</th><th>Status</th></tr></thead>
 <tbody>
 <tr><td>Aggregates (whole-table)</td><td><code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code></td><td>✅</td></tr>
-<tr><td>Aggregates (grouped + more)</td><td>the above per-group, <code>group_concat</code>/<code>string_agg</code>, <code>total</code></td><td>⊕ 6B</td></tr>
+<tr><td>Aggregates (grouped + more)</td><td>the above per-group, <code>group_concat</code>/<code>string_agg</code>, <code>count(distinct)</code></td><td>✅ (6B)</td></tr>
 <tr><td>String</td><td><code>length</code>, <code>lower</code>, <code>upper</code>, <code>substr/substring</code>, <code>trim</code>/<code>ltrim</code>/<code>rtrim</code>, <code>replace</code>, <code>coalesce</code>, <code>concat</code>, <code>instr</code>/<code>strpos</code>, <code>repeat</code>, <code>reverse</code>, <code>left</code>/<code>right</code>, <code>lpad</code>/<code>rpad</code></td><td>✅ (6C)</td></tr>
 <tr><td>Numeric / math</td><td><code>abs</code>, <code>round</code>, <code>ceil</code>, <code>floor</code>, <code>mod</code>, <code>power</code>, <code>sqrt</code>, <code>sign</code>, <code>trunc</code>, <code>exp</code>/<code>ln</code>/<code>log</code>, <code>random</code></td><td>✅ (6C)</td></tr>
 <tr><td>Conditional / null</td><td><code>coalesce</code>, <code>nullif</code>, <code>ifnull</code>, <code>greatest</code>, <code>least</code>, <code>iif</code></td><td>✅ (6A)</td></tr>
@@ -245,8 +245,12 @@
 <li><strong>Versions:</strong> <code>ENGINE_ABI_VERSION</code> stays <code>3</code>; <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>.</li>
 </ul>
 
-<h3>Stage 6B — Multi-table &amp; aggregation (the big one)</h3>
+<h3>Stage 6B — Multi-table &amp; aggregation (the big one) <span class="badge badge-status status-review">Implemented</span></h3>
 <p>The structural jump: more than one row source, qualified names, grouping. This is where the executor gains a small relational layer above the per-table scan, staying brute-force (nested-loop, hash-group) — appropriate for an in-memory MVCC OLTP store.</p>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>A relational executor (<code>exec.rs</code> nested <code>mod relational</code>) materializes the <code>FROM</code> into a single column namespace, then runs the same filter/group/project/order pipeline resolving names against it. Delivered: <code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code> joins with <code>ON</code>/<code>USING</code> and the comma form; table aliases and qualified <code>alias.col</code> resolution (ambiguous/unknown → <code>ENGINE_ERR_SQL</code>); derived tables and non-recursive <code>WITH</code> CTEs; <code>DISTINCT</code> and <code>COUNT(DISTINCT)</code>; <code>group_concat</code>/<code>string_agg</code>; set operations <code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT [ALL]</code>; and non-correlated scalar / <code>IN</code> / <code>EXISTS</code> subqueries (folded to literals before the scan). Joins resolve MVCC visibility per base row exactly as the single-table path does. The single-table fast path (and its HNSW KNN shortcut) is unchanged. Deferred (clean rejection): correlated subqueries, <code>CREATE VIEW</code>, <code>UPDATE … FROM</code>/<code>DELETE … USING</code>, recursive CTEs. <code>ENGINE_ABI_VERSION</code> stays <code>3</code>; <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>. Tests: <code>crates/engine/tests/relational_6b.rs</code>.</p>
+</div>
 <ul>
 <li><strong>AST:</strong> generalize <code>SelectStmt.from</code> from <code>Option&lt;String&gt;</code> to a <code>FromClause</code> tree: base tables with aliases, <code>JOIN</code> nodes (<code>Inner/Left/Right/Full/Cross</code>) with <code>ON</code>/<code>USING</code>, and derived tables (<code>(SELECT …) AS a</code>). Add <code>group_by: Vec&lt;Expr&gt;</code>, <code>having: Option&lt;Expr&gt;</code>, <code>distinct: bool</code>, and a <code>set_op</code> wrapper (<code>UNION/INTERSECT/EXCEPT [ALL]</code>). Add <code>Expr::Subquery</code> (scalar) and <code>Expr::Exists</code>/<code>Expr::InSubquery</code>.</li>
 <li><strong>Name resolution:</strong> replace the "drop the table qualifier, keep the column" shortcut in <code>primary()</code> with a real binder: resolve <code>alias.col</code> against the active <code>FromClause</code>'s column namespace; raise <code>ENGINE_ERR_SQL</code> on ambiguous/unknown.</li>

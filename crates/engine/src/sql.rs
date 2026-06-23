@@ -6,7 +6,7 @@
 
 use crate::error::{EngineError, Result};
 use crate::lex::{lex, Tok};
-use crate::value::ColumnType;
+use crate::value::{ColumnType, Value};
 use crate::vector::{IndexParams, Metric};
 
 // ---- AST ------------------------------------------------------------------
@@ -43,7 +43,7 @@ pub enum Stmt {
         /// `RETURNING …` projection over the inserted rows, if present.
         returning: Option<Vec<SelItem>>,
     },
-    Select(SelectStmt),
+    Select(Box<SelectStmt>),
     Update {
         table: String,
         sets: Vec<(String, Expr)>,
@@ -109,16 +109,74 @@ pub struct ForeignKeySpec {
     pub foreign_columns: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SelectStmt {
+    /// Non-recursive common table expressions (`WITH a AS (…), …`). Empty unless
+    /// the query opened with `WITH`. Carried only on the outermost select.
+    pub with: Vec<CteDef>,
+    pub distinct: bool,
     pub items: Vec<SelItem>,
-    pub from: Option<String>,
+    pub from: Option<FromClause>,
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
+    /// Trailing set-operation chain (`UNION`/`INTERSECT`/`EXCEPT [ALL]`); the
+    /// `order_by`/`limit`/`offset` below apply to the combined result.
+    pub set_ops: Vec<SetOpPart>,
     pub order_by: Vec<OrderKey>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+}
+
+/// A `WITH` binding: a name and the query it stands for (materialized once).
+#[derive(Debug, Clone)]
+pub struct CteDef {
+    pub name: String,
+    pub query: Box<SelectStmt>,
+}
+
+/// One arm of a set-operation chain after the leading select.
+#[derive(Debug, Clone)]
+pub struct SetOpPart {
+    pub op: SetOp,
+    pub all: bool,
+    pub query: Box<SelectStmt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// The `FROM` clause: a single source, a join tree, or a derived table.
+#[derive(Debug, Clone)]
+pub enum FromClause {
+    /// A base table or CTE reference, with an optional alias.
+    Table { name: String, alias: Option<String> },
+    /// A parenthesized subquery `(SELECT …) AS alias`.
+    Derived {
+        query: Box<SelectStmt>,
+        alias: String,
+    },
+    /// A join of two sources. `on`/`using` are empty for `CROSS JOIN`.
+    Join {
+        left: Box<FromClause>,
+        right: Box<FromClause>,
+        kind: JoinKind,
+        on: Option<Box<Expr>>,
+        using: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
 }
 
 /// One `ORDER BY` key: the sort expression, direction, and NULL placement.
@@ -131,13 +189,19 @@ pub struct OrderKey {
     pub nulls_first: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SelItem {
-    Star,
-    Expr { expr: Expr, alias: Option<String> },
+    /// `*` (all columns) or `alias.*` (all columns of one source).
+    Star {
+        qualifier: Option<String>,
+    },
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+    },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggFunc {
     Count,
     Sum,
@@ -147,6 +211,8 @@ pub enum AggFunc {
     /// `json_agg(expr)` — aggregate the group's values into a JSON array. The
     /// data-path shape PostgREST wraps result sets in.
     JsonAgg,
+    /// `group_concat`/`string_agg` — join the group's values with a separator.
+    GroupConcat,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +228,9 @@ pub enum Expr {
     Real(f64),
     Str(String),
     Vector(Vec<f32>),
+    /// A pre-computed value — produced when the relational planner folds a
+    /// non-correlated subquery down to a constant.
+    Lit(Value),
     Param(usize), // 1-based
     Column(String),
     Binary {
@@ -229,6 +298,28 @@ pub enum Expr {
     Aggregate {
         func: AggFunc,
         arg: AggArg,
+        /// `DISTINCT` argument (e.g. `COUNT(DISTINCT x)`).
+        distinct: bool,
+        /// Separator for `group_concat`/`string_agg` (default `,`).
+        sep: Option<Box<Expr>>,
+    },
+    /// A qualified column reference `table.col` / `alias.col`. Resolved against
+    /// the active `FROM` namespace by the relational executor; the single-table
+    /// path ignores the qualifier.
+    Qualified(String, String),
+    /// A scalar subquery `(SELECT …)` — must yield at most one row/column.
+    /// Non-correlated only (evaluated once before the main scan).
+    ScalarSubquery(Box<SelectStmt>),
+    /// `[NOT] EXISTS (SELECT …)` (non-correlated).
+    Exists {
+        query: Box<SelectStmt>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (SELECT …)` (non-correlated).
+    InSubquery {
+        e: Box<Expr>,
+        query: Box<SelectStmt>,
+        negated: bool,
     },
 }
 
@@ -417,8 +508,8 @@ impl Parser {
             }
         } else if self.is_kw("insert") {
             self.insert()
-        } else if self.is_kw("select") {
-            Ok(Stmt::Select(self.select()?))
+        } else if self.is_kw("select") || self.is_kw("with") {
+            Ok(Stmt::Select(Box::new(self.select()?)))
         } else if self.is_kw("update") {
             self.update()
         } else if self.is_kw("delete") {
@@ -929,14 +1020,79 @@ impl Parser {
         Ok(Some(items))
     }
 
+    /// A full query: optional `WITH`, a select core, a set-operation chain, and
+    /// the trailing `ORDER BY`/`LIMIT`/`OFFSET` that apply to the combined result.
     fn select(&mut self) -> Result<SelectStmt> {
-        self.expect_kw("select")?;
-        let _ = self.eat_kw("all"); // ALL is the default; DISTINCT unsupported in P1
-        if self.is_kw("distinct") {
-            return Err(EngineError::sql(
-                "SELECT DISTINCT is not supported in Phase 1",
-            ));
+        let with = self.parse_with()?;
+        let mut q = self.select_core()?;
+        q.with = with;
+        loop {
+            let op = if self.eat_kw("union") {
+                SetOp::Union
+            } else if self.eat_kw("intersect") {
+                SetOp::Intersect
+            } else if self.eat_kw("except") {
+                SetOp::Except
+            } else {
+                break;
+            };
+            let all = self.eat_kw("all");
+            let _ = self.eat_kw("distinct"); // the default; accepted explicitly
+            let part = if self.peek() == &Tok::LParen {
+                self.expect(Tok::LParen)?;
+                let s = self.select()?;
+                self.expect(Tok::RParen)?;
+                s
+            } else {
+                self.select_core()?
+            };
+            q.set_ops.push(SetOpPart {
+                op,
+                all,
+                query: Box::new(part),
+            });
         }
+        q.order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit_offset()?;
+        q.limit = limit;
+        q.offset = offset;
+        Ok(q)
+    }
+
+    /// `WITH [RECURSIVE] name [(cols)] AS (query), …` — the leading CTE list.
+    /// `RECURSIVE` is accepted but self-referential bodies are unsupported (they
+    /// fail at execution); the column-alias list is accepted and ignored.
+    fn parse_with(&mut self) -> Result<Vec<CteDef>> {
+        if !self.eat_kw("with") {
+            return Ok(Vec::new());
+        }
+        let _ = self.eat_kw("recursive");
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident()?;
+            if self.peek() == &Tok::LParen {
+                let _ = self.paren_ident_list()?;
+            }
+            self.expect_kw("as")?;
+            self.expect(Tok::LParen)?;
+            let query = self.select()?;
+            self.expect(Tok::RParen)?;
+            ctes.push(CteDef {
+                name,
+                query: Box::new(query),
+            });
+            if !self.skip(Tok::Comma) {
+                break;
+            }
+        }
+        Ok(ctes)
+    }
+
+    /// A single select core (no `WITH`, set-op chain, or trailing ORDER/LIMIT).
+    fn select_core(&mut self) -> Result<SelectStmt> {
+        self.expect_kw("select")?;
+        let _ = self.eat_kw("all");
+        let distinct = self.eat_kw("distinct");
         let mut items = Vec::new();
         loop {
             items.push(self.select_item()?);
@@ -946,7 +1102,7 @@ impl Parser {
             break;
         }
         let from = if self.eat_kw("from") {
-            Some(self.ident()?)
+            Some(self.parse_from()?)
         } else {
             None
         };
@@ -961,18 +1117,130 @@ impl Parser {
         } else {
             None
         };
-        let order_by = self.parse_order_by()?;
-        let (limit, offset) = self.parse_limit_offset()?;
         Ok(SelectStmt {
+            with: Vec::new(),
+            distinct,
             items,
             from,
             filter,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            set_ops: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
         })
+    }
+
+    /// Parse the `FROM` clause: a source, optionally chained with joins (or
+    /// comma = `CROSS JOIN`).
+    fn parse_from(&mut self) -> Result<FromClause> {
+        let mut left = self.parse_from_item()?;
+        loop {
+            if let Some(kind) = self.parse_join_kind()? {
+                let right = self.parse_from_item()?;
+                let (on, using) = if kind == JoinKind::Cross {
+                    (None, Vec::new())
+                } else {
+                    self.parse_join_condition()?
+                };
+                left = FromClause::Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind,
+                    on,
+                    using,
+                };
+            } else if self.skip(Tok::Comma) {
+                let right = self.parse_from_item()?;
+                left = FromClause::Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind: JoinKind::Cross,
+                    on: None,
+                    using: Vec::new(),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    /// A single `FROM` source: a (possibly aliased) table, a derived table, or a
+    /// parenthesized join.
+    fn parse_from_item(&mut self) -> Result<FromClause> {
+        if self.peek() == &Tok::LParen {
+            self.bump();
+            if self.is_kw("select") || self.is_kw("with") {
+                let query = self.select()?;
+                self.expect(Tok::RParen)?;
+                let alias = self.parse_from_alias(true)?.ok_or_else(|| {
+                    EngineError::sql("a derived table (subquery) in FROM requires an alias")
+                })?;
+                return Ok(FromClause::Derived {
+                    query: Box::new(query),
+                    alias,
+                });
+            }
+            let inner = self.parse_from()?;
+            self.expect(Tok::RParen)?;
+            return Ok(inner);
+        }
+        let name = self.ident()?;
+        let alias = self.parse_from_alias(false)?;
+        Ok(FromClause::Table { name, alias })
+    }
+
+    /// `[INNER | LEFT|RIGHT|FULL [OUTER] | CROSS] JOIN`, or `None` if the next
+    /// token does not begin a join.
+    fn parse_join_kind(&mut self) -> Result<Option<JoinKind>> {
+        if self.eat_kw("join") || self.is_kw("inner") && self.next_is_kw("join") {
+            let _ = self.eat_kw("inner") && self.eat_kw("join");
+            return Ok(Some(JoinKind::Inner));
+        }
+        if self.eat_kw("cross") {
+            self.expect_kw("join")?;
+            return Ok(Some(JoinKind::Cross));
+        }
+        for (kw, kind) in [
+            ("left", JoinKind::Left),
+            ("right", JoinKind::Right),
+            ("full", JoinKind::Full),
+        ] {
+            if self.is_kw(kw) {
+                self.bump();
+                let _ = self.eat_kw("outer");
+                self.expect_kw("join")?;
+                return Ok(Some(kind));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The `ON predicate` or `USING (cols)` after a join.
+    fn parse_join_condition(&mut self) -> Result<(Option<Box<Expr>>, Vec<String>)> {
+        if self.eat_kw("on") {
+            Ok((Some(Box::new(self.expr()?)), Vec::new()))
+        } else if self.eat_kw("using") {
+            Ok((None, self.paren_ident_list()?))
+        } else {
+            Err(EngineError::sql("JOIN requires an ON or USING clause"))
+        }
+    }
+
+    /// An optional table alias: `[AS] ident`, stopping at a clause/join keyword.
+    /// `require` is unused here but documents the derived-table call site.
+    fn parse_from_alias(&mut self, _require: bool) -> Result<Option<String>> {
+        if self.eat_kw("as") {
+            return Ok(Some(self.ident()?));
+        }
+        if let Some(w) = self.peek_word() {
+            if !is_from_boundary_kw(w) {
+                return Ok(Some(self.ident()?));
+            }
+        }
+        Ok(None)
     }
 
     /// `GROUP BY expr, ...` (empty when absent).
@@ -1068,7 +1336,18 @@ impl Parser {
     fn select_item(&mut self) -> Result<SelItem> {
         if self.peek() == &Tok::Star {
             self.bump();
-            return Ok(SelItem::Star);
+            return Ok(SelItem::Star { qualifier: None });
+        }
+        // `alias.*` — all columns of one FROM source.
+        if let Tok::Word(w) = self.peek().clone() {
+            if matches!(self.toks.get(self.pos + 1), Some(Tok::Dot))
+                && matches!(self.toks.get(self.pos + 2), Some(Tok::Star))
+            {
+                self.bump();
+                self.bump();
+                self.bump();
+                return Ok(SelItem::Star { qualifier: Some(w) });
+            }
         }
         // Aggregates (and trailing `::type` casts on them, e.g. `count(*)::int`)
         // parse through the ordinary expression grammar now, so this is uniform.
@@ -1249,12 +1528,17 @@ impl Parser {
         })
     }
 
-    /// `[NOT] IN (expr, …)` — `left` and `IN` already consumed. (Subquery IN
-    /// is a stage-6B feature; a `SELECT` here is rejected for now.)
+    /// `[NOT] IN (expr, …)` or `[NOT] IN (SELECT …)` — `left` and `IN` consumed.
     fn in_tail(&mut self, left: Expr, negated: bool) -> Result<Expr> {
         self.expect(Tok::LParen)?;
-        if self.is_kw("select") {
-            return Err(EngineError::sql("IN (SELECT …) is not supported yet"));
+        if self.is_kw("select") || self.is_kw("with") {
+            let query = self.select()?;
+            self.expect(Tok::RParen)?;
+            return Ok(Expr::InSubquery {
+                e: Box::new(left),
+                query: Box::new(query),
+                negated,
+            });
         }
         let mut list = Vec::new();
         if self.peek() != &Tok::RParen {
@@ -1480,18 +1764,30 @@ impl Parser {
         Ok(Expr::Func { name, args })
     }
 
-    /// Parse `(* | [DISTINCT] expr)` for an aggregate; cursor sits on `(`.
+    /// Parse `(* | [DISTINCT] expr [, separator])` for an aggregate; cursor sits
+    /// on `(`. The trailing separator applies to `string_agg`/`group_concat`.
     fn aggregate_call(&mut self, func: AggFunc) -> Result<Expr> {
         self.expect(Tok::LParen)?;
-        let _ = self.eat_kw("distinct") || self.eat_kw("all");
+        let distinct = self.eat_kw("distinct");
+        let _ = self.eat_kw("all");
         let arg = if self.peek() == &Tok::Star {
             self.bump();
             AggArg::Star
         } else {
             AggArg::Expr(Box::new(self.expr()?))
         };
+        let sep = if self.skip(Tok::Comma) {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
         self.expect(Tok::RParen)?;
-        Ok(Expr::Aggregate { func, arg })
+        Ok(Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+            sep,
+        })
     }
 
     fn next_is_lparen(&self) -> bool {
@@ -1510,6 +1806,18 @@ impl Parser {
         Ok(Expr::Cast {
             e: Box::new(e),
             target,
+        })
+    }
+
+    /// `[NOT] EXISTS ( SELECT … )`. A leading `NOT` is handled by `not_expr`.
+    fn exists_expr(&mut self) -> Result<Expr> {
+        self.bump(); // EXISTS
+        self.expect(Tok::LParen)?;
+        let query = self.select()?;
+        self.expect(Tok::RParen)?;
+        Ok(Expr::Exists {
+            query: Box::new(query),
+            negated: false,
         })
     }
 
@@ -1582,6 +1890,13 @@ impl Parser {
             }
             Tok::LParen => {
                 self.bump();
+                // A parenthesized subquery is a scalar subquery; otherwise it is
+                // a grouped expression.
+                if self.is_kw("select") || self.is_kw("with") {
+                    let q = self.select()?;
+                    self.expect(Tok::RParen)?;
+                    return Ok(Expr::ScalarSubquery(Box::new(q)));
+                }
                 let e = self.expr()?;
                 self.expect(Tok::RParen)?;
                 Ok(e)
@@ -1603,20 +1918,22 @@ impl Parser {
                     self.cast_call()
                 } else if w.eq_ignore_ascii_case("extract") && self.next_is_lparen() {
                     self.extract_call()
+                } else if w.eq_ignore_ascii_case("exists") && self.next_is_lparen() {
+                    self.exists_expr()
                 } else {
                     self.bump();
                     if self.peek() == &Tok::LParen {
                         self.func_call(w)
                     } else if self.skip(Tok::Dot) {
                         // qualified `name.column`. `excluded.col` (the upsert
-                        // pseudo-table) keeps its qualifier; for an ordinary
-                        // `table.col` the qualifier is dropped (single-table; a
-                        // real binder lands in stage 6B).
+                        // pseudo-table) is its own node; an ordinary `table.col`
+                        // becomes a qualified reference the relational binder
+                        // resolves (the single-table path ignores the qualifier).
                         let col = self.ident()?;
                         if w.eq_ignore_ascii_case("excluded") {
                             Ok(Expr::Excluded(col))
                         } else {
-                            Ok(Expr::Column(col))
+                            Ok(Expr::Qualified(w, col))
                         }
                     } else {
                         Ok(Expr::Column(w))
@@ -1684,6 +2001,8 @@ fn agg_func(w: &str) -> Option<AggFunc> {
         _ if w.eq_ignore_ascii_case("avg") => Some(AggFunc::Avg),
         _ if w.eq_ignore_ascii_case("json_agg") => Some(AggFunc::JsonAgg),
         _ if w.eq_ignore_ascii_case("jsonb_agg") => Some(AggFunc::JsonAgg),
+        _ if w.eq_ignore_ascii_case("group_concat") => Some(AggFunc::GroupConcat),
+        _ if w.eq_ignore_ascii_case("string_agg") => Some(AggFunc::GroupConcat),
         _ => None,
     }
 }
@@ -1715,6 +2034,36 @@ fn is_clause_kw(w: &str) -> bool {
         "returning",
         "on",
         "between",
+        "union",
+        "intersect",
+        "except",
+    ]
+    .iter()
+    .any(|k| w.eq_ignore_ascii_case(k))
+}
+
+/// Keywords that terminate an optional `FROM`-source alias (so we don't read a
+/// join/clause keyword as the alias name).
+fn is_from_boundary_kw(w: &str) -> bool {
+    [
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "on",
+        "using",
+        "where",
+        "group",
+        "order",
+        "limit",
+        "offset",
+        "having",
+        "union",
+        "intersect",
+        "except",
+        "as",
     ]
     .iter()
     .any(|k| w.eq_ignore_ascii_case(k))
