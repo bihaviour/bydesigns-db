@@ -30,6 +30,7 @@ pub(crate) enum Tok {
     Minus,
     Slash,
     Percent,
+    Concat,    // `||` string concatenation
     VecL2,     // <->
     VecCosine, // <=>
     VecIp,     // <#>
@@ -60,6 +61,7 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Tok>> {
         }
         let (tok, next) = match c {
             b'<' | b'>' | b'!' => lex_operator(b, i)?,
+            b'|' => lex_pipe(b, i)?,
             b':' => lex_colon(b, i)?,
             b'\'' => lex_string(b, i)?,
             b'"' => lex_quoted_ident(b, i)?,
@@ -116,6 +118,18 @@ fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize)> {
             _ => return Err(EngineError::sql("unexpected '!'")),
         },
     })
+}
+
+/// `||` is the string-concatenation operator; a lone `|` (bitwise OR) is out of
+/// scope and rejected rather than mis-parsed.
+fn lex_pipe(b: &[u8], i: usize) -> Result<(Tok, usize)> {
+    if b.get(i + 1) == Some(&b'|') {
+        Ok((Tok::Concat, i + 2))
+    } else {
+        Err(EngineError::sql(
+            "unexpected '|' (bitwise OR is unsupported)",
+        ))
+    }
 }
 
 /// `::` is the only colon form the engine accepts (the Postgres type cast); a

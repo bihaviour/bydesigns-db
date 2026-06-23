@@ -82,25 +82,39 @@ DROP TABLE IF EXISTS notes;</code></pre>
 <section>
 <h2>Data manipulation (DML)</h2>
 <h3>INSERT</h3>
-<p>Insert one or more rows. The column list is optional; when given, values bind to those columns by position. Multiple parenthesised tuples insert several rows in one statement. <code>OR REPLACE</code> / <code>OR IGNORE</code> are accepted after <code>INSERT</code> and ignored.</p>
+<p>Insert one or more rows. The column list is optional; when given, values bind to those columns by position. Multiple parenthesised tuples insert several rows in one statement, and the row source may be a query (<code>INSERT … SELECT</code>). A clashing primary key is resolved by an explicit <code>ON CONFLICT</code> action or by SQLite's <code>OR IGNORE</code> / <code>OR REPLACE</code>. <code>RETURNING</code> projects the inserted rows back as a result set.</p>
 <pre data-lang="sql"><code>INSERT INTO notes (id, title, body) VALUES (1, 'first', 'hello');
 
 INSERT INTO notes (id, title) VALUES (2, 'two'), (3, 'three');
 
 INSERT INTO notes VALUES (4, 'four', NULL, 9.5, NULL);
 
--- with parameters
-INSERT INTO notes (id, title) VALUES (?, ?);</code></pre>
+-- copy rows from a query
+INSERT INTO archive (id, title) SELECT id, title FROM notes WHERE score IS NULL;
+
+-- upsert: do nothing, or update using the proposed row via `excluded`
+INSERT INTO notes (id, title) VALUES (1, 'dup') ON CONFLICT (id) DO NOTHING;
+INSERT INTO notes (id, title) VALUES (1, 'new')
+  ON CONFLICT (id) DO UPDATE SET title = excluded.title;
+
+-- SQLite resolutions
+INSERT OR IGNORE  INTO notes (id, title) VALUES (1, 'skip');
+INSERT OR REPLACE INTO notes (id, title) VALUES (1, 'replace whole row');
+
+-- return the inserted rows
+INSERT INTO notes (id, title) VALUES (?, ?) RETURNING id, title;</code></pre>
 
 <h3>UPDATE</h3>
-<p>Assign one or more columns, optionally filtered by a <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is updated. The number of rows changed is reported by <code>engine_changes()</code>.</p>
+<p>Assign one or more columns, optionally filtered by a <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is updated. The number of rows changed is reported by <code>engine_changes()</code>; <code>RETURNING</code> projects the new row versions.</p>
 <pre data-lang="sql"><code>UPDATE notes SET title = 'renamed', score = score + 1 WHERE id = 1;
-UPDATE notes SET body = NULL;</code></pre>
+UPDATE notes SET body = NULL;
+UPDATE notes SET score = score + 1 WHERE id = 1 RETURNING id, score;</code></pre>
 
 <h3>DELETE</h3>
-<p>Remove rows matching an optional <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is deleted.</p>
+<p>Remove rows matching an optional <code>WHERE</code> predicate. Without <code>WHERE</code>, every row is deleted. <code>RETURNING</code> projects the deleted rows.</p>
 <pre data-lang="sql"><code>DELETE FROM notes WHERE score IS NULL;
-DELETE FROM notes;</code></pre>
+DELETE FROM notes;
+DELETE FROM notes WHERE id = 9 RETURNING id, title;</code></pre>
 </section>
 
 <section>
@@ -138,8 +152,8 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 
 <h3>ORDER BY, LIMIT and OFFSET</h3>
 <ul class="reqs">
-<li><span class="req-tag may">MAY</span> sort by one or more expressions, each independently <code>ASC</code> (default) or <code>DESC</code>; an <code>ORDER BY</code> key may name a select-list alias.</li>
-<li><span class="req-tag must">MUST</span> give <code>LIMIT</code> / <code>OFFSET</code> an integer literal (<code>LIMIT ALL</code> means no limit) — a non-integer is a parse error.</li>
+<li><span class="req-tag may">MAY</span> sort by one or more expressions, each independently <code>ASC</code> (default) or <code>DESC</code>, with optional <code>NULLS FIRST</code> / <code>NULLS LAST</code>; an <code>ORDER BY</code> key may name a select-list alias.</li>
+<li><span class="req-tag must">MUST</span> give <code>LIMIT</code> / <code>OFFSET</code> an integer literal or a parameter (<code>LIMIT ALL</code> means no limit) — a non-integer is a parse error.</li>
 </ul>
 </section>
 
@@ -159,7 +173,9 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>Parameter</td><td><code>?</code> (positional, bound 1-based)</td></tr>
 <tr><td>Parenthesised</td><td><code>(score + 1) * 2</code></td></tr>
 <tr><td>Function call</td><td><code>lower(title)</code>, <code>coalesce(x, 0)</code></td></tr>
-<tr><td>Type cast</td><td><code>x::int</code>, <code>'42'::integer</code>, <code>count(*)::int</code> (Postgres <code>::</code>)</td></tr>
+<tr><td>Type cast</td><td><code>x::int</code>, <code>'42'::integer</code>, <code>CAST(x AS int)</code>, <code>count(*)::int</code></td></tr>
+<tr><td><code>CASE</code></td><td><code>CASE WHEN c &gt; 0 THEN 'pos' ELSE 'neg' END</code>, simple <code>CASE x WHEN 1 THEN … END</code></td></tr>
+<tr><td>Membership / range</td><td><code>x IN (1, 2, 3)</code>, <code>x NOT IN (…)</code>, <code>x BETWEEN 1 AND 10</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -170,7 +186,7 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <table>
 <thead><tr><th>Group</th><th>Functions</th></tr></thead>
 <tbody>
-<tr><td>Null handling</td><td><code>coalesce(...)</code>, <code>nullif(a, b)</code></td></tr>
+<tr><td>Null / conditional</td><td><code>coalesce(...)</code>, <code>nullif(a, b)</code>, <code>ifnull(a, b)</code>, <code>iif(c, a, b)</code>, <code>greatest(...)</code>, <code>least(...)</code></td></tr>
 <tr><td>String</td><td><code>lower</code>, <code>upper</code>, <code>trim</code>/<code>btrim</code>, <code>ltrim</code>, <code>rtrim</code>, <code>length</code>/<code>char_length</code>, <code>concat</code></td></tr>
 <tr><td>Numeric</td><td><code>abs</code>, <code>round</code></td></tr>
 <tr><td>JSON</td><td><code>to_json</code>, <code>json_build_object(k, v, ...)</code>, and the <code>json_agg</code> aggregate</td></tr>
@@ -193,8 +209,10 @@ SELECT title, score * 2 AS doubled FROM notes ORDER BY id;</code></pre>
 <tr><td>Logical NOT</td><td><code>NOT</code></td><td>Prefix</td></tr>
 <tr><td>Comparison</td><td><code>=</code>, <code>&lt;&gt;</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td><code>&lt;&gt;</code> and <code>!=</code> are both inequality</td></tr>
 <tr><td>Null test</td><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td></td></tr>
-<tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code></td><td>Pattern match against a string expression</td></tr>
+<tr><td>Membership / range</td><td><code>IN (…)</code>, <code>NOT IN (…)</code>, <code>BETWEEN … AND …</code>, <code>NOT BETWEEN …</code></td><td>Three-valued logic over a value list / range</td></tr>
+<tr><td>Pattern</td><td><code>LIKE</code>, <code>NOT LIKE</code>, <code>ILIKE</code>, <code>… ESCAPE c</code></td><td>Match against a string expression; <code>ESCAPE</code> sets the escape char</td></tr>
 <tr><td>Vector distance</td><td><code>&lt;-&gt;</code>, <code>&lt;=&gt;</code>, <code>&lt;#&gt;</code></td><td>L2 / cosine / inner-product distance — see <a href="#vector-search">Vector search</a></td></tr>
+<tr><td>Concatenation</td><td><code>||</code></td><td>String concat (NULL-propagating); binds looser than <code>+</code></td></tr>
 <tr><td>Additive</td><td><code>+</code>, <code>-</code></td><td></td></tr>
 <tr><td>Multiplicative</td><td><code>*</code>, <code>/</code>, <code>%</code></td><td>Multiply, divide, modulo</td></tr>
 <tr><td>Unary</td><td><code>-</code>, <code>+</code></td><td>Negation / identity prefix</td></tr>

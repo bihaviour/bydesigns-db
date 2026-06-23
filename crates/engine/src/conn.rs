@@ -219,8 +219,7 @@ impl Connection {
                 Ok(ResultSet::default())
             }
             Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } => {
-                self.exec_dml(stmt, params)?;
-                Ok(ResultSet::default())
+                self.exec_dml(stmt, params)
             }
         }
     }
@@ -290,7 +289,7 @@ impl Connection {
 
     // ---- DML ------------------------------------------------------------
 
-    fn exec_dml(&mut self, stmt: &Stmt, params: &[Value]) -> Result<()> {
+    fn exec_dml(&mut self, stmt: &Stmt, params: &[Value]) -> Result<ResultSet> {
         let implicit = self.txn.is_none();
         if implicit {
             self.txn = Some(Txn {
@@ -310,29 +309,61 @@ impl Connection {
                 Stmt::Insert {
                     table,
                     columns,
-                    rows,
-                } => run_insert(&mut store, table, columns, rows, owner, params),
+                    source,
+                    on_conflict,
+                    returning,
+                } => run_insert(
+                    &mut store,
+                    table,
+                    columns,
+                    source,
+                    on_conflict,
+                    returning.as_deref(),
+                    snapshot,
+                    owner,
+                    params,
+                ),
                 Stmt::Update {
                     table,
                     sets,
                     filter,
-                } => run_update(&mut store, table, sets, filter, snapshot, owner, params),
-                Stmt::Delete { table, filter } => {
-                    run_delete(&mut store, table, filter, snapshot, owner, params)
-                }
+                    returning,
+                } => run_update(
+                    &mut store,
+                    table,
+                    sets,
+                    filter,
+                    returning.as_deref(),
+                    snapshot,
+                    owner,
+                    params,
+                ),
+                Stmt::Delete {
+                    table,
+                    filter,
+                    returning,
+                } => run_delete(
+                    &mut store,
+                    table,
+                    filter,
+                    returning.as_deref(),
+                    snapshot,
+                    owner,
+                    params,
+                ),
                 _ => unreachable!(),
             }
         };
 
         match result {
-            Ok((wal_ops, changes)) => {
-                self.txn.as_mut().unwrap().wal_ops.extend(wal_ops);
-                self.last_changes = changes;
+            Ok(mutation) => {
+                self.txn.as_mut().unwrap().wal_ops.extend(mutation.wal);
+                self.last_changes = mutation.changes;
                 if implicit {
                     let txn = self.txn.take().unwrap();
                     self.finish_commit(txn)?;
                 }
-                Ok(())
+                Ok(mutation.result.unwrap_or_default())
             }
             Err(e) => {
                 // The statement is atomic (store untouched on failure). For an

@@ -37,21 +37,54 @@ pub enum Stmt {
     Insert {
         table: String,
         columns: Option<Vec<String>>,
-        rows: Vec<Vec<Expr>>,
+        source: InsertSource,
+        /// Conflict action for a clashing key (`ON CONFLICT …` / `OR …`).
+        on_conflict: OnConflict,
+        /// `RETURNING …` projection over the inserted rows, if present.
+        returning: Option<Vec<SelItem>>,
     },
     Select(SelectStmt),
     Update {
         table: String,
         sets: Vec<(String, Expr)>,
         filter: Option<Expr>,
+        returning: Option<Vec<SelItem>>,
     },
     Delete {
         table: String,
         filter: Option<Expr>,
+        returning: Option<Vec<SelItem>>,
     },
     Begin,
     Commit,
     Rollback,
+}
+
+/// Where an `INSERT` gets its rows: literal `VALUES` tuples or the result of a
+/// query (`INSERT … SELECT`). The query is evaluated to rows that feed the same
+/// staging/validation loop the `VALUES` form uses.
+#[derive(Debug)]
+pub enum InsertSource {
+    Values(Vec<Vec<Expr>>),
+    Select(Box<SelectStmt>),
+}
+
+/// The action taken when an `INSERT` row clashes with an existing primary key.
+/// Covers Postgres `ON CONFLICT …` and SQLite `INSERT OR …` (mapped on parse).
+#[derive(Debug)]
+pub enum OnConflict {
+    /// Default: a clash is a `UNIQUE` constraint violation.
+    Error,
+    /// `ON CONFLICT … DO NOTHING` / `INSERT OR IGNORE`: skip the clashing row.
+    Nothing,
+    /// `ON CONFLICT … DO UPDATE SET …`: update the existing row. `excluded.<col>`
+    /// in an assignment refers to the row proposed for insertion.
+    Update {
+        sets: Vec<(String, Expr)>,
+        filter: Option<Expr>,
+    },
+    /// `INSERT OR REPLACE`: replace the existing row wholesale with the new one.
+    Replace,
 }
 
 #[derive(Debug)]
@@ -83,9 +116,19 @@ pub struct SelectStmt {
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
-    pub order_by: Vec<(Expr, bool)>, // (expr, ascending)
+    pub order_by: Vec<OrderKey>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+}
+
+/// One `ORDER BY` key: the sort expression, direction, and NULL placement.
+/// `nulls_first` defaults to the engine's historical rule (NULLs first on `ASC`,
+/// last on `DESC`) unless an explicit `NULLS FIRST`/`NULLS LAST` overrides it.
+#[derive(Debug, Clone)]
+pub struct OrderKey {
+    pub expr: Expr,
+    pub asc: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Debug)]
@@ -137,8 +180,38 @@ pub enum Expr {
     Like {
         e: Box<Expr>,
         pattern: Box<Expr>,
+        /// Optional `ESCAPE c` — the character that escapes a literal `%`/`_`.
+        escape: Option<Box<Expr>>,
+        negated: bool,
+        /// `true` for case-insensitive `ILIKE` (Postgres); `false` for `LIKE`.
+        /// (The engine's historical `LIKE` is case-insensitive; the split lands
+        /// in stage 6E. Until then both are case-insensitive — see the executor.)
+        insensitive: bool,
+    },
+    /// `expr [NOT] IN (a, b, c)` — membership against a literal value list.
+    InList {
+        e: Box<Expr>,
+        list: Vec<Expr>,
         negated: bool,
     },
+    /// `expr [NOT] BETWEEN lo AND hi` — desugared to `>= lo AND <= hi` at eval.
+    Between {
+        e: Box<Expr>,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+        negated: bool,
+    },
+    /// `CASE [operand] WHEN cond THEN result … [ELSE result] END`. A searched
+    /// `CASE` has `operand == None`; a simple `CASE` compares `operand` to each
+    /// `when` value for equality.
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<(Expr, Expr)>,
+        els: Option<Box<Expr>>,
+    },
+    /// `excluded.<col>` inside an `ON CONFLICT DO UPDATE` — the proposed-insert
+    /// value for that column (resolved from the upsert's excluded row).
+    Excluded(String),
     /// Postgres `expr::type` cast — coerces the inner value to `target`.
     Cast {
         e: Box<Expr>,
@@ -203,6 +276,8 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    /// String concatenation `||` (NULL-propagating, operands rendered to text).
+    Concat,
     /// Vector distance operators (spec 12): `<->` L2, `<=>` cosine, `<#>` inner
     /// product. Each evaluates to a REAL distance and selects the matching
     /// HNSW metric when pushed into an index scan.
@@ -731,26 +806,46 @@ impl Parser {
 
     fn insert(&mut self) -> Result<Stmt> {
         self.expect_kw("insert")?;
-        // Accept (and ignore) an optional `OR REPLACE` / `OR IGNORE` clause.
+        // SQLite `INSERT OR REPLACE|IGNORE` maps to a conflict action; the other
+        // SQLite resolutions (ABORT/FAIL/ROLLBACK) behave like the default error.
+        let mut on_conflict = OnConflict::Error;
         if self.eat_kw("or") {
-            let _ = self.eat_kw("replace") || self.eat_kw("ignore");
+            if self.eat_kw("replace") {
+                on_conflict = OnConflict::Replace;
+            } else if self.eat_kw("ignore") {
+                on_conflict = OnConflict::Nothing;
+            } else {
+                let _ = self.eat_kw("abort") || self.eat_kw("fail") || self.eat_kw("rollback");
+            }
         }
         self.expect_kw("into")?;
         let table = self.ident()?;
-        let columns = if self.skip(Tok::LParen) {
-            let mut cols = Vec::new();
-            loop {
-                cols.push(self.ident()?);
-                if self.skip(Tok::Comma) {
-                    continue;
-                }
-                break;
-            }
-            self.expect(Tok::RParen)?;
-            Some(cols)
+        let columns = if self.peek() == &Tok::LParen && !self.next_is_kw("select") {
+            Some(self.paren_ident_list()?)
         } else {
             None
         };
+        let source = self.insert_source()?;
+        // An explicit `ON CONFLICT …` overrides any `OR …` resolution.
+        if self.eat_kw("on") {
+            self.expect_kw("conflict")?;
+            on_conflict = self.on_conflict_action()?;
+        }
+        let returning = self.opt_returning()?;
+        Ok(Stmt::Insert {
+            table,
+            columns,
+            source,
+            on_conflict,
+            returning,
+        })
+    }
+
+    /// The row source after `INSERT … [(cols)]`: `VALUES (…)[, …]` or a `SELECT`.
+    fn insert_source(&mut self) -> Result<InsertSource> {
+        if self.is_kw("select") {
+            return Ok(InsertSource::Select(Box::new(self.select()?)));
+        }
         self.expect_kw("values")?;
         let mut rows = Vec::new();
         loop {
@@ -772,11 +867,66 @@ impl Parser {
             }
             break;
         }
-        Ok(Stmt::Insert {
-            table,
-            columns,
-            rows,
-        })
+        Ok(InsertSource::Values(rows))
+    }
+
+    /// Parse the action after `ON CONFLICT`: an optional conflict target
+    /// `(col, …)` (accepted, not used — the engine keys on the primary key),
+    /// then `DO NOTHING` or `DO UPDATE SET … [WHERE …]`.
+    fn on_conflict_action(&mut self) -> Result<OnConflict> {
+        if self.peek() == &Tok::LParen {
+            let _ = self.paren_ident_list()?; // conflict target columns
+        } else if self.eat_kw("on") {
+            // `ON CONSTRAINT <name>` target form.
+            self.expect_kw("constraint")?;
+            let _ = self.ident()?;
+        }
+        self.expect_kw("do")?;
+        if self.eat_kw("nothing") {
+            return Ok(OnConflict::Nothing);
+        }
+        self.expect_kw("update")?;
+        self.expect_kw("set")?;
+        let sets = self.assignment_list()?;
+        let filter = if self.eat_kw("where") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(OnConflict::Update { sets, filter })
+    }
+
+    /// A comma-separated `col = expr` assignment list (shared by `UPDATE SET`
+    /// and `ON CONFLICT DO UPDATE SET`).
+    fn assignment_list(&mut self) -> Result<Vec<(String, Expr)>> {
+        let mut sets = Vec::new();
+        loop {
+            let col = self.ident()?;
+            self.expect(Tok::Eq)?;
+            let val = self.expr()?;
+            sets.push((col, val));
+            if self.skip(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(sets)
+    }
+
+    /// `RETURNING <select-item-list>` after a DML statement, if present.
+    fn opt_returning(&mut self) -> Result<Option<Vec<SelItem>>> {
+        if !self.eat_kw("returning") {
+            return Ok(None);
+        }
+        let mut items = Vec::new();
+        loop {
+            items.push(self.select_item()?);
+            if self.skip(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(Some(items))
     }
 
     fn select(&mut self) -> Result<SelectStmt> {
@@ -840,20 +990,35 @@ impl Parser {
         Ok(group_by)
     }
 
-    /// `ORDER BY expr [ASC|DESC], ...` (empty when absent).
-    fn parse_order_by(&mut self) -> Result<Vec<(Expr, bool)>> {
+    /// `ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...` (empty when absent).
+    fn parse_order_by(&mut self) -> Result<Vec<OrderKey>> {
         let mut order_by = Vec::new();
         if self.eat_kw("order") {
             self.expect_kw("by")?;
             loop {
-                let e = self.expr()?;
+                let expr = self.expr()?;
                 let asc = if self.eat_kw("desc") {
                     false
                 } else {
                     let _ = self.eat_kw("asc");
                     true
                 };
-                order_by.push((e, asc));
+                // Default placement preserves the engine's historical behaviour
+                // (NULLs first on ASC, last on DESC); `NULLS FIRST/LAST` overrides.
+                let mut nulls_first = asc;
+                if self.eat_kw("nulls") {
+                    if self.eat_kw("first") {
+                        nulls_first = true;
+                    } else {
+                        self.expect_kw("last")?;
+                        nulls_first = false;
+                    }
+                }
+                order_by.push(OrderKey {
+                    expr,
+                    asc,
+                    nulls_first,
+                });
                 if !self.skip(Tok::Comma) {
                     break;
                 }
@@ -930,26 +1095,18 @@ impl Parser {
         self.expect_kw("update")?;
         let table = self.ident()?;
         self.expect_kw("set")?;
-        let mut sets = Vec::new();
-        loop {
-            let col = self.ident()?;
-            self.expect(Tok::Eq)?;
-            let val = self.expr()?;
-            sets.push((col, val));
-            if self.skip(Tok::Comma) {
-                continue;
-            }
-            break;
-        }
+        let sets = self.assignment_list()?;
         let filter = if self.eat_kw("where") {
             Some(self.expr()?)
         } else {
             None
         };
+        let returning = self.opt_returning()?;
         Ok(Stmt::Update {
             table,
             sets,
             filter,
+            returning,
         })
     }
 
@@ -962,7 +1119,12 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::Delete { table, filter })
+        let returning = self.opt_returning()?;
+        Ok(Stmt::Delete {
+            table,
+            filter,
+            returning,
+        })
     }
 
     // ---- expression parsing (precedence climbing) --------------------------
@@ -1020,26 +1182,22 @@ impl Parser {
                 negated,
             });
         }
-        // [NOT] LIKE
-        let not_like = if self.is_kw("not")
-            && self
-                .toks
-                .get(self.pos + 1)
-                .map(|t| matches!(t, Tok::Word(w) if w.eq_ignore_ascii_case("like")))
-                .unwrap_or(false)
-        {
-            self.bump(); // not
+        // A `NOT` here belongs to the infix predicate that follows it
+        // (`NOT LIKE`/`NOT ILIKE`/`NOT IN`/`NOT BETWEEN`), not a logical NOT.
+        let negated = if self.is_kw("not") && self.next_starts_neg_predicate() {
+            self.bump();
             true
         } else {
             false
         };
-        if self.eat_kw("like") {
-            let pattern = self.vecdist_expr()?;
-            return Ok(Expr::Like {
-                e: Box::new(left),
-                pattern: Box::new(pattern),
-                negated: not_like,
-            });
+        if self.is_kw("like") || self.is_kw("ilike") {
+            return self.like_tail(left, negated);
+        }
+        if self.eat_kw("in") {
+            return self.in_tail(left, negated);
+        }
+        if self.eat_kw("between") {
+            return self.between_tail(left, negated);
         }
         let op = match self.peek() {
             Tok::Eq => Some(BinOp::Eq),
@@ -1063,11 +1221,79 @@ impl Parser {
         }
     }
 
+    /// Whether the token after a `NOT` begins an infix predicate that takes the
+    /// `NOT` (so `a NOT LIKE b` is one node, not `NOT (a LIKE b)`).
+    fn next_starts_neg_predicate(&self) -> bool {
+        matches!(self.toks.get(self.pos + 1),
+            Some(Tok::Word(w)) if ["like", "ilike", "in", "between"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k)))
+    }
+
+    /// `[NOT] (LIKE|ILIKE) pattern [ESCAPE c]` — `left` already parsed.
+    fn like_tail(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        let insensitive = self.is_kw("ilike");
+        self.bump(); // LIKE | ILIKE
+        let pattern = self.vecdist_expr()?;
+        let escape = if self.eat_kw("escape") {
+            Some(Box::new(self.vecdist_expr()?))
+        } else {
+            None
+        };
+        Ok(Expr::Like {
+            e: Box::new(left),
+            pattern: Box::new(pattern),
+            escape,
+            negated,
+            insensitive,
+        })
+    }
+
+    /// `[NOT] IN (expr, …)` — `left` and `IN` already consumed. (Subquery IN
+    /// is a stage-6B feature; a `SELECT` here is rejected for now.)
+    fn in_tail(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        self.expect(Tok::LParen)?;
+        if self.is_kw("select") {
+            return Err(EngineError::sql("IN (SELECT …) is not supported yet"));
+        }
+        let mut list = Vec::new();
+        if self.peek() != &Tok::RParen {
+            loop {
+                list.push(self.expr()?);
+                if self.skip(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Expr::InList {
+            e: Box::new(left),
+            list,
+            negated,
+        })
+    }
+
+    /// `[NOT] BETWEEN lo AND hi` — `left` and `BETWEEN` already consumed. The
+    /// bounds parse at the additive level so the trailing `AND` is the BETWEEN
+    /// separator, not a logical conjunction.
+    fn between_tail(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        let lo = self.vecdist_expr()?;
+        self.expect_kw("and")?;
+        let hi = self.vecdist_expr()?;
+        Ok(Expr::Between {
+            e: Box::new(left),
+            lo: Box::new(lo),
+            hi: Box::new(hi),
+            negated,
+        })
+    }
+
     /// Vector distance operators bind tighter than comparison but looser than
     /// arithmetic, so `embedding <-> ? < 0.5` parses as `(embedding <-> ?) < 0.5`
     /// and `a + 1 <-> b` as `(a + 1) <-> b`.
     fn vecdist_expr(&mut self) -> Result<Expr> {
-        let mut left = self.add_expr()?;
+        let mut left = self.concat_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::VecL2 => BinOp::VecL2,
@@ -1076,9 +1302,25 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.add_expr()?;
+            let right = self.concat_expr()?;
             left = Expr::Binary {
                 op,
+                l: Box::new(left),
+                r: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// String concatenation `||`, between the distance and additive levels
+    /// (Postgres puts `||` looser than `+`/`-`, tighter than comparison).
+    fn concat_expr(&mut self) -> Result<Expr> {
+        let mut left = self.add_expr()?;
+        while self.peek() == &Tok::Concat {
+            self.bump();
+            let right = self.add_expr()?;
+            left = Expr::Binary {
+                op: BinOp::Concat,
                 l: Box::new(left),
                 r: Box::new(right),
             };
@@ -1236,6 +1478,57 @@ impl Parser {
         Ok(Expr::Aggregate { func, arg })
     }
 
+    fn next_is_lparen(&self) -> bool {
+        matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+    }
+
+    /// `CAST ( expr AS type )` — the functional cast form. Routes through the
+    /// same [`parse_cast_type`] machinery the `::` operator uses.
+    fn cast_call(&mut self) -> Result<Expr> {
+        self.bump(); // CAST
+        self.expect(Tok::LParen)?;
+        let e = self.expr()?;
+        self.expect_kw("as")?;
+        let target = self.parse_cast_type()?;
+        self.expect(Tok::RParen)?;
+        Ok(Expr::Cast {
+            e: Box::new(e),
+            target,
+        })
+    }
+
+    /// `CASE [operand] WHEN cond THEN result … [ELSE result] END`.
+    fn case_expr(&mut self) -> Result<Expr> {
+        self.expect_kw("case")?;
+        // A simple CASE has an operand before the first WHEN.
+        let operand = if self.is_kw("when") {
+            None
+        } else {
+            Some(Box::new(self.expr()?))
+        };
+        let mut whens = Vec::new();
+        while self.eat_kw("when") {
+            let cond = self.expr()?;
+            self.expect_kw("then")?;
+            let result = self.expr()?;
+            whens.push((cond, result));
+        }
+        if whens.is_empty() {
+            return Err(EngineError::sql("CASE requires at least one WHEN"));
+        }
+        let els = if self.eat_kw("else") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        self.expect_kw("end")?;
+        Ok(Expr::Case {
+            operand,
+            whens,
+            els,
+        })
+    }
+
     fn primary(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             Tok::Int(n) => {
@@ -1273,14 +1566,25 @@ impl Parser {
                 } else if w.eq_ignore_ascii_case("false") {
                     self.bump();
                     Ok(Expr::Int(0))
+                } else if w.eq_ignore_ascii_case("case") {
+                    self.case_expr()
+                } else if w.eq_ignore_ascii_case("cast") && self.next_is_lparen() {
+                    self.cast_call()
                 } else {
                     self.bump();
                     if self.peek() == &Tok::LParen {
                         self.func_call(w)
                     } else if self.skip(Tok::Dot) {
-                        // table.column -> use column part (single-table in P1)
+                        // qualified `name.column`. `excluded.col` (the upsert
+                        // pseudo-table) keeps its qualifier; for an ordinary
+                        // `table.col` the qualifier is dropped (single-table; a
+                        // real binder lands in stage 6B).
                         let col = self.ident()?;
-                        Ok(Expr::Column(col))
+                        if w.eq_ignore_ascii_case("excluded") {
+                            Ok(Expr::Excluded(col))
+                        } else {
+                            Ok(Expr::Column(col))
+                        }
                     } else {
                         Ok(Expr::Column(w))
                     }
@@ -1359,8 +1663,25 @@ fn is_constraint_kw(w: &str) -> bool {
 
 fn is_clause_kw(w: &str) -> bool {
     [
-        "from", "where", "order", "limit", "offset", "group", "having", "as", "and", "or", "is",
-        "like", "asc", "desc",
+        "from",
+        "where",
+        "order",
+        "limit",
+        "offset",
+        "group",
+        "having",
+        "as",
+        "and",
+        "or",
+        "is",
+        "like",
+        "ilike",
+        "asc",
+        "desc",
+        "nulls",
+        "returning",
+        "on",
+        "between",
     ]
     .iter()
     .any(|k| w.eq_ignore_ascii_case(k))

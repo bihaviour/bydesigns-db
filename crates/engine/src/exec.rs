@@ -8,13 +8,16 @@
 
 use crate::catalog::TableSchema;
 use crate::error::{EngineError, Result};
-use crate::sql::{AggArg, AggFunc, BinOp, CastTarget, Expr, SelItem, SelectStmt, UnOp};
+use crate::sql::{
+    AggArg, AggFunc, BinOp, CastTarget, Expr, InsertSource, OnConflict, OrderKey, SelItem,
+    SelectStmt, UnOp,
+};
 use crate::store::{RowVersion, Store, PENDING};
 use crate::value::{parse_vector, ColumnType, Value};
 use crate::vector::{distance, Metric};
 use crate::wal::WalOp;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// How many candidates the HNSW scan over-fetches per requested result, to
 /// absorb hits that are MVCC-invisible or filtered out by a `WHERE` clause.
@@ -40,6 +43,9 @@ struct EvalCtx<'a> {
     /// aggregated query. When set, [`Expr::Aggregate`] folds over these rows;
     /// when `None`, an aggregate expression is an error.
     group: Option<&'a [&'a [Value]]>,
+    /// The proposed-insert row backing `excluded.<col>` inside an
+    /// `ON CONFLICT DO UPDATE`; `None` everywhere else.
+    excluded: Option<&'a [Value]>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -50,6 +56,7 @@ impl<'a> EvalCtx<'a> {
             schema: None,
             params,
             group: None,
+            excluded: None,
         }
     }
 
@@ -60,6 +67,7 @@ impl<'a> EvalCtx<'a> {
             schema: Some(schema),
             params,
             group: None,
+            excluded: None,
         }
     }
 }
@@ -116,18 +124,46 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::Like {
             e,
             pattern,
+            escape,
             negated,
+            insensitive,
         } => {
             let v = eval(e, ctx)?;
             let p = eval(pattern, ctx)?;
+            let esc = match escape {
+                Some(x) => match eval(x, ctx)? {
+                    Value::Null => return Ok(Value::Null),
+                    other => other.render().and_then(|s| s.chars().next()),
+                },
+                None => None,
+            };
             match (v, p) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Text(s), Value::Text(pat)) => {
-                    let m = like_match(&s, &pat);
+                    let m = like_match(&s, &pat, esc, *insensitive);
                     Ok(Value::Int((m ^ negated) as i64))
                 }
                 _ => Ok(Value::Null),
             }
+        }
+        Expr::InList { e, list, negated } => eval_in_list(e, list, *negated, ctx),
+        Expr::Between { e, lo, hi, negated } => eval_between(e, lo, hi, *negated, ctx),
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => eval_case(operand, whens, els, ctx),
+        Expr::Excluded(name) => {
+            let row = ctx.excluded.ok_or_else(|| {
+                EngineError::sql("excluded.* is only valid in ON CONFLICT DO UPDATE")
+            })?;
+            let schema = ctx
+                .schema
+                .ok_or_else(|| EngineError::sql("excluded.* referenced with no table"))?;
+            let idx = schema
+                .column_index(name)
+                .ok_or_else(|| EngineError::sql(format!("no such column: excluded.{name}")))?;
+            Ok(row[idx].clone())
         }
         Expr::Binary { op, l, r } => {
             let lv = eval(l, ctx)?;
@@ -229,7 +265,90 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
         And => Ok(three_valued_and(l.as_bool(), r.as_bool())),
         Or => Ok(three_valued_or(l.as_bool(), r.as_bool())),
         Add | Sub | Mul | Div | Mod => arith(op, l, r),
+        Concat => Ok(concat_values(l, r)),
         VecL2 | VecCosine | VecIp => vec_distance(op, &l, &r),
+    }
+}
+
+/// `||` string concatenation: NULL-propagating, operands rendered to text.
+fn concat_values(l: Value, r: Value) -> Value {
+    if l.is_null() || r.is_null() {
+        return Value::Null;
+    }
+    Value::Text(format!(
+        "{}{}",
+        l.render().unwrap_or_default(),
+        r.render().unwrap_or_default()
+    ))
+}
+
+/// `expr [NOT] IN (list)` with SQL three-valued logic: NULL if `expr` is NULL or
+/// no element matched but some element compared NULL; otherwise the membership.
+fn eval_in_list(e: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<Value> {
+    let v = eval(e, ctx)?;
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let mut saw_null = false;
+    for item in list {
+        match v.sql_eq(&eval(item, ctx)?) {
+            Some(true) => return Ok(Value::Int(!negated as i64)),
+            Some(false) => {}
+            None => saw_null = true,
+        }
+    }
+    Ok(if saw_null {
+        Value::Null
+    } else {
+        Value::Int(negated as i64)
+    })
+}
+
+/// `expr [NOT] BETWEEN lo AND hi`, i.e. `expr >= lo AND expr <= hi` (negated by
+/// De Morgan), preserving three-valued logic via [`eval_binary`].
+fn eval_between(e: &Expr, lo: &Expr, hi: &Expr, negated: bool, ctx: &EvalCtx) -> Result<Value> {
+    let v = eval(e, ctx)?;
+    let lo = eval(lo, ctx)?;
+    let hi = eval(hi, ctx)?;
+    let ge = eval_binary(BinOp::Ge, v.clone(), lo)?;
+    let le = eval_binary(BinOp::Le, v, hi)?;
+    let within = three_valued_and(ge.as_bool(), le.as_bool());
+    if !negated {
+        return Ok(within);
+    }
+    Ok(match within.as_bool() {
+        Some(b) => Value::Int(!b as i64),
+        None => Value::Null,
+    })
+}
+
+/// Evaluate a `CASE` expression, short-circuiting at the first matching branch.
+/// A simple `CASE operand WHEN v …` compares `operand` to each `v` for equality;
+/// a searched `CASE WHEN cond …` tests each `cond` for truth.
+fn eval_case(
+    operand: &Option<Box<Expr>>,
+    whens: &[(Expr, Expr)],
+    els: &Option<Box<Expr>>,
+    ctx: &EvalCtx,
+) -> Result<Value> {
+    let operand = match operand {
+        Some(e) => Some(eval(e, ctx)?),
+        None => None,
+    };
+    for (cond, result) in whens {
+        let matched = match &operand {
+            // Simple form: operand = when-value (NULL never matches).
+            Some(op) => eval(cond, ctx)?.sql_eq(op) == Some(true),
+            // Searched form: when-condition is truthy.
+            None => eval(cond, ctx)?.as_bool().unwrap_or(false),
+        };
+        if matched {
+            return eval(result, ctx);
+        }
+    }
+    match els {
+        Some(e) => eval(e, ctx),
+        None => Ok(Value::Null),
     }
 }
 
@@ -356,19 +475,49 @@ fn num(v: &Value) -> Result<f64> {
     }
 }
 
-/// SQL `LIKE` with `%` (any run) and `_` (single char), ASCII-case-insensitive.
-fn like_match(s: &str, pattern: &str) -> bool {
-    let s: Vec<char> = s.to_lowercase().chars().collect();
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    fn go(s: &[char], p: &[char]) -> bool {
+/// SQL `LIKE`/`ILIKE` with `%` (any run) and `_` (single char). `escape`, when
+/// set, makes the following pattern char a literal (so `\%` matches a real `%`).
+/// `insensitive` (or the engine's default `LIKE`) folds ASCII case before
+/// matching. The pattern is pre-tokenized into "literal char" vs "wildcard".
+fn like_match(s: &str, pattern: &str, escape: Option<char>, insensitive: bool) -> bool {
+    // The engine's historical LIKE is case-insensitive; the LIKE/ILIKE split is
+    // a stage-6E dialect concern, so for now both fold case.
+    let _ = insensitive;
+    let fold = |c: char| c.to_ascii_lowercase();
+    let s: Vec<char> = s.chars().map(fold).collect();
+
+    // Tokens: '%' (any run), '_' (one char), or a literal char.
+    enum P {
+        Any,
+        One,
+        Lit(char),
+    }
+    let mut p: Vec<P> = Vec::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            if let Some(n) = chars.next() {
+                p.push(P::Lit(fold(n)));
+            } else {
+                p.push(P::Lit(fold(c)));
+            }
+        } else if c == '%' {
+            p.push(P::Any);
+        } else if c == '_' {
+            p.push(P::One);
+        } else {
+            p.push(P::Lit(fold(c)));
+        }
+    }
+
+    fn go(s: &[char], p: &[P]) -> bool {
         if p.is_empty() {
             return s.is_empty();
         }
-        match p[0] {
-            '%' => {
-                // collapse consecutive %, then try every split
+        match &p[0] {
+            P::Any => {
                 let mut k = 0;
-                while k < p.len() && p[k] == '%' {
+                while k < p.len() && matches!(p[k], P::Any) {
                     k += 1;
                 }
                 let rest = &p[k..];
@@ -377,8 +526,8 @@ fn like_match(s: &str, pattern: &str) -> bool {
                 }
                 (0..=s.len()).any(|i| go(&s[i..], rest))
             }
-            '_' => !s.is_empty() && go(&s[1..], &p[1..]),
-            c => !s.is_empty() && s[0] == c && go(&s[1..], &p[1..]),
+            P::One => !s.is_empty() && go(&s[1..], &p[1..]),
+            P::Lit(c) => !s.is_empty() && s[0] == *c && go(&s[1..], &p[1..]),
         }
     }
     go(&s, &p)
@@ -471,6 +620,23 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Binary { l, r, .. } => expr_has_aggregate(l) || expr_has_aggregate(r),
         Expr::Like { e, pattern, .. } => expr_has_aggregate(e) || expr_has_aggregate(pattern),
         Expr::Func { args, .. } => args.iter().any(expr_has_aggregate),
+        Expr::InList { e, list, .. } => {
+            expr_has_aggregate(e) || list.iter().any(expr_has_aggregate)
+        }
+        Expr::Between { e, lo, hi, .. } => {
+            expr_has_aggregate(e) || expr_has_aggregate(lo) || expr_has_aggregate(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().is_some_and(expr_has_aggregate)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_has_aggregate(c) || expr_has_aggregate(r))
+                || els.as_deref().is_some_and(expr_has_aggregate)
+        }
         _ => false,
     }
 }
@@ -542,11 +708,15 @@ fn order_matched(
 
 /// Resolve each `ORDER BY` key against the select list: a bare column that
 /// matches an output alias is replaced by that item's expression (Postgres
-/// resolves `ORDER BY <alias>`). Other keys pass through unchanged.
-fn resolved_order_keys(sel: &SelectStmt) -> Vec<(Expr, bool)> {
+/// resolves `ORDER BY <alias>`). Direction / NULL placement pass through.
+fn resolved_order_keys(sel: &SelectStmt) -> Vec<OrderKey> {
     sel.order_by
         .iter()
-        .map(|(e, asc)| (resolve_alias(sel, e), *asc))
+        .map(|k| OrderKey {
+            expr: resolve_alias(sel, &k.expr),
+            asc: k.asc,
+            nulls_first: k.nulls_first,
+        })
         .collect()
 }
 
@@ -569,30 +739,59 @@ fn resolve_alias(sel: &SelectStmt, expr: &Expr) -> Expr {
 
 /// Compare two rows by the ordered key list, recording the first eval error.
 fn order_key_cmp(
-    keys: &[(Expr, bool)],
+    keys: &[OrderKey],
     schema: &TableSchema,
     ra: &[Value],
     rb: &[Value],
     params: &[Value],
     err: &mut Option<EngineError>,
 ) -> Ordering {
-    for (expr, asc) in keys {
+    for key in keys {
         let ca = EvalCtx::row(ra, schema, params);
         let cb = EvalCtx::row(rb, schema, params);
-        let (va, vb) = match (eval(expr, &ca), eval(expr, &cb)) {
+        let (va, vb) = match (eval(&key.expr, &ca), eval(&key.expr, &cb)) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) | (_, Err(e)) => {
                 *err = Some(e);
                 return Ordering::Equal;
             }
         };
-        let ord = null_aware_cmp(&va, &vb);
-        let ord = if *asc { ord } else { ord.reverse() };
+        let ord = order_cmp(&va, &vb, key.asc, key.nulls_first);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
+}
+
+/// Compare two values for `ORDER BY`: direction applies to non-NULL values;
+/// NULL placement is independent (`nulls_first`), per the SQL standard.
+fn order_cmp(a: &Value, b: &Value, asc: bool, nulls_first: bool) -> Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let ord = a.sql_cmp(b).unwrap_or(Ordering::Equal);
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        }
+    }
 }
 
 /// Project the `matched` rows through the SELECT list, producing column names,
@@ -661,11 +860,11 @@ fn knn_plan(sel: &SelectStmt, limit: Option<i64>) -> Option<KnnPlan<'_>> {
     if limit < 0 || sel.order_by.len() != 1 {
         return None;
     }
-    let (order_expr, asc) = &sel.order_by[0];
-    if !asc || sel.offset.is_some() || is_aggregated(sel) {
+    let key = &sel.order_by[0];
+    if !key.asc || sel.offset.is_some() || is_aggregated(sel) {
         return None;
     }
-    let Expr::Binary { op, l, r } = order_expr else {
+    let Expr::Binary { op, l, r } = &key.expr else {
         return None;
     };
     let metric = op.vec_metric()?;
@@ -894,6 +1093,7 @@ fn grouped_select(
             schema: Some(schema),
             params,
             group: Some(&rows),
+            excluded: None,
         };
         // HAVING filters whole groups.
         if let Some(h) = &sel.having {
@@ -969,28 +1169,29 @@ fn order_groups(
         if err.is_some() {
             return Ordering::Equal;
         }
-        for (expr, asc) in &keys {
+        for key in &keys {
             let ca = EvalCtx {
                 row: a.1.first().copied(),
                 schema: Some(schema),
                 params,
                 group: Some(&a.1),
+                excluded: None,
             };
             let cb = EvalCtx {
                 row: b.1.first().copied(),
                 schema: Some(schema),
                 params,
                 group: Some(&b.1),
+                excluded: None,
             };
-            let (va, vb) = match (eval(expr, &ca), eval(expr, &cb)) {
+            let (va, vb) = match (eval(&key.expr, &ca), eval(&key.expr, &cb)) {
                 (Ok(x), Ok(y)) => (x, y),
                 (Err(e), _) | (_, Err(e)) => {
                     err = Some(e);
                     return Ordering::Equal;
                 }
             };
-            let ord = null_aware_cmp(&va, &vb);
-            let ord = if *asc { ord } else { ord.reverse() };
+            let ord = order_cmp(&va, &vb, key.asc, key.nulls_first);
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -1141,6 +1342,29 @@ fn call_func(name: &str, args: Vec<Value>) -> Result<Value> {
                 a
             })
         }
+        // `ifnull(a, b)` / SQLite alias of two-arg coalesce.
+        "ifnull" => {
+            let a = args.first().cloned().unwrap_or(Value::Null);
+            Ok(if a.is_null() {
+                args.get(1).cloned().unwrap_or(Value::Null)
+            } else {
+                a
+            })
+        }
+        // `iif(cond, a, b)` (SQLite/T-SQL): the ternary conditional.
+        "iif" | "if" => {
+            if args.len() != 3 {
+                return Err(EngineError::sql("iif() takes exactly three arguments"));
+            }
+            Ok(match args[0].as_bool() {
+                Some(true) => args[1].clone(),
+                _ => args[2].clone(),
+            })
+        }
+        // `greatest`/`least`: the max/min non-NULL argument (NULLs ignored; all
+        // NULL → NULL), matching Postgres.
+        "greatest" => Ok(extreme(args, Ordering::Greater)),
+        "least" => Ok(extreme(args, Ordering::Less)),
         // Strings.
         "lower" => Ok(map_text(args, |s| s.to_lowercase())),
         "upper" => Ok(map_text(args, |s| s.to_uppercase())),
@@ -1184,6 +1408,15 @@ fn call_func(name: &str, args: Vec<Value>) -> Result<Value> {
         "json_build_object" | "jsonb_build_object" => json_build_object(&args),
         other => Err(EngineError::sql(format!("unknown function: {other}"))),
     }
+}
+
+/// Reduce arguments to the one comparing `want` (Greatest/Least), skipping NULLs
+/// (Postgres semantics); all-NULL or empty → NULL.
+fn extreme(args: Vec<Value>, want: Ordering) -> Value {
+    args.into_iter()
+        .filter(|v| !v.is_null())
+        .reduce(|a, b| if a.sql_cmp(&b) == Some(want) { a } else { b })
+        .unwrap_or(Value::Null)
 }
 
 /// Apply `f` to a single text argument, propagating NULL and rendering non-text
@@ -1263,118 +1496,320 @@ fn json_quote(s: &str) -> String {
 
 // ---- writes (validate fully, then apply: atomic per statement) -------------
 
+/// The outcome of a write statement: the WAL ops to make durable, the affected-
+/// row count, and — when the statement carried `RETURNING` — the projected rows.
+#[derive(Default)]
+pub struct Mutation {
+    pub wal: Vec<WalOp>,
+    pub changes: i64,
+    pub result: Option<ResultSet>,
+}
+
+/// Project affected rows (full table-row value vectors) through a `RETURNING`
+/// list — `*` expands the table's columns, expressions evaluate per row.
+fn project_returning(
+    items: &[SelItem],
+    schema: &TableSchema,
+    rows: &[Vec<Value>],
+    params: &[Value],
+) -> Result<ResultSet> {
+    let mut columns = Vec::new();
+    let mut types: Vec<ColumnType> = Vec::new();
+    let mut plan: Vec<ProjItem> = Vec::new();
+    for item in items {
+        match item {
+            SelItem::Star => {
+                for c in &schema.columns {
+                    columns.push(c.name.clone());
+                    types.push(c.ty);
+                    plan.push(ProjItem::Column(schema.column_index(&c.name).unwrap()));
+                }
+            }
+            SelItem::Expr { expr, alias } => {
+                columns.push(column_name(expr, alias, columns.len()));
+                types.push(expr_type(expr, Some(schema)));
+                plan.push(ProjItem::Expr(expr.clone()));
+            }
+        }
+    }
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut out = Vec::with_capacity(plan.len());
+        for p in &plan {
+            match p {
+                ProjItem::Column(i) => out.push(r[*i].clone()),
+                ProjItem::Expr(e) => {
+                    let ctx = EvalCtx::row(r, schema, params);
+                    out.push(eval(e, &ctx)?);
+                }
+            }
+        }
+        out_rows.push(out);
+    }
+    Ok(ResultSet {
+        columns,
+        types,
+        rows: out_rows,
+    })
+}
+
+/// NOT NULL enforcement over a fully-formed row (insert/update validation pass).
+fn check_not_null(schema: &TableSchema, vals: &[Value], table: &str) -> Result<()> {
+    for (i, c) in schema.columns.iter().enumerate() {
+        if c.not_null && vals[i].is_null() {
+            return Err(EngineError::constraint(format!(
+                "NOT NULL constraint failed: {}.{}",
+                table, c.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Stamp `old_vid` as superseded by this writer and emit its delete WAL op.
+fn supersede(store: &mut Store, table: &str, old_vid: u64, owner: u64, wal: &mut Vec<WalOp>) {
+    if let Some(rv) = store.table_mut(table).unwrap().version_mut(old_vid) {
+        rv.delete_lsn = PENDING;
+        rv.owner = owner;
+    }
+    wal.push(WalOp::Delete {
+        table: table.to_string(),
+        vid: old_vid,
+    });
+}
+
+/// Append a new PENDING row version to `table`, emit its insert WAL op, and
+/// return the allocated vid.
+fn append_version(
+    store: &mut Store,
+    table: &str,
+    vals: &[Value],
+    owner: u64,
+    wal: &mut Vec<WalOp>,
+) -> u64 {
+    let t = store.table_mut(table).unwrap();
+    let vid = t.alloc_vid();
+    t.rows.push(RowVersion {
+        vid,
+        values: vals.to_vec(),
+        create_lsn: PENDING,
+        delete_lsn: 0,
+        owner,
+    });
+    wal.push(WalOp::Insert {
+        table: table.to_string(),
+        vid,
+        values: vals.to_vec(),
+    });
+    vid
+}
+
+/// For a table with primary-key column `pk`: keys live in committed state mapped
+/// to their row vid (the rows an upsert may replace/update), plus the keys a
+/// concurrent in-flight writer is inserting (a clash there is retryable).
+fn pk_index(
+    store: &Store,
+    table: &str,
+    pk: usize,
+    me: u64,
+) -> (HashMap<String, u64>, HashSet<String>) {
+    let mut committed = HashMap::new();
+    let mut pending = HashSet::new();
+    if let Some(t) = store.table(table) {
+        for v in &t.rows {
+            if v.visible_to_writer(store.committed_lsn, me) {
+                committed.insert(value_key(&v.values[pk]), v.vid);
+            } else if v.create_lsn == PENDING && v.owner != me && v.delete_lsn == 0 {
+                pending.insert(value_key(&v.values[pk]));
+            }
+        }
+    }
+    (committed, pending)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_insert(
     store: &mut Store,
     table: &str,
     columns: &Option<Vec<String>>,
-    rows: &[Vec<Expr>],
+    source: &InsertSource,
+    on_conflict: &OnConflict,
+    returning: Option<&[SelItem]>,
+    snapshot: u64,
     owner: u64,
     params: &[Value],
-) -> Result<(Vec<WalOp>, i64)> {
+) -> Result<Mutation> {
     let schema = store
         .table(table)
         .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?
         .schema
         .clone();
     let ncols = schema.columns.len();
-    let ctx = EvalCtx::root(params);
 
-    let mut staged: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
-    for row_exprs in rows {
+    // 1) Evaluate the row source (literal VALUES or a query) into value rows.
+    let source_rows: Vec<Vec<Value>> = match source {
+        InsertSource::Values(rows) => {
+            let ctx = EvalCtx::root(params);
+            let mut out = Vec::with_capacity(rows.len());
+            for exprs in rows {
+                out.push(exprs.iter().map(|e| eval(e, &ctx)).collect::<Result<_>>()?);
+            }
+            out
+        }
+        // INSERT … SELECT: the query sees this writer's snapshot (committed +
+        // its own pending), feeding its result rows into the same staging loop.
+        InsertSource::Select(sel) => run_select(store, sel, snapshot, Some(owner), params)?.rows,
+    };
+
+    // 2) Map provided values onto full column vectors, coerce, and validate.
+    let mut staged: Vec<Vec<Value>> = Vec::with_capacity(source_rows.len());
+    for src in &source_rows {
         let mut vals = vec![Value::Null; ncols];
         match columns {
             Some(cols) => {
-                if cols.len() != row_exprs.len() {
+                if cols.len() != src.len() {
                     return Err(EngineError::sql("INSERT column/value count mismatch"));
                 }
-                for (c, e) in cols.iter().zip(row_exprs) {
+                for (c, v) in cols.iter().zip(src) {
                     let idx = schema
                         .column_index(c)
                         .ok_or_else(|| EngineError::sql(format!("no such column: {c}")))?;
-                    vals[idx] = schema.columns[idx].ty.coerce(eval(e, &ctx)?);
+                    vals[idx] = schema.columns[idx].ty.coerce(v.clone());
                 }
             }
             None => {
-                if row_exprs.len() != ncols {
+                if src.len() != ncols {
                     return Err(EngineError::sql(format!(
                         "table {table} has {ncols} columns but {} values supplied",
-                        row_exprs.len()
+                        src.len()
                     )));
                 }
-                for (i, e) in row_exprs.iter().enumerate() {
-                    vals[i] = schema.columns[i].ty.coerce(eval(e, &ctx)?);
+                for (i, v) in src.iter().enumerate() {
+                    vals[i] = schema.columns[i].ty.coerce(v.clone());
                 }
             }
         }
-        // NOT NULL + vector dimension.
-        for (i, c) in schema.columns.iter().enumerate() {
-            if c.not_null && vals[i].is_null() {
-                return Err(EngineError::constraint(format!(
-                    "NOT NULL constraint failed: {}.{}",
-                    table, c.name
-                )));
-            }
-        }
+        check_not_null(&schema, &vals, table)?;
         check_vector_dims(&schema, &vals, table)?;
         staged.push(vals);
     }
 
-    // PRIMARY KEY uniqueness (vs existing visible rows + concurrent pending
-    // inserts + within this batch). A clash with another in-flight writer's
-    // pending insert is reported as a conflict (retryable) rather than a hard
-    // constraint failure, since on retry the key may be free again.
-    if let Some(pk) = schema.primary_key_index() {
-        let (mut committed, pending) = pk_keys(store, table, pk, owner, &[]);
-        for vals in &staged {
-            let key = value_key(&vals[pk]);
-            if pending.contains(&key) {
-                return Err(EngineError::new(
-                    crate::error::EngineStatus::ErrConflict,
-                    format!(
-                        "write conflict: {}.{} is being inserted by a concurrent transaction",
-                        table, schema.columns[pk].name
-                    ),
-                ));
+    // 3) Resolve the primary-key conflict action and apply.
+    let maintain = store.table_has_index(table);
+    let mut wal = Vec::new();
+    let mut affected: Vec<Vec<Value>> = Vec::new();
+    let mut new_index_rows: Vec<(u64, Vec<Value>)> = Vec::new();
+
+    match schema.primary_key_index() {
+        // No primary key → no conflict is possible; straight inserts.
+        None => {
+            for vals in staged {
+                let vid = append_version(store, table, &vals, owner, &mut wal);
+                if maintain {
+                    new_index_rows.push((vid, vals.clone()));
+                }
+                affected.push(vals);
             }
-            if !committed.insert(key) {
-                return Err(EngineError::constraint(format!(
-                    "UNIQUE constraint failed: {}.{}",
-                    table, schema.columns[pk].name
-                )));
+        }
+        Some(pk) => {
+            let (mut live_vid, pending) = pk_index(store, table, pk, owner);
+            for vals in staged {
+                let key = value_key(&vals[pk]);
+                if pending.contains(&key) {
+                    return Err(EngineError::new(
+                        crate::error::EngineStatus::ErrConflict,
+                        format!(
+                            "write conflict: {}.{} is being inserted by a concurrent transaction",
+                            table, schema.columns[pk].name
+                        ),
+                    ));
+                }
+                let Some(&old_vid) = live_vid.get(&key) else {
+                    // No clash: ordinary insert.
+                    let vid = append_version(store, table, &vals, owner, &mut wal);
+                    live_vid.insert(key, vid);
+                    if maintain {
+                        new_index_rows.push((vid, vals.clone()));
+                    }
+                    affected.push(vals);
+                    continue;
+                };
+                // A clash with a key already live (committed or inserted earlier
+                // in this batch) — apply the conflict action.
+                match on_conflict {
+                    OnConflict::Error => {
+                        return Err(EngineError::constraint(format!(
+                            "UNIQUE constraint failed: {}.{}",
+                            table, schema.columns[pk].name
+                        )));
+                    }
+                    OnConflict::Nothing => continue,
+                    OnConflict::Replace => {
+                        supersede(store, table, old_vid, owner, &mut wal);
+                        let vid = append_version(store, table, &vals, owner, &mut wal);
+                        live_vid.insert(key, vid);
+                        if maintain {
+                            new_index_rows.push((vid, vals.clone()));
+                        }
+                        affected.push(vals);
+                    }
+                    OnConflict::Update { sets, filter } => {
+                        let existing = store
+                            .table(table)
+                            .and_then(|t| t.version(old_vid))
+                            .map(|r| r.values.clone())
+                            .ok_or_else(|| {
+                                EngineError::sql(
+                                    "ON CONFLICT DO UPDATE cannot affect one row twice",
+                                )
+                            })?;
+                        let ctx = EvalCtx {
+                            row: Some(&existing),
+                            schema: Some(&schema),
+                            params,
+                            group: None,
+                            excluded: Some(&vals),
+                        };
+                        if let Some(f) = filter {
+                            if !eval(f, &ctx)?.as_bool().unwrap_or(false) {
+                                continue;
+                            }
+                        }
+                        let mut nv = existing.clone();
+                        for (col, expr) in sets {
+                            let idx = schema.column_index(col).ok_or_else(|| {
+                                EngineError::sql(format!("no such column: {col}"))
+                            })?;
+                            nv[idx] = schema.columns[idx].ty.coerce(eval(expr, &ctx)?);
+                        }
+                        check_not_null(&schema, &nv, table)?;
+                        check_vector_dims(&schema, &nv, table)?;
+                        supersede(store, table, old_vid, owner, &mut wal);
+                        let vid = append_version(store, table, &nv, owner, &mut wal);
+                        live_vid.insert(key, vid);
+                        if maintain {
+                            new_index_rows.push((vid, nv.clone()));
+                        }
+                        affected.push(nv);
+                    }
+                }
             }
         }
     }
 
-    // Apply, then maintain any vector index on the table (spec 12).
-    let maintain = store.table_has_index(table);
-    let n = staged.len() as i64;
-    let mut wal = Vec::with_capacity(staged.len());
-    let mut inserted: Vec<(u64, Vec<Value>)> = Vec::new();
-    {
-        let t = store.table_mut(table).unwrap();
-        for vals in staged {
-            let vid = t.alloc_vid();
-            wal.push(WalOp::Insert {
-                table: table.to_string(),
-                vid,
-                values: vals.clone(),
-            });
-            if maintain {
-                inserted.push((vid, vals.clone()));
-            }
-            t.rows.push(RowVersion {
-                vid,
-                values: vals,
-                create_lsn: PENDING,
-                delete_lsn: 0,
-                owner,
-            });
-        }
-    }
-    for (vid, vals) in &inserted {
+    for (vid, vals) in &new_index_rows {
         store.index_row_inserted(table, *vid, vals);
     }
-    Ok((wal, n))
+    let changes = affected.len() as i64;
+    let result = match returning {
+        Some(items) => Some(project_returning(items, &schema, &affected, params)?),
+        None => None,
+    };
+    Ok(Mutation {
+        wal,
+        changes,
+        result,
+    })
 }
 
 /// Enforce the declared dimension of every `vector(n)` column (spec 12 — vectors
@@ -1414,10 +1849,11 @@ pub fn run_delete(
     store: &mut Store,
     table: &str,
     filter: &Option<Expr>,
+    returning: Option<&[SelItem]>,
     snapshot: u64,
     owner: u64,
     params: &[Value],
-) -> Result<(Vec<WalOp>, i64)> {
+) -> Result<Mutation> {
     let schema = store
         .table(table)
         .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?
@@ -1425,6 +1861,8 @@ pub fn run_delete(
         .clone();
     let t = store.table(table).unwrap();
     let mut victims = Vec::new();
+    // RETURNING projects the deleted (old) row values.
+    let mut affected: Vec<Vec<Value>> = Vec::new();
     for v in &t.rows {
         if !v.visible_to_writer(snapshot, owner) {
             continue;
@@ -1433,32 +1871,38 @@ pub fn run_delete(
         if predicate(filter, &ctx)? {
             check_no_conflict(v, snapshot, owner)?;
             victims.push(v.vid);
+            if returning.is_some() {
+                affected.push(v.values.clone());
+            }
         }
     }
-    let t = store.table_mut(table).unwrap();
     let mut wal = Vec::with_capacity(victims.len());
     for vid in &victims {
-        if let Some(rv) = t.version_mut(*vid) {
-            rv.delete_lsn = PENDING;
-            rv.owner = owner;
-        }
-        wal.push(WalOp::Delete {
-            table: table.to_string(),
-            vid: *vid,
-        });
+        supersede(store, table, *vid, owner, &mut wal);
     }
-    Ok((wal, victims.len() as i64))
+    let changes = victims.len() as i64;
+    let result = match returning {
+        Some(items) => Some(project_returning(items, &schema, &affected, params)?),
+        None => None,
+    };
+    Ok(Mutation {
+        wal,
+        changes,
+        result,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_update(
     store: &mut Store,
     table: &str,
     sets: &[(String, Expr)],
     filter: &Option<Expr>,
+    returning: Option<&[SelItem]>,
     snapshot: u64,
     owner: u64,
     params: &[Value],
-) -> Result<(Vec<WalOp>, i64)> {
+) -> Result<Mutation> {
     let schema = store
         .table(table)
         .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?
@@ -1490,14 +1934,7 @@ pub fn run_update(
         for (idx, expr) in &targets {
             nv[*idx] = schema.columns[*idx].ty.coerce(eval(expr, &ctx)?);
         }
-        for (i, c) in schema.columns.iter().enumerate() {
-            if c.not_null && nv[i].is_null() {
-                return Err(EngineError::constraint(format!(
-                    "NOT NULL constraint failed: {}.{}",
-                    table, c.name
-                )));
-            }
-        }
+        check_not_null(&schema, &nv, table)?;
         check_vector_dims(&schema, &nv, table)?;
         updates.push((v.vid, nv));
     }
@@ -1531,40 +1968,28 @@ pub fn run_update(
     let maintain = store.table_has_index(table);
     let n = updates.len() as i64;
     let mut wal = Vec::new();
-    let mut inserted: Vec<(u64, Vec<Value>)> = Vec::new();
-    {
-        let t = store.table_mut(table).unwrap();
-        for (old_vid, nv) in updates {
-            if let Some(rv) = t.version_mut(old_vid) {
-                rv.delete_lsn = PENDING;
-                rv.owner = owner;
-            }
-            let new_vid = t.alloc_vid();
-            wal.push(WalOp::Delete {
-                table: table.to_string(),
-                vid: old_vid,
-            });
-            wal.push(WalOp::Insert {
-                table: table.to_string(),
-                vid: new_vid,
-                values: nv.clone(),
-            });
-            if maintain {
-                inserted.push((new_vid, nv.clone()));
-            }
-            t.rows.push(RowVersion {
-                vid: new_vid,
-                values: nv,
-                create_lsn: PENDING,
-                delete_lsn: 0,
-                owner,
-            });
+    let mut new_index_rows: Vec<(u64, Vec<Value>)> = Vec::new();
+    let mut affected: Vec<Vec<Value>> = Vec::new();
+    for (old_vid, nv) in updates {
+        supersede(store, table, old_vid, owner, &mut wal);
+        let new_vid = append_version(store, table, &nv, owner, &mut wal);
+        if maintain {
+            new_index_rows.push((new_vid, nv.clone()));
         }
+        affected.push(nv);
     }
-    for (vid, vals) in &inserted {
+    for (vid, vals) in &new_index_rows {
         store.index_row_inserted(table, *vid, vals);
     }
-    Ok((wal, n))
+    let result = match returning {
+        Some(items) => Some(project_returning(items, &schema, &affected, params)?),
+        None => None,
+    };
+    Ok(Mutation {
+        wal,
+        changes: n,
+        result,
+    })
 }
 
 /// PK keys that would clash with a new value, split into two buckets:

@@ -112,11 +112,11 @@
 <tbody>
 <tr><td><code>INSERT INTO t [(cols)] VALUES (…)[, (…)]</code></td><td>✅</td><td>Multi-row supported. Fully transactional.</td></tr>
 <tr><td><code>INSERT … DEFAULT VALUES</code></td><td>⊕ 6D</td><td>Needs <code>DEFAULT</code> support.</td></tr>
-<tr><td><code>INSERT INTO t SELECT …</code></td><td>⊕ 6A</td><td>Replace the <code>VALUES</code>-only source with "rows from a query" — reuses the executor's result rows as the insert source.</td></tr>
+<tr><td><code>INSERT INTO t SELECT …</code></td><td>✅ (6A)</td><td>The <code>VALUES</code> source generalized to "rows from a query" — the executor's result rows feed the same staging loop.</td></tr>
 <tr><td><code>UPDATE … SET … [WHERE]</code>, <code>DELETE … [WHERE]</code></td><td>✅</td><td>Fully transactional; first-committer-wins conflict checks.</td></tr>
 <tr><td><code>UPDATE … FROM …</code>, <code>DELETE … USING …</code></td><td>⊕ 6B</td><td>Join-driven DML; depends on the join machinery.</td></tr>
-<tr><td><code>… RETURNING *</code> / column list (PG; SQLite 3.35+)</td><td>⊕ 6A</td><td>Project the affected new row versions through a result set on the existing exec path. High value, low risk.</td></tr>
-<tr><td>Upsert: PG <code>INSERT … ON CONFLICT (…) DO UPDATE/NOTHING</code>, SQLite <code>INSERT … ON CONFLICT …</code> / <code>OR REPLACE</code>/<code>OR IGNORE</code></td><td>◑ → ⊕ 6A</td><td><strong>Hazard today:</strong> <code>OR REPLACE</code>/<code>OR IGNORE</code> are parsed and <em>silently ignored</em>, so they fall through to plain insert (and can fail PK). 6A implements true conflict actions and tightens the silent-ignore.</td></tr>
+<tr><td><code>… RETURNING *</code> / column list (PG; SQLite 3.35+)</td><td>✅ (6A)</td><td>Projects the affected row versions (new for INSERT/UPDATE, old for DELETE) through a result set on the existing exec path.</td></tr>
+<tr><td>Upsert: PG <code>INSERT … ON CONFLICT (…) DO UPDATE/NOTHING</code>, SQLite <code>INSERT … ON CONFLICT …</code> / <code>OR REPLACE</code>/<code>OR IGNORE</code></td><td>✅ (6A)</td><td>True conflict actions, with <code>excluded.*</code> in <code>DO UPDATE</code>. The earlier silent-ignore hazard for <code>OR REPLACE</code>/<code>OR IGNORE</code> is closed — they now skip/replace as documented.</td></tr>
 <tr><td><code>TRUNCATE</code></td><td>↻</td><td><code>DELETE FROM t</code> with no <code>WHERE</code> (already supported); a native fast-path is ✗.</td></tr>
 <tr><td><code>MERGE</code></td><td>✗</td><td>Covered functionally by upsert (6A).</td></tr>
 <tr><td><code>COPY</code> (bulk load)</td><td>↻</td><td>Use batched multi-row <code>INSERT</code> from the client. Native <code>COPY</code> wire support is a server-mode concern (spec 07), not core SQL.</td></tr>
@@ -132,9 +132,9 @@
 <tr><td>Projection: <code>*</code>, expressions, <code>AS</code> alias</td><td>✅</td><td>—</td></tr>
 <tr><td><code>FROM</code> single table; <code>SELECT</code> with no <code>FROM</code> (constants)</td><td>✅</td><td>—</td></tr>
 <tr><td><code>WHERE</code></td><td>✅</td><td>Full expression predicate, three-valued logic.</td></tr>
-<tr><td><code>ORDER BY expr [ASC|DESC]</code> (multi-key)</td><td>✅</td><td>Ranks by <em>expressions</em>, not output aliases or ordinals. <code>NULLS FIRST/LAST</code> ⊕ 6A (NULLs sort first today).</td></tr>
+<tr><td><code>ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]</code> (multi-key)</td><td>✅</td><td>Ranks by expressions; an alias resolves to its select item. <code>NULLS FIRST/LAST</code> shipped in 6A (default: NULLs first on ASC, last on DESC).</td></tr>
 <tr><td><code>LIMIT n</code></td><td>✅</td><td>Integer literal only.</td></tr>
-<tr><td><code>OFFSET n</code>, <code>LIMIT … OFFSET …</code>, <code>FETCH FIRST</code></td><td>⊕ 6A</td><td>Trivial parser + slice addition.</td></tr>
+<tr><td><code>OFFSET n</code>, <code>LIMIT … OFFSET …</code></td><td>✅ (6A)</td><td>Integer literal or parameter; <code>FETCH FIRST</code> remains out.</td></tr>
 <tr><td>Aggregates <code>COUNT/SUM/MIN/MAX/AVG</code> (whole-table)</td><td>◑</td><td>Work only when <em>all</em> select items are aggregates; cannot mix with plain columns (no grouping).</td></tr>
 <tr><td><code>GROUP BY</code> / <code>HAVING</code></td><td>⊕ 6B</td><td>Reserved as keywords today but unimplemented. The big aggregation gap.</td></tr>
 <tr><td><code>DISTINCT</code>, <code>COUNT(DISTINCT x)</code></td><td>◑ → ⊕ 6B</td><td><code>SELECT DISTINCT</code> is explicitly rejected today; implement with grouping.</td></tr>
@@ -157,14 +157,14 @@
 <tr><td>Comparison <code>= &lt;&gt; != &lt; &lt;= &gt; &gt;=</code>, logical <code>AND/OR/NOT</code>, three-valued logic</td><td>✅</td><td>—</td></tr>
 <tr><td>Arithmetic <code>+ - * / %</code>, unary <code>-</code>/<code>+</code></td><td>✅</td><td>Int overflow promotes to real; integer <code>/</code> and <code>%</code> by zero → NULL (SQLite-ish).</td></tr>
 <tr><td><code>IS [NOT] NULL</code></td><td>✅</td><td>—</td></tr>
-<tr><td><code>[NOT] LIKE</code></td><td>◑</td><td><code>%</code>/<code>_</code> wildcards, <strong>ASCII case-insensitive</strong> (PG <code>LIKE</code> is case-sensitive; this matches PG <code>ILIKE</code>). <code>ESCAPE</code> clause ⊕ 6A. Add case-sensitive <code>LIKE</code> + <code>ILIKE</code> split in 6E (dialect).</td></tr>
+<tr><td><code>[NOT] LIKE</code> / <code>ILIKE</code> / <code>… ESCAPE c</code></td><td>◑ (6A)</td><td><code>%</code>/<code>_</code> wildcards, <strong>ASCII case-insensitive</strong>. <code>ESCAPE</code> and <code>ILIKE</code> parse (6A); the case-sensitive <code>LIKE</code> vs <code>ILIKE</code> split is deferred to 6E.</td></tr>
 <tr><td>Vector distance <code>&lt;-&gt;</code> / <code>&lt;=&gt;</code> / <code>&lt;#&gt;</code></td><td>✅</td><td>Phase 5.</td></tr>
-<tr><td>String concat <code>||</code></td><td>⊕ 6A</td><td>One lexer token + one <code>BinOp</code>; high value.</td></tr>
-<tr><td><code>BETWEEN … AND …</code>, <code>IN (list)</code>, <code>NOT IN</code></td><td>⊕ 6A</td><td>Desugar <code>BETWEEN</code> to <code>&gt;= AND &lt;=</code>; <code>IN (list)</code> to an OR-chain / set test.</td></tr>
-<tr><td><code>CASE WHEN … THEN … ELSE … END</code> (searched + simple)</td><td>⊕ 6A</td><td>New <code>Expr::Case</code>; pure evaluator addition.</td></tr>
-<tr><td><code>CAST(x AS type)</code> / PG <code>x::type</code></td><td>⊕ 6A</td><td>New <code>Expr::Cast</code> over the existing affinity-coercion machinery (<code>ColumnType::coerce</code>).</td></tr>
-<tr><td><code>COALESCE</code>/<code>NULLIF</code>/<code>GREATEST</code>/<code>LEAST</code></td><td>⊕ 6A</td><td>Variadic scalar built-ins (see functions).</td></tr>
-<tr><td><code>x LIKE … ESCAPE c</code>, <code>SIMILAR TO</code>, POSIX regex <code>~</code>/<code>~*</code></td><td>⊕ 6A / ✗</td><td><code>ESCAPE</code> 6A. <code>SIMILAR TO</code>/regex are ✗ (no regex engine; keep deps minimal).</td></tr>
+<tr><td>String concat <code>||</code></td><td>✅ (6A)</td><td>NULL-propagating; binds looser than <code>+</code>/<code>-</code>, tighter than comparison.</td></tr>
+<tr><td><code>BETWEEN … AND …</code>, <code>IN (list)</code>, <code>NOT IN</code></td><td>✅ (6A)</td><td>Three-valued logic preserved; <code>IN (SELECT …)</code> waits for 6B.</td></tr>
+<tr><td><code>CASE WHEN … THEN … ELSE … END</code> (searched + simple)</td><td>✅ (6A)</td><td><code>Expr::Case</code>, short-circuiting at the first matching branch.</td></tr>
+<tr><td><code>CAST(x AS type)</code> / PG <code>x::type</code></td><td>✅ (6A)</td><td><code>Expr::Cast</code> over the affinity-coercion machinery (<code>ColumnType::coerce</code>).</td></tr>
+<tr><td><code>COALESCE</code>/<code>NULLIF</code>/<code>GREATEST</code>/<code>LEAST</code></td><td>✅ (6A)</td><td>Plus <code>ifnull</code>/<code>iif</code>; <code>GREATEST</code>/<code>LEAST</code> skip NULLs.</td></tr>
+<tr><td><code>x LIKE … ESCAPE c</code>, <code>SIMILAR TO</code>, POSIX regex <code>~</code>/<code>~*</code></td><td>✅ / ✗</td><td><code>ESCAPE</code> shipped (6A). <code>SIMILAR TO</code>/regex are ✗ (no regex engine; keep deps minimal).</td></tr>
 <tr><td>Parameters: <code>?</code> positional</td><td>✅</td><td>PG <code>$1</code> and named <code>:name</code> → ⊕ 6E (dialect shim; server mode already speaks the extended protocol).</td></tr>
 </tbody>
 </table>
@@ -180,7 +180,7 @@
 <tr><td>Aggregates (grouped + more)</td><td>the above per-group, <code>group_concat</code>/<code>string_agg</code>, <code>total</code></td><td>⊕ 6B</td></tr>
 <tr><td>String</td><td><code>length</code>, <code>lower</code>, <code>upper</code>, <code>substr/substring</code>, <code>trim</code>/<code>ltrim</code>/<code>rtrim</code>, <code>replace</code>, <code>coalesce</code>, <code>concat</code>, <code>instr</code>/<code>position</code>, <code>like</code></td><td>⊕ 6C</td></tr>
 <tr><td>Numeric / math</td><td><code>abs</code>, <code>round</code>, <code>ceil</code>, <code>floor</code>, <code>mod</code>, <code>power</code>, <code>sqrt</code>, <code>min</code>/<code>max</code> scalar, <code>random</code></td><td>⊕ 6C</td></tr>
-<tr><td>Conditional / null</td><td><code>coalesce</code>, <code>nullif</code>, <code>ifnull</code>, <code>greatest</code>, <code>least</code>, <code>iif</code></td><td>⊕ 6A</td></tr>
+<tr><td>Conditional / null</td><td><code>coalesce</code>, <code>nullif</code>, <code>ifnull</code>, <code>greatest</code>, <code>least</code>, <code>iif</code></td><td>✅ (6A)</td></tr>
 <tr><td>Date / time</td><td><code>now</code>/<code>current_timestamp</code>, <code>date</code>, <code>time</code>, <code>datetime</code>, <code>strftime</code>, <code>extract</code>, <code>date_trunc</code></td><td>⊕ 6C</td></tr>
 <tr><td>UUID / misc</td><td><code>gen_random_uuid</code>, <code>typeof</code>, <code>hex</code>, <code>cast</code></td><td>⊕ 6C</td></tr>
 <tr><td>JSON</td><td><code>json_extract</code>, <code>json_array</code>, <code>json_object</code>, <code>-&gt;</code>/<code>-&gt;&gt;</code></td><td>⊕ 6C (minimal)</td></tr>
@@ -228,8 +228,12 @@
 <h2>Implementation spec</h2>
 <p>The gaps cluster into five stages, ordered by value/risk. They are <strong>additive frontend changes</strong>: each grows the <code>Stmt</code>/<code>Expr</code> AST (<code>sql.rs</code>), the parser, and the executor (<code>exec.rs</code>), plus the catalog (<code>catalog.rs</code>) and transaction manager (<code>conn.rs</code>) for the few stateful items. None touches <code>trait Storage</code>; the WAL op set (<code>wal.rs</code>) only grows if a stage adds a new durable catalog fact (called out). Proposed as <strong>Phase 6 — SQL Surface Completeness</strong> in the roadmap (spec <a href="13-roadmap.html">13</a>); ship the stages as independent, individually-testable increments.</p>
 
-<h3>Stage 6A — Expression &amp; single-table completeness (low risk, high value)</h3>
+<h3>Stage 6A — Expression &amp; single-table completeness (low risk, high value) <span class="badge badge-status status-review">Implemented</span></h3>
 <p>The cheapest, highest-coverage wins; no new execution model, only richer expressions and result shapes over the existing single-table scan.</p>
+<div class="callout success">
+<p class="callout-title">Shipped</p>
+<p>Delivered: <code>||</code> concat, <code>CASE</code> (searched + simple), <code>CAST(x AS t)</code> alongside <code>::</code>, <code>IN (list)</code>/<code>NOT IN</code>, <code>BETWEEN</code>/<code>NOT BETWEEN</code>, <code>NULLS FIRST/LAST</code>, <code>LIKE … ESCAPE</code> and <code>ILIKE</code> (parsed; case-fold pending the 6E split), the conditional/null group (<code>ifnull</code>, <code>iif</code>, <code>greatest</code>, <code>least</code>), <code>RETURNING</code> on INSERT/UPDATE/DELETE, upsert (<code>ON CONFLICT DO NOTHING|UPDATE</code> with <code>excluded.*</code>, plus SQLite <code>OR IGNORE</code>/<code>OR REPLACE</code> — the silent-ignore hazard is closed), and <code>INSERT … SELECT</code>. <code>ENGINE_ABI_VERSION</code> stays <code>3</code>; <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>. Tests: <code>crates/engine/tests/expr_6a.rs</code>, plus a <code>RETURNING</code> case in <code>tests/ffi.rs</code>.</p>
+</div>
 <ul>
 <li><strong>Lexer:</strong> add <code>||</code> (concat) and <code>::</code> (cast) tokens; keep the existing <code>&lt;</code>-disambiguation discipline (vector ops bind first) in <code>lex_lt</code>.</li>
 <li><strong>AST / parser:</strong> <code>Expr::Case</code>, <code>Expr::Cast{expr, ty}</code>, <code>Expr::InList{expr, list, negated}</code>, <code>Expr::Between{expr, lo, hi, negated}</code>, <code>Expr::Call{name, args}</code>, and <code>BinOp::Concat</code>. Add <code>SelectStmt.offset: Option&lt;i64&gt;</code> and per-key <code>NULLS FIRST/LAST</code>. Add <code>LIKE … ESCAPE</code>.</li>
