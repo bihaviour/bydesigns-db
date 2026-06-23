@@ -1,6 +1,10 @@
-//! `twill-bench` — the benchmark driver for the validation plan (spec 09; issue
-//! #6 / #29). It reports latency as **percentiles** (p50/p99/p999 via an
-//! HDR-style [`Histogram`]), never mean-only, exactly as spec 09 mandates.
+//! `twill-bench` — the benchmarking, correctness, and serverless-efficiency
+//! driver for Twill DB (spec 09 — the falsifiable validation plan; spec 15 — the
+//! CLI that operationalizes it; issue #6 / #29). It reports latency as
+//! **percentiles** (p50/p90/p95/p99/p999 via an HDR-style [`Histogram`]), never
+//! mean-only, exactly as spec 09 mandates, and — for the correctness profiles —
+//! asserts ACID invariants over the data it just drove, failing the run (exit
+//! code 2) when an invariant is violated regardless of how fast it was.
 //!
 //! Two transports drive the *same* experiments, so the embedded and server paths
 //! are measured the same way (spec 09 — "it applies to both the embedded FFI and
@@ -16,34 +20,119 @@
 //!
 //! Either transport runs against any `--url` backend (`file://` for a smoke run,
 //! an object-store URL on a real host for the W1 tail that gates the
-//! architecture). Subcommands map to the plan's experiments:
-//!   * `exp1` — single-commit latency floor (one sequential writer).
-//!   * `exp2` — group-commit throughput curve (N independent-row writers).
-//!   * `exp3` — write-contention wall (N writers hammering the same row).
+//! architecture). Subcommands group into four families (spec 15 "Command
+//! structure"):
+//!   * **experiments** (`exp1`/`exp2`/`exp3`) — the spec-09 latency floor,
+//!     group-commit curve, and contention wall.
+//!   * **request-mix scenarios** (`read-heavy`/`write-heavy`/`mixed-oltp`) — named
+//!     workload shapes driving a ratio-controlled SELECT/INSERT/UPDATE/DELETE mix.
+//!   * **correctness profiles** (`counter`/`bank-transfer`) — drive a contended
+//!     workload, then assert an ACID invariant over the result (no lost update,
+//!     conserved balance) and exit non-zero on violation.
+//!   * **release comparison** (`compare`) — diff two archived JSON records into a
+//!     PASS/regression verdict.
 
+pub mod compare;
+pub mod correctness;
 pub mod hist;
 pub mod pgclient;
+pub mod workload;
 
-use engine::{Connection, EngineStatus};
+use engine::{Connection, EngineStatus, Value};
 use hist::Histogram;
 use pgclient::{ExecError, PgClient};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const TABLE_LEDGER: &str = "bench_ledger";
-const TABLE_COUNTER: &str = "bench_counter";
+pub(crate) const TABLE_LEDGER: &str = "bench_ledger";
+pub(crate) const TABLE_COUNTER: &str = "bench_counter";
 
-/// CLI entry point (the `twill-bench` binary is a thin shim over this).
+/// Process exit codes (spec 15 "Exit codes"). A run is only a success (`0`) when
+/// it both completed *and* preserved correctness; a fast run that loses an acked
+/// write exits `2`, not `0`.
+pub mod exit {
+    /// Success — completed and (for correctness profiles) invariants held.
+    pub const OK: i32 = 0;
+    /// The benchmark itself failed (engine/transport error, or `compare`
+    /// detected a regression).
+    pub const BENCH_FAILED: i32 = 1;
+    /// A correctness invariant was violated (lost update, broken balance, …).
+    pub const CORRECTNESS: i32 = 2;
+    /// Bad flags / usage / unknown subcommand.
+    pub const CONFIG: i32 = 3;
+    /// Could not connect to / open the target.
+    pub const CONNECTION: i32 = 4;
+}
+
+/// A driver failure, carrying which [`exit`] code it maps to. Run-time failures
+/// (the common case) convert from `String` via [`From`], so `?` on an internal
+/// `Result<_, String>` yields a [`BenchError::Run`]; the connection and config
+/// classes are constructed explicitly where they arise.
+#[derive(Debug)]
+pub enum BenchError {
+    /// Bad flags / usage → [`exit::CONFIG`].
+    Config(String),
+    /// Could not connect to / open the target → [`exit::CONNECTION`].
+    Connection(String),
+    /// Engine/transport error mid-run → [`exit::BENCH_FAILED`].
+    Run(String),
+}
+
+impl BenchError {
+    pub fn code(&self) -> i32 {
+        match self {
+            BenchError::Config(_) => exit::CONFIG,
+            BenchError::Connection(_) => exit::CONNECTION,
+            BenchError::Run(_) => exit::BENCH_FAILED,
+        }
+    }
+}
+
+impl std::fmt::Display for BenchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BenchError::Config(m) => write!(f, "configuration error: {m}"),
+            BenchError::Connection(m) => write!(f, "connection error: {m}"),
+            BenchError::Run(m) => write!(f, "benchmark failed: {m}"),
+        }
+    }
+}
+
+impl From<String> for BenchError {
+    fn from(m: String) -> Self {
+        BenchError::Run(m)
+    }
+}
+
+/// CLI entry point (the `twill-bench` binary is a thin shim over this). Computes
+/// the [`exit`] code and terminates the process with it.
 pub fn cli_main() {
-    let args: Vec<String> = std::env::args().collect();
+    std::process::exit(run_cli(&std::env::args().collect::<Vec<_>>()));
+}
+
+/// The dispatch core, factored out of [`cli_main`] so tests can assert exit
+/// codes without spawning a process.
+pub fn run_cli(args: &[String]) -> i32 {
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
-    let opts = match Opts::parse(&args[2.min(args.len())..]) {
+    let rest = &args[2.min(args.len())..];
+
+    // `compare` is post-processing over archived records, not a run; it owns its
+    // own flag parsing and returns an exit code directly.
+    if cmd == "compare" {
+        return compare::run(rest);
+    }
+    if matches!(cmd, "help" | "-h" | "--help") {
+        print_help();
+        return exit::OK;
+    }
+
+    let opts = match Opts::parse(rest) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {e}\n");
             print_help();
-            std::process::exit(2);
+            return exit::CONFIG;
         }
     };
 
@@ -51,22 +140,32 @@ pub fn cli_main() {
         "exp1" => run_experiment(Experiment::LatencyFloor, &opts),
         "exp2" => run_experiment(Experiment::GroupCommit, &opts),
         "exp3" => run_experiment(Experiment::Contention, &opts),
-        "help" | "-h" | "--help" => {
-            print_help();
-            return;
-        }
+        "read-heavy" => workload::run_scenario(workload::Scenario::ReadHeavy, &opts),
+        "write-heavy" => workload::run_scenario(workload::Scenario::WriteHeavy, &opts),
+        "mixed-oltp" => workload::run_scenario(workload::Scenario::MixedOltp, &opts),
+        "counter" => correctness::run_counter(&opts),
+        "bank-transfer" => correctness::run_bank_transfer(&opts),
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
-            std::process::exit(2);
+            return exit::CONFIG;
         }
     };
 
     match result {
-        Ok(report) => report.print(),
+        Ok(report) => {
+            report.print();
+            // A profile that drove the data but broke an invariant is a failure,
+            // however fast it ran (spec 15 — correctness gates the exit code).
+            if report.correctness.as_ref().is_some_and(|c| !c.passed) {
+                exit::CORRECTNESS
+            } else {
+                exit::OK
+            }
+        }
         Err(e) => {
-            eprintln!("benchmark failed: {e}");
-            std::process::exit(1);
+            eprintln!("{e}");
+            e.code()
         }
     }
 }
@@ -112,16 +211,23 @@ fn parse_transport(s: &str) -> Result<Transport, String> {
     }
 }
 
-struct Opts {
-    url: String,
-    writers: usize,
-    warmup: Duration,
-    duration: Duration,
-    label: String,
-    transport: Transport,
+pub(crate) struct Opts {
+    pub url: String,
+    pub writers: usize,
+    pub warmup: Duration,
+    pub duration: Duration,
+    /// Per-writer operation count for the fixed-work correctness profiles
+    /// (`counter`/`bank-transfer`), where the expected result must be known.
+    pub ops: u64,
+    /// Pre-seeded row count for the request-mix scenarios' working set.
+    pub rows: u64,
+    pub label: String,
+    pub transport: Transport,
+    /// Emit only the one-line JSON record on stdout (for scripting / CI).
+    pub json: bool,
     /// `Some(addr)` drives an already-running `engine-server` over pgwire;
     /// `None` (with `--transport pgwire`) spins one up in-process.
-    server: Option<String>,
+    pub server: Option<String>,
 }
 
 impl Opts {
@@ -130,13 +236,22 @@ impl Opts {
         let mut writers = 1usize;
         let mut warmup_ms = 200u64;
         let mut duration_ms = 1000u64;
+        let mut ops = 200u64;
+        let mut rows = 1000u64;
         let mut label = String::new();
         let mut transport = Transport::Embedded;
+        let mut json = false;
         let mut server = None;
 
         let mut i = 0;
         while i < args.len() {
             let key = args[i].as_str();
+            // `--json` is a bare flag; everything else takes a value.
+            if key == "--json" {
+                json = true;
+                i += 1;
+                continue;
+            }
             let val = || {
                 args.get(i + 1)
                     .cloned()
@@ -149,6 +264,8 @@ impl Opts {
                 "--duration-ms" => {
                     duration_ms = val()?.parse().map_err(|_| "invalid --duration-ms")?
                 }
+                "--ops" => ops = val()?.parse().map_err(|_| "invalid --ops")?,
+                "--rows" => rows = val()?.parse().map_err(|_| "invalid --rows")?,
                 "--label" => label = val()?,
                 "--transport" => transport = parse_transport(&val()?)?,
                 "--server" => server = Some(val()?),
@@ -167,8 +284,11 @@ impl Opts {
             writers: writers.max(1),
             warmup: Duration::from_millis(warmup_ms),
             duration: Duration::from_millis(duration_ms),
+            ops: ops.max(1),
+            rows: rows.max(1),
             label,
             transport,
+            json,
             server,
         })
     }
@@ -176,7 +296,7 @@ impl Opts {
 
 /// What a writer connects to, cloneable so each writer thread opens its own.
 #[derive(Clone)]
-enum Target {
+pub(crate) enum Target {
     /// Drive the engine in-process at this URL.
     Embedded(String),
     /// Drive the engine through pgwire at this `host:port`.
@@ -184,33 +304,37 @@ enum Target {
 }
 
 impl Target {
-    fn open(&self) -> Result<Writer, String> {
+    /// Open a writer against this target. A failure here is a [connection
+    /// error](exit::CONNECTION), not a generic run failure.
+    pub fn open(&self) -> Result<Writer, BenchError> {
         match self {
             Target::Embedded(url) => Connection::open(url)
                 .map(Writer::Embedded)
-                .map_err(|e| format!("open {url}: {e}")),
+                .map_err(|e| BenchError::Connection(format!("open {url}: {e}"))),
             Target::Pgwire(addr) => PgClient::connect(addr)
                 .map(Writer::Pg)
-                .map_err(|e| format!("connect {addr}: {e}")),
+                .map_err(|e| BenchError::Connection(format!("connect {addr}: {e}"))),
         }
     }
 }
 
 /// A transport-agnostic writer: an embedded connection or a pgwire client.
-enum Writer {
+pub(crate) enum Writer {
     Embedded(Connection),
     Pg(PgClient),
 }
 
 /// The classification a writer loop reacts to, identical across transports.
-enum Outcome {
+pub(crate) enum Outcome {
     Ok,
     Conflict,
     Fatal(String),
 }
 
 impl Writer {
-    fn exec(&mut self, sql: &str) -> Outcome {
+    /// Run a statement, classifying the result the same way over either
+    /// transport: clean commit, retry-able conflict, or fatal error.
+    pub fn exec(&mut self, sql: &str) -> Outcome {
         match self {
             Writer::Embedded(c) => match c.exec(sql) {
                 Ok(()) => Outcome::Ok,
@@ -224,18 +348,50 @@ impl Writer {
             },
         }
     }
+
+    /// Read a single integer scalar (first cell of the first row), identical
+    /// across transports — used by the mix read path and the post-run
+    /// correctness assertions.
+    pub fn query_i64(&mut self, sql: &str) -> Result<i64, String> {
+        match self {
+            Writer::Embedded(c) => {
+                let rs = c.query(sql).map_err(|e| e.to_string())?;
+                match rs.rows.first().and_then(|r| r.first()) {
+                    Some(Value::Int(i)) => Ok(*i),
+                    Some(v) => Err(format!("non-integer scalar: {}", v.type_name())),
+                    None => Err("query returned no rows".into()),
+                }
+            }
+            Writer::Pg(c) => c.query_scalar_i64(sql).map_err(|e| match e {
+                ExecError::Conflict => "unexpected conflict on read".to_string(),
+                ExecError::Fatal(m) => m,
+            }),
+        }
+    }
+
+    /// Run a read for its side effect of exercising the read path, discarding the
+    /// rows. A point read that matches *zero* rows (e.g. a key a concurrent
+    /// writer just deleted in the mix) is a valid, successful read — unlike
+    /// [`Writer::query_i64`], which is for assertions that require a row.
+    pub fn read(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Writer::Embedded(c) => c.query(sql).map(|_| ()).map_err(|e| e.to_string()),
+            Writer::Pg(c) => c.exec(sql).map_err(|e| match e {
+                ExecError::Conflict => "unexpected conflict on read".to_string(),
+                ExecError::Fatal(m) => m,
+            }),
+        }
+    }
 }
 
 /// A writer's tally from one run window.
-struct Tally {
-    conflicts: u64,
-    hist: Histogram,
+pub(crate) struct Tally {
+    pub conflicts: u64,
+    pub hist: Histogram,
 }
 
 /// Resolve the run target, spinning up an in-process pgwire server if needed.
-/// The returned `_server` (when present) keeps the listener thread alive for the
-/// run's duration — dropping the database it serves only on return.
-fn resolve_target(opts: &Opts) -> Result<Target, String> {
+pub(crate) fn resolve_target(opts: &Opts) -> Result<Target, BenchError> {
     match opts.transport {
         Transport::Embedded => Ok(Target::Embedded(opts.url.clone())),
         Transport::Pgwire => match &opts.server {
@@ -245,10 +401,10 @@ fn resolve_target(opts: &Opts) -> Result<Target, String> {
                 // same `--url` backend; the bind happens here so a client can
                 // connect immediately, the accept loop runs on a detached thread.
                 let listener = TcpListener::bind("127.0.0.1:0")
-                    .map_err(|e| format!("bind in-process server: {e}"))?;
+                    .map_err(|e| BenchError::Connection(format!("bind in-process server: {e}")))?;
                 let addr = listener
                     .local_addr()
-                    .map_err(|e| format!("server addr: {e}"))?
+                    .map_err(|e| BenchError::Connection(format!("server addr: {e}")))?
                     .to_string();
                 let url = opts.url.clone();
                 std::thread::spawn(move || {
@@ -260,7 +416,16 @@ fn resolve_target(opts: &Opts) -> Result<Target, String> {
     }
 }
 
-fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, String> {
+/// A per-run nonce keeping inserted keys unique across repeated runs against the
+/// same durable database (a `PRIMARY KEY` would otherwise collide).
+pub(crate) fn run_nonce() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0)
+}
+
+fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
     // exp1 is the single-writer floor regardless of --writers.
     let writers = match exp {
         Experiment::LatencyFloor => 1,
@@ -275,12 +440,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, String> {
     let mut setup = target.open()?;
     setup_schema(&mut setup, same_row)?;
 
-    // A per-run nonce keeps inserted ledger keys unique across repeated runs on
-    // the same durable database (PRIMARY KEY would otherwise collide).
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros())
-        .unwrap_or(0);
+    let nonce = run_nonce();
 
     let (tallies, elapsed) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..writers)
@@ -292,7 +452,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, String> {
             })
             .collect();
         let start = Instant::now();
-        let tallies: Vec<Result<Tally, String>> =
+        let tallies: Vec<Result<Tally, BenchError>> =
             handles.into_iter().map(|h| h.join().unwrap()).collect();
         (tallies, start.elapsed())
     });
@@ -310,31 +470,32 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, String> {
         experiment: exp.name(),
         label: opts.label.clone(),
         transport: opts.transport.name(),
-        url_scheme: opts.url.split("://").next().unwrap_or("?").to_string(),
+        url_scheme: url_scheme(&opts.url),
         writers,
         duration_s: elapsed.as_secs_f64(),
         commits,
         conflicts,
+        failures: 0,
         throughput: commits as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
         hist: merged,
         git_sha: git_sha(),
+        json_only: opts.json,
+        correctness: None,
     })
 }
 
-fn setup_schema(w: &mut Writer, same_row: bool) -> Result<(), String> {
+fn setup_schema(w: &mut Writer, same_row: bool) -> Result<(), BenchError> {
     match w.exec(&format!(
         "CREATE TABLE IF NOT EXISTS {TABLE_LEDGER} (k TEXT PRIMARY KEY, v INTEGER)"
     )) {
-        Outcome::Ok => {}
-        Outcome::Conflict => {}
-        Outcome::Fatal(m) => return Err(format!("create ledger: {m}")),
+        Outcome::Ok | Outcome::Conflict => {}
+        Outcome::Fatal(m) => return Err(BenchError::Run(format!("create ledger: {m}"))),
     }
     match w.exec(&format!(
         "CREATE TABLE IF NOT EXISTS {TABLE_COUNTER} (id INTEGER PRIMARY KEY, n INTEGER)"
     )) {
-        Outcome::Ok => {}
-        Outcome::Conflict => {}
-        Outcome::Fatal(m) => return Err(format!("create counter: {m}")),
+        Outcome::Ok | Outcome::Conflict => {}
+        Outcome::Fatal(m) => return Err(BenchError::Run(format!("create counter: {m}"))),
     }
     if same_row {
         // Idempotent across reruns: ignore a duplicate-key (already seeded) error.
@@ -353,14 +514,14 @@ fn writer_loop(
     same_row: bool,
     warmup: Duration,
     duration: Duration,
-) -> Result<Tally, String> {
+) -> Result<Tally, BenchError> {
     let mut conn = target.open()?;
     let seq = AtomicU64::new(0);
 
     let one = |conn: &mut Writer,
                hist: Option<&mut Histogram>,
                conflicts: &mut u64|
-     -> Result<(), String> {
+     -> Result<(), BenchError> {
         let t0 = Instant::now();
         loop {
             let sql = if same_row {
@@ -375,7 +536,11 @@ fn writer_loop(
                     *conflicts += 1;
                     continue;
                 }
-                Outcome::Fatal(m) => return Err(format!("writer {writer} commit failed: {m}")),
+                Outcome::Fatal(m) => {
+                    return Err(BenchError::Run(format!(
+                        "writer {writer} commit failed: {m}"
+                    )))
+                }
             }
         }
         if let Some(h) = hist {
@@ -402,51 +567,88 @@ fn writer_loop(
     Ok(Tally { conflicts, hist })
 }
 
-struct Report {
-    experiment: &'static str,
-    label: String,
-    transport: &'static str,
-    url_scheme: String,
-    writers: usize,
-    duration_s: f64,
-    commits: u64,
-    conflicts: u64,
-    throughput: f64,
-    hist: Histogram,
-    git_sha: String,
+/// The result of any correctness profile: a named ACID invariant, whether it
+/// held, and a human detail string (e.g. `expected 1200, got 1200`).
+pub(crate) struct Correctness {
+    pub name: &'static str,
+    pub passed: bool,
+    pub detail: String,
+}
+
+pub(crate) struct Report {
+    pub experiment: &'static str,
+    pub label: String,
+    pub transport: &'static str,
+    pub url_scheme: String,
+    pub writers: usize,
+    pub duration_s: f64,
+    /// Successful operations (commits / reads) recorded in the timed window.
+    pub commits: u64,
+    /// Retry-able conflicts encountered and retried (never lost).
+    pub conflicts: u64,
+    /// Operations that failed irrecoverably (non-zero is itself a red flag).
+    pub failures: u64,
+    pub throughput: f64,
+    pub hist: Histogram,
+    pub git_sha: String,
+    /// When true, [`Report::print`] emits only the one-line JSON record.
+    pub json_only: bool,
+    /// Present for correctness profiles; drives the `exit::CORRECTNESS` gate.
+    pub correctness: Option<Correctness>,
 }
 
 impl Report {
     fn print(&self) {
         let p = |q: f64| self.hist.value_at_quantile(q);
-        // Human-readable summary.
-        println!("── {} ─────────────────────────────", self.experiment);
-        if !self.label.is_empty() {
-            println!("label        {}", self.label);
+        if !self.json_only {
+            // Human-readable summary.
+            println!("── {} ─────────────────────────────", self.experiment);
+            if !self.label.is_empty() {
+                println!("label        {}", self.label);
+            }
+            println!("transport    {}", self.transport);
+            println!("backend      {}://", self.url_scheme);
+            println!("git          {}", self.git_sha);
+            println!("writers      {}", self.writers);
+            println!("duration     {:.2}s", self.duration_s);
+            println!("ops          {} (ok)", self.commits);
+            println!("conflicts    {} (retried)", self.conflicts);
+            println!("failures     {}", self.failures);
+            println!("throughput   {:.0} ops/s", self.throughput);
+            println!(
+                "latency µs   p50={}  p90={}  p95={}  p99={}  p999={}  min={}  max={}  mean={:.1}",
+                p(0.50),
+                p(0.90),
+                p(0.95),
+                p(0.99),
+                p(0.999),
+                self.hist.min(),
+                self.hist.max(),
+                self.hist.mean(),
+            );
+            if let Some(c) = &self.correctness {
+                println!(
+                    "correctness  {} — {} ({})",
+                    c.name,
+                    if c.passed { "PASS" } else { "FAIL" },
+                    c.detail,
+                );
+            }
         }
-        println!("transport    {}", self.transport);
-        println!("backend      {}://", self.url_scheme);
-        println!("git          {}", self.git_sha);
-        println!("writers      {}", self.writers);
-        println!("duration     {:.2}s", self.duration_s);
-        println!("commits      {}", self.commits);
-        println!("conflicts    {} (retried)", self.conflicts);
-        println!("throughput   {:.0} commits/s", self.throughput);
-        println!(
-            "latency µs   p50={}  p99={}  p999={}  min={}  max={}  mean={:.1}",
-            p(0.50),
-            p(0.99),
-            p(0.999),
-            self.hist.min(),
-            self.hist.max(),
-            self.hist.mean(),
-        );
         // Machine-readable record (one JSON line) for archiving / plotting.
+        let correctness = match &self.correctness {
+            Some(c) => format!(
+                "{{\"name\":\"{}\",\"passed\":{},\"detail\":\"{}\"}}",
+                c.name, c.passed, c.detail
+            ),
+            None => "null".to_string(),
+        };
         println!(
             "{{\"experiment\":\"{}\",\"label\":\"{}\",\"transport\":\"{}\",\"backend\":\"{}\",\
              \"git\":\"{}\",\"writers\":{},\"duration_s\":{:.3},\"commits\":{},\"conflicts\":{},\
-             \"throughput_per_s\":{:.1},\"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\
-             \"min_us\":{},\"max_us\":{},\"mean_us\":{:.1}}}",
+             \"failures\":{},\"throughput_per_s\":{:.1},\"p50_us\":{},\"p90_us\":{},\"p95_us\":{},\
+             \"p99_us\":{},\"p999_us\":{},\"min_us\":{},\"max_us\":{},\"mean_us\":{:.1},\
+             \"correctness\":{}}}",
             self.experiment,
             self.label,
             self.transport,
@@ -456,15 +658,25 @@ impl Report {
             self.duration_s,
             self.commits,
             self.conflicts,
+            self.failures,
             self.throughput,
             p(0.50),
+            p(0.90),
+            p(0.95),
             p(0.99),
             p(0.999),
             self.hist.min(),
             self.hist.max(),
             self.hist.mean(),
+            correctness,
         );
     }
+}
+
+/// The scheme of a connection URL (`file`, `s3`, …) for the report, defaulting
+/// to `?` if the URL is malformed.
+pub(crate) fn url_scheme(url: &str) -> String {
+    url.split("://").next().unwrap_or("?").to_string()
 }
 
 /// Best-effort short commit SHA for reproducibility (spec 09 SHOULD); `unknown`
@@ -487,30 +699,44 @@ fn git_sha() -> String {
 
 fn print_help() {
     eprintln!(
-        "twill-bench — benchmark driver (spec 09 / issue #29)\n\
+        "twill-bench — benchmark, correctness & efficiency driver (spec 09 / 15)\n\
          \n\
          USAGE:\n\
-         \x20 twill-bench <exp1|exp2|exp3> --url <URL> [flags]\n\
+         \x20 twill-bench <command> --url <URL> [flags]\n\
          \n\
-         EXPERIMENTS:\n\
-         \x20 exp1   single-commit latency floor (one sequential writer)\n\
-         \x20 exp2   group-commit throughput curve (N independent-row writers)\n\
-         \x20 exp3   write-contention wall (N writers on the same row)\n\
+         EXPERIMENTS (spec 09):\n\
+         \x20 exp1            single-commit latency floor (one sequential writer)\n\
+         \x20 exp2            group-commit throughput curve (N independent-row writers)\n\
+         \x20 exp3            write-contention wall (N writers on the same row)\n\
+         \n\
+         REQUEST-MIX SCENARIOS (ratio-controlled SELECT/INSERT/UPDATE/DELETE):\n\
+         \x20 read-heavy      90%% read / 10%% insert\n\
+         \x20 write-heavy     20%% read / 80%% insert\n\
+         \x20 mixed-oltp      70%% read / 20%% insert / 8%% update / 2%% delete\n\
+         \n\
+         CORRECTNESS PROFILES (assert an invariant; exit 2 on violation):\n\
+         \x20 counter         N writers increment one row; asserts zero lost updates\n\
+         \x20 bank-transfer   concurrent transfers; asserts the summed balance is conserved\n\
+         \n\
+         RELEASE COMPARISON:\n\
+         \x20 compare --baseline <FILE> --candidate <FILE> [--threshold <FRAC>]\n\
          \n\
          FLAGS:\n\
-         \x20 --url <URL>          file:///path or s3://bucket/db (required)\n\
+         \x20 --url <URL>          file:///path or s3://bucket/db (required for runs)\n\
          \x20 --transport <T>      embedded (default) or pgwire (server path)\n\
          \x20 --server <HOST:PORT> drive a running engine-server (implies pgwire)\n\
-         \x20 --writers <N>        concurrent writers for exp2/exp3 (default 1)\n\
+         \x20 --writers <N>        concurrent writers (default 1)\n\
          \x20 --warmup-ms <MS>     discarded warm-up window (default 200)\n\
-         \x20 --duration-ms <MS>   timed window (default 1000)\n\
+         \x20 --duration-ms <MS>   timed window for experiments/scenarios (default 1000)\n\
+         \x20 --ops <N>            per-writer ops for the correctness profiles (default 200)\n\
+         \x20 --rows <N>           pre-seeded working-set size for the mix scenarios (default 1000)\n\
          \x20 --label <TEXT>       free-form tag recorded in the output\n\
+         \x20 --json               emit only the one-line JSON record (for scripting)\n\
          \n\
-         Reports p50/p99/p999 (never mean-only) plus a JSON line for archiving.\n\
+         Reports p50/p90/p95/p99/p999 (never mean-only) plus a JSON line for archiving.\n\
          `--transport pgwire` without `--server` spins up an in-process listener,\n\
-         so the wire path runs offline; point `--server` at a deployed\n\
-         engine-server (or reproduce with pgbench) for real-host numbers.\n\
-         Use file:// for a smoke run; an object-store URL on a real host for the\n\
-         W1 tail numbers that gate placement."
+         so the wire path runs offline; point `--server` at a deployed engine-server\n\
+         (or reproduce with pgbench) for real-host numbers. Use file:// for a smoke\n\
+         run; an object-store URL on a real host for the W1 tail that gates placement."
     );
 }

@@ -1,10 +1,14 @@
 # twill-bench
 
-The benchmark driver for the validation plan
-(`pages/specs/09-benchmark-plan.html`; issue #6 / #29). It reports latency as
-**percentiles** (p50/p99/p999) via a compact HDR-style histogram — never
-mean-only, as spec 09 requires — and drives the *same* experiments over two
-transports, so the embedded and server paths are measured identically:
+The benchmarking, correctness, and serverless-efficiency driver for Twill DB
+(the validation plan `pages/specs/09-benchmark-plan.html` and the CLI it
+operationalizes, `pages/specs/15-twill-bench.html`; issue #6 / #29). It reports
+latency as **percentiles** (p50/p90/p95/p99/p999) via a compact HDR-style
+histogram — never mean-only, as spec 09 requires — and, for the correctness
+profiles, **asserts an ACID invariant over the data it just drove**, failing the
+run (exit code 2) when an invariant is violated however fast it ran. It drives
+the *same* work over two transports, so the embedded and server paths are
+measured identically:
 
 - **embedded** (default) — the engine in-process through the Rust/FFI API.
 - **pgwire** (`--transport pgwire`) — the engine through the Postgres wire
@@ -14,6 +18,10 @@ transports, so the embedded and server paths are measured identically:
   takes.
 
 ## Run
+
+The subcommands group into four families (spec 15 "Command structure").
+
+### Experiments (spec 09 — one lever each)
 
 ```bash
 cargo build -p twill-bench --release
@@ -36,13 +44,63 @@ $BIN exp2 --transport pgwire --url file:///tmp/bench.db --writers 8 --duration-m
 $BIN exp2 --server 127.0.0.1:5433 --url file:///srv.db --writers 8 --duration-ms 5000
 ```
 
-Each run prints a human summary plus a one-line JSON record (experiment, backend,
-git SHA, writers, throughput, p50/p99/p999) for archiving and plotting.
+### Request-mix scenarios (named workload shapes)
 
-Flags: `--url` (required), `--transport embedded|pgwire`, `--server HOST:PORT`
-(implies pgwire), `--writers`, `--warmup-ms` (default 200), `--duration-ms`
-(default 1000), `--label`. The JSON record carries the `transport` so embedded
-and server runs are distinguishable when archived together.
+A ratio-controlled mix of `SELECT`/`INSERT`/`UPDATE`/`DELETE` over a pre-seeded
+working set (`--rows`), approximating an application's request distribution. The
+op kind for each request is drawn from the scenario's fixed ratios by a
+deterministic per-writer PRNG, so a run is reproducible.
+
+```bash
+$BIN read-heavy  --url file:///tmp/bench.db --writers 8 --duration-ms 5000 --rows 10000  # 90% read / 10% insert
+$BIN write-heavy --url file:///tmp/bench.db --writers 8 --duration-ms 5000               # 20% read / 80% insert
+$BIN mixed-oltp  --url file:///tmp/bench.db --writers 8 --duration-ms 5000               # 70/20/8/2
+```
+
+### Correctness profiles (assert an ACID invariant)
+
+Fixed-work (`--ops` per writer, so the expected result is known) contended
+workloads that drive the engine hard, then **assert an invariant over the
+result** and exit non-zero (code 2) on violation. Conflicts are retried, so a
+violation can only come from a real isolation/durability bug.
+
+```bash
+# N writers increment one row; asserts the final value == writers × ops.
+$BIN counter --url file:///tmp/bench.db --writers 8 --ops 1000
+
+# Concurrent atomic transfers between two accounts; asserts the summed balance
+# is conserved (no torn transfer leaks or destroys value).
+$BIN bank-transfer --url file:///tmp/bench.db --writers 8 --ops 1000
+```
+
+### Release comparison (CI regression gate)
+
+Diff two archived JSON records into a PASS/regression verdict — pure
+post-processing, no engine or transport needed. A regression (throughput down,
+or p99/p999 up, beyond `--threshold`, default 10%) exits 1.
+
+```bash
+$BIN exp2 --url file:///tmp/bench.db --writers 8 --json > baseline.json
+# … build the candidate …
+$BIN exp2 --url file:///tmp/bench.db --writers 8 --json > candidate.json
+$BIN compare --baseline baseline.json --candidate candidate.json --threshold 0.10
+```
+
+Each run prints a human summary plus a one-line JSON record (experiment, backend,
+git SHA, writers, throughput, p50/p90/p95/p99/p999, and — for the profiles — the
+correctness verdict) for archiving and plotting; `--json` emits only that record.
+
+Flags: `--url` (required for runs), `--transport embedded|pgwire`,
+`--server HOST:PORT` (implies pgwire), `--writers`, `--warmup-ms` (default 200),
+`--duration-ms` (default 1000, experiments/scenarios), `--ops` (default 200,
+correctness profiles), `--rows` (default 1000, mix working set), `--label`,
+`--json`. The JSON record carries the `transport` so embedded and server runs are
+distinguishable when archived together.
+
+### Exit codes
+
+`0` success · `1` benchmark failed (or `compare` regression) · `2` correctness
+invariant violated · `3` configuration/usage error · `4` connection error.
 
 ## What runs here vs on a real host
 
