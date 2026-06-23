@@ -137,8 +137,13 @@
         + '<div class="nav-group-items">';
       g.items.forEach(function (it) {
         var active = it.file === here ? " active" : "";
+        // Derive a spec-number badge from the filename prefix (e.g. "12-…" → 12),
+        // so each sidebar entry shows which spec it is. Files without a numeric
+        // prefix (index, phase-* maps) carry their own naming and get no badge.
+        var m = /^(\d+)-/.exec(it.file);
+        var num = m ? ' <span class="nav-num">[' + parseInt(m[1], 10) + ']</span>' : '';
         html += '<a class="nav-link' + active + '" href="' + it.file + '">'
-          + '<span class="nav-text">' + it.title + '</span></a>';
+          + '<span class="nav-text">' + it.title + num + '</span></a>';
       });
       html += "</div></div>";
     });

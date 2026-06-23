@@ -178,6 +178,7 @@ body {
   border-left: 2px solid transparent;
   transition: background .12s, color .12s, border-color .12s;
 }
+.nav-num { color: var(--text-muted); font-variant-numeric: tabular-nums; font-size: .82em; }
 .nav-link:hover { color: var(--heading); background: var(--bg-sunken); }
 .nav-link.active {
   color: var(--accent-text);
