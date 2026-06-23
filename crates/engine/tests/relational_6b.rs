@@ -463,3 +463,76 @@ fn view_name_conflicting_with_table_is_rejected() {
     assert!(db.exec("CREATE VIEW t AS SELECT 1").is_err());
     let _ = fs::remove_file(&p);
 }
+
+// ---- correlated subqueries (deferred 6B item) ------------------------------
+
+#[test]
+fn correlated_scalar_subquery_in_projection() {
+    let (mut db, p) = library();
+    // The subquery references the outer row (a.id) — evaluated per outer row.
+    let rs = db
+        .query(
+            "SELECT a.name, \
+                (SELECT count(*) FROM books b WHERE b.author_id = a.id) AS cnt \
+             FROM authors a ORDER BY a.id",
+        )
+        .unwrap();
+    assert_eq!(
+        col(&rs, 0),
+        vec![Some("Ada".into()), Some("Bel".into()), Some("Cy".into()),]
+    );
+    assert_eq!(
+        col(&rs, 1),
+        vec![Some("2".into()), Some("1".into()), Some("0".into()),]
+    );
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn correlated_exists_and_not_exists_in_where() {
+    let (mut db, p) = library();
+    let has = db
+        .query(
+            "SELECT a.name FROM authors a \
+             WHERE EXISTS (SELECT 1 FROM books b WHERE b.author_id = a.id) ORDER BY a.id",
+        )
+        .unwrap();
+    assert_eq!(col(&has, 0), vec![Some("Ada".into()), Some("Bel".into())]);
+
+    let missing = db
+        .query(
+            "SELECT a.name FROM authors a \
+             WHERE NOT EXISTS (SELECT 1 FROM books b WHERE b.author_id = a.id)",
+        )
+        .unwrap();
+    assert_eq!(col(&missing, 0), vec![Some("Cy".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn correlated_scalar_subquery_in_where_predicate() {
+    let (mut db, p) = library();
+    // Only authors with at least two books.
+    let rs = db
+        .query(
+            "SELECT a.name FROM authors a \
+             WHERE (SELECT count(*) FROM books b WHERE b.author_id = a.id) >= 2",
+        )
+        .unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("Ada".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn non_correlated_subquery_still_works() {
+    // The fast (pre-fold once) path is unchanged for non-correlated subqueries.
+    let (mut db, p) = library();
+    let rs = db
+        .query(
+            "SELECT title FROM books \
+             WHERE author_id = (SELECT id FROM authors WHERE name = 'Bel')",
+        )
+        .unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("B1".into())]);
+    let _ = fs::remove_file(&p);
+}
