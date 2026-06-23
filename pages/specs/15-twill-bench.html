@@ -16,8 +16,8 @@
 <header class="page-header">
 <div class="spec-meta">
 <span class="badge badge-id">15</span>
-<span class="badge badge-status status-draft">Draft v0.1</span>
-<span class="spec-date">Updated 2026-06-21</span>
+<span class="badge badge-status status-draft">Draft v0.2</span>
+<span class="spec-date">Updated 2026-06-23</span>
 </div>
 <h1>Twill Bench CLI</h1>
 <p class="lede">The official benchmarking, correctness, and serverless-efficiency CLI for Twill DB — a single driver that knows the engine's internals, so it measures not just request latency but commit durability, lifecycle behaviour, and data correctness under load. This page captures the product vision and <strong>verifies it against what ships today</strong>, separating what already exists from what is aligned-but-unbuilt and what would strain the architecture's rules.</p>
@@ -47,14 +47,16 @@
 
 <section>
 <h2>Command structure</h2>
-<p>The brief proposes a <code>twill bench &lt;scenario&gt; [options]</code> surface. Today the binary is invoked as <code>twill-bench &lt;expN&gt; --url … [flags]</code>. Both are sub-command driven; the work below is to grow the scenario vocabulary and a profile loader, not to re-architect the entry point.</p>
-<div class="code-block"><pre><code>twill bench read-heavy
-twill bench write-heavy
-twill bench burst
-twill bench scale-to-zero
-twill bench bank-transfer        # correctness workload profile
-twill bench compare --baseline v0.5.0 --candidate v0.5.1
-twill bench custom --profile workload.yaml</code></pre></div>
+<p>The brief proposes a <code>twill bench &lt;scenario&gt; [options]</code> surface. The binary is invoked as <code>twill-bench &lt;command&gt; --url … [flags]</code>; both are sub-command driven. The request-mix scenarios, the correctness profiles, and <code>compare</code> below now ship; the remaining work is the lifecycle scenarios and a profile loader, not a re-architected entry point. (There is no separate <code>twilldb</code> CLI — <code>twill-bench</code> is the driver's own binary, as the brief intends.)</p>
+<div class="code-block"><pre><code>twill-bench read-heavy --url file://./b.db      # shipped
+twill-bench write-heavy --url file://./b.db     # shipped
+twill-bench mixed-oltp --url file://./b.db      # shipped
+twill-bench counter --url file://./b.db         # correctness profile (shipped)
+twill-bench bank-transfer --url file://./b.db   # correctness profile (shipped)
+twill-bench compare --baseline base.json --candidate cand.json   # shipped
+twill-bench burst                               # NEEDS DESIGN (controller in the loop)
+twill-bench scale-to-zero                       # NEEDS DESIGN (spec 09 Exp 5)
+twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)</code></pre></div>
 </section>
 
 <section>
@@ -66,9 +68,9 @@ twill bench custom --profile workload.yaml</code></pre></div>
 <tr><th>Scenario</th><th>Shape</th><th>Verification status</th></tr>
 </thead>
 <tbody>
-<tr><td><strong>read-heavy</strong></td><td>90% SELECT / 10% INSERT — analytical-leaning mix</td><td><span class="req-tag should">PLANNED</span> mix engine exists (writer loop); needs read path + ratio control</td></tr>
-<tr><td><strong>write-heavy</strong></td><td>20% SELECT / 80% INSERT — ingestion</td><td><span class="req-tag should">PLANNED</span> close to today's <code>exp2</code> independent-row insert loop</td></tr>
-<tr><td><strong>mixed-oltp</strong></td><td>70% SELECT / 20% INSERT / 8% UPDATE / 2% DELETE — SaaS</td><td><span class="req-tag should">PLANNED</span> needs UPDATE/DELETE/SELECT in the driver loop</td></tr>
+<tr><td><strong>read-heavy</strong></td><td>90% SELECT / 10% INSERT — analytical-leaning mix</td><td><span class="req-tag must">IMPLEMENTED</span> ratio-controlled mix over a pre-seeded working set</td></tr>
+<tr><td><strong>write-heavy</strong></td><td>20% SELECT / 80% INSERT — ingestion</td><td><span class="req-tag must">IMPLEMENTED</span> same mix driver, ingestion weights</td></tr>
+<tr><td><strong>mixed-oltp</strong></td><td>70% SELECT / 20% INSERT / 8% UPDATE / 2% DELETE — SaaS</td><td><span class="req-tag must">IMPLEMENTED</span> all four op kinds in the driver loop, deterministic per-writer PRNG</td></tr>
 <tr><td><strong>burst</strong></td><td>idle → 500 → 5k → 20k rps → idle, repeat; measures cold/warm starts + scaling latency</td><td><span class="req-tag may">NEEDS DESIGN</span> requires the controller's lifecycle signals, not just the engine</td></tr>
 <tr><td><strong>scale-to-zero</strong></td><td>query → idle 10m → query; measures cold boot, compute reuse, cache restore</td><td><span class="req-tag may">NEEDS DESIGN</span> this is spec 09 <strong>Exp 5</strong> (cold read) — SHOULD, not yet a subcommand</td></tr>
 <tr><td><strong>long-run</strong></td><td>hours/days; detects memory/resource/connection leaks, scheduler drift</td><td><span class="req-tag may">NEEDS DESIGN</span> soak harness + resource sampling</td></tr>
@@ -87,7 +89,7 @@ twill bench custom --profile workload.yaml</code></pre></div>
 <p>The brief groups metrics into five families. The query family ships today; the compute and scheduler families are the new, lifecycle-dependent surface and must be sourced from the controller/server, never invented inside the engine.</p>
 
 <h3>Query metrics <span class="req-tag must">IMPLEMENTED</span></h3>
-<p>Total / successful / failed requests, requests/sec, and the latency distribution (median, p90, p95, p99, max). Today's driver records per-commit latency into an HDR-style histogram and prints p50/p99/p999; widening to p90/p95 and a success/failure split is additive.</p>
+<p>Total / successful / failed requests, requests/sec, and the latency distribution (median, p90, p95, p99, max). The driver records per-op latency into an HDR-style histogram and reports p50/p90/p95/p99/p999 (plus min/max/mean) alongside an ok / retried-conflict / failure split — both in the human summary and the JSON record.</p>
 
 <h3>Storage metrics <span class="req-tag should">PARTIAL</span></h3>
 <p>Commit latency is measured today (it is the experiment). Snapshot/WAL read &amp; write counts, storage-fetch latency, and cache hit/miss ratio require the engine/storage to expose counters through a read-only stats surface — additive, but a new seam-respecting introspection path (no backend internals leak into the <code>Storage</code> trait).</p>
@@ -106,16 +108,16 @@ twill bench custom --profile workload.yaml</code></pre></div>
 <li><span class="req-tag must">MUST</span> detect: missing rows, duplicate rows, lost updates, dirty reads, non-repeatable reads, phantom reads, serializable violations, and transaction-consistency breaks.</li>
 <li><span class="req-tag must">MUST</span> exit non-zero (code 2) when any invariant is violated, regardless of latency.</li>
 </ul>
-<p>Today's <code>exp3</code> already counts first-committer-wins conflicts and retries them, proving no-lost-update on a contended counter (over pgwire the conflict surfaces as SQLSTATE <code>40001</code>); the conformance and group-commit suites prove durability and isolation at the crate level. The new work is to lift those assertions into named, result-checking <em>workload profiles</em>.</p>
+<p>Two named, result-checking <em>workload profiles</em> now ship (<code>counter</code>, <code>bank-transfer</code>): each drives a contended fixed-work load, then reads the durable state back and asserts an invariant, setting a correctness verdict that the CLI turns into exit code 2 on violation. They build on what <code>exp3</code> proved informally — first-committer-wins conflicts are counted and retried (over pgwire the conflict surfaces as SQLSTATE <code>40001</code>), and the conformance and group-commit suites prove durability and isolation at the crate level — and lift it into an explicit pass/fail assertion over the result set.</p>
 
 <h3>Workload profiles</h3>
 <div class="table-wrap">
 <table>
 <thead><tr><th>Profile</th><th>Drives</th><th>Asserts</th></tr></thead>
 <tbody>
-<tr><td><strong>bank-transfer</strong></td><td>concurrent transfers between two accounts</td><td>ACID, balance invariant (sum conserved), transaction correctness</td></tr>
+<tr><td><strong>bank-transfer</strong> <span class="req-tag must">IMPLEMENTED</span></td><td>concurrent atomic transfers between two accounts</td><td>ACID, balance invariant (sum conserved), transaction correctness</td></tr>
+<tr><td><strong>counter</strong> <span class="req-tag must">IMPLEMENTED</span></td><td>thousands of concurrent increments</td><td>atomicity, zero lost updates (generalizes <code>exp3</code>)</td></tr>
 <tr><td><strong>inventory</strong></td><td>concurrent stock decrements</td><td>no negative inventory, optimistic-lock conflict handling</td></tr>
-<tr><td><strong>counter</strong></td><td>thousands of concurrent increments</td><td>atomicity, zero lost updates (generalizes <code>exp3</code>)</td></tr>
 <tr><td><strong>document-editing</strong></td><td>concurrent updates to one document</td><td>conflict rate, merge/retry latency, retry behaviour</td></tr>
 </tbody>
 </table>
@@ -130,13 +132,13 @@ twill bench custom --profile workload.yaml</code></pre></div>
 <h3>Serverless-efficiency report <span class="req-tag may">NEEDS DESIGN</span></h3>
 <p>Unique to Twill DB: compute-active vs idle time, scale-to-zero count, average worker lifetime, compute-seconds/query, storage-reads/query, average compute utilization. This reframes a run around <em>operational cost</em>, not just latency — the most differentiated piece of the brief, and entirely controller-sourced.</p>
 
-<h3>Release comparison <span class="req-tag should">PLANNED</span></h3>
-<p><code>twill bench compare --baseline vX --candidate vY</code> diffs two runs (read/write latency, cold start, memory, throughput) into a PASS/regression verdict. The JSON record already carries the git SHA and all percentiles; comparison is a post-processing layer over two archived records, naturally CI-friendly.</p>
+<h3>Release comparison <span class="req-tag must">IMPLEMENTED</span></h3>
+<p><code>twill-bench compare --baseline base.json --candidate cand.json [--threshold 0.10]</code> diffs two archived JSON records (throughput, p50/p99/p999) into a PASS/regression verdict — a regression (throughput down, or a tail latency up, beyond the threshold) exits 1. It is pure post-processing over the records the driver already emits (each carries the git SHA and the full percentile set), so it needs neither the engine nor a transport, and is naturally CI-friendly. Cold-start and memory deltas join the diff once those metrics are sourced from the controller.</p>
 
 <h3>Output formats</h3>
 <ul class="reqs">
-<li><span class="req-tag must">IMPLEMENTED</span> — terminal summary + one-line JSON record (experiment, transport, backend, SHA, throughput, percentiles).</li>
-<li><span class="req-tag should">PLANNED</span> — <code>--json</code> as the sole stdout payload for scripting (today the JSON line accompanies the human summary).</li>
+<li><span class="req-tag must">IMPLEMENTED</span> — terminal summary + one-line JSON record (experiment, transport, backend, SHA, throughput, percentiles, and the correctness verdict for profiles).</li>
+<li><span class="req-tag must">IMPLEMENTED</span> — <code>--json</code> emits only the one-line JSON record on stdout (for scripting / CI), suppressing the human summary.</li>
 <li><span class="req-tag may">NEEDS DESIGN</span> — <code>--prometheus</code> export for Grafana/CI. Keep the exporter dependency CLI-only and feature-gated; it must never reach the engine.</li>
 </ul>
 
@@ -153,7 +155,7 @@ twill bench custom --profile workload.yaml</code></pre></div>
 </tbody>
 </table>
 </div>
-<p>Today the binary uses <code>2</code> for a usage/parse error and <code>1</code> for a run failure. Adopting the brief's table (notably <code>2</code> = correctness failure, <code>3</code> = config) is a small, behaviour-defining change worth pinning in a test.</p>
+<p><span class="req-tag must">IMPLEMENTED</span> — the binary now follows this table exactly: <code>0</code> success, <code>1</code> benchmark failed (or a <code>compare</code> regression), <code>2</code> a violated correctness invariant, <code>3</code> a configuration/usage error, <code>4</code> a connection failure. The mapping is pinned by the scenario tests (<code>crates/bench/tests/scenarios.rs</code>).</p>
 </section>
 
 <section>
@@ -166,9 +168,10 @@ twill bench custom --profile workload.yaml</code></pre></div>
 <tr><td>p50/p99/p999 via HDR histogram, JSON record, git SHA</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>exp1/exp2/exp3</code>, embedded + pgwire, <code>file://</code> + <code>s3://</code></td></tr>
 <tr><td>Group-commit + contention experiments</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>maps to spec 09 Exp 1–3; conflict retry proven</td></tr>
 <tr><td>Crash-safety gate</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>spec 09 Exp 4, in <code>crates/storage</code> (CI gate), not yet a bench subcommand</td></tr>
-<tr><td>Request-mix scenarios (read/write/mixed)</td><td><span class="req-tag should">PLANNED</span></td><td>needs SELECT/UPDATE/DELETE in the driver loop + ratio control</td></tr>
-<tr><td>Correctness workload profiles</td><td><span class="req-tag should">PLANNED</span></td><td>generalize <code>exp3</code>; assert invariants, exit code 2 on violation</td></tr>
-<tr><td>Release comparison</td><td><span class="req-tag should">PLANNED</span></td><td>post-process two archived JSON records</td></tr>
+<tr><td>Request-mix scenarios (read/write/mixed)</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>read-heavy</code>/<code>write-heavy</code>/<code>mixed-oltp</code> — ratio-controlled SELECT/INSERT/UPDATE/DELETE over a seeded working set</td></tr>
+<tr><td>Correctness workload profiles</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>counter</code>/<code>bank-transfer</code> — assert the invariant, exit code 2 on violation</td></tr>
+<tr><td>Release comparison</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>compare</code> post-processes two archived JSON records into a PASS/regression verdict</td></tr>
+<tr><td>Exit-code contract, <code>--json</code> sole payload, p90/p95</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>0–4 exit table, <code>--json</code>, widened percentiles + ok/conflict/failure split</td></tr>
 <tr><td>Cold-read / scale-to-zero scenario (Exp 5)</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>spec 09 SHOULD; needs controller in the loop</td></tr>
 <tr><td>Compute / scheduler / serverless-efficiency metrics</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>controller-sourced; overlaps a future OTLP export — bench consumes, engine never generates</td></tr>
 <tr><td>Storage counters, latency breakdown</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>read-only introspection surface that respects the storage seam</td></tr>
