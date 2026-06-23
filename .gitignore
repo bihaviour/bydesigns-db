@@ -22,6 +22,11 @@ clients/bun/dist/
 # Tooling artifacts
 .playwright-mcp/
 
+# Release binaries downloaded from a GitHub release for a manual npm publish
+# (native libengine .so/.dylib/.dll + engine.h). Generated/fetched, never source.
+/artifacts/
+/artifacts-gh/
+
 # Local env / secrets
 .env
 .env.*
