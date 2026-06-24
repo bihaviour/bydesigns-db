@@ -243,6 +243,7 @@ impl Session {
     fn inspect(&self, sql: &str) -> Canned {
         match introspect::intercept(sql, &self.user, &self.database) {
             Canned::Reflect(kind) => reflect::reflect(kind, &self.conn.catalog()),
+            Canned::Stats => introspect::stats_rows(&self.conn.stats()),
             other => other,
         }
     }
@@ -265,6 +266,7 @@ impl Session {
                 Ok(())
             }
             Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
+            Canned::Stats => unreachable!("inspect() resolves Stats"),
             Canned::Pass => match self.conn.query(sql) {
                 Ok(rs) => {
                     if !rs.columns.is_empty() {
@@ -465,6 +467,7 @@ impl Session {
                 }
                 Canned::Tag(_) => out.no_data(),
                 Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
+                Canned::Stats => unreachable!("inspect() resolves Stats"),
                 Canned::Pass if is_row_returning(&sql) => match self.dummy_columns(&sql, order_len)
                 {
                     Ok(Some((columns, oids))) => out.row_description(&fields(&columns, &oids, &[])),
@@ -648,6 +651,7 @@ impl Session {
                 has_rows: false,
             },
             Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
+            Canned::Stats => unreachable!("inspect() resolves Stats"),
             Canned::Pass => self.run_engine(&sql, &params, &order)?,
         };
         self.portals.get_mut(portal).unwrap().materialized = Some(mat);

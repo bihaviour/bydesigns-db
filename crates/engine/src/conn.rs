@@ -166,6 +166,13 @@ impl Connection {
         self.txn.is_some()
     }
 
+    /// A read-only [`EngineStats`](crate::EngineStats) snapshot of the shared
+    /// database — the engine + storage observability surface (#53 / spec 15),
+    /// surfaced over pgwire by the server's `SHOW twill.stats`.
+    pub fn stats(&self) -> crate::EngineStats {
+        self.db.stats()
+    }
+
     /// Reflect the catalog (tables + columns) for wire-protocol introspection
     /// (e.g. the pgwire server answering a PostgREST schema-cache query). Returns
     /// tables sorted by name, each column carrying its Postgres type name and

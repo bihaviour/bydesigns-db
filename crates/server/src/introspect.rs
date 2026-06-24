@@ -34,6 +34,10 @@ pub enum Canned {
     /// A schema-cache query the session must answer by reflecting the live
     /// catalog (the pure classifier here has no catalog access).
     Reflect(ReflectKind),
+    /// The `twill.stats` observability surface (#53 / spec 15): the session must
+    /// answer it by pulling the live [`engine::EngineStats`] snapshot (the pure
+    /// classifier here has no engine access, exactly like `Reflect`).
+    Stats,
     /// Not intercepted — hand the statement to the engine.
     Pass,
 }
@@ -92,6 +96,45 @@ fn empty_rows(columns: &[&str]) -> Canned {
     }
 }
 
+/// Format a live [`engine::EngineStats`] snapshot into the `twill.stats` result
+/// set: `(metric TEXT, value BIGINT)`, one row per signal under the settled #53
+/// vocabulary (spec 15). Pure formatting from a passed-in value — this module
+/// never reaches the engine; the session pulls the snapshot and calls this. The
+/// server reports the engine + storage families it can source from one process;
+/// the compute/scheduler family joins it over a controller-driven deployment.
+pub fn stats_rows(stats: &engine::EngineStats) -> Canned {
+    let st = &stats.storage;
+    let metrics: &[(&str, u64)] = &[
+        // commit family
+        ("twill_commit_total", stats.commits),
+        ("twill_durable_append_total", stats.durable_appends),
+        ("twill_committed_lsn", stats.committed_lsn),
+        // storage family (pulled through the seam)
+        ("twill_storage_wal_appends_total", st.wal_appends),
+        ("twill_storage_wal_bytes_total", st.wal_bytes),
+        ("twill_storage_page_reads_total", st.page_reads),
+        ("twill_storage_page_read_bytes_total", st.page_read_bytes),
+        ("twill_storage_cache_hits_total", st.cache_hits),
+        ("twill_storage_cache_misses_total", st.cache_misses),
+        (
+            "twill_storage_fetch_latency_us_total",
+            st.fetch_latency_us_total,
+        ),
+        ("twill_storage_fsync_total", st.fsyncs),
+    ];
+    let rows = metrics
+        .iter()
+        .map(|(name, v)| vec![Value::Text(name.to_string()), Value::Int(*v as i64)])
+        .collect::<Vec<_>>();
+    let n = rows.len();
+    Canned::Rows {
+        columns: vec!["metric".to_string(), "value".to_string()],
+        oids: vec![],
+        rows,
+        tag: format!("SELECT {n}"),
+    }
+}
+
 /// Inspect a statement; return a canned answer or [`Canned::Pass`].
 pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     let s = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
@@ -111,6 +154,22 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     }
     if s.starts_with("unlisten ") {
         return Canned::Tag("UNLISTEN".to_string());
+    }
+
+    // `twill.stats` — the read-only observability surface (#53 / spec 15),
+    // pulled in-band over pgwire. Recognized as a `SHOW`, a view select, or a
+    // bare `TABLE`. Matched before the generic `SHOW <name>` so it is not
+    // mistaken for a GUC. The session resolves it against the live engine.
+    if matches!(
+        s.as_str(),
+        "show twill.stats"
+            | "show twill_stats"
+            | "select * from twill.stats"
+            | "select * from twill_stats"
+            | "table twill.stats"
+            | "table twill_stats"
+    ) {
+        return Canned::Stats;
     }
 
     // SHOW <name> — one row named after the setting.
@@ -331,6 +390,54 @@ mod tests {
             scalar("select current_setting('nonesuch')").as_deref(),
             Some("")
         );
+    }
+
+    #[test]
+    fn twill_stats_is_intercepted_and_formatted() {
+        // All accepted spellings classify as the stats surface, not a GUC.
+        for q in [
+            "SHOW twill.stats",
+            "show twill_stats",
+            "SELECT * FROM twill_stats",
+            "TABLE twill.stats",
+        ] {
+            assert!(
+                matches!(intercept(q, "u", "d"), Canned::Stats),
+                "{q} should intercept to Stats"
+            );
+        }
+        // A normal SHOW is unaffected (still a one-row GUC answer).
+        assert_eq!(scalar("SHOW client_encoding").as_deref(), Some("UTF8"));
+
+        // The formatter renders the (metric, value) rows under the settled names.
+        let stats = engine::EngineStats {
+            commits: 7,
+            durable_appends: 3,
+            committed_lsn: 42,
+            storage: engine::StorageStats {
+                wal_appends: 3,
+                fsyncs: 4,
+                ..Default::default()
+            },
+        };
+        match stats_rows(&stats) {
+            Canned::Rows { columns, rows, .. } => {
+                assert_eq!(columns, vec!["metric".to_string(), "value".to_string()]);
+                let kv: std::collections::HashMap<String, i64> = rows
+                    .iter()
+                    .map(|r| match (&r[0], &r[1]) {
+                        (Value::Text(k), Value::Int(v)) => (k.clone(), *v),
+                        other => panic!("unexpected cell {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(kv["twill_commit_total"], 7);
+                assert_eq!(kv["twill_durable_append_total"], 3);
+                assert_eq!(kv["twill_committed_lsn"], 42);
+                assert_eq!(kv["twill_storage_wal_appends_total"], 3);
+                assert_eq!(kv["twill_storage_fsync_total"], 4);
+            }
+            _ => panic!("expected rows from stats_rows"),
+        }
     }
 
     #[test]

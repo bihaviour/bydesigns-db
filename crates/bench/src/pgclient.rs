@@ -114,6 +114,24 @@ impl PgClient {
         }
     }
 
+    /// Run a query and collect every row as a vector of text cells (`None` =
+    /// SQL NULL). Used to read multi-column results such as the `twill.stats`
+    /// observability surface (#53); the benchmark's hot loop uses the scalar
+    /// path instead.
+    pub fn query_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>, ExecError> {
+        self.send_query(sql)
+            .map_err(|e| ExecError::Fatal(e.to_string()))?;
+        let mut rows = Vec::new();
+        let err = self
+            .collect_rows_to_ready(&mut |row| rows.push(row))
+            .map_err(|e| ExecError::Fatal(e.to_string()))?;
+        match err {
+            None => Ok(rows),
+            Some((code, _)) if code == "40001" => Err(ExecError::Conflict),
+            Some((_, msg)) => Err(ExecError::Fatal(msg)),
+        }
+    }
+
     // ---- wire plumbing ----------------------------------------------------
 
     fn send_query(&mut self, sql: &str) -> io::Result<()> {
@@ -164,6 +182,52 @@ impl PgClient {
             }
         }
     }
+
+    /// Read until `ReadyForQuery`, calling `on_row` with all cells of each
+    /// `DataRow`, returning any `ErrorResponse`'s `(SQLSTATE, message)`.
+    fn collect_rows_to_ready(
+        &mut self,
+        on_row: &mut dyn FnMut(Vec<Option<String>>),
+    ) -> io::Result<Option<(String, String)>> {
+        let mut err = None;
+        loop {
+            let (tag, body) = self.read_msg()?;
+            match tag {
+                b'D' => on_row(all_cells(&body)),
+                b'E' => err = Some(parse_error(&body)),
+                b'Z' => return Ok(err),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Parse every column of a `DataRow` body into text cells (`None` = SQL NULL).
+fn all_cells(body: &[u8]) -> Vec<Option<String>> {
+    let mut cells = Vec::new();
+    if body.len() < 2 {
+        return cells;
+    }
+    let ncols = i16::from_be_bytes([body[0], body[1]]).max(0) as usize;
+    let mut pos = 2;
+    for _ in 0..ncols {
+        if pos + 4 > body.len() {
+            break;
+        }
+        let len = i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        pos += 4;
+        if len < 0 {
+            cells.push(None);
+            continue;
+        }
+        let end = pos + len as usize;
+        if end > body.len() {
+            break;
+        }
+        cells.push(Some(String::from_utf8_lossy(&body[pos..end]).into_owned()));
+        pos = end;
+    }
+    cells
 }
 
 /// Extract the first column of a `DataRow` body as text (`None` = SQL NULL).
