@@ -16,8 +16,8 @@
 <header class="page-header">
 <div class="spec-meta">
 <span class="badge badge-id">15</span>
-<span class="badge badge-status status-draft">Draft v0.2</span>
-<span class="spec-date">Updated 2026-06-23</span>
+<span class="badge badge-status status-draft">Draft v0.3</span>
+<span class="spec-date">Updated 2026-06-24</span>
 </div>
 <h1>Twill Bench CLI</h1>
 <p class="lede">The official benchmarking, correctness, and serverless-efficiency CLI for Twill DB — a single driver that knows the engine's internals, so it measures not just request latency but commit durability, lifecycle behaviour, and data correctness under load. This page captures the product vision and <strong>verifies it against what ships today</strong>, separating what already exists from what is aligned-but-unbuilt and what would strain the architecture's rules.</p>
@@ -92,13 +92,93 @@ twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)<
 <p>Total / successful / failed requests, requests/sec, and the latency distribution (median, p90, p95, p99, max). The driver records per-op latency into an HDR-style histogram and reports p50/p90/p95/p99/p999 (plus min/max/mean) alongside an ok / retried-conflict / failure split — both in the human summary and the JSON record.</p>
 
 <h3>Storage metrics <span class="req-tag should">PARTIAL</span></h3>
-<p>Commit latency is measured today (it is the experiment). Snapshot/WAL read &amp; write counts, storage-fetch latency, and cache hit/miss ratio require the engine/storage to expose counters through a read-only stats surface — additive, but a new seam-respecting introspection path (no backend internals leak into the <code>Storage</code> trait).</p>
+<p>Commit latency is measured today (it is the experiment). Snapshot/WAL read &amp; write counts, storage-fetch latency, and cache hit/miss ratio require the engine/storage to expose counters through a read-only stats surface — additive, but a new seam-respecting introspection path (no backend internals leak into the <code>Storage</code> trait). That surface is now designed: see <a href="#observability-design">Observability design decision (#53)</a>, Decision 1 (<code>Storage::stats() → StorageStats</code>).</p>
 
-<h3>Compute &amp; scheduler metrics <span class="req-tag may">NEEDS DESIGN</span></h3>
-<p>Cold/warm starts, average start time, worker-reuse rate, compute active/idle duration, scale-to-zero events, peak workers; queue depth, scheduling delay, allocation/placement time. These come from <a href="06-lifecycle-controller.html"><code>twill-controller</code></a> and the server, and overlap directly with a future observability/OTLP export. Twill Bench consumes them; it does not generate them.</p>
+<h3>Compute &amp; scheduler metrics <span class="req-tag may">DESIGN RESOLVED</span></h3>
+<p>Cold/warm starts, average start time, worker-reuse rate, compute active/idle duration, scale-to-zero events, peak workers; queue depth, scheduling delay, allocation/placement time. These come from <a href="06-lifecycle-controller.html"><code>twill-controller</code></a> and the server, and overlap directly with a future observability/OTLP export. Twill Bench consumes them; it does not generate them — by <em>pulling</em> a <code>ControllerStats</code> snapshot, never scraping logs or pushing from the core (<a href="#observability-design">Observability design decision (#53)</a>, Decision 2).</p>
 
 <h3>Network metrics <span class="req-tag may">NEEDS DESIGN</span></h3>
 <p>Client RTT, TLS handshake, request/response transfer — meaningful only on the pgwire transport; measured client-side in the bench driver.</p>
+</section>
+
+<section id="observability-design">
+<h2>Observability design decision (#53): metric source &amp; read-only stats surface</h2>
+<p>The lifecycle scenarios and the serverless-efficiency report need numbers the bench cannot make up — cold starts, worker reuse, scale-to-zero events, storage reads, cache hit/miss, compute active/idle time. <a href="https://github.com/bihaviour/twill-db/issues/53">Issue #53</a> asks three questions before any of that can be built: <em>what read-only surface exposes those counters without leaking backend internals across the <a href="03-storage-interface.html">seam</a>; how does the bench observe controller lifecycle events; and which latency segments are observable today versus blocked.</em> This section resolves all three and settles the metric vocabulary once, so the future observability/OTLP exporter emits the same names the bench reports.</p>
+
+<div class="callout note">
+<p class="callout-title">One rule decides the shape: pull a snapshot, never push from the core</p>
+<p>Each tier already holds its counters as in-process atomics (the controller's <code>warm_count</code>/<code>peak_concurrent_warms</code>, the engine's group-commit <code>(durable_appends, commits)</code>). The decision is to <strong>expose one read-only <code>stats()</code> snapshot accessor per tier</strong> — additive, allocation-free, returning a plain value struct of backend-neutral counters — and have the bench <strong>pull</strong> it. No log scraping (format-coupled, brittle), and no push/emit from the engine or storage (that would put a metrics pipeline inside the thread-free core and across the seam — both forbidden). The live OTLP exporter, when it lands, reads the <em>same</em> snapshots and pushes them; the bench and the exporter share one source, one vocabulary.</p>
+</div>
+
+<h3>Decision 1 — the read-only stats surface (per tier, pulled, seam-safe)</h3>
+<p>Four snapshot accessors, each owned by the tier that already tracks the signal, each a cheap relaxed-atomic load returning a <code>Copy</code> value struct (no allocation, safe to poll on a hot loop):</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Accessor</th><th>Tier / today</th><th>Snapshot fields (all backend-neutral)</th></tr></thead>
+<tbody>
+<tr><td><code>Storage::stats() → StorageStats</code></td><td><a href="03-storage-interface.html"><code>crates/storage</code></a> — <span class="req-tag may">NEW</span> additive trait method, default-zero impl, bumps <code>STORAGE_TRAIT_VERSION</code> 2→3</td><td>wal_appends, wal_bytes, page_reads, page_read_bytes, cache_hits, cache_misses, fetch_latency_us (histogram), fsyncs, fsync_latency_us</td></tr>
+<tr><td><code>Database::stats() → EngineStats</code></td><td><a href="02-engine-core.html"><code>crates/engine</code></a> — extends today's <code>group_commit_stats()</code></td><td>commits, durable_appends (→ coalescing ratio), conflicts, commit_latency_us, committed_lsn (gauge), lease_renews, lease_renew_failures</td></tr>
+<tr><td><code>Controller::stats() → ControllerStats</code></td><td><a href="06-lifecycle-controller.html"><code>crates/controller</code></a> — extends <code>warm_count()</code>/<code>peak_concurrent_warms()</code></td><td>cold_starts, warm_starts, scale_to_zero_events, peak_workers, compute_active_us, compute_idle_us, admission_wait_us (histogram)</td></tr>
+<tr><td><code>SHOW twill.stats</code> / <code>twill_stats</code> view</td><td><a href="07-server-mode.html"><code>crates/server</code></a> — aggregates the three above</td><td>the union, surfaced in-band over pgwire so the bench (a plain client) pulls it on the same connection — no side channel</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">Seam invariant: <code>StorageStats</code> is counters, never internals</p>
+<p>The new trait method returns only backend-neutral aggregates — counts, byte totals, latency histograms. It MUST NOT carry an S3 key, a file offset, an LSM layer id, or any other backend-specific concept (the storage-seam rule). <code>LocalFileStorage</code> and <code>ObjectStorage</code> populate the <em>same</em> field set; a field that is meaningless for a backend stays zero (fetch latency ≈ 0 and cache hit/miss unused for <code>file://</code>; both live for object stores). Because the method is additive with a default-zero impl, every existing backend and the C1–C8 conformance suite stay green; the bump to <code>STORAGE_TRAIT_VERSION</code> is the only contract change.</p>
+</div>
+
+<h3>Decision 2 — how the bench observes controller lifecycle events</h3>
+<p><strong>Pull the controller's snapshot; do not scrape logs and do not require a collector.</strong> Three candidate mechanisms were weighed:</p>
+<ul class="reqs">
+<li><span class="req-tag must-not">REJECTED</span> <strong>log scrape</strong> — couples the bench to a log format, needs a parser, races with rotation, and carries no histograms. Brittle for a number that gates a placement decision.</li>
+<li><span class="req-tag must-not">REJECTED (for the bench)</span> <strong>push / emit from the controller</strong> — that <em>is</em> the future OTLP exporter, and it would force the bench to stand up a collector to read its own run. The exporter reads the same snapshot; it does not replace it.</li>
+<li><span class="req-tag must">CHOSEN</span> <strong>pull a snapshot</strong> — <code>Controller::stats()</code> in-process for an embedded/controller-driven run; <code>SHOW twill.stats</code> over pgwire for a deployed server. The bench samples it at start and end of a scenario (and on an interval for <code>long-run</code>), and the per-scenario delta becomes the report. Cumulative counters make deltas exact; gauges (peak_workers, committed_lsn) are read as-of.</li>
+</ul>
+<p>This keeps lifecycle generation where it belongs — the controller and server own the events; the engine core stays thread-free and metric-free — and gives the bench a stable, typed, histogram-carrying read with no new runtime dependency.</p>
+
+<h3>Decision 3 — latency-breakdown attribution: observable now vs. blocked</h3>
+<p>The full request path is <em>receive → auth → scheduler/admission → compute spin-up → metadata load → storage read → execution → commit → response</em>. What each segment costs, and where the number comes from:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Segment</th><th>Status</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>total (end-to-end)</td><td><span class="req-tag must">OBSERVABLE TODAY</span></td><td>bench driver, client-side (the existing per-op histogram)</td></tr>
+<tr><td>client RTT, TLS handshake</td><td><span class="req-tag must">OBSERVABLE TODAY</span></td><td>bench driver, pgwire transport only</td></tr>
+<tr><td>auth</td><td><span class="req-tag should">≈ 0</span></td><td>cleartext pgwire subset — negligible, not separately instrumented</td></tr>
+<tr><td>commit (durable round-trip)</td><td><span class="req-tag must">OBSERVABLE TODAY</span></td><td>this is the Exp 1–3 measurement; <code>EngineStats.commit_latency_us</code> formalizes it</td></tr>
+<tr><td>execution</td><td><span class="req-tag should">OBSERVABLE (engine)</span></td><td>engine-side span, exposed via <code>EngineStats</code> once the accessor lands</td></tr>
+<tr><td>storage read</td><td><span class="req-tag may">UNLOCKED BY Decision 1</span></td><td><code>StorageStats.fetch_latency_us</code> — blocked until the stats surface ships</td></tr>
+<tr><td>scheduler / admission</td><td><span class="req-tag may">UNLOCKED BY Decision 1</span></td><td><code>ControllerStats.admission_wait_us</code> (thundering-herd queue)</td></tr>
+<tr><td>compute spin-up, metadata load</td><td><span class="req-tag may">COLD-PATH ONLY</span></td><td>controller cold-start timing, split spin-up vs. replay/metadata — meaningful only on the <em>first</em> request to a cold instance; steady-state requests have zero spin-up, so this is a cold-start breakdown, not a per-request one. It is exactly the <code>scale-to-zero</code> (Exp 5) scenario's payload.</td></tr>
+</tbody>
+</table>
+</div>
+<p>So the breakdown ships in two steps: a client-side + commit breakdown is available <em>now</em>; the storage / scheduler / spin-up segments unlock together the moment Decision 1's accessors land, and the spin-up/metadata split is reported only on the cold path the scale-to-zero scenario drives.</p>
+
+<h3>The settled metric vocabulary (shared with the future OTLP exporter)</h3>
+<p>One namespaced signal set, defined here once. The bench reports these names in its JSON record; the live exporter emits the same names. Families map onto the snapshot accessors above.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Family / source</th><th>Signals</th></tr></thead>
+<tbody>
+<tr><td><strong>query</strong> — bench, client-side <span class="req-tag must">SHIPS TODAY</span></td><td><code>twill_query_total</code>, <code>twill_query_ok</code>, <code>twill_query_conflict</code>, <code>twill_query_failed</code>, <code>twill_query_latency_us</code>{p50…p999}, <code>twill_throughput_per_s</code></td></tr>
+<tr><td><strong>commit</strong> — <code>EngineStats</code></td><td><code>twill_commit_total</code>, <code>twill_durable_append_total</code>, <code>twill_commit_coalescing_ratio</code>, <code>twill_commit_latency_us</code>, <code>twill_conflict_total</code>, <code>twill_committed_lsn</code></td></tr>
+<tr><td><strong>storage</strong> — <code>StorageStats</code></td><td><code>twill_storage_wal_appends_total</code>, <code>twill_storage_wal_bytes_total</code>, <code>twill_storage_page_reads_total</code>, <code>twill_storage_cache_hits_total</code>, <code>twill_storage_cache_misses_total</code>, <code>twill_storage_fetch_latency_us</code>, <code>twill_storage_fsync_total</code></td></tr>
+<tr><td><strong>compute / scheduler</strong> — <code>ControllerStats</code></td><td><code>twill_cold_start_total</code>, <code>twill_warm_start_total</code>, <code>twill_worker_reuse_ratio</code>, <code>twill_scale_to_zero_total</code>, <code>twill_compute_active_seconds_total</code>, <code>twill_compute_idle_seconds_total</code>, <code>twill_peak_workers</code>, <code>twill_admission_wait_us</code>, <code>twill_lease_renew_total</code></td></tr>
+<tr><td><strong>serverless-efficiency</strong> — derived (report-only)</td><td><code>compute_seconds_per_query</code> = active / query_total, <code>storage_reads_per_query</code>, <code>utilization</code> = active / (active + idle), <code>scale_to_zero_count</code>, <code>avg_worker_lifetime</code></td></tr>
+<tr><td><strong>network</strong> — bench, pgwire only</td><td><code>twill_client_rtt_us</code>, <code>twill_tls_handshake_us</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The efficiency family is pure arithmetic over the others — no new instrumentation, only the snapshot deltas a controller-driven run already yields. That is the report issue #53 asks for, and it falls out of Decisions 1–2 for free.</p>
+
+<h3>Build order this unblocks</h3>
+<ol class="reqs">
+<li><span class="req-tag must">1</span> Land the four <code>stats()</code> accessors (additive; bump <code>STORAGE_TRAIT_VERSION</code> 2→3, keep C1–C8 green). This is the gating change — every later item reads from it.</li>
+<li><span class="req-tag must">2</span> <code>scale-to-zero</code> (Exp 5) cold-read scenario: drive query → idle past the controller's reaper → query, pull <code>ControllerStats</code> deltas, report the cold-boot percentile distribution against a controller-driven deployment.</li>
+<li><span class="req-tag must">3</span> The serverless-efficiency report: compute active/idle, scale-to-zero count, compute-seconds/query, utilization — derived from the snapshot deltas, emitted under the vocabulary above.</li>
+</ol>
 </section>
 
 <section>
@@ -126,11 +206,11 @@ twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)<
 
 <section>
 <h2>Reporting</h2>
-<h3>Latency breakdown <span class="req-tag may">NEEDS DESIGN</span></h3>
-<p>Rather than a single total, attribute time across the request path — receive, auth, scheduler, compute spin-up, metadata load, storage read, execution, commit, response. The spin-up / metadata / storage segments require the same controller + storage introspection as the compute/storage metrics above; until those land, the breakdown is partial (client-side + commit only).</p>
+<h3>Latency breakdown <span class="req-tag may">DESIGN RESOLVED</span></h3>
+<p>Rather than a single total, attribute time across the request path — receive, auth, scheduler, compute spin-up, metadata load, storage read, execution, commit, response. The spin-up / metadata / storage segments require the same controller + storage introspection as the compute/storage metrics above; until those land, the breakdown is partial (client-side + commit only). The per-segment attribution and what is observable today versus unlocked by the stats surface is settled in <a href="#observability-design">Observability design decision (#53)</a>, Decision 3.</p>
 
-<h3>Serverless-efficiency report <span class="req-tag may">NEEDS DESIGN</span></h3>
-<p>Unique to Twill DB: compute-active vs idle time, scale-to-zero count, average worker lifetime, compute-seconds/query, storage-reads/query, average compute utilization. This reframes a run around <em>operational cost</em>, not just latency — the most differentiated piece of the brief, and entirely controller-sourced.</p>
+<h3>Serverless-efficiency report <span class="req-tag may">DESIGN RESOLVED</span></h3>
+<p>Unique to Twill DB: compute-active vs idle time, scale-to-zero count, average worker lifetime, compute-seconds/query, storage-reads/query, average compute utilization. This reframes a run around <em>operational cost</em>, not just latency — the most differentiated piece of the brief, and entirely controller-sourced. It is pure arithmetic over the snapshot deltas a controller-driven run yields; the signal set is fixed in the <a href="#observability-design">settled metric vocabulary</a>, and the build order it falls out of is listed there.</p>
 
 <h3>Release comparison <span class="req-tag must">IMPLEMENTED</span></h3>
 <p><code>twill-bench compare --baseline base.json --candidate cand.json [--threshold 0.10]</code> diffs two archived JSON records (throughput, p50/p99/p999) into a PASS/regression verdict — a regression (throughput down, or a tail latency up, beyond the threshold) exits 1. It is pure post-processing over the records the driver already emits (each carries the git SHA and the full percentile set), so it needs neither the engine nor a transport, and is naturally CI-friendly. Cold-start and memory deltas join the diff once those metrics are sourced from the controller.</p>
@@ -173,8 +253,8 @@ twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)<
 <tr><td>Release comparison</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>compare</code> post-processes two archived JSON records into a PASS/regression verdict</td></tr>
 <tr><td>Exit-code contract, <code>--json</code> sole payload, p90/p95</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>0–4 exit table, <code>--json</code>, widened percentiles + ok/conflict/failure split</td></tr>
 <tr><td>Cold-read / scale-to-zero scenario (Exp 5)</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>spec 09 SHOULD; needs controller in the loop</td></tr>
-<tr><td>Compute / scheduler / serverless-efficiency metrics</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>controller-sourced; overlaps a future OTLP export — bench consumes, engine never generates</td></tr>
-<tr><td>Storage counters, latency breakdown</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>read-only introspection surface that respects the storage seam</td></tr>
+<tr><td>Compute / scheduler / serverless-efficiency metrics</td><td><span class="req-tag may">DESIGN RESOLVED</span></td><td>controller-sourced via a pulled <code>ControllerStats</code> snapshot; vocabulary shared with a future OTLP export (<a href="#observability-design">#53</a>) — bench consumes, engine never generates</td></tr>
+<tr><td>Storage counters, latency breakdown</td><td><span class="req-tag may">DESIGN RESOLVED</span></td><td>read-only <code>Storage::stats()</code> snapshot, backend-neutral, additive (<a href="#observability-design">#53</a>); seam-safe</td></tr>
 <tr><td>YAML custom profiles, Prometheus export</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>CLI-only, feature-gated deps; keep out of engine core</td></tr>
 </tbody>
 </table>
@@ -186,7 +266,7 @@ twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)<
 <ul class="reqs">
 <li><span class="req-tag must-not">MUST NOT</span> let any reporting feature (YAML, Prometheus, OTLP) add a dependency to <code>crates/engine</code> or move a backend concept into the <code>Storage</code> trait — these live in the bench/server/controller crates only.</li>
 <li><span class="req-tag must-not">MUST NOT</span> generate lifecycle/compute metrics inside the thread-free engine; consume them from <a href="06-lifecycle-controller.html"><code>twill-controller</code></a> and the server.</li>
-<li><span class="req-tag should">SHOULD</span> resolve: do the new compute/efficiency metrics share one signal vocabulary with a future observability/OTLP exporter? They should — settle the metric set in the bench first, then emit the same set live.</li>
+<li><span class="req-tag should">RESOLVED</span> — yes, the compute/efficiency metrics share one signal vocabulary with the future observability/OTLP exporter. The set is settled in <a href="#observability-design">Observability design decision (#53)</a>: each tier exposes a pulled <code>stats()</code> snapshot, the bench reports those names, and the live exporter emits the same names from the same snapshots.</li>
 <li><span class="req-tag should">SHOULD</span> resolve: what is the safe-against-production guard? Read-only scenarios run anywhere; any mutating scenario requires an explicit opt-in flag and a non-production URL by default.</li>
 <li><span class="req-tag may">MAY</span> defer (future enhancements per the brief): multi-region runs, fault injection, network-latency simulation, storage-backend comparison, flamegraphs, continuous mode, a historical benchmark DB, HTML reports, and an interactive TUI.</li>
 </ul>
