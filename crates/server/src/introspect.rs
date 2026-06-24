@@ -96,6 +96,40 @@ fn empty_rows(columns: &[&str]) -> Canned {
     }
 }
 
+/// The CommandComplete tag for a fire-and-forget session-setup command
+/// (`SET` / `DISCARD` / `LISTEN` / `UNLISTEN`), or `None` if `s` is not one.
+/// Drivers issue these on connect and ignore the reply; the engine has no GUCs
+/// or pub/sub, so they are accepted as no-ops. Split out of `intercept` to keep
+/// that classifier within the project's lizard complexity gate.
+fn session_noop_tag(s: &str) -> Option<&'static str> {
+    if s.starts_with("set ") || s == "begin read only" {
+        Some("SET")
+    } else if s.starts_with("discard ") {
+        Some("DISCARD ALL")
+    } else if s.starts_with("listen ") {
+        Some("LISTEN")
+    } else if s.starts_with("unlisten ") {
+        Some("UNLISTEN")
+    } else {
+        None
+    }
+}
+
+/// Whether `s` (already lowercased/trimmed) is one of the accepted spellings of
+/// the `twill.stats` observability surface (#53). Split out of `intercept` to
+/// keep that classifier's cyclomatic complexity within the project's lizard gate.
+fn is_twill_stats_query(s: &str) -> bool {
+    matches!(
+        s,
+        "show twill.stats"
+            | "show twill_stats"
+            | "select * from twill.stats"
+            | "select * from twill_stats"
+            | "table twill.stats"
+            | "table twill_stats"
+    )
+}
+
 /// Format a live [`engine::EngineStats`] snapshot into the `twill.stats` result
 /// set: `(metric TEXT, value BIGINT)`, one row per signal under the settled #53
 /// vocabulary (spec 15). Pure formatting from a passed-in value — this module
@@ -139,36 +173,18 @@ pub fn stats_rows(stats: &engine::EngineStats) -> Canned {
 pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     let s = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
 
-    // Session-setup commands drivers fire and forget.
-    if s.starts_with("set ") || s == "begin read only" {
-        return Canned::Tag("SET".to_string());
-    }
-    if s.starts_with("discard ") {
-        return Canned::Tag("DISCARD ALL".to_string());
-    }
-    // LISTEN / UNLISTEN — PostgREST opens a `pgrst` channel for schema-cache
-    // reload notifications. The engine has no pub/sub; accept the command as a
-    // no-op (the client simply never receives async notifications).
-    if s.starts_with("listen ") {
-        return Canned::Tag("LISTEN".to_string());
-    }
-    if s.starts_with("unlisten ") {
-        return Canned::Tag("UNLISTEN".to_string());
+    // Session-setup commands drivers fire and forget (SET / DISCARD / LISTEN /
+    // UNLISTEN) — grouped into a helper to keep this classifier within the
+    // project's lizard complexity gate.
+    if let Some(tag) = session_noop_tag(&s) {
+        return Canned::Tag(tag.to_string());
     }
 
     // `twill.stats` — the read-only observability surface (#53 / spec 15),
     // pulled in-band over pgwire. Recognized as a `SHOW`, a view select, or a
     // bare `TABLE`. Matched before the generic `SHOW <name>` so it is not
     // mistaken for a GUC. The session resolves it against the live engine.
-    if matches!(
-        s.as_str(),
-        "show twill.stats"
-            | "show twill_stats"
-            | "select * from twill.stats"
-            | "select * from twill_stats"
-            | "table twill.stats"
-            | "table twill_stats"
-    ) {
+    if is_twill_stats_query(&s) {
         return Canned::Stats;
     }
 
