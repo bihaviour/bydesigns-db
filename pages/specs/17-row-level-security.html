@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Row-Level Security (Proposal) · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">17</span>
+<span class="badge badge-status status-draft">Proposal v0.1</span>
+<span class="spec-date">Updated 2026-06-23</span>
+</div>
+<h1>Row-Level Security (Proposal)</h1>
+<p class="lede">A proposal to resolve the open authorization question from <a href="12-capabilities.html">Capabilities</a>: bring Supabase-style row-level security to Twill by splitting it along the build-in-vs-compose seam — the <em>per-row enforcement predicate</em> is an execution capability built <strong>into</strong> the engine, while <em>identity, JWT verification, and policy authoring</em> stay composed <strong>around</strong> it. The storage seam never moves; RLS rides the same WAL/replay path the rows do, so policies branch and scale-to-zero with the database.</p>
+</header>
+
+<section>
+<h2>Status &amp; purpose</h2>
+<div class="callout warning">
+<p class="callout-title">This is a proposal, not a ratified spec</p>
+<p>Phases 1–6 are implemented; row-level security is <strong>not</strong> built and not yet committed to the roadmap. This page exists to answer the dangling open question in <a href="12-capabilities.html">Capabilities §Open questions</a> — "<em>where do row-level security / policy enforcement live — in the engine, in PostgREST, or in the app?</em>" — with a concrete, seam-respecting design and a proposed roadmap slot. It is <span class="badge badge-status status-draft">Proposal v0.1</span> until engineering sign-off promotes it to <span class="badge badge-status status-review">In review</span>.</p>
+</div>
+<p>The motivation is the Supabase experience: the database itself enforces <em>who can see and change which rows</em>, driven by a request's authenticated identity (a JWT's claims and role), so a single auto-generated API surface (PostgREST) can be exposed to untrusted clients safely. The application writes <code>CREATE POLICY</code> once; every query — no matter which client issues it — is filtered by the engine. This page specifies how that experience maps onto Twill without violating the <a href="12-capabilities.html">deciding rule</a> or the <a href="03-storage-interface.html">storage seam</a>.</p>
+<div class="callout note">
+<p class="callout-title">Reference shape</p>
+<p>"Postgres RLS as Supabase uses it." In Postgres, <code>CREATE POLICY … USING (auth.uid() = user_id)</code> plus <code>ALTER TABLE … ENABLE ROW LEVEL SECURITY</code> make the <em>executor</em> AND a per-row predicate into every scan; the composed layers (GoTrue verifies the JWT, PostgREST sets <code>request.jwt.claims</code> and <code>SET ROLE</code> per request) only supply identity. Enforcement is the database's job; identity is the boundary's job. This proposal keeps exactly that division.</p>
+</div>
+</section>
+
+<section>
+<h2>Classifying RLS with the deciding rule</h2>
+<p>The <a href="12-capabilities.html">Capabilities</a> rule is binary: storage/execution capabilities build IN, interface/service capabilities compose AROUND. RLS does not fall cleanly on one side — and that ambiguity is exactly why it was left open. Splitting it into its two constituent concerns resolves the tension:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Concern</th><th>Question from the rule</th><th>Kind</th><th>Placement</th></tr></thead>
+<tbody>
+<tr><td>Per-row visibility / write predicate</td><td>Is it a query operator the executor evaluates over rows?</td><td>execution</td><td><span class="pill build">build IN</span></td></tr>
+<tr><td>Session principal (claims + role) the predicate reads</td><td>Is it state the executor must consult per statement?</td><td>execution (tiny)</td><td><span class="pill build">build IN</span></td></tr>
+<tr><td>JWT verification / identity resolution</td><td>Is it a service holding its own state &amp; secrets?</td><td>service</td><td><span class="pill blue">compose</span></td></tr>
+<tr><td>Policy authoring UX / role management</td><td>Is it a request/management surface?</td><td>interface / service</td><td><span class="pill blue">compose</span></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout tip">
+<p class="callout-title">The placement (proposed, normative)</p>
+<p><strong>Enforcement is an execution capability — it builds INTO the engine.</strong> A row-visibility predicate is evaluated against every row the executor scans; by the rule's third test it is unambiguously in-core.</p>
+<p><strong>Identity is a service — it stays composed AROUND the engine.</strong> Verifying a JWT, minting sessions, and managing role membership hold their own secrets and state; they remain in better-auth / the app / the wire boundary, exactly as <a href="07-server-mode.html">Server Mode</a> already says ("auth is per-connection, authorization is per-statement").</p>
+</div>
+</section>
+
+<section>
+<h2>Why composed-only enforcement is insufficient</h2>
+<p>The tempting answer — "let PostgREST or the app filter rows" — fails the security property, and it is worth stating why precisely, because it is the crux of the whole proposal.</p>
+<div class="callout danger">
+<p class="callout-title">The bypass problem</p>
+<p>A predicate enforced <em>above</em> the engine only protects the one path that goes through that layer. The moment any other client speaks to the engine — a second pg-wire tool, a direct embedded FFI call, a branch opened for debugging, a future GraphQL gateway — the filter is gone and every row is visible. Row-level security is only a <em>security</em> property if it is enforced at the lowest common chokepoint every query must pass through. In this architecture that chokepoint is the executor, not any composed layer above it.</p>
+</div>
+<p>This is the same reasoning that put MVCC visibility in the executor rather than in a client library: a per-row filter that some callers can skip is not a guarantee. Composed identity is fine (every path must still present a principal), but composed <em>enforcement</em> is not. Hence the split.</p>
+</section>
+
+<section>
+<h2>Proposed design — engine-native enforcement</h2>
+
+<h3>1 · Session principal (reuse, don't reinvent)</h3>
+<p>The wire layer already "resolves a principal and forwards statements tagged with that principal" (<a href="07-server-mode.html">Server Mode</a>). RLS needs that principal readable from inside the executor. The proposal adds a per-connection, per-transaction <strong>session context</strong> — a small bag of claims plus an active role — set through the existing statement path (no new hot-path export):</p>
+<pre data-lang="sql"><code>-- composed identity layer sets these after verifying the JWT (6E-style SET shims):
+SET twill.jwt.claims = '{"sub":"u_42","role":"authenticated","org":"acme"}';
+SET ROLE authenticated;          -- pins the active role for policy matching
+-- claims are readable inside policies via a tiny built-in accessor:
+--   auth.uid()        -> claims->>'sub'
+--   auth.role()       -> current role
+--   auth.claim('org') -> claims->>'org'</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> scope the session context to the connection (and overrideable per transaction), never process-global — multiple connections to one shared <code>Database</code> (see <code>db.rs</code> registry) MUST NOT see each other's principal.</li>
+<li><span class="req-tag must">MUST</span> treat the claims blob as opaque, untrusted input the engine never verifies — verification is the composed layer's job; the engine only reads the already-trusted principal the boundary vouched for.</li>
+<li><span class="req-tag should">SHOULD</span> flow through the existing <code>SET</code> handling added in stage <a href="13-roadmap.html">6E</a> rather than a new C-ABI export, so <code>ENGINE_ABI_VERSION</code> need not bump.</li>
+</ul>
+
+<h3>2 · Policy DDL &amp; the catalog fact</h3>
+<p>Policies are catalog state, added the same additive way Phase 6 added constraints and defaults — a new backward-compatible WAL op, replayed on recovery, branched with the database. No storage-trait change.</p>
+<pre data-lang="sql"><code>ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY notes_owner ON notes
+  FOR ALL                              -- or SELECT / INSERT / UPDATE / DELETE
+  TO authenticated                     -- role this policy applies to
+  USING      (user_id = auth.uid())    -- read/visibility predicate
+  WITH CHECK (user_id = auth.uid());   -- write-admissibility predicate</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> persist each policy as an additive <code>CreatePolicy</code> WAL fact (predicate AST + command + roles), exposed via <code>Connection::catalog</code> like other schema facts; recovery rebuilds the policy set by replay, exactly as Phase 6 catalog facts do.</li>
+<li><span class="req-tag must">MUST</span> keep policy DDL autocommit-only, consistent with the existing DDL scope boundary (<code>ENGINE_ERR_TXN</code> inside an explicit transaction).</li>
+<li><span class="req-tag should">SHOULD</span> default-deny once RLS is enabled on a table and no policy grants access — matching Postgres semantics (enable = "deny all" until a policy opens a hole).</li>
+</ul>
+
+<h3>3 · Enforcement in the executor</h3>
+<p>This is the load-bearing part and the reason it must be in-core. When the executor (<code>exec.rs</code>) scans a table with RLS enabled, it AND-s the matching policies' <code>USING</code> predicate into the scan filter, evaluated per row against the session principal — over the <em>same</em> MVCC snapshot, so visibility and security compose without a second pass. Writes are additionally checked against <code>WITH CHECK</code> before a row version is stamped.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> apply the <code>USING</code> predicate to every read of a protected table — base scans, join inputs, subqueries, and the row set feeding <code>RETURNING</code> — so no query shape leaks an unfiltered row.</li>
+<li><span class="req-tag must">MUST</span> reject a write whose new/updated row fails <code>WITH CHECK</code> (<code>ENGINE_ERR_*</code> permission error), before the WAL op is emitted, so a denied write never becomes durable.</li>
+<li><span class="req-tag must">MUST</span> enforce identically in embedded mode and server mode — the executor is the single chokepoint, so an FFI caller and a pg-wire caller get the same filtering.</li>
+<li><span class="req-tag may">MAY</span> provide a privileged bypass for a designated owner/superuser role and for trusted internal maintenance (compaction, replay), gated explicitly and off by default.</li>
+</ul>
+<div class="diagram">
+<pre>
+  COMPOSE AROUND (identity)                BUILD IN (enforcement)
+  ─────────────────────────                ──────────────────────
+  better-auth / GoTrue  ─ verify JWT ─┐
+  PostgREST / app ─ SET claims+role ──┤
+                                      ▼
+                              ┌───────────────────────────────┐
+   every client path ───────►│  executor (exec.rs)            │
+   (FFI, pgwire, branch)     │   scan ⨯ MVCC visibility       │
+                             │        ⨯ policy USING predicate │──► only
+                             │   write ⨯ WITH CHECK            │    visible
+                             └───────────────┬─────────────────┘    rows
+                                             │ same WAL / replay
+                                             ▼
+                                   policies = catalog facts
+                                   (branch + scale-to-zero for free)
+</pre>
+<p class="diagram-caption">Identity is supplied at the boundary by composed layers; enforcement happens once, in the executor, on the path every client shares — so no caller can bypass it.</p>
+</div>
+</section>
+
+<section>
+<h2>Why it inherits branching, scale-to-zero, and S3-backing</h2>
+<p>Because policies are catalog facts carried in the WAL and rebuilt on replay — never a side file — they ride the same machinery the rows and the vector index already do:</p>
+<dl class="fields">
+<dt>branching</dt><dd>a branch forks the catalog at the fork LSN, so it inherits the parent's policies and can diverge them independently — a staging branch can loosen RLS for debugging without touching production. No policy pages are copied (copy-on-write).</dd>
+<dt>scale-to-zero</dt><dd>policies re-materialize from WAL replay on cold start exactly like tables; there is no separate durable policy store to warm.</dd>
+<dt>S3-backing / PITR</dt><dd>policy changes are LSN-stamped facts, so point-in-time recovery restores the policy set that was in effect at that LSN.</dd>
+</dl>
+<div class="callout success">
+<p class="callout-title">The seam never moves</p>
+<p><code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>; the C1–C8 conformance suite and the branching battery are untouched. RLS is additive frontend + executor growth plus one backward-compatible catalog fact — the same shape as Phase 6. If session context can ride the existing <code>SET</code>/query path, <code>ENGINE_ABI_VERSION</code> stays <code>3</code> as well.</p>
+</div>
+</section>
+
+<section>
+<h2>Approaches considered</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Approach</th><th>Enforcement site</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><strong>A — Fully composed</strong> (PostgREST/app filters rows)</td><td>above the engine</td><td><span class="pill red">rejected</span> — bypassable by any other client path; not a security property (see "bypass problem").</td></tr>
+<tr><td><strong>B — Engine-native predicate + composed identity</strong> (this proposal)</td><td>executor, on the shared path</td><td><span class="pill green">recommended</span> — single chokepoint, inherits branch/scale-to-zero, respects the deciding rule by splitting enforcement from identity.</td></tr>
+<tr><td><strong>C — Full engine-native auth</strong> (engine verifies JWTs, owns roles/secrets)</td><td>executor + in-core auth service</td><td><span class="pill red">rejected</span> — welds a service holding its own secrets into the core, violating the rule and the "keep the core small" discipline.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Normative requirements</h2>
+<h3>Placement discipline</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> build only enforcement (the per-row predicate + the session-principal read) into the engine; identity verification, role management, and policy-authoring UX stay composed.</li>
+<li><span class="req-tag must-not">MUST NOT</span> add JWT verification, secret handling, or an auth schema to the engine core — that is a composed service (better-auth / the boundary), per <a href="12-capabilities.html">Capabilities</a>.</li>
+<li><span class="req-tag must-not">MUST NOT</span> rely on a composed layer for enforcement; a policy that some client path can skip is not a guarantee.</li>
+</ul>
+<h3>Enforcement correctness</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> apply policies in the executor over the same MVCC snapshot, on every read shape, identically in embedded and server mode.</li>
+<li><span class="req-tag must">MUST</span> default-deny on an RLS-enabled table with no matching policy, and reject writes failing <code>WITH CHECK</code> before they become durable.</li>
+<li><span class="req-tag must">MUST</span> persist policies as additive WAL catalog facts so they branch, replay, and PITR-restore with the database, leaving the storage seam unchanged.</li>
+<li><span class="req-tag should">SHOULD</span> evaluate the wire-resolved principal once per statement and treat it as already-trusted, never re-verifying it in the engine.</li>
+</ul>
+</section>
+
+<section>
+<h2>Proposed roadmap placement — Phase 7</h2>
+<p>RLS slots naturally <em>after</em> Phase 6 (it extends the same hand-written <code>sql.rs</code>→<code>exec.rs</code> frontend and reuses 6E's <code>SET</code> handling and the Phase-3 per-statement principal). Like Phase 6 it is additive frontend + executor work; unlike Phase 6 it adds one new catalog fact and a security guarantee, so it carries its own gate.</p>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> ship as <strong>Phase 7 — Row-level security &amp; session authorization</strong>: session-context primitive, <code>CREATE POLICY</code> / <code>ENABLE ROW LEVEL SECURITY</code> DDL, executor enforcement, and the <code>CreatePolicy</code> WAL fact.</li>
+<li><span class="req-tag should">SHOULD</span> gate on a security-focused test battery: an unfiltered-bypass attempt across <em>every</em> client path (FFI, pgwire, branch) returns only authorized rows; denied writes never reach the WAL; a branch inherits then independently diverges policies; PITR restores the policy set at an LSN.</li>
+<li><span class="req-tag should">SHOULD</span> keep <code>STORAGE_TRAIT_VERSION</code> at <code>2</code> and the C ABI frozen, proving (as Phase 6 did) that the capability is pure frontend/executor growth over an unmoved seam.</li>
+<li><span class="req-tag must">MUST</span> demonstrate unmodified PostgREST + a composed identity layer (better-auth or a JWT shim) delivering the Supabase experience end-to-end: a single REST surface, safe for untrusted clients, filtered by engine-enforced policies.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul class="reqs">
+<li><span class="req-tag may">MAY</span> — predicate cost: an RLS predicate runs per row on every scan of a protected table. How is it kept cheap (predicate caching per statement, index-aware pushdown), and does it ever change a plan's index choice?</li>
+<li><span class="req-tag may">MAY</span> — claims accessor surface: which <code>auth.*</code> built-ins are in scope (just <code>uid()</code>/<code>role()</code>/<code>claim()</code>, or a broader set), and how do they relate to the 6C function library?</li>
+<li><span class="req-tag may">MAY</span> — role model depth: flat roles (Supabase's <code>anon</code>/<code>authenticated</code>/<code>service_role</code> shape) vs. role hierarchies/membership; the latter edges toward the <code>GRANT</code> surface deliberately kept out of scope in <a href="16-sql-compatibility.html">SQL Compatibility</a>.</li>
+<li><span class="req-tag may">MAY</span> — bypass governance: how is the privileged owner/maintenance bypass authenticated so it cannot itself become the bypass an attacker uses?</li>
+<li><span class="req-tag should">SHOULD</span> — interaction with FK-embedding data-path rewrites in <code>crates/server</code>: embedded sub-queries must be filtered by the embedded table's policies too, not just the top-level relation.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="12-capabilities.html"><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">the deciding rule this proposal applies, and the open authorization question it resolves</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">"auth per-connection, authorization per-statement" — the principal this proposal reads in the executor</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">the parser → executor the enforcement predicate extends, over the same MVCC snapshot</span></a>
+<a class="xref" href="16-sql-compatibility.html"><span class="xref-title">SQL Compatibility &amp; Mapping</span><span class="xref-desc">where roles/GRANT sit out of scope; RLS is the narrow authorization slice that does build in</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">the additive phase model this proposes a Phase 7 against</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">the seam that stays at version 2 — RLS is frontend/executor growth, not a storage change</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-23. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

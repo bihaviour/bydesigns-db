@@ -383,7 +383,7 @@ object storage  (S3 / R2 / GCS)
 <li><span class="req-tag may">MAY</span> — columnar staleness bound: what snapshot interval keeps DuckDB analytics "fresh enough" without overwhelming the materialization job, and should CDC replace batch?</li>
 <li><span class="req-tag may">MAY</span> — does any other high-value capability (full-text search, geospatial) belong in-core by the rule, or are they better composed?</li>
 <li><span class="req-tag may">MAY</span> — pg-wire surface completeness: which catalog/type details must server mode expose so the long tail of pg-wire tools (not just PostgREST) attach unmodified?</li>
-<li><span class="req-tag may">MAY</span> — authorization beyond authentication: where do row-level security / policy enforcement live — in the engine, in PostgREST, or in the app composing them?</li>
+<li><span class="req-tag may">MAY</span> — authorization beyond authentication: where do row-level security / policy enforcement live — in the engine, in PostgREST, or in the app composing them? <em>A proposed answer: <a href="17-row-level-security.html">Row-Level Security (Proposal)</a> splits it — per-row enforcement builds INTO the executor, identity stays composed AROUND.</em></li>
 </ul>
 </section>
 

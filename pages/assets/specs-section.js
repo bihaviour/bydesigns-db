@@ -31,6 +31,7 @@ window.SECTION = {
       { file: "13-roadmap.html",            title: "Roadmap & Build Sequence" },
       { file: "14-tradeoffs-risks.html",    title: "Tradeoffs & Risk Register" },
       { file: "16-sql-compatibility.html",  title: "SQL Compatibility & Mapping" },
+      { file: "17-row-level-security.html", title: "Row-Level Security (Proposal)" },
     ]},
     { label: "Implementation Maps", items: [
       { file: "phase-1-embedded.html",            title: "Phase 1 — Embedded Library" },
