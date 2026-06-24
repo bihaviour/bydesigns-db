@@ -34,7 +34,7 @@
 use crate::hist::Histogram;
 use crate::workload::Rng;
 use crate::{
-    resolve_target, run_nonce, url_scheme, BenchError, Correctness, Fault, Opts, Outcome, Report,
+    resolve_target, run_tag, url_scheme, BenchError, Correctness, Fault, Opts, Outcome, Report,
     Target, Writer, TABLE_COUNTER,
 };
 use std::time::Instant;
@@ -121,7 +121,7 @@ pub(crate) fn run_counter(opts: &Opts) -> Result<Report, BenchError> {
 /// summed balance is conserved (ACID — no torn transfer leaks or destroys value).
 pub(crate) fn run_bank_transfer(opts: &Opts) -> Result<Report, BenchError> {
     let target = resolve_target(opts)?;
-    let nonce = run_nonce();
+    let tag = run_tag();
 
     let mut setup = target.open()?;
     ddl(
@@ -144,7 +144,7 @@ pub(crate) fn run_bank_transfer(opts: &Opts) -> Result<Report, BenchError> {
         let handles: Vec<_> = (0..opts.writers)
             .map(|w| {
                 let target = target.clone();
-                let seed = nonce as u64 ^ ((w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let seed = tag as u64 ^ ((w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 scope.spawn(move || {
                     let mut rng = Rng::new(seed);
                     fixed_work(&target, ops, move |conn| transfer(conn, &mut rng))
@@ -527,5 +527,6 @@ fn report(
         git_sha: crate::git_sha(),
         json_only: opts.json,
         correctness: Some(correctness),
+        lifecycle: None,
     }
 }

@@ -18,3 +18,4 @@ path = "src/main.rs"
 [dependencies]
 engine = { package = "twill-engine", path = "../engine" }
 twill-server = { path = "../server" }
+controller = { package = "twill-controller", path = "../controller" }

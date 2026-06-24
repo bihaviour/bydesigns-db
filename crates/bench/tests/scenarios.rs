@@ -123,6 +123,49 @@ fn document_editing_profile_passes_with_no_lost_edit() {
 }
 
 #[test]
+fn scale_to_zero_drives_cold_starts_cleanly() {
+    // The lifecycle scenario (spec 09 Exp 5 / spec 15): each cycle cold-starts the
+    // instance, reads the seeded rows back, then idles past the reaper. A clean
+    // exit proves every cold read saw its durable state across the teardown (the
+    // scenario fails the run otherwise). Short idle window + few cycles keep it
+    // fast while still exercising the full cold path end to end.
+    let url = unique_url();
+    let code = run_cli(&argv(&[
+        "scale-to-zero",
+        "--url",
+        &url,
+        "--rows",
+        "20",
+        "--cycles",
+        "3",
+        "--idle-ms",
+        "40",
+        "--json",
+    ]));
+    assert_eq!(
+        code,
+        exit::OK,
+        "scale-to-zero must complete with no durable loss across teardowns"
+    );
+}
+
+#[test]
+fn scale_to_zero_rejects_the_pgwire_form() {
+    // The scenario owns an in-process controller; a deployed server runs its own,
+    // out of the bench's reach, so the pgwire/server form is a config error.
+    assert_eq!(
+        run_cli(&argv(&[
+            "scale-to-zero",
+            "--url",
+            "file:///tmp/x.db",
+            "--transport",
+            "pgwire",
+        ])),
+        exit::CONFIG
+    );
+}
+
+#[test]
 fn seeded_lost_update_violation_exits_two() {
     // The negative case: inject a real lost update (one acked increment dropped)
     // and prove the no-lost-update checker catches it and fails the run with the

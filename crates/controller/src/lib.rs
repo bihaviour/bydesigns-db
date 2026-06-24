@@ -110,6 +110,10 @@ struct InstState {
     /// Outstanding leases (active connections). Teardown only when this is 0.
     active: u64,
     last_activity: Instant,
+    /// When the instance entered its current `phase` — drives the compute
+    /// active/idle accounting (the serverless-efficiency signal): the time
+    /// spent in a phase is accrued when the instance leaves it.
+    phase_since: Instant,
 }
 
 struct Instance {
@@ -131,6 +135,15 @@ struct ControllerInner {
     warm_starts: AtomicU64,
     /// Warm→Cold teardowns (idle reaper or explicit `stop`) — scale-to-zero.
     scale_to_zero: AtomicU64,
+    /// Cumulative microseconds instances spent Active (serving leases).
+    compute_active_us: AtomicU64,
+    /// Cumulative microseconds instances spent Idle (warm, no leases).
+    compute_idle_us: AtomicU64,
+    /// Cumulative microseconds `warm` spent blocked on the warm-admission
+    /// semaphore — the thundering-herd scheduling/admission wait.
+    admission_wait_us: AtomicU64,
+    /// Successful lease heartbeats by the reaper (one per warm instance per pass).
+    lease_renews: AtomicU64,
     stop: Mutex<bool>,
     stop_cv: Condvar,
 }
@@ -147,6 +160,7 @@ impl ControllerInner {
                         handle: None,
                         active: 0,
                         last_activity: Instant::now(),
+                        phase_since: Instant::now(),
                     }),
                     cv: Condvar::new(),
                 })
@@ -154,9 +168,30 @@ impl ControllerInner {
             .clone()
     }
 
+    /// Move `s` into `new`, accruing the time spent in the phase being left
+    /// into the compute active/idle totals (the serverless-efficiency signal).
+    /// Cumulative, so a consumer takes the delta between two `stats()` pulls.
+    fn enter_phase(&self, s: &mut InstState, new: LifecycleState) {
+        let elapsed = s.phase_since.elapsed().as_micros() as u64;
+        match s.phase {
+            LifecycleState::Active => {
+                self.compute_active_us.fetch_add(elapsed, Ordering::SeqCst);
+            }
+            LifecycleState::Idle => {
+                self.compute_idle_us.fetch_add(elapsed, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        s.phase = new;
+        s.phase_since = Instant::now();
+    }
+
     /// Open the database under warm-admission control, tracking the gauges.
     fn warm(&self, url: &str) -> Result<Arc<Database>, EngineError> {
+        let wait0 = Instant::now();
         self.warm_sem.acquire();
+        self.admission_wait_us
+            .fetch_add(wait0.elapsed().as_micros() as u64, Ordering::SeqCst);
         let cur = self.cur_warms.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak_warms.fetch_max(cur, Ordering::SeqCst);
         let res = Database::open(url);
@@ -179,35 +214,45 @@ impl ControllerInner {
             let Some(db) = handle else { continue };
 
             // Heartbeat the writer lease for any warm instance (Active or Idle).
-            let fenced = matches!(phase, LifecycleState::Active | LifecycleState::Idle)
-                && db.renew_lease().is_err();
+            let warm = matches!(phase, LifecycleState::Active | LifecycleState::Idle);
+            let fenced = if warm {
+                match db.renew_lease() {
+                    Ok(()) => {
+                        self.lease_renews.fetch_add(1, Ordering::SeqCst);
+                        false
+                    }
+                    Err(_) => true,
+                }
+            } else {
+                false
+            };
 
             let mut s = inst.st.lock().unwrap();
             if fenced {
-                s.phase = LifecycleState::Cold;
                 s.handle = None;
+                self.enter_phase(&mut s, LifecycleState::Cold);
                 s.last_activity = Instant::now();
                 inst.cv.notify_all();
                 continue;
             }
             if s.active == 0 {
                 if s.phase == LifecycleState::Active {
-                    s.phase = LifecycleState::Idle;
+                    self.enter_phase(&mut s, LifecycleState::Idle);
                 }
                 let idle_for = s.last_activity.elapsed();
                 if s.phase == LifecycleState::Idle
                     && idle_for >= self.cfg.idle_timeout
                     && !self.cfg.keep_warm
                 {
-                    s.phase = LifecycleState::Stopping;
+                    self.enter_phase(&mut s, LifecycleState::Stopping); // accrue the Idle time
                     s.handle = None; // dropped at end of scope → engine releases the fence
-                    s.phase = LifecycleState::Cold;
+                    self.enter_phase(&mut s, LifecycleState::Cold);
                     s.last_activity = Instant::now();
                     self.scale_to_zero.fetch_add(1, Ordering::SeqCst);
                     inst.cv.notify_all();
                 }
             } else if s.phase == LifecycleState::Idle {
-                s.phase = LifecycleState::Active;
+                self.enter_phase(&mut s, LifecycleState::Active);
             }
         }
     }
@@ -274,6 +319,10 @@ impl Controller {
             peak_warms: AtomicU64::new(0),
             warm_starts: AtomicU64::new(0),
             scale_to_zero: AtomicU64::new(0),
+            compute_active_us: AtomicU64::new(0),
+            compute_idle_us: AtomicU64::new(0),
+            admission_wait_us: AtomicU64::new(0),
+            lease_renews: AtomicU64::new(0),
             stop: Mutex::new(false),
             stop_cv: Condvar::new(),
             cfg,
@@ -295,7 +344,7 @@ impl Controller {
             let mut s = inst.st.lock().unwrap();
             match s.phase {
                 LifecycleState::Active | LifecycleState::Idle => {
-                    s.phase = LifecycleState::Active;
+                    self.inner.enter_phase(&mut s, LifecycleState::Active);
                     s.active += 1;
                     s.last_activity = Instant::now();
                     let db = s.handle.clone().expect("active instance has a handle");
@@ -307,13 +356,13 @@ impl Controller {
                 }
                 LifecycleState::Cold => {
                     // Win the right to warm; everyone else will see Warming.
-                    s.phase = LifecycleState::Warming;
+                    self.inner.enter_phase(&mut s, LifecycleState::Warming);
                     drop(s);
                     let res = self.inner.warm(&inst.url);
                     let mut s = inst.st.lock().unwrap();
                     match res {
                         Ok(db) => {
-                            s.phase = LifecycleState::Active;
+                            self.inner.enter_phase(&mut s, LifecycleState::Active);
                             s.handle = Some(db.clone());
                             s.active += 1;
                             s.last_activity = Instant::now();
@@ -325,7 +374,7 @@ impl Controller {
                         }
                         Err(e) => {
                             // A failed warm returns cleanly to Cold (no durable effect).
-                            s.phase = LifecycleState::Cold;
+                            self.inner.enter_phase(&mut s, LifecycleState::Cold);
                             inst.cv.notify_all();
                             return Err(e);
                         }
@@ -361,8 +410,8 @@ impl Controller {
                 if s.handle.is_some() {
                     self.inner.scale_to_zero.fetch_add(1, Ordering::SeqCst);
                 }
-                s.phase = LifecycleState::Cold;
                 s.handle = None;
+                self.inner.enter_phase(&mut s, LifecycleState::Cold);
                 s.last_activity = Instant::now();
                 inst.cv.notify_all();
             }
@@ -385,33 +434,47 @@ impl Controller {
     /// active/idle-seconds and admission-wait histograms layer on top in a later
     /// step. Cumulative counters plus the live `warm_instances` gauge.
     pub fn stats(&self) -> ControllerStats {
-        let warm_instances = self
-            .inner
-            .instances
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|i| {
-                matches!(
-                    i.st.lock().unwrap().phase,
-                    LifecycleState::Active | LifecycleState::Idle
-                )
-            })
-            .count() as u64;
+        // One pass over the instance table: count resident instances and fold in
+        // the time the currently-warm ones have spent in their live phase so far
+        // (the settled totals only accrue when an instance *leaves* a phase), so
+        // the active/idle read is accurate as-of the call even mid-cycle.
+        let mut warm_instances = 0u64;
+        let mut active_us = self.inner.compute_active_us.load(Ordering::SeqCst);
+        let mut idle_us = self.inner.compute_idle_us.load(Ordering::SeqCst);
+        for inst in self.inner.instances.lock().unwrap().values() {
+            let s = inst.st.lock().unwrap();
+            let live = s.phase_since.elapsed().as_micros() as u64;
+            match s.phase {
+                LifecycleState::Active => {
+                    warm_instances += 1;
+                    active_us += live;
+                }
+                LifecycleState::Idle => {
+                    warm_instances += 1;
+                    idle_us += live;
+                }
+                _ => {}
+            }
+        }
         ControllerStats {
             cold_starts: self.inner.warm_count.load(Ordering::SeqCst),
             warm_starts: self.inner.warm_starts.load(Ordering::SeqCst),
             scale_to_zero_events: self.inner.scale_to_zero.load(Ordering::SeqCst),
             peak_workers: self.inner.peak_warms.load(Ordering::SeqCst),
             warm_instances,
+            compute_active_us: active_us,
+            compute_idle_us: idle_us,
+            admission_wait_us: self.inner.admission_wait_us.load(Ordering::SeqCst),
+            lease_renew_total: self.inner.lease_renews.load(Ordering::SeqCst),
         }
     }
 }
 
 /// Read-only controller observability snapshot (#53 / spec 15). Cumulative
 /// counters plus a live gauge; a consumer takes the delta between two pulls.
-/// The compute active/idle durations and admission-wait histogram named in the
-/// settled vocabulary join this struct with the scale-to-zero scenario work.
+/// The compute active/idle durations, admission-wait, and lease-renew totals
+/// named in the settled metric vocabulary land here with the scale-to-zero
+/// scenario — the serverless-efficiency report is pure arithmetic over them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControllerStats {
     /// Cold→warm transitions (cold starts); one per key per cold start.
@@ -425,6 +488,18 @@ pub struct ControllerStats {
     pub peak_workers: u64,
     /// Databases currently resident (Active or Idle) — a gauge.
     pub warm_instances: u64,
+    /// Cumulative microseconds instances spent serving (Active) — the numerator
+    /// of `utilization` and `compute_seconds_per_query`. Includes the in-flight
+    /// active time of any currently-resident instance as-of the pull.
+    pub compute_active_us: u64,
+    /// Cumulative microseconds instances spent warm-but-idle (Idle). With
+    /// `compute_active_us`, `active / (active + idle)` is utilization.
+    pub compute_idle_us: u64,
+    /// Cumulative microseconds `start` blocked on warm admission (the
+    /// thundering-herd queue) — the scheduler/admission latency segment.
+    pub admission_wait_us: u64,
+    /// Successful single-writer lease heartbeats by the reaper.
+    pub lease_renew_total: u64,
 }
 
 impl Drop for Controller {

@@ -87,6 +87,29 @@ A test-only `--inject-fault lost-update` hook makes `counter` deliberately drop
 one acked increment, so the suite can prove the checker itself bites: a seeded
 violation must exit 2, not pass.
 
+### Lifecycle scenario (serverless-efficiency report)
+
+`scale-to-zero` is spec 09 **Experiment 5** (cold read): it drives `query → idle
+past the controller's reaper → query` for `--cycles` cold-boot samples, so each
+cycle pays a real cold start (fence acquire + WAL replay) and a first cold read.
+It is **controller-driven and in-process** — the scenario owns a
+`twill-controller` and *pulls* its `ControllerStats` snapshot at the run
+boundaries (the #53 metric source: pull, never scrape or push), reporting the
+cold-boot percentile distribution plus the controller-sourced lifecycle figures
+(cold/warm starts, scale-to-zero events, compute active/idle, admission wait,
+lease renews) and the derived serverless-efficiency numbers (utilization,
+compute-seconds/query) under the settled `twill_*` vocabulary.
+
+```bash
+# 20 cold-boot cycles; --idle-ms sets the reaper window (short for a smoke run;
+# spec 09 Exp 5 uses a long idle window on a real object-store deployment).
+$BIN scale-to-zero --url file:///tmp/bench.db --rows 1000 --cycles 20 --idle-ms 100
+```
+
+A deployed server runs its own controller out of the bench's reach, so the
+`--server`/`--transport pgwire` form is rejected; run it embedded against any
+backend URL (`file://` for a smoke run, an object store for the spec-09 tail).
+
 ### Release comparison (CI regression gate)
 
 Diff two archived JSON records into a PASS/regression verdict — pure
@@ -107,9 +130,11 @@ correctness verdict) for archiving and plotting; `--json` emits only that record
 Flags: `--url` (required for runs), `--transport embedded|pgwire`,
 `--server HOST:PORT` (implies pgwire), `--writers`, `--warmup-ms` (default 200),
 `--duration-ms` (default 1000, experiments/scenarios), `--ops` (default 200,
-correctness profiles), `--rows` (default 1000, mix working set), `--label`,
-`--json`. The JSON record carries the `transport` so embedded and server runs are
-distinguishable when archived together.
+correctness profiles), `--rows` (default 1000, mix working set / cold-read set),
+`--cycles` (default 20, scale-to-zero cold-boot samples), `--idle-ms` (default
+100, scale-to-zero reaper window), `--label`, `--json`. The JSON record carries
+the `transport` so embedded and server runs are distinguishable when archived
+together.
 
 ### Exit codes
 
