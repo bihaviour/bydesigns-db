@@ -269,75 +269,117 @@ pub(crate) struct Opts {
 
 impl Opts {
     fn parse(args: &[String]) -> Result<Opts, String> {
-        let mut url = None;
-        let mut writers = 1usize;
-        let mut warmup_ms = 200u64;
-        let mut duration_ms = 1000u64;
-        let mut ops = 200u64;
-        let mut rows = 1000u64;
-        let mut label = String::new();
-        let mut transport = Transport::Embedded;
-        let mut json = false;
-        let mut server = None;
-        let mut inject_fault = None;
-        let mut cycles = 20u64;
-        let mut idle_ms = 100u64;
-
+        let mut raw = RawOpts::default();
         let mut i = 0;
         while i < args.len() {
             let key = args[i].as_str();
-            // `--json` is a bare flag; everything else takes a value.
+            // `--json` is a bare flag; everything else takes a value, fetched
+            // once here so the per-flag match stays a flat, low-branch dispatch.
             if key == "--json" {
-                json = true;
+                raw.json = true;
                 i += 1;
                 continue;
             }
-            let val = || {
-                args.get(i + 1)
-                    .cloned()
-                    .ok_or_else(|| format!("missing value for {key}"))
-            };
-            match key {
-                "--url" => url = Some(val()?),
-                "--writers" => writers = val()?.parse().map_err(|_| "invalid --writers")?,
-                "--warmup-ms" => warmup_ms = val()?.parse().map_err(|_| "invalid --warmup-ms")?,
-                "--duration-ms" => {
-                    duration_ms = val()?.parse().map_err(|_| "invalid --duration-ms")?
-                }
-                "--ops" => ops = val()?.parse().map_err(|_| "invalid --ops")?,
-                "--rows" => rows = val()?.parse().map_err(|_| "invalid --rows")?,
-                "--label" => label = val()?,
-                "--transport" => transport = parse_transport(&val()?)?,
-                "--server" => server = Some(val()?),
-                "--inject-fault" => inject_fault = Some(parse_fault(&val()?)?),
-                "--cycles" => cycles = val()?.parse().map_err(|_| "invalid --cycles")?,
-                "--idle-ms" => idle_ms = val()?.parse().map_err(|_| "invalid --idle-ms")?,
-                other => return Err(format!("unknown flag {other}")),
-            }
+            let value = args
+                .get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {key}"))?;
+            raw.set(key, value)?;
             i += 2;
         }
+        raw.finish()
+    }
+}
 
-        // `--server` implies the pgwire transport (it has no meaning embedded).
-        if server.is_some() {
-            transport = Transport::Pgwire;
+/// Mutable accumulator for [`Opts::parse`]: one field per flag, filled as the
+/// argv is walked. Split out so the flag dispatch ([`RawOpts::set`]) and the
+/// final validation ([`RawOpts::finish`]) are each a small, single-purpose unit.
+struct RawOpts {
+    url: Option<String>,
+    writers: usize,
+    warmup_ms: u64,
+    duration_ms: u64,
+    ops: u64,
+    rows: u64,
+    label: String,
+    transport: Transport,
+    json: bool,
+    server: Option<String>,
+    inject_fault: Option<Fault>,
+    cycles: u64,
+    idle_ms: u64,
+}
+
+impl Default for RawOpts {
+    fn default() -> RawOpts {
+        RawOpts {
+            url: None,
+            writers: 1,
+            warmup_ms: 200,
+            duration_ms: 1000,
+            ops: 200,
+            rows: 1000,
+            label: String::new(),
+            transport: Transport::Embedded,
+            json: false,
+            server: None,
+            inject_fault: None,
+            cycles: 20,
+            idle_ms: 100,
         }
+    }
+}
 
+impl RawOpts {
+    /// Apply one `--flag value` pair (the value already fetched by the caller).
+    fn set(&mut self, key: &str, value: String) -> Result<(), String> {
+        match key {
+            "--url" => self.url = Some(value),
+            "--writers" => self.writers = parse_num(&value, key)?,
+            "--warmup-ms" => self.warmup_ms = parse_num(&value, key)?,
+            "--duration-ms" => self.duration_ms = parse_num(&value, key)?,
+            "--ops" => self.ops = parse_num(&value, key)?,
+            "--rows" => self.rows = parse_num(&value, key)?,
+            "--cycles" => self.cycles = parse_num(&value, key)?,
+            "--idle-ms" => self.idle_ms = parse_num(&value, key)?,
+            "--label" => self.label = value,
+            "--transport" => self.transport = parse_transport(&value)?,
+            "--server" => self.server = Some(value),
+            "--inject-fault" => self.inject_fault = Some(parse_fault(&value)?),
+            other => return Err(format!("unknown flag {other}")),
+        }
+        Ok(())
+    }
+
+    /// Validate and finalize into an [`Opts`].
+    fn finish(mut self) -> Result<Opts, String> {
+        // `--server` implies the pgwire transport (it has no meaning embedded).
+        if self.server.is_some() {
+            self.transport = Transport::Pgwire;
+        }
         Ok(Opts {
-            url: url.ok_or("--url is required (e.g. file:///tmp/bench.db or s3://bucket/db)")?,
-            writers: writers.max(1),
-            warmup: Duration::from_millis(warmup_ms),
-            duration: Duration::from_millis(duration_ms),
-            ops: ops.max(1),
-            rows: rows.max(1),
-            label,
-            transport,
-            json,
-            server,
-            inject_fault,
-            cycles: cycles.max(1),
-            idle: Duration::from_millis(idle_ms.max(1)),
+            url: self
+                .url
+                .ok_or("--url is required (e.g. file:///tmp/bench.db or s3://bucket/db)")?,
+            writers: self.writers.max(1),
+            warmup: Duration::from_millis(self.warmup_ms),
+            duration: Duration::from_millis(self.duration_ms),
+            ops: self.ops.max(1),
+            rows: self.rows.max(1),
+            label: self.label,
+            transport: self.transport,
+            json: self.json,
+            server: self.server,
+            inject_fault: self.inject_fault,
+            cycles: self.cycles.max(1),
+            idle: Duration::from_millis(self.idle_ms.max(1)),
         })
     }
+}
+
+/// Parse a numeric flag value, mapping a parse failure to `invalid <flag>`.
+fn parse_num<T: std::str::FromStr>(value: &str, flag: &str) -> Result<T, String> {
+    value.parse().map_err(|_| format!("invalid {flag}"))
 }
 
 /// What a writer connects to, cloneable so each writer thread opens its own.
@@ -462,9 +504,10 @@ pub(crate) fn resolve_target(opts: &Opts) -> Result<Target, BenchError> {
     }
 }
 
-/// A per-run nonce keeping inserted keys unique across repeated runs against the
-/// same durable database (a `PRIMARY KEY` would otherwise collide).
-pub(crate) fn run_nonce() -> u128 {
+/// A per-run tag keeping inserted keys unique across repeated runs against the
+/// same durable database (a `PRIMARY KEY` would otherwise collide). Not a
+/// cryptographic value — just a uniqueness suffix for benchmark row keys.
+pub(crate) fn run_tag() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros())
@@ -486,7 +529,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
     let mut setup = target.open()?;
     setup_schema(&mut setup, same_row)?;
 
-    let nonce = run_nonce();
+    let tag = run_tag();
 
     let (tallies, elapsed) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..writers)
@@ -494,7 +537,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
                 let target = target.clone();
                 let warmup = opts.warmup;
                 let duration = opts.duration;
-                scope.spawn(move || writer_loop(&target, w, nonce, same_row, warmup, duration))
+                scope.spawn(move || writer_loop(&target, w, tag, same_row, warmup, duration))
             })
             .collect();
         let start = Instant::now();
@@ -557,7 +600,7 @@ fn setup_schema(w: &mut Writer, same_row: bool) -> Result<(), BenchError> {
 fn writer_loop(
     target: &Target,
     writer: usize,
-    nonce: u128,
+    tag: u128,
     same_row: bool,
     warmup: Duration,
     duration: Duration,
@@ -575,7 +618,7 @@ fn writer_loop(
                 format!("UPDATE {TABLE_COUNTER} SET n = n + 1 WHERE id = 1")
             } else {
                 let i = seq.fetch_add(1, Ordering::Relaxed);
-                format!("INSERT INTO {TABLE_LEDGER} (k, v) VALUES ('{nonce}-{writer}-{i}', 1)")
+                format!("INSERT INTO {TABLE_LEDGER} (k, v) VALUES ('{tag}-{writer}-{i}', 1)")
             };
             match conn.exec(&sql) {
                 Outcome::Ok => break,

@@ -7,14 +7,14 @@
 //!
 //! The op kind for each request is drawn from the scenario's [`Mix`] weights by a
 //! tiny, dependency-free per-writer PRNG ([`Rng`], xorshift64) — deterministic
-//! given the run nonce and writer index, so a run is reproducible. Conflicts are
+//! given the run tag and writer index, so a run is reproducible. Conflicts are
 //! retried exactly as the experiments retry them (so a contended `UPDATE` never
 //! loses), and every operation's end-to-end latency (including retries) lands in
 //! the shared HDR histogram.
 
 use crate::hist::Histogram;
 use crate::{
-    resolve_target, run_nonce, url_scheme, BenchError, Opts, Outcome, Report, Tally, Target, Writer,
+    resolve_target, run_tag, url_scheme, BenchError, Opts, Outcome, Report, Tally, Target, Writer,
 };
 use std::time::{Duration, Instant};
 
@@ -98,7 +98,7 @@ impl Mix {
 }
 
 /// A minimal xorshift64 PRNG — no external dependency, deterministic per seed, so
-/// a scenario run is reproducible from its nonce + writer index.
+/// a scenario run is reproducible from its tag + writer index.
 pub struct Rng(u64);
 
 impl Rng {
@@ -129,10 +129,10 @@ impl Rng {
 pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, BenchError> {
     let mix = scenario.mix();
     let target = resolve_target(opts)?;
-    let nonce = run_nonce();
+    let tag = run_tag();
 
     // Setup: schema + a deterministic working set of `--rows` keys [0, rows) the
-    // read/update/delete ops target. Inserts use keys >= rows (nonce-disjoint).
+    // read/update/delete ops target. Inserts use keys >= rows (tag-disjoint).
     let mut setup = target.open()?;
     seed_working_set(&mut setup, opts.rows)?;
 
@@ -143,7 +143,7 @@ pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, Be
                 let warmup = opts.warmup;
                 let duration = opts.duration;
                 let rows = opts.rows;
-                scope.spawn(move || mix_writer(&target, w, nonce, mix, rows, warmup, duration))
+                scope.spawn(move || mix_writer(&target, w, tag, mix, rows, warmup, duration))
             })
             .collect();
         let start = Instant::now();
@@ -201,14 +201,14 @@ fn seed_working_set(w: &mut Writer, rows: u64) -> Result<(), BenchError> {
 fn mix_writer(
     target: &Target,
     writer: usize,
-    nonce: u128,
+    tag: u128,
     mix: Mix,
     rows: u64,
     warmup: Duration,
     duration: Duration,
 ) -> Result<Tally, BenchError> {
     let mut conn = target.open()?;
-    let mut rng = Rng::new(nonce as u64 ^ ((writer as u64).wrapping_mul(0x100_0000_01b3)));
+    let mut rng = Rng::new(tag as u64 ^ ((writer as u64).wrapping_mul(0x100_0000_01b3)));
     // Inserts carve a per-writer key band above the seeded working set so they
     // never collide across writers or with the seed.
     let mut insert_seq: u64 = 0;

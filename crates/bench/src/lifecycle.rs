@@ -21,7 +21,7 @@
 //! host for the spec-09 Exp 5 tail).
 
 use crate::hist::Histogram;
-use crate::{git_sha, run_nonce, url_scheme, BenchError, Lifecycle, Opts, Report, Transport};
+use crate::{git_sha, run_tag, url_scheme, BenchError, Lifecycle, Opts, Report, Transport};
 use controller::{Controller, ControllerConfig};
 use engine::Connection;
 use std::time::{Duration, Instant};
@@ -58,8 +58,8 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
     // Seed over a plain connection (not the controller) so each cold start has
     // real WAL to replay — the cold-read payload — then drop it so it does not
     // pin the instance warm. The controller stays unaware until the first cycle.
-    let nonce = run_nonce();
-    seed(&url, nonce, opts.rows)?;
+    let tag = run_tag();
+    seed(&url, tag, opts.rows)?;
 
     let start = ctrl.stats();
     let mut hist = Histogram::new();
@@ -137,10 +137,10 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
     })
 }
 
-/// Drop + recreate the table and insert `rows` keyed by the run nonce, in one
+/// Drop + recreate the table and insert `rows` keyed by the run tag, in one
 /// transaction. DDL is autocommit (engine rule); the inserts batch under an
 /// explicit transaction so seeding is one durable append, not `rows` of them.
-fn seed(url: &str, nonce: u128, rows: u64) -> Result<(), BenchError> {
+fn seed(url: &str, tag: u128, rows: u64) -> Result<(), BenchError> {
     let mut conn =
         Connection::open(url).map_err(|e| BenchError::Connection(format!("open {url}: {e}")))?;
     // A prior run may have left the table; reset it so the row count is exact.
@@ -153,7 +153,7 @@ fn seed(url: &str, nonce: u128, rows: u64) -> Result<(), BenchError> {
         .map_err(|e| BenchError::Run(format!("begin: {e}")))?;
     for i in 0..rows {
         conn.exec(&format!(
-            "INSERT INTO {TABLE} (k, v) VALUES ('{nonce}-{i}', {i})"
+            "INSERT INTO {TABLE} (k, v) VALUES ('{tag}-{i}', {i})"
         ))
         .map_err(|e| BenchError::Run(format!("seed insert {i}: {e}")))?;
     }
