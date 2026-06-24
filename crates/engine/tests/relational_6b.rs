@@ -304,3 +304,235 @@ fn join_respects_mvcc_snapshot() {
     assert_eq!(cell(&after, 0, 0).as_deref(), Some("4"));
     let _ = fs::remove_file(&p);
 }
+
+// ---- join-driven DML: UPDATE … FROM / DELETE … USING (deferred 6B item) ----
+
+#[test]
+fn update_from_join_applies_correlated_values() {
+    let p = db_path("upd-from");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        .unwrap();
+    db.exec("CREATE TABLE deltas (id INTEGER, amount INTEGER)")
+        .unwrap();
+    db.exec("INSERT INTO accounts VALUES (1,100),(2,200),(3,300)")
+        .unwrap();
+    db.exec("INSERT INTO deltas VALUES (1,10),(2,-5)").unwrap();
+
+    // Correlate the target to the source through WHERE (Postgres UPDATE … FROM).
+    db.exec(
+        "UPDATE accounts SET balance = balance + d.amount \
+         FROM deltas d WHERE accounts.id = d.id",
+    )
+    .unwrap();
+    assert_eq!(db.last_changes, 2, "only the two correlated rows update");
+
+    let rs = db
+        .query("SELECT balance FROM accounts ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        col(&rs, 0),
+        vec![
+            Some("110".into()),
+            Some("195".into()),
+            Some("300".into()), // id 3 has no delta → untouched
+        ]
+    );
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn update_from_join_returning_projects_target() {
+    let p = db_path("upd-from-ret");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    db.exec("CREATE TABLE src (id INTEGER, tag TEXT)").unwrap();
+    db.exec("INSERT INTO t VALUES (1,'a'),(2,'b')").unwrap();
+    db.exec("INSERT INTO src VALUES (1,'X'),(2,'Y')").unwrap();
+    let rs = db
+        .query(
+            "UPDATE t SET tag = s.tag FROM src s WHERE t.id = s.id \
+             RETURNING id, tag",
+        )
+        .unwrap();
+    assert_eq!(rs.columns, vec!["id", "tag"]);
+    assert_eq!(rs.rows.len(), 2);
+    // RETURNING projects the post-update target row.
+    let tags = col(&rs, 1);
+    assert!(tags.contains(&Some("X".into())) && tags.contains(&Some("Y".into())));
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn delete_using_join_removes_correlated_rows() {
+    let (mut db, p) = library();
+    // Delete every book whose author is 'Ada' (id 1 → books 10, 11).
+    db.exec("DELETE FROM books USING authors a WHERE books.author_id = a.id AND a.name = 'Ada'")
+        .unwrap();
+    assert_eq!(db.last_changes, 2);
+    let rs = db.query("SELECT id FROM books ORDER BY id").unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("12".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+// ---- CREATE VIEW / DROP VIEW (deferred 6B item) ----------------------------
+
+#[test]
+fn create_view_resolves_and_drops() {
+    let (mut db, p) = library();
+    db.exec(
+        "CREATE VIEW author_books AS \
+         SELECT a.name AS author, b.title AS title \
+         FROM authors a JOIN books b ON a.id = b.author_id",
+    )
+    .unwrap();
+    // The view resolves as a derived table — projection, filter, and aggregation
+    // over it all work.
+    let rs = db
+        .query("SELECT author, title FROM author_books ORDER BY title")
+        .unwrap();
+    assert_eq!(rs.rows.len(), 3);
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("Ada"));
+    let n = db
+        .query("SELECT count(*) FROM author_books WHERE author = 'Ada'")
+        .unwrap();
+    assert_eq!(cell(&n, 0, 0).as_deref(), Some("2"));
+
+    db.exec("DROP VIEW author_books").unwrap();
+    assert!(db.query("SELECT * FROM author_books").is_err());
+    // DROP VIEW IF EXISTS on a missing view is a no-op.
+    db.exec("DROP VIEW IF EXISTS author_books").unwrap();
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn view_over_view_composes() {
+    let p = db_path("view-chain");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE nums (n INTEGER)").unwrap();
+    db.exec("INSERT INTO nums VALUES (1),(2),(3),(4)").unwrap();
+    db.exec("CREATE VIEW evens AS SELECT n FROM nums WHERE n % 2 = 0")
+        .unwrap();
+    db.exec("CREATE VIEW evens_plus AS SELECT n + 10 AS m FROM evens")
+        .unwrap();
+    let rs = db.query("SELECT m FROM evens_plus ORDER BY m").unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("12".into()), Some("14".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn view_persists_across_restart() {
+    let p = db_path("view-persist");
+    let url = format!("file://{}", p.display());
+    {
+        let mut db = Connection::open(&url).unwrap();
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        db.exec("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
+        db.exec("CREATE VIEW big AS SELECT id FROM t WHERE v >= 20")
+            .unwrap();
+    }
+    // Reopen → the view is rebuilt from the durable WAL (re-parsed on replay).
+    let mut db = Connection::open(&url).unwrap();
+    let rs = db.query("SELECT id FROM big ORDER BY id").unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("2".into()), Some("3".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn recursive_views_are_rejected() {
+    let p = db_path("view-cycle");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    // Direct self-reference.
+    assert!(db
+        .exec("CREATE VIEW vs AS SELECT 1 WHERE 1 IN (SELECT 1 FROM vs)")
+        .is_err());
+    // Mutual recursion: va is fine (vb not yet a view), vb closes the cycle.
+    db.exec("CREATE VIEW va AS SELECT * FROM vb").unwrap();
+    assert!(db.exec("CREATE VIEW vb AS SELECT * FROM va").is_err());
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn view_name_conflicting_with_table_is_rejected() {
+    let p = db_path("view-conflict");
+    let mut db = Connection::open(&format!("file://{}", p.display())).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER)").unwrap();
+    assert!(db.exec("CREATE VIEW t AS SELECT 1").is_err());
+    let _ = fs::remove_file(&p);
+}
+
+// ---- correlated subqueries (deferred 6B item) ------------------------------
+
+#[test]
+fn correlated_scalar_subquery_in_projection() {
+    let (mut db, p) = library();
+    // The subquery references the outer row (a.id) — evaluated per outer row.
+    let rs = db
+        .query(
+            "SELECT a.name, \
+                (SELECT count(*) FROM books b WHERE b.author_id = a.id) AS cnt \
+             FROM authors a ORDER BY a.id",
+        )
+        .unwrap();
+    assert_eq!(
+        col(&rs, 0),
+        vec![Some("Ada".into()), Some("Bel".into()), Some("Cy".into()),]
+    );
+    assert_eq!(
+        col(&rs, 1),
+        vec![Some("2".into()), Some("1".into()), Some("0".into()),]
+    );
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn correlated_exists_and_not_exists_in_where() {
+    let (mut db, p) = library();
+    let has = db
+        .query(
+            "SELECT a.name FROM authors a \
+             WHERE EXISTS (SELECT 1 FROM books b WHERE b.author_id = a.id) ORDER BY a.id",
+        )
+        .unwrap();
+    assert_eq!(col(&has, 0), vec![Some("Ada".into()), Some("Bel".into())]);
+
+    let missing = db
+        .query(
+            "SELECT a.name FROM authors a \
+             WHERE NOT EXISTS (SELECT 1 FROM books b WHERE b.author_id = a.id)",
+        )
+        .unwrap();
+    assert_eq!(col(&missing, 0), vec![Some("Cy".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn correlated_scalar_subquery_in_where_predicate() {
+    let (mut db, p) = library();
+    // Only authors with at least two books.
+    let rs = db
+        .query(
+            "SELECT a.name FROM authors a \
+             WHERE (SELECT count(*) FROM books b WHERE b.author_id = a.id) >= 2",
+        )
+        .unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("Ada".into())]);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn non_correlated_subquery_still_works() {
+    // The fast (pre-fold once) path is unchanged for non-correlated subqueries.
+    let (mut db, p) = library();
+    let rs = db
+        .query(
+            "SELECT title FROM books \
+             WHERE author_id = (SELECT id FROM authors WHERE name = 'Bel')",
+        )
+        .unwrap();
+    assert_eq!(col(&rs, 0), vec![Some("B1".into())]);
+    let _ = fs::remove_file(&p);
+}

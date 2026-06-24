@@ -13,6 +13,7 @@
 //! in-flight set). `owner == 0` means fully committed (no pending stamp).
 
 use crate::catalog::TableSchema;
+use crate::sql::SelectStmt;
 use crate::value::Value;
 use crate::vector::{IndexDef, VectorIndex};
 use std::collections::HashMap;
@@ -108,6 +109,10 @@ pub struct Store {
     /// structures over a table's vector column — rebuilt from the rows on replay,
     /// so they branch and scale-to-zero with the database (see `vector.rs`).
     indexes: HashMap<String, VectorIndex>,
+    /// Views, keyed by lowercased name → the parsed query each stands for. A view
+    /// resolves as a derived table when referenced in a `FROM` (deferred 6B item).
+    /// Like an index, it is a catalog fact rebuilt from the WAL on replay.
+    views: HashMap<String, SelectStmt>,
     /// Highest committed transaction boundary published to readers.
     pub committed_lsn: u64,
 }
@@ -147,6 +152,26 @@ impl Store {
         self.indexes
             .retain(|_, ix| !ix.def.table.eq_ignore_ascii_case(name));
         existed
+    }
+
+    // ---- views (deferred 6B item) ---------------------------------------
+
+    pub fn has_view(&self, name: &str) -> bool {
+        self.views.contains_key(&Self::key(name))
+    }
+
+    /// The parsed body of view `name`, if it exists.
+    pub fn view(&self, name: &str) -> Option<&SelectStmt> {
+        self.views.get(&Self::key(name))
+    }
+
+    /// Register (or replace) a view with its already-parsed body.
+    pub fn insert_view(&mut self, name: String, query: SelectStmt) {
+        self.views.insert(Self::key(&name), query);
+    }
+
+    pub fn drop_view(&mut self, name: &str) -> bool {
+        self.views.remove(&Self::key(name)).is_some()
     }
 
     // ---- vector indexes (spec 12) ---------------------------------------
@@ -268,6 +293,12 @@ impl Store {
     }
     pub fn replay_drop(&mut self, name: &str) {
         self.drop_table(name);
+    }
+    pub fn replay_create_view(&mut self, name: String, query: SelectStmt) {
+        self.insert_view(name, query);
+    }
+    pub fn replay_drop_view(&mut self, name: &str) {
+        self.drop_view(name);
     }
     pub fn replay_insert(&mut self, table: &str, vid: u64, values: Vec<Value>, commit_lsn: u64) {
         if let Some(t) = self.table_mut(table) {

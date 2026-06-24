@@ -671,7 +671,11 @@ pub fn run_select(
     // shape directly; multi-source / set-op / DISTINCT / CTE / subquery queries
     // route to the relational executor.
     match &sel.from {
-        Some(FromClause::Table { name, .. }) if !needs_relational(sel) => {
+        // A view name has no base table, so it falls through to the relational
+        // path (which expands it as a derived table).
+        Some(FromClause::Table { name, .. })
+            if !needs_relational(sel) && store.table(name).is_some() =>
+        {
             single_table_select(store, sel, name, snapshot, writer, params)
         }
         None if !needs_relational(sel) => constant_select(sel, params),
@@ -2730,6 +2734,7 @@ fn check_vector_dims(schema: &TableSchema, vals: &[Value], table: &str) -> Resul
 pub fn run_delete(
     store: &mut Store,
     table: &str,
+    using: Option<&FromClause>,
     filter: &Option<Expr>,
     returning: Option<&[SelItem]>,
     wc: &WriteCtx,
@@ -2739,23 +2744,13 @@ pub fn run_delete(
         .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?
         .schema
         .clone();
-    let t = store.table(table).unwrap();
-    let mut victims = Vec::new();
-    // RETURNING projects the deleted (old) row values.
-    let mut affected: Vec<Vec<Value>> = Vec::new();
-    for v in &t.rows {
-        if !v.visible_to_writer(wc.snapshot, wc.owner) {
-            continue;
+    let want_returning = returning.is_some();
+    let (victims, affected) = match using {
+        None => collect_delete_victims(store, &schema, table, filter, want_returning, wc)?,
+        Some(u) => {
+            collect_delete_victims_join(store, &schema, table, u, filter, want_returning, wc)?
         }
-        let ctx = EvalCtx::row(&v.values, &schema, wc.params);
-        if predicate(filter, &ctx)? {
-            check_no_conflict(v, wc.snapshot, wc.owner)?;
-            victims.push(v.vid);
-            if returning.is_some() {
-                affected.push(v.values.clone());
-            }
-        }
-    }
+    };
     let mut wal = Vec::with_capacity(victims.len());
     for vid in &victims {
         supersede(store, table, *vid, wc.owner, &mut wal);
@@ -2772,10 +2767,81 @@ pub fn run_delete(
     })
 }
 
+/// Collect the visible target rows a single-table DELETE removes — their vids and
+/// (when RETURNING) their old values.
+fn collect_delete_victims(
+    store: &Store,
+    schema: &TableSchema,
+    table: &str,
+    filter: &Option<Expr>,
+    want_returning: bool,
+    wc: &WriteCtx,
+) -> Result<(Vec<u64>, Vec<Vec<Value>>)> {
+    let t = store.table(table).unwrap();
+    let mut victims = Vec::new();
+    let mut affected: Vec<Vec<Value>> = Vec::new();
+    for v in &t.rows {
+        if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        let ctx = EvalCtx::row(&v.values, schema, wc.params);
+        if predicate(filter, &ctx)? {
+            check_no_conflict(v, wc.snapshot, wc.owner)?;
+            victims.push(v.vid);
+            if want_returning {
+                affected.push(v.values.clone());
+            }
+        }
+    }
+    Ok((victims, affected))
+}
+
+/// Collect the target rows a join-driven `DELETE … USING` removes: the target is
+/// nested-loop-joined against the materialized `USING` sources and a target row
+/// is a victim if any combination satisfies `WHERE` (over `[target | sources]`).
+fn collect_delete_victims_join(
+    store: &Store,
+    schema: &TableSchema,
+    table: &str,
+    using: &FromClause,
+    filter: &Option<Expr>,
+    want_returning: bool,
+    wc: &WriteCtx,
+) -> Result<(Vec<u64>, Vec<Vec<Value>>)> {
+    let (from_cols, from_rows) =
+        relational::materialize(store, using, wc.snapshot, Some(wc.owner), wc.params)?;
+    let mut cols = target_rel_cols(schema, table);
+    cols.extend(from_cols);
+
+    let t = store.table(table).unwrap();
+    let mut victims = Vec::new();
+    let mut affected: Vec<Vec<Value>> = Vec::new();
+    for v in &t.rows {
+        if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        for frow in &from_rows {
+            let mut combined = v.values.clone();
+            combined.extend(frow.iter().cloned());
+            let ctx = EvalCtx::rel(&combined, &cols, wc.params);
+            if predicate(filter, &ctx)? {
+                check_no_conflict(v, wc.snapshot, wc.owner)?;
+                victims.push(v.vid);
+                if want_returning {
+                    affected.push(v.values.clone());
+                }
+                break;
+            }
+        }
+    }
+    Ok((victims, affected))
+}
+
 pub fn run_update(
     store: &mut Store,
     table: &str,
     sets: &[(String, Expr)],
+    from: Option<&FromClause>,
     filter: &Option<Expr>,
     returning: Option<&[SelItem]>,
     wc: &WriteCtx,
@@ -2785,9 +2851,86 @@ pub fn run_update(
         .ok_or_else(|| EngineError::sql(format!("no such table: {table}")))?
         .schema
         .clone();
-    let updates = compute_updates(store, &schema, table, sets, filter, wc)?;
+    let updates = match from {
+        None => compute_updates(store, &schema, table, sets, filter, wc)?,
+        Some(from) => compute_updates_join(store, &schema, table, sets, from, filter, wc)?,
+    };
     check_update_uniques(store, &schema, table, &updates, wc.owner)?;
     apply_updates(store, &schema, table, updates, returning, wc)
+}
+
+/// The target table's columns as a relational namespace qualified by the table
+/// name — the left side of a join-driven `UPDATE … FROM` / `DELETE … USING`.
+fn target_rel_cols(schema: &TableSchema, table: &str) -> Vec<RelCol> {
+    schema
+        .columns
+        .iter()
+        .map(|c| RelCol {
+            table: Some(table.to_string()),
+            name: c.name.clone(),
+            ty: c.ty,
+        })
+        .collect()
+}
+
+/// Compute `(old_vid, new_values)` for a join-driven `UPDATE … FROM`. The target
+/// rows are nested-loop-joined against the materialized `FROM` sources; the
+/// `WHERE` predicate (the only correlation) is evaluated over the combined
+/// namespace `[target | sources]`. A target row updates at most once — the first
+/// matching combination wins (the multi-match result is unspecified, as in PG).
+fn compute_updates_join(
+    store: &Store,
+    schema: &TableSchema,
+    table: &str,
+    sets: &[(String, Expr)],
+    from: &FromClause,
+    filter: &Option<Expr>,
+    wc: &WriteCtx,
+) -> Result<Vec<(u64, Vec<Value>)>> {
+    let mut targets = Vec::with_capacity(sets.len());
+    for (col, expr) in sets {
+        let idx = schema
+            .column_index(col)
+            .ok_or_else(|| EngineError::sql(format!("no such column: {col}")))?;
+        targets.push((idx, expr));
+    }
+    let check_exprs: Vec<Expr> = schema
+        .checks
+        .iter()
+        .map(|s| crate::sql::parse_expr(s))
+        .collect::<Result<_>>()?;
+
+    let (from_cols, from_rows) =
+        relational::materialize(store, from, wc.snapshot, Some(wc.owner), wc.params)?;
+    let mut cols = target_rel_cols(schema, table);
+    cols.extend(from_cols);
+
+    let t = store.table(table).unwrap();
+    let mut updates: Vec<(u64, Vec<Value>)> = Vec::new();
+    for v in &t.rows {
+        if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        for frow in &from_rows {
+            let mut combined = v.values.clone();
+            combined.extend(frow.iter().cloned());
+            let ctx = EvalCtx::rel(&combined, &cols, wc.params);
+            if !predicate(filter, &ctx)? {
+                continue;
+            }
+            check_no_conflict(v, wc.snapshot, wc.owner)?;
+            let mut nv = v.values.clone();
+            for (idx, expr) in &targets {
+                nv[*idx] = schema.columns[*idx].ty.coerce(eval(expr, &ctx)?);
+            }
+            check_not_null(schema, &nv, table)?;
+            check_vector_dims(schema, &nv, table)?;
+            check_row_constraints(&check_exprs, schema, &nv)?;
+            updates.push((v.vid, nv));
+            break; // one update per target row (first match wins)
+        }
+    }
+    Ok(updates)
 }
 
 /// Compute `(old_vid, new_values)` for every row matching the UPDATE filter,
@@ -3024,6 +3167,21 @@ mod relational {
         Ok(acc)
     }
 
+    /// Materialize a `FROM` clause (no CTEs in scope) into a flat column
+    /// namespace + value rows — the right-hand row source for join-driven DML
+    /// (`UPDATE … FROM` / `DELETE … USING`). The target table is prepended by the
+    /// caller; here we only build the extra sources.
+    pub(super) fn materialize(
+        store: &Store,
+        from: &FromClause,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<(Vec<RelCol>, Vec<Vec<Value>>)> {
+        let rel = build_from(store, Some(from), snapshot, writer, params, &HashMap::new())?;
+        Ok((rel.cols, rel.rows))
+    }
+
     fn relation_from_result(alias: &str, rs: ResultSet) -> Relation {
         let cols = rs
             .columns
@@ -3055,56 +3213,36 @@ mod relational {
     ) -> Result<ResultSet> {
         let rel = build_from(store, sel.from.as_ref(), snapshot, writer, params, ctes)?;
         let cols = &rel.cols;
+        let scan = Scan {
+            store,
+            snapshot,
+            writer,
+            params,
+        };
 
-        // Fold non-correlated subqueries to literals before evaluating.
-        let filter = resolve_opt(&sel.filter, store, snapshot, writer, params)?;
-        let items = resolve_items(&sel.items, store, snapshot, writer, params)?;
-        let group_by = resolve_list(&sel.group_by, store, snapshot, writer, params)?;
-        let having = resolve_opt(&sel.having, store, snapshot, writer, params)?;
+        // A non-aggregated query with a correlated subquery folds those subqueries
+        // per outer row (binding the outer reference); everything else pre-folds
+        // its non-correlated subqueries once, up front.
+        let aggregated = agg_query(&sel.items, &sel.group_by, &sel.having);
+        let correlated =
+            !aggregated && select_has_correlated(sel, store, snapshot, writer, params, cols)?;
 
-        // WHERE.
-        let mut kept: Vec<usize> = Vec::new();
-        for (i, row) in rel.rows.iter().enumerate() {
-            let ctx = EvalCtx::rel(row, cols, params);
-            if predicate(&filter, &ctx)? {
-                kept.push(i);
-            }
-        }
-
-        // Output columns + types.
+        let (filter, items, group_by, having) = resolve_clauses(&scan, sel, correlated)?;
+        let kept = collect_kept(&scan, &rel.rows, cols, &filter, correlated)?;
         let (columns, types) = output_columns(&items, cols);
 
-        // Build (output row, group member indices) entries.
-        let aggregated = agg_query(&items, &group_by, &having);
-        let entries = if aggregated {
-            grouped_entries(&items, &group_by, &having, cols, &rel.rows, &kept, params)?
-        } else {
-            let mut e = Vec::with_capacity(kept.len());
-            for &i in &kept {
-                let ctx = EvalCtx::rel(&rel.rows[i], cols, params);
-                let mut out = Vec::new();
-                for item in &items {
-                    project_item(item, &ctx, cols, &rel.rows[i], &mut out)?;
-                }
-                e.push((out, vec![i]));
-            }
-            e
+        let plan = CorePlan {
+            aggregated,
+            correlated,
+            items: &items,
+            group_by: &group_by,
+            having: &having,
         };
+        let entries = build_entries(&scan, &plan, cols, &rel.rows, &kept)?;
 
         // ORDER BY (apply_tail) over the group-aware context, then DISTINCT, then
         // OFFSET/LIMIT.
-        let order_keys = if apply_tail {
-            sel.order_by
-                .iter()
-                .map(|k| OrderKey {
-                    expr: resolve_alias_rel(&items, &k.expr),
-                    asc: k.asc,
-                    nulls_first: k.nulls_first,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let order_keys = order_keys_for(sel, &items, apply_tail);
         let mut rows = order_and_collect(entries, &order_keys, cols, &rel.rows, params)?;
 
         if sel.distinct {
@@ -3120,6 +3258,160 @@ mod relational {
             types,
             rows,
         })
+    }
+
+    /// The store + snapshot + params a relational scan reads against, bundled so
+    /// the per-clause helpers stay within the parameter budget.
+    struct Scan<'a> {
+        store: &'a Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &'a [Value],
+    }
+
+    /// The resolved projection/grouping a core's entries are built from.
+    struct CorePlan<'a> {
+        aggregated: bool,
+        correlated: bool,
+        items: &'a [SelItem],
+        group_by: &'a [Expr],
+        having: &'a Option<Expr>,
+    }
+
+    /// Resolve the WHERE/projection/group/having clauses: a correlated query keeps
+    /// them raw (folded per row later), otherwise non-correlated subqueries fold
+    /// to literals once here.
+    #[allow(clippy::type_complexity)]
+    fn resolve_clauses(
+        scan: &Scan,
+        sel: &SelectStmt,
+        correlated: bool,
+    ) -> Result<(Option<Expr>, Vec<SelItem>, Vec<Expr>, Option<Expr>)> {
+        if correlated {
+            return Ok((
+                sel.filter.clone(),
+                sel.items.clone(),
+                sel.group_by.clone(),
+                sel.having.clone(),
+            ));
+        }
+        let (s, sn, w, p) = (scan.store, scan.snapshot, scan.writer, scan.params);
+        Ok((
+            resolve_opt(&sel.filter, s, sn, w, p)?,
+            resolve_items(&sel.items, s, sn, w, p)?,
+            resolve_list(&sel.group_by, s, sn, w, p)?,
+            resolve_opt(&sel.having, s, sn, w, p)?,
+        ))
+    }
+
+    /// Apply WHERE, returning the indices of the kept rows. A correlated filter is
+    /// folded against each row before evaluation.
+    fn collect_kept(
+        scan: &Scan,
+        rows: &[Vec<Value>],
+        cols: &[RelCol],
+        filter: &Option<Expr>,
+        correlated: bool,
+    ) -> Result<Vec<usize>> {
+        let mut kept = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let ctx = EvalCtx::rel(row, cols, scan.params);
+            let pass = if correlated {
+                let f = fold_corr_opt(
+                    filter,
+                    scan.store,
+                    scan.snapshot,
+                    scan.writer,
+                    scan.params,
+                    row,
+                    cols,
+                )?;
+                predicate(&f, &ctx)?
+            } else {
+                predicate(filter, &ctx)?
+            };
+            if pass {
+                kept.push(i);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Build the (output row, group-member indices) entries: grouped aggregation,
+    /// or one entry per kept row (folding correlated subqueries per row).
+    fn build_entries(
+        scan: &Scan,
+        plan: &CorePlan,
+        cols: &[RelCol],
+        rows: &[Vec<Value>],
+        kept: &[usize],
+    ) -> Result<Vec<(Vec<Value>, Vec<usize>)>> {
+        if plan.aggregated {
+            return grouped_entries(
+                plan.items,
+                plan.group_by,
+                plan.having,
+                cols,
+                rows,
+                kept,
+                scan.params,
+            );
+        }
+        let mut e = Vec::with_capacity(kept.len());
+        for &i in kept {
+            let row = &rows[i];
+            let ctx = EvalCtx::rel(row, cols, scan.params);
+            let mut out = Vec::new();
+            for item in plan.items {
+                if plan.correlated {
+                    let folded = fold_corr_item(scan, item, row, cols)?;
+                    project_item(&folded, &ctx, cols, row, &mut out)?;
+                } else {
+                    project_item(item, &ctx, cols, row, &mut out)?;
+                }
+            }
+            e.push((out, vec![i]));
+        }
+        Ok(e)
+    }
+
+    /// Fold the correlated subqueries inside one projection item for `row`.
+    fn fold_corr_item(
+        scan: &Scan,
+        item: &SelItem,
+        row: &[Value],
+        cols: &[RelCol],
+    ) -> Result<SelItem> {
+        Ok(match item {
+            SelItem::Expr { expr, alias } => SelItem::Expr {
+                expr: fold_corr(
+                    expr,
+                    scan.store,
+                    scan.snapshot,
+                    scan.writer,
+                    scan.params,
+                    row,
+                    cols,
+                )?,
+                alias: alias.clone(),
+            },
+            other => other.clone(),
+        })
+    }
+
+    /// The resolved ORDER BY keys for a core (empty unless its tail applies).
+    fn order_keys_for(sel: &SelectStmt, items: &[SelItem], apply_tail: bool) -> Vec<OrderKey> {
+        if !apply_tail {
+            return Vec::new();
+        }
+        sel.order_by
+            .iter()
+            .map(|k| OrderKey {
+                expr: resolve_alias_rel(items, &k.expr),
+                asc: k.asc,
+                nulls_first: k.nulls_first,
+            })
+            .collect()
     }
 
     /// Materialize a `FROM` clause into a single relation.
@@ -3146,6 +3438,12 @@ mod relational {
                         cols,
                         rows: cte.rows.clone(),
                     });
+                }
+                // A view expands as a derived table over its stored query (the
+                // CREATE-time cycle check guarantees this recursion terminates).
+                if let Some(view_query) = store.view(name) {
+                    let rs = run_query(store, view_query, snapshot, writer, params)?;
+                    return Ok(relation_from_result(&src, rs));
                 }
                 let table = store
                     .table(name)
@@ -4002,5 +4300,447 @@ mod relational {
                 AggArg::Expr(Box::new(resolve_sub(e, store, snapshot, writer, params)?))
             }
         })
+    }
+
+    // ---- correlated subqueries (per-row binding) ----------------------------
+    //
+    // A correlated subquery references a column from the outer query's row. We
+    // evaluate it per outer row: bind those outer references to the row's values
+    // (turning the subquery non-correlated), then fold it with the same machinery
+    // the non-correlated path uses. This is opt-in — only queries that actually
+    // contain a correlated subquery take this path, so the common case is
+    // untouched. Supported in the non-aggregated WHERE / projection; correlation
+    // inside aggregation or deeper than one level is left to the (unchanged)
+    // non-correlated path (which rejects what it cannot resolve).
+
+    /// The column namespace a subquery's own `FROM` exposes (used to tell an
+    /// outer reference from one the subquery resolves itself).
+    fn from_namespace(
+        store: &Store,
+        from: Option<&FromClause>,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+    ) -> Result<Vec<RelCol>> {
+        match from {
+            None => Ok(Vec::new()),
+            Some(f) => {
+                Ok(build_from(store, Some(f), snapshot, writer, params, &HashMap::new())?.cols)
+            }
+        }
+    }
+
+    /// Whether `cols` contains a column matching an (optionally qualified) ref.
+    fn namespace_has(cols: &[RelCol], table: Option<&str>, name: &str) -> bool {
+        cols.iter().any(|c| {
+            c.name.eq_ignore_ascii_case(name)
+                && match table {
+                    None => true,
+                    Some(t) => c
+                        .table
+                        .as_deref()
+                        .is_some_and(|ct| ct.eq_ignore_ascii_case(t)),
+                }
+        })
+    }
+
+    /// Collect an expression's column refs *without* descending into nested
+    /// subqueries (whose refs belong to their own scope).
+    fn shallow_refs<'a>(e: &'a Expr, out: &mut Vec<(Option<&'a str>, &'a str)>) {
+        match e {
+            Expr::Column(n) => out.push((None, n)),
+            Expr::Qualified(t, n) => out.push((Some(t), n)),
+            Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+            _ => {
+                each_child(e, &mut |c| shallow_refs(c, out));
+            }
+        }
+    }
+
+    /// Run `f` on each direct child expression of `e` (leaves have none).
+    fn each_child<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+        match e {
+            Expr::Binary { l, r, .. } => {
+                f(l);
+                f(r);
+            }
+            Expr::Unary { e, .. } | Expr::IsNull { e, .. } | Expr::Cast { e, .. } => f(e),
+            Expr::Like {
+                e, pattern, escape, ..
+            } => {
+                f(e);
+                f(pattern);
+                if let Some(x) = escape {
+                    f(x);
+                }
+            }
+            Expr::InList { e, list, .. } => {
+                f(e);
+                for x in list {
+                    f(x);
+                }
+            }
+            Expr::Between { e, lo, hi, .. } => {
+                f(e);
+                f(lo);
+                f(hi);
+            }
+            Expr::Case {
+                operand,
+                whens,
+                els,
+            } => {
+                if let Some(o) = operand {
+                    f(o);
+                }
+                for (c, r) in whens {
+                    f(c);
+                    f(r);
+                }
+                if let Some(x) = els {
+                    f(x);
+                }
+            }
+            Expr::Func { args, .. } => {
+                for a in args {
+                    f(a);
+                }
+            }
+            Expr::Aggregate { arg, sep, .. } => {
+                if let AggArg::Expr(x) = arg {
+                    f(x);
+                }
+                if let Some(s) = sep {
+                    f(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a subquery references a column it cannot resolve itself but the
+    /// outer namespace can — i.e. it is correlated to the outer row.
+    fn subquery_correlated(
+        sub: &SelectStmt,
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+        outer: &[RelCol],
+    ) -> Result<bool> {
+        let inner = from_namespace(store, sub.from.as_ref(), snapshot, writer, params)?;
+        let mut refs = Vec::new();
+        select_shallow_refs(sub, &mut refs);
+        Ok(refs
+            .iter()
+            .any(|(t, n)| !namespace_has(&inner, *t, n) && namespace_has(outer, *t, n)))
+    }
+
+    /// Collect a select core's own column refs (filter / projection / having /
+    /// group / order), not descending into nested subqueries.
+    fn select_shallow_refs<'a>(sel: &'a SelectStmt, out: &mut Vec<(Option<&'a str>, &'a str)>) {
+        if let Some(e) = &sel.filter {
+            shallow_refs(e, out);
+        }
+        for item in &sel.items {
+            if let SelItem::Expr { expr, .. } = item {
+                shallow_refs(expr, out);
+            }
+        }
+        for e in &sel.group_by {
+            shallow_refs(e, out);
+        }
+        if let Some(e) = &sel.having {
+            shallow_refs(e, out);
+        }
+        for k in &sel.order_by {
+            shallow_refs(&k.expr, out);
+        }
+    }
+
+    /// Whether any subquery anywhere in `e` is correlated to `outer`.
+    fn expr_has_correlated(
+        e: &Expr,
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+        outer: &[RelCol],
+    ) -> Result<bool> {
+        match e {
+            Expr::ScalarSubquery(q) | Expr::Exists { query: q, .. } => {
+                subquery_correlated(q, store, snapshot, writer, params, outer)
+            }
+            Expr::InSubquery { e, query, .. } => Ok(expr_has_correlated(
+                e, store, snapshot, writer, params, outer,
+            )? || subquery_correlated(
+                query, store, snapshot, writer, params, outer,
+            )?),
+            _ => {
+                let mut found = false;
+                let mut err = None;
+                each_child(e, &mut |c| {
+                    if found || err.is_some() {
+                        return;
+                    }
+                    match expr_has_correlated(c, store, snapshot, writer, params, outer) {
+                        Ok(true) => found = true,
+                        Ok(false) => {}
+                        Err(e) => err = Some(e),
+                    }
+                });
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(found),
+                }
+            }
+        }
+    }
+
+    /// Whether `sel`'s WHERE or projection holds a correlated subquery.
+    fn select_has_correlated(
+        sel: &SelectStmt,
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+        outer: &[RelCol],
+    ) -> Result<bool> {
+        if let Some(f) = &sel.filter {
+            if expr_has_correlated(f, store, snapshot, writer, params, outer)? {
+                return Ok(true);
+            }
+        }
+        for item in &sel.items {
+            if let SelItem::Expr { expr, .. } = item {
+                if expr_has_correlated(expr, store, snapshot, writer, params, outer)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Rewrite `e`, replacing each outer-only column reference with the literal
+    /// value from `row` (resolved via `outer`); refs the subquery resolves itself
+    /// (`inner`) are left alone, as are nested subqueries (bound when they run).
+    fn bind_expr(e: &Expr, inner: &[RelCol], outer: &[RelCol], row: &[Value]) -> Expr {
+        let bind_ref = |table: Option<&str>, name: &str, orig: &Expr| -> Expr {
+            if namespace_has(inner, table, name) {
+                return orig.clone();
+            }
+            if let Ok(idx) = resolve_col(outer, table, name) {
+                return Expr::Lit(row[idx].clone());
+            }
+            orig.clone()
+        };
+        match e {
+            Expr::Column(n) => bind_ref(None, n, e),
+            Expr::Qualified(t, n) => bind_ref(Some(t), n, e),
+            Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => e.clone(),
+            _ => map_children(e, &|c| Ok(bind_expr(c, inner, outer, row))).unwrap(),
+        }
+    }
+
+    /// Bind a subquery's outer references to the current outer row's values.
+    fn bind_select(
+        sub: &SelectStmt,
+        inner: &[RelCol],
+        outer: &[RelCol],
+        row: &[Value],
+    ) -> SelectStmt {
+        let mut s = sub.clone();
+        s.filter = s.filter.as_ref().map(|e| bind_expr(e, inner, outer, row));
+        s.items = s
+            .items
+            .iter()
+            .map(|i| match i {
+                SelItem::Expr { expr, alias } => SelItem::Expr {
+                    expr: bind_expr(expr, inner, outer, row),
+                    alias: alias.clone(),
+                },
+                other => other.clone(),
+            })
+            .collect();
+        s.group_by = s
+            .group_by
+            .iter()
+            .map(|e| bind_expr(e, inner, outer, row))
+            .collect();
+        s.having = s.having.as_ref().map(|e| bind_expr(e, inner, outer, row));
+        s.order_by = s
+            .order_by
+            .iter()
+            .map(|k| OrderKey {
+                expr: bind_expr(&k.expr, inner, outer, row),
+                asc: k.asc,
+                nulls_first: k.nulls_first,
+            })
+            .collect();
+        s
+    }
+
+    /// Fold every subquery in `e` to a literal for one outer row: bind its outer
+    /// references to `row`, then run it through the non-correlated folder.
+    fn fold_corr(
+        e: &Expr,
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+        row: &[Value],
+        outer: &[RelCol],
+    ) -> Result<Expr> {
+        let bind = |sub: &SelectStmt| -> Result<SelectStmt> {
+            let inner = from_namespace(store, sub.from.as_ref(), snapshot, writer, params)?;
+            Ok(bind_select(sub, &inner, outer, row))
+        };
+        match e {
+            Expr::ScalarSubquery(q) => {
+                let node = Expr::ScalarSubquery(Box::new(bind(q)?));
+                resolve_subquery_node(&node, store, snapshot, writer, params)
+            }
+            Expr::Exists { query, negated } => {
+                let node = Expr::Exists {
+                    query: Box::new(bind(query)?),
+                    negated: *negated,
+                };
+                resolve_subquery_node(&node, store, snapshot, writer, params)
+            }
+            Expr::InSubquery { e, query, negated } => {
+                let lhs = fold_corr(e, store, snapshot, writer, params, row, outer)?;
+                let node = Expr::InSubquery {
+                    e: Box::new(lhs),
+                    query: Box::new(bind(query)?),
+                    negated: *negated,
+                };
+                resolve_subquery_node(&node, store, snapshot, writer, params)
+            }
+            Expr::Column(_) | Expr::Qualified(_, _) => Ok(e.clone()),
+            _ => map_children(e, &|c| {
+                fold_corr(c, store, snapshot, writer, params, row, outer)
+            }),
+        }
+    }
+
+    fn fold_corr_opt(
+        e: &Option<Expr>,
+        store: &Store,
+        snapshot: u64,
+        writer: Option<u64>,
+        params: &[Value],
+        row: &[Value],
+        outer: &[RelCol],
+    ) -> Result<Option<Expr>> {
+        match e {
+            Some(e) => Ok(Some(fold_corr(
+                e, store, snapshot, writer, params, row, outer,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Rebuild a composite expression with `f` applied to each child (leaves and
+    /// nodes the caller handles specially are cloned unchanged). The multi-child
+    /// variants live in [`map_children_compound`] to keep each branch count low.
+    fn map_children(e: &Expr, f: &dyn Fn(&Expr) -> Result<Expr>) -> Result<Expr> {
+        Ok(match e {
+            Expr::Binary { op, l, r } => Expr::Binary {
+                op: *op,
+                l: map_box(l, f)?,
+                r: map_box(r, f)?,
+            },
+            Expr::Unary { op, e } => Expr::Unary {
+                op: *op,
+                e: map_box(e, f)?,
+            },
+            Expr::IsNull { e, negated } => Expr::IsNull {
+                e: map_box(e, f)?,
+                negated: *negated,
+            },
+            Expr::InList { e, list, negated } => Expr::InList {
+                e: map_box(e, f)?,
+                list: list.iter().map(f).collect::<Result<_>>()?,
+                negated: *negated,
+            },
+            Expr::Cast { e, target } => Expr::Cast {
+                e: map_box(e, f)?,
+                target: *target,
+            },
+            Expr::Func { name, args } => Expr::Func {
+                name: name.clone(),
+                args: args.iter().map(f).collect::<Result<_>>()?,
+            },
+            _ => map_children_compound(e, f)?,
+        })
+    }
+
+    /// The multi-child / optional-child expression variants (split out of
+    /// [`map_children`]); leaves and already-handled nodes clone unchanged.
+    fn map_children_compound(e: &Expr, f: &dyn Fn(&Expr) -> Result<Expr>) -> Result<Expr> {
+        Ok(match e {
+            Expr::Like {
+                e,
+                pattern,
+                escape,
+                negated,
+                insensitive,
+            } => Expr::Like {
+                e: map_box(e, f)?,
+                pattern: map_box(pattern, f)?,
+                escape: map_box_opt(escape, f)?,
+                negated: *negated,
+                insensitive: *insensitive,
+            },
+            Expr::Between { e, lo, hi, negated } => Expr::Between {
+                e: map_box(e, f)?,
+                lo: map_box(lo, f)?,
+                hi: map_box(hi, f)?,
+                negated: *negated,
+            },
+            Expr::Case {
+                operand,
+                whens,
+                els,
+            } => Expr::Case {
+                operand: map_box_opt(operand, f)?,
+                whens: whens
+                    .iter()
+                    .map(|(c, r)| Ok((f(c)?, f(r)?)))
+                    .collect::<Result<_>>()?,
+                els: map_box_opt(els, f)?,
+            },
+            Expr::Aggregate {
+                func,
+                arg,
+                distinct,
+                sep,
+            } => Expr::Aggregate {
+                func: *func,
+                arg: match arg {
+                    AggArg::Star => AggArg::Star,
+                    AggArg::Expr(x) => AggArg::Expr(Box::new(f(x)?)),
+                },
+                distinct: *distinct,
+                sep: map_box_opt(sep, f)?,
+            },
+            other => other.clone(),
+        })
+    }
+
+    /// Apply `f` to a boxed child expression.
+    fn map_box(x: &Expr, f: &dyn Fn(&Expr) -> Result<Expr>) -> Result<Box<Expr>> {
+        Ok(Box::new(f(x)?))
+    }
+
+    /// Apply `f` to an optional boxed child expression (`None` stays `None`).
+    fn map_box_opt(
+        x: &Option<Box<Expr>>,
+        f: &dyn Fn(&Expr) -> Result<Expr>,
+    ) -> Result<Option<Box<Expr>>> {
+        match x {
+            Some(e) => Ok(Some(Box::new(f(e)?))),
+            None => Ok(None),
+        }
     }
 }
