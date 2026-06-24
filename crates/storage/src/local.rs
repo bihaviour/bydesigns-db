@@ -88,6 +88,11 @@ struct Inner {
     pages: HashMap<u64, PageChain>,
     branches: HashMap<u64, BranchRef>,
     next_branch_id: u64,
+    /// Read-only observability counters (#53). Backend-neutral cumulative
+    /// totals; snapshotted by [`Storage::stats`]. Held under the same lock as
+    /// the rest of `Inner` — `stats()` is sampled at scenario boundaries, never
+    /// on a hot inner loop, so the brief lock is fine.
+    stats: StorageStats,
 }
 
 /// Pure-embedded backend persisting all state in one `.db` file.
@@ -126,6 +131,7 @@ impl LocalFileStorage {
                 pages: HashMap::new(),
                 branches: HashMap::new(),
                 next_branch_id: 1,
+                stats: StorageStats::default(),
             }
         } else {
             recover(file)?
@@ -182,6 +188,7 @@ impl Inner {
             .map_err(|e| StorageError::DurabilityUnconfirmed(e.to_string()))?;
 
         self.end += buf.len() as u64;
+        self.stats.fsyncs += 1;
         Ok(())
     }
 }
@@ -189,7 +196,7 @@ impl Inner {
 #[async_trait]
 impl Storage for LocalFileStorage {
     async fn get_page(&self, page_id: PageId, lsn: Lsn) -> Result<Page, StorageError> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         if lsn.0 < g.retention_floor {
             return Err(StorageError::NotFound(format!(
                 "lsn {} below PITR floor {}",
@@ -203,11 +210,16 @@ impl Storage for LocalFileStorage {
         // Greatest version with version-LSN <= requested lsn.
         let best = chain.iter().rev().find(|(vlsn, _)| *vlsn <= lsn.0);
         match best {
-            Some((vlsn, image)) => Ok(Page {
-                id: page_id,
-                lsn: Lsn(*vlsn),
-                bytes: image.clone(),
-            }),
+            Some((vlsn, image)) => {
+                let page = Page {
+                    id: page_id,
+                    lsn: Lsn(*vlsn),
+                    bytes: image.clone(),
+                };
+                g.stats.page_reads += 1;
+                g.stats.page_read_bytes += PAGE_SIZE as u64;
+                Ok(page)
+            }
             None => Err(StorageError::NotFound(format!(
                 "page {} has no version at-or-before lsn {}",
                 page_id.0, lsn.0
@@ -233,6 +245,7 @@ impl Storage for LocalFileStorage {
             payload.extend_from_slice(&(r.bytes.len() as u32).to_le_bytes());
             payload.extend_from_slice(&r.bytes);
         }
+        let wal_bytes = payload.len() as u64;
         g.append_frame(T_WAL, &payload)?;
 
         let first = g.next_lsn;
@@ -240,6 +253,8 @@ impl Storage for LocalFileStorage {
         g.next_lsn = last + 1;
         g.durable_lsn = last;
         g.commit_lsn = last;
+        g.stats.wal_appends += 1;
+        g.stats.wal_bytes += wal_bytes;
         Ok(Lsn(last))
     }
 
@@ -296,10 +311,12 @@ impl Storage for LocalFileStorage {
     }
 
     async fn flush(&self) -> Result<(), StorageError> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         g.file
             .sync_all()
-            .map_err(|e| StorageError::DurabilityUnconfirmed(e.to_string()))
+            .map_err(|e| StorageError::DurabilityUnconfirmed(e.to_string()))?;
+        g.stats.fsyncs += 1;
+        Ok(())
     }
 
     async fn durable_lsn(&self) -> Result<Lsn, StorageError> {
@@ -430,6 +447,10 @@ impl Storage for LocalFileStorage {
 
     async fn pitr_floor(&self) -> Result<Lsn, StorageError> {
         Ok(Lsn(self.inner.lock().unwrap().retention_floor))
+    }
+
+    fn stats(&self) -> StorageStats {
+        self.inner.lock().unwrap().stats
     }
 }
 
@@ -668,6 +689,7 @@ fn recover(mut file: File) -> Result<Inner, StorageError> {
         pages,
         branches,
         next_branch_id,
+        stats: StorageStats::default(),
     })
 }
 

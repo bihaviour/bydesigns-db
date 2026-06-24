@@ -13,9 +13,10 @@ single most load-bearing artifact in the project.
   (the MVCC read floor). LSNs are strictly monotonic, gap-free, never reused.
 - Keep the trait **async and signature-stable**; alternate backends must drop in
   without changing the signatures the engine calls (`ObjectStorage` did in Phase 2;
-  branching was additive in Phase 4). Bump `STORAGE_TRAIT_VERSION` for any
-  signature/contract change (currently `2`), and keep the full C1–C8 conformance
-  suite green (`crates/storage/src/conformance.rs`).
+  branching was additive in Phase 4; the read-only `stats()` surface was additive
+  for #53). Bump `STORAGE_TRAIT_VERSION` for any signature/contract change
+  (currently `3`), and keep the full C1–C8 conformance suite green
+  (`crates/storage/src/conformance.rs`).
 - Never leak backend-specific concepts (S3 keys, file offsets, LSM layer ids)
   into the trait surface.
 - **Branching lives at the seam, not in the engine.** A branch is a

@@ -225,7 +225,7 @@ These are deliberate, not omissions — don't "fix" them without checking the ro
   under `pages/docs/`.
 - Storage-trait changes must keep all C1–C8 conformance tests green (and the
   Phase-4 branching battery, `crates/storage/tests/branching.rs`) and bump
-  `STORAGE_TRAIT_VERSION` per the trait's versioning policy (currently `2`).
+  `STORAGE_TRAIT_VERSION` per the trait's versioning policy (currently `3`).
 - Engine-behaviour or ABI changes: update `engine.h`, the Rust FFI tests
   (`crates/engine/tests/ffi.rs`), and re-run `bun test` against a fresh release build.
 

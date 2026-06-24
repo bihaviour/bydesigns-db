@@ -39,11 +39,15 @@ pub mod conn;
 pub mod ffi;
 
 pub use conn::{CatalogColumn, CatalogForeignKey, CatalogTable, Connection, Statement};
-pub use db::Database;
+pub use db::{Database, EngineStats};
 pub use error::{EngineError, EngineStatus, Result};
 pub use exec::ResultSet;
 pub use value::{ColumnType, Value};
 pub use vector::{IndexParams, Metric};
+
+/// Re-export the storage observability snapshot so embedders reading
+/// [`EngineStats::storage`] need not depend on `twill-storage` directly (#53).
+pub use twill_storage::StorageStats;
 
 /// ABI version embedded in `engine.h`; bindings verify it at load time.
 ///

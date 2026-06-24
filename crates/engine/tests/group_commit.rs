@@ -130,6 +130,60 @@ fn independent_writers_coalesce_and_are_durable() {
 }
 
 #[test]
+fn database_stats_fold_engine_and_storage_counters() {
+    // `Database::stats()` is the engine tier of the #53 observability surface: it
+    // folds the group-commit counters and the committed-LSN gauge together with
+    // the backend's StorageStats, pulled through the seam — so one pull on a
+    // handle yields both. Asserts the snapshot moves with real work and that the
+    // embedded storage counters are populated (the engine reaches the backend's
+    // counters without the backend leaking internals across the seam).
+    let p = db_path("stats");
+    let url = url_for(&p);
+
+    let db = Database::open(&url).unwrap();
+    let before = db.stats();
+
+    let mut c = Connection::open(&url).unwrap();
+    c.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 0..25 {
+        c.exec(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 2))
+            .unwrap();
+    }
+    // A read, so a SELECT round-trip is part of the observed window.
+    assert_eq!(scalar_i64(&mut c, "SELECT COUNT(*) FROM t"), 25);
+
+    let after = db.stats();
+    assert!(
+        after.commits > before.commits,
+        "commits advanced: {} -> {}",
+        before.commits,
+        after.commits
+    );
+    assert!(
+        after.committed_lsn > before.committed_lsn,
+        "committed LSN gauge advanced"
+    );
+    // group_commit_stats() and stats() agree on the same underlying counters.
+    let (appends, commits) = db.group_commit_stats();
+    assert_eq!(after.commits, commits);
+    assert_eq!(after.durable_appends, appends);
+    // Storage counters reached through the seam reflect the durable appends.
+    assert!(
+        after.storage.wal_appends >= after.durable_appends,
+        "storage saw at least one WAL append per durable batch"
+    );
+    assert!(
+        after.storage.fsyncs > 0,
+        "durable commits fsync the backend"
+    );
+
+    drop(c);
+    drop(db);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
 fn commit_lsns_are_unique_across_concurrent_writers() {
     // Each autocommit insert publishes at its own commit LSN; across concurrent
     // writers those LSNs must be distinct and positive (the batched append

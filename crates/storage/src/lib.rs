@@ -32,8 +32,8 @@ pub mod object;
 
 pub use branch::BranchStorage;
 pub use types::{
-    BranchId, BranchRef, FenceToken, LogEntry, Lsn, Page, PageId, StorageError, WalRecord,
-    WriterId, PAGE_SIZE,
+    BranchId, BranchRef, FenceToken, LogEntry, Lsn, Page, PageId, StorageError, StorageStats,
+    WalRecord, WriterId, PAGE_SIZE,
 };
 
 pub use object::{
@@ -50,7 +50,12 @@ use async_trait::async_trait;
 /// v2 (Phase 4): branching gains a write path — `BranchRef` carries `parent`,
 /// and the trait gains [`Storage::list_branches`] / [`Storage::delete_branch`].
 /// All additive; the v1 read/commit/fence surface is unchanged.
-pub const STORAGE_TRAIT_VERSION: u32 = 2;
+///
+/// v3 (#53): the read-only observability surface — the trait gains
+/// [`Storage::stats`] returning a [`StorageStats`] snapshot of backend-neutral
+/// counters. Additive (default impl returns zeros), so every existing backend
+/// and the C1–C8 conformance suite stay green; only the surface grew.
+pub const STORAGE_TRAIT_VERSION: u32 = 3;
 
 /// The one seam. The engine calls this; it never touches disk directly.
 ///
@@ -156,6 +161,16 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Oldest LSN still recoverable (start of the PITR window).
     async fn pitr_floor(&self) -> Result<Lsn, StorageError>;
+
+    // ---- Read-only observability (#53) ----------------------------------
+    /// A snapshot of this backend's cumulative [`StorageStats`] counters — the
+    /// seam-safe stats surface consumed by Twill Bench and a future OTLP
+    /// exporter (spec 15). Synchronous: a cheap read of in-process counters, no
+    /// awaiting. Default returns zeros, so a backend opts in by overriding;
+    /// the contract carries only backend-neutral aggregates, never internals.
+    fn stats(&self) -> StorageStats {
+        StorageStats::default()
+    }
 }
 
 pub use local::LocalFileStorage;

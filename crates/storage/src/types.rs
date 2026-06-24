@@ -86,6 +86,36 @@ pub struct LogEntry {
     pub record: WalRecord,
 }
 
+/// Read-only counters a backend exposes through [`crate::Storage::stats`] — the
+/// seam-safe observability surface (spec 15 / #53). Every field is a
+/// backend-neutral cumulative total: counts and byte/latency aggregates, never
+/// a backend-specific concept (no S3 key, file offset, or LSM layer id crosses
+/// the seam). A field meaningless for a backend stays `0` (e.g. `cache_*` and
+/// `fetch_latency_us_total` are unused by the in-memory-paged
+/// [`crate::LocalFileStorage`] but live for object stores). Cumulative, so a
+/// consumer takes the delta between two snapshots; `Copy`, so sampling never
+/// allocates or blocks the hot path. The future observability/OTLP exporter
+/// reads the same struct.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StorageStats {
+    /// Durable WAL appends performed (`append_wal` calls that became durable).
+    pub wal_appends: u64,
+    /// Total encoded WAL bytes appended.
+    pub wal_bytes: u64,
+    /// Page versions read (`get_page`/`get_pages`, per page).
+    pub page_reads: u64,
+    /// Total page bytes returned by reads.
+    pub page_read_bytes: u64,
+    /// Page reads served from a warm cache without a backend fetch.
+    pub cache_hits: u64,
+    /// Page reads that missed the cache and fetched from the backend.
+    pub cache_misses: u64,
+    /// Cumulative backend-fetch latency, microseconds (object stores; ~0 local).
+    pub fetch_latency_us_total: u64,
+    /// `fsync`/durable-flush operations performed.
+    pub fsyncs: u64,
+}
+
 /// Unique per engine instance / process; identifies a fence holder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WriterId(pub u128);
