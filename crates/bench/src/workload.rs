@@ -176,6 +176,7 @@ pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, Be
         git_sha: crate::git_sha(),
         json_only: opts.json,
         correctness: None,
+        lifecycle: None,
     })
 }
 

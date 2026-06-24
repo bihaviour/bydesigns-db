@@ -232,3 +232,44 @@ fn explicit_stop_counts_as_scale_to_zero() {
     ctrl.stop(&url);
     assert_eq!(ctrl.stats().scale_to_zero_events, 1, "no double count");
 }
+
+#[test]
+fn stats_track_compute_active_idle_and_lease_renews() {
+    // The serverless-efficiency signals: an instance accrues Active time while
+    // it holds a lease and Idle time after, the reaper heartbeats its lease, and
+    // a scale-to-zero settles the accrued time. These feed utilization and
+    // compute-seconds/query in the bench's scale-to-zero report.
+    let ctrl = Controller::new(fast_cfg()).unwrap();
+    let url = unique_url("compute");
+
+    let lease = ctrl.start(&url).unwrap();
+    // Hold the lease long enough for at least one reaper heartbeat pass.
+    std::thread::sleep(Duration::from_millis(60));
+    let s = ctrl.stats();
+    assert!(
+        s.compute_active_us > 0,
+        "an instance holding a lease accrues active time (got {})",
+        s.compute_active_us
+    );
+    assert!(
+        s.lease_renew_total >= 1,
+        "the reaper heartbeats the warm instance's lease (got {})",
+        s.lease_renew_total
+    );
+
+    drop(lease); // → Idle, then the reaper scales it to zero
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        ctrl.status(&url),
+        Some(LifecycleState::Cold),
+        "scaled to zero"
+    );
+    let s = ctrl.stats();
+    assert!(
+        s.compute_active_us > 0 && s.compute_idle_us > 0,
+        "both active and idle time accrued over the cycle (active={}, idle={})",
+        s.compute_active_us,
+        s.compute_idle_us
+    );
+    assert_eq!(s.warm_instances, 0, "no resident instance after teardown");
+}

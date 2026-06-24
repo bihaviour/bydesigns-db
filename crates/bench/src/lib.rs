@@ -30,12 +30,17 @@
 //!     `document-editing`) — drive a contended workload, then assert an ACID
 //!     invariant over the result (no lost update, conserved balance, no oversell,
 //!     no lost edit) and exit non-zero on violation.
+//!   * **lifecycle scenarios** (`scale-to-zero`) — controller-driven cold-path
+//!     measurement (spec 09 Experiment 5): drive query → idle past the reaper →
+//!     query, pull the [`controller`] stats snapshot at the run boundaries, and
+//!     report the cold-boot distribution + the serverless-efficiency figures.
 //!   * **release comparison** (`compare`) — diff two archived JSON records into a
 //!     PASS/regression verdict.
 
 pub mod compare;
 pub mod correctness;
 pub mod hist;
+pub mod lifecycle;
 pub mod pgclient;
 pub mod workload;
 
@@ -148,6 +153,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         "bank-transfer" => correctness::run_bank_transfer(&opts),
         "inventory" => correctness::run_inventory(&opts),
         "document-editing" => correctness::run_document_editing(&opts),
+        "scale-to-zero" => lifecycle::run_scale_to_zero(&opts),
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
@@ -252,6 +258,13 @@ pub(crate) struct Opts {
     /// Test-only fault to inject into a correctness profile (see [`Fault`]);
     /// `None` in every real run.
     pub inject_fault: Option<Fault>,
+    /// Number of scale-to-zero cycles (cold-boot samples) for the
+    /// `scale-to-zero` lifecycle scenario.
+    pub cycles: u64,
+    /// Idle timeout before the controller's reaper tears a warm instance down,
+    /// for the `scale-to-zero` scenario. Short for a smoke run; spec 09's
+    /// Experiment 5 uses a long (≈10 min) window on a real deployment.
+    pub idle: Duration,
 }
 
 impl Opts {
@@ -267,6 +280,8 @@ impl Opts {
         let mut json = false;
         let mut server = None;
         let mut inject_fault = None;
+        let mut cycles = 20u64;
+        let mut idle_ms = 100u64;
 
         let mut i = 0;
         while i < args.len() {
@@ -295,6 +310,8 @@ impl Opts {
                 "--transport" => transport = parse_transport(&val()?)?,
                 "--server" => server = Some(val()?),
                 "--inject-fault" => inject_fault = Some(parse_fault(&val()?)?),
+                "--cycles" => cycles = val()?.parse().map_err(|_| "invalid --cycles")?,
+                "--idle-ms" => idle_ms = val()?.parse().map_err(|_| "invalid --idle-ms")?,
                 other => return Err(format!("unknown flag {other}")),
             }
             i += 2;
@@ -317,6 +334,8 @@ impl Opts {
             json,
             server,
             inject_fault,
+            cycles: cycles.max(1),
+            idle: Duration::from_millis(idle_ms.max(1)),
         })
     }
 }
@@ -508,6 +527,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
         git_sha: git_sha(),
         json_only: opts.json,
         correctness: None,
+        lifecycle: None,
     })
 }
 
@@ -602,6 +622,52 @@ pub(crate) struct Correctness {
     pub detail: String,
 }
 
+/// The controller-sourced lifecycle section of a [`Report`], present only for
+/// the `scale-to-zero` scenario (spec 15 — serverless-efficiency). Carries the
+/// `ControllerStats` deltas observed across the run plus the derived
+/// serverless-efficiency figures (pure arithmetic over those deltas), reported
+/// under the settled `twill_*` metric vocabulary.
+pub(crate) struct Lifecycle {
+    /// Cold→warm transitions over the run (one per cold-boot cycle).
+    pub cold_starts: u64,
+    /// Reuses of an already-warm instance.
+    pub warm_starts: u64,
+    /// Warm→Cold teardowns (the scale-to-zero events the scenario drives).
+    pub scale_to_zero: u64,
+    /// Peak databases warming simultaneously.
+    pub peak_workers: u64,
+    /// Cumulative compute time the instance spent serving / warm-but-idle.
+    pub compute_active_us: u64,
+    pub compute_idle_us: u64,
+    /// Cumulative warm-admission wait (the scheduler/admission segment).
+    pub admission_wait_us: u64,
+    /// Lease heartbeats observed over the run.
+    pub lease_renews: u64,
+    /// Cold reads driven (one per cycle) — the denominator for per-query figures.
+    pub queries: u64,
+}
+
+impl Lifecycle {
+    /// `utilization` = active / (active + idle); the share of resident time the
+    /// compute actually served. `0.0` when nothing was resident.
+    fn utilization(&self) -> f64 {
+        let denom = (self.compute_active_us + self.compute_idle_us) as f64;
+        if denom > 0.0 {
+            self.compute_active_us as f64 / denom
+        } else {
+            0.0
+        }
+    }
+    /// `compute_seconds_per_query` = active seconds / cold reads driven.
+    fn compute_seconds_per_query(&self) -> f64 {
+        if self.queries > 0 {
+            (self.compute_active_us as f64 / 1e6) / self.queries as f64
+        } else {
+            0.0
+        }
+    }
+}
+
 pub(crate) struct Report {
     pub experiment: &'static str,
     pub label: String,
@@ -622,6 +688,9 @@ pub(crate) struct Report {
     pub json_only: bool,
     /// Present for correctness profiles; drives the `exit::CORRECTNESS` gate.
     pub correctness: Option<Correctness>,
+    /// Present for the `scale-to-zero` scenario; the controller-sourced
+    /// lifecycle deltas + derived serverless-efficiency figures.
+    pub lifecycle: Option<Lifecycle>,
 }
 
 impl Report {
@@ -661,6 +730,26 @@ impl Report {
                     c.detail,
                 );
             }
+            if let Some(l) = &self.lifecycle {
+                // The cold-boot distribution is the `hist` printed above; this is
+                // the controller-sourced lifecycle + serverless-efficiency view.
+                println!("cold starts  {}", l.cold_starts);
+                println!("warm starts  {}", l.warm_starts);
+                println!("scale→0      {}", l.scale_to_zero);
+                println!("peak workers {}", l.peak_workers);
+                println!(
+                    "compute      active={:.3}s  idle={:.3}s  admission_wait={}µs  lease_renews={}",
+                    l.compute_active_us as f64 / 1e6,
+                    l.compute_idle_us as f64 / 1e6,
+                    l.admission_wait_us,
+                    l.lease_renews,
+                );
+                println!(
+                    "efficiency   utilization={:.3}  compute_s/query={:.6}",
+                    l.utilization(),
+                    l.compute_seconds_per_query(),
+                );
+            }
         }
         // Machine-readable record (one JSON line) for archiving / plotting.
         let correctness = match &self.correctness {
@@ -670,12 +759,35 @@ impl Report {
             ),
             None => "null".to_string(),
         };
+        // The lifecycle section reports the controller deltas + derived
+        // serverless-efficiency figures under the settled `twill_*` names.
+        let lifecycle = match &self.lifecycle {
+            Some(l) => format!(
+                "{{\"twill_cold_start_total\":{},\"twill_warm_start_total\":{},\
+                 \"twill_scale_to_zero_total\":{},\"twill_peak_workers\":{},\
+                 \"twill_compute_active_seconds_total\":{:.6},\
+                 \"twill_compute_idle_seconds_total\":{:.6},\"twill_admission_wait_us\":{},\
+                 \"twill_lease_renew_total\":{},\"utilization\":{:.6},\
+                 \"compute_seconds_per_query\":{:.6}}}",
+                l.cold_starts,
+                l.warm_starts,
+                l.scale_to_zero,
+                l.peak_workers,
+                l.compute_active_us as f64 / 1e6,
+                l.compute_idle_us as f64 / 1e6,
+                l.admission_wait_us,
+                l.lease_renews,
+                l.utilization(),
+                l.compute_seconds_per_query(),
+            ),
+            None => "null".to_string(),
+        };
         println!(
             "{{\"experiment\":\"{}\",\"label\":\"{}\",\"transport\":\"{}\",\"backend\":\"{}\",\
              \"git\":\"{}\",\"writers\":{},\"duration_s\":{:.3},\"commits\":{},\"conflicts\":{},\
              \"failures\":{},\"throughput_per_s\":{:.1},\"p50_us\":{},\"p90_us\":{},\"p95_us\":{},\
              \"p99_us\":{},\"p999_us\":{},\"min_us\":{},\"max_us\":{},\"mean_us\":{:.1},\
-             \"correctness\":{}}}",
+             \"correctness\":{},\"lifecycle\":{}}}",
             self.experiment,
             self.label,
             self.transport,
@@ -696,6 +808,7 @@ impl Report {
             self.hist.max(),
             self.hist.mean(),
             correctness,
+            lifecycle,
         );
     }
 }
@@ -747,6 +860,10 @@ fn print_help() {
          \x20 inventory       concurrent stock decrements; asserts no oversell (no negative stock)\n\
          \x20 document-editing concurrent edits to one row (read-modify-write); asserts no lost edit\n\
          \n\
+         LIFECYCLE SCENARIOS (controller-driven; serverless-efficiency report):\n\
+         \x20 scale-to-zero   query → idle past the reaper → query (spec 09 Exp 5 cold read);\n\
+         \x20                 reports the cold-boot distribution + controller-sourced efficiency\n\
+         \n\
          RELEASE COMPARISON:\n\
          \x20 compare --baseline <FILE> --candidate <FILE> [--threshold <FRAC>]\n\
          \n\
@@ -759,6 +876,8 @@ fn print_help() {
          \x20 --duration-ms <MS>   timed window for experiments/scenarios (default 1000)\n\
          \x20 --ops <N>            per-writer ops for the correctness profiles (default 200)\n\
          \x20 --rows <N>           pre-seeded working-set size for the mix scenarios (default 1000)\n\
+         \x20 --cycles <N>         scale-to-zero cold-boot samples (default 20)\n\
+         \x20 --idle-ms <MS>       idle window before the reaper scales to zero (default 100)\n\
          \x20 --label <TEXT>       free-form tag recorded in the output\n\
          \x20 --json               emit only the one-line JSON record (for scripting)\n\
          \n\

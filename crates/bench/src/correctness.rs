@@ -527,5 +527,6 @@ fn report(
         git_sha: crate::git_sha(),
         json_only: opts.json,
         correctness: Some(correctness),
+        lifecycle: None,
     }
 }
