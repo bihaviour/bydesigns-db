@@ -127,6 +127,10 @@ struct ControllerInner {
     warm_count: AtomicU64,
     cur_warms: AtomicU64,
     peak_warms: AtomicU64,
+    /// Reuses of an already-warm instance (a `start` that hit Active/Idle).
+    warm_starts: AtomicU64,
+    /// Warm→Cold teardowns (idle reaper or explicit `stop`) — scale-to-zero.
+    scale_to_zero: AtomicU64,
     stop: Mutex<bool>,
     stop_cv: Condvar,
 }
@@ -199,6 +203,7 @@ impl ControllerInner {
                     s.handle = None; // dropped at end of scope → engine releases the fence
                     s.phase = LifecycleState::Cold;
                     s.last_activity = Instant::now();
+                    self.scale_to_zero.fetch_add(1, Ordering::SeqCst);
                     inst.cv.notify_all();
                 }
             } else if s.phase == LifecycleState::Idle {
@@ -267,6 +272,8 @@ impl Controller {
             warm_count: AtomicU64::new(0),
             cur_warms: AtomicU64::new(0),
             peak_warms: AtomicU64::new(0),
+            warm_starts: AtomicU64::new(0),
+            scale_to_zero: AtomicU64::new(0),
             stop: Mutex::new(false),
             stop_cv: Condvar::new(),
             cfg,
@@ -292,6 +299,7 @@ impl Controller {
                     s.active += 1;
                     s.last_activity = Instant::now();
                     let db = s.handle.clone().expect("active instance has a handle");
+                    self.inner.warm_starts.fetch_add(1, Ordering::SeqCst);
                     return Ok(Lease {
                         inst: inst.clone(),
                         db,
@@ -348,6 +356,11 @@ impl Controller {
         if let Some(inst) = inst {
             let mut s = inst.st.lock().unwrap();
             if s.active == 0 {
+                // Only a warm→Cold transition is a scale-to-zero event; stopping
+                // an already-cold instance is a no-op for the counter.
+                if s.handle.is_some() {
+                    self.inner.scale_to_zero.fetch_add(1, Ordering::SeqCst);
+                }
                 s.phase = LifecycleState::Cold;
                 s.handle = None;
                 s.last_activity = Instant::now();
@@ -365,6 +378,53 @@ impl Controller {
     pub fn peak_concurrent_warms(&self) -> u64 {
         self.inner.peak_warms.load(Ordering::SeqCst)
     }
+
+    /// A read-only [`ControllerStats`] snapshot — the compute/scheduler tier of
+    /// the #53 observability surface (spec 15). Pulled by Twill Bench's
+    /// lifecycle scenarios and a future OTLP exporter; the lifecycle scenarios'
+    /// active/idle-seconds and admission-wait histograms layer on top in a later
+    /// step. Cumulative counters plus the live `warm_instances` gauge.
+    pub fn stats(&self) -> ControllerStats {
+        let warm_instances = self
+            .inner
+            .instances
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|i| {
+                matches!(
+                    i.st.lock().unwrap().phase,
+                    LifecycleState::Active | LifecycleState::Idle
+                )
+            })
+            .count() as u64;
+        ControllerStats {
+            cold_starts: self.inner.warm_count.load(Ordering::SeqCst),
+            warm_starts: self.inner.warm_starts.load(Ordering::SeqCst),
+            scale_to_zero_events: self.inner.scale_to_zero.load(Ordering::SeqCst),
+            peak_workers: self.inner.peak_warms.load(Ordering::SeqCst),
+            warm_instances,
+        }
+    }
+}
+
+/// Read-only controller observability snapshot (#53 / spec 15). Cumulative
+/// counters plus a live gauge; a consumer takes the delta between two pulls.
+/// The compute active/idle durations and admission-wait histogram named in the
+/// settled vocabulary join this struct with the scale-to-zero scenario work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControllerStats {
+    /// Cold→warm transitions (cold starts); one per key per cold start.
+    pub cold_starts: u64,
+    /// Reuses of an already-warm instance (a `start` that hit Active/Idle) —
+    /// `warm_starts / (cold_starts + warm_starts)` is the worker-reuse ratio.
+    pub warm_starts: u64,
+    /// Warm→Cold teardowns (idle reaper or explicit `stop`).
+    pub scale_to_zero_events: u64,
+    /// Peak number of databases warming simultaneously.
+    pub peak_workers: u64,
+    /// Databases currently resident (Active or Idle) — a gauge.
+    pub warm_instances: u64,
 }
 
 impl Drop for Controller {

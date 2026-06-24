@@ -49,6 +49,22 @@ impl WriteLane {
     }
 }
 
+/// Read-only engine + storage observability snapshot (#53 / spec 15). Pulled by
+/// Twill Bench and a future OTLP exporter at scenario boundaries; cumulative, so
+/// a consumer takes the delta between two pulls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineStats {
+    /// Transactions committed durably (the group-commit `commits` counter).
+    pub commits: u64,
+    /// Durable WAL appends (group-commit batches). `commits > durable_appends`
+    /// proves coalescing engaged — the W1 lever (spec 09 Experiment 2).
+    pub durable_appends: u64,
+    /// Highest committed (visible) LSN — a gauge, not a counter.
+    pub committed_lsn: u64,
+    /// The backend's counters, pulled through the seam (`Storage::stats`).
+    pub storage: twill_storage::StorageStats,
+}
+
 pub struct Database {
     pub(crate) storage: Box<dyn Storage>,
     pub(crate) token: FenceToken,
@@ -207,6 +223,22 @@ impl Database {
     /// hook — the commit/durability contract does not depend on it.
     pub fn group_commit_stats(&self) -> (u64, u64) {
         self.group_commit.metrics()
+    }
+
+    /// A read-only [`EngineStats`] snapshot — the engine-tier observability
+    /// surface (#53 / spec 15). Folds the group-commit counters and the
+    /// committed-LSN gauge together with the backend's [`StorageStats`], pulled
+    /// through the seam ([`twill_storage::Storage::stats`]), so a single pull on
+    /// an engine handle yields both engine and storage counters. Pure
+    /// observation; the commit/durability contract does not depend on it.
+    pub fn stats(&self) -> EngineStats {
+        let (durable_appends, commits) = self.group_commit.metrics();
+        EngineStats {
+            commits,
+            durable_appends,
+            committed_lsn: self.committed_lsn(),
+            storage: self.storage.stats(),
+        }
     }
 
     /// The URL this database (or its base, for a branch) was opened from.

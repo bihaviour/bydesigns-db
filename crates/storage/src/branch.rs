@@ -179,4 +179,13 @@ impl Storage for BranchStorage {
     async fn pitr_floor(&self) -> Result<Lsn, StorageError> {
         Ok(self.to_global(self.overlay.pitr_floor().await?))
     }
+
+    /// A branch reports its own diverged activity: the counters of its private
+    /// overlay, where every branch write lands. The shared parent's global
+    /// counters are not folded in (they belong to the base line, not this
+    /// branch), keeping a branch snapshot branch-private — the same isolation
+    /// the rest of `BranchStorage` preserves.
+    fn stats(&self) -> StorageStats {
+        self.overlay.stats()
+    }
 }

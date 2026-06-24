@@ -56,6 +56,77 @@ fn pgwire_client_round_trips_dml_and_scalar() {
 }
 
 #[test]
+fn pgwire_show_twill_stats_surfaces_observability_counters() {
+    // `SHOW twill.stats` is the #53 observability surface pulled in-band over
+    // pgwire (spec 15): the server intercepts it and answers from the live
+    // engine + storage snapshot, never handing it to the SQL parser. Drive some
+    // work, then read the (metric, value) rows back and assert the counters
+    // moved — the same pull a controller-driven bench run makes at a scenario
+    // boundary.
+    let addr = start_server(unique_url());
+    let mut c = PgClient::connect(&addr).unwrap();
+
+    c.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 0..20 {
+        c.exec(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 2))
+            .unwrap();
+    }
+
+    let read_stats = |c: &mut PgClient| -> std::collections::HashMap<String, i64> {
+        c.query_rows("SHOW twill.stats")
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let name = row[0].clone().unwrap();
+                let val: i64 = row[1].as_deref().unwrap().trim().parse().unwrap();
+                (name, val)
+            })
+            .collect()
+    };
+
+    let stats = read_stats(&mut c);
+    // The vocabulary names are present (the surface is the settled signal set).
+    assert!(stats.contains_key("twill_commit_total"), "stats: {stats:?}");
+    assert!(stats.contains_key("twill_storage_fsync_total"));
+    assert!(stats.contains_key("twill_storage_wal_appends_total"));
+    // The counters reflect the work just driven over the wire.
+    // The 20 row-DML commits route through group commit (DDL uses the quiesce
+    // path and is not counted here).
+    assert!(
+        stats["twill_commit_total"] >= 20,
+        "at least 20 INSERT commits, saw {}",
+        stats["twill_commit_total"]
+    );
+    assert!(
+        stats["twill_storage_fsync_total"] > 0,
+        "durable work fsynced"
+    );
+    assert!(stats["twill_committed_lsn"] > 0, "committed LSN advanced");
+
+    // The view alias resolves identically, and counters are cumulative — a
+    // second pull after more work strictly advances the commit total.
+    c.exec("INSERT INTO t (id, v) VALUES (100, 1)").unwrap();
+    let after = c
+        .query_rows("SELECT * FROM twill_stats")
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap(),
+                row[1].as_deref().unwrap().trim().parse::<i64>().unwrap(),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    assert!(
+        after["twill_commit_total"] > stats["twill_commit_total"],
+        "cumulative commit total advances: {} -> {}",
+        stats["twill_commit_total"],
+        after["twill_commit_total"]
+    );
+}
+
+#[test]
 fn pgwire_classifies_fatal_vs_conflict() {
     let addr = start_server(unique_url());
     let mut c = PgClient::connect(&addr).unwrap();
