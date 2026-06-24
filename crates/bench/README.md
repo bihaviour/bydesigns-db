@@ -71,7 +71,21 @@ $BIN counter --url file:///tmp/bench.db --writers 8 --ops 1000
 # Concurrent atomic transfers between two accounts; asserts the summed balance
 # is conserved (no torn transfer leaks or destroys value).
 $BIN bank-transfer --url file:///tmp/bench.db --writers 8 --ops 1000
+
+# Concurrent stock decrements (read → refuse-oversell → decrement, in a txn);
+# seeded with exactly writers × ops units, asserts the shelf lands at exactly 0
+# (no decrement lost, no stock driven negative).
+$BIN inventory --url file:///tmp/bench.db --writers 8 --ops 1000
+
+# Concurrent client-side read-modify-write edits to one document (read rev,
+# write rev + 1); asserts the final rev == writers × ops (no lost edit — proof
+# snapshot isolation conflicts the colliding commits).
+$BIN document-editing --url file:///tmp/bench.db --writers 8 --ops 1000
 ```
+
+A test-only `--inject-fault lost-update` hook makes `counter` deliberately drop
+one acked increment, so the suite can prove the checker itself bites: a seeded
+violation must exit 2, not pass.
 
 ### Release comparison (CI regression gate)
 

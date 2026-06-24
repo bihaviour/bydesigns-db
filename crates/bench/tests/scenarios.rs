@@ -87,6 +87,81 @@ fn bank_transfer_profile_passes_when_balance_is_conserved() {
 }
 
 #[test]
+fn inventory_profile_passes_with_no_oversell() {
+    // Stock is seeded to exactly writers * ops; every decrement must succeed and
+    // the shelf must land at exactly zero (no lost decrement, no negative stock).
+    let url = unique_url();
+    let code = run_cli(&argv(&[
+        "inventory",
+        "--url",
+        &url,
+        "--writers",
+        "4",
+        "--ops",
+        "80",
+        "--json",
+    ]));
+    assert_eq!(code, exit::OK, "inventory must sell each unit exactly once");
+}
+
+#[test]
+fn document_editing_profile_passes_with_no_lost_edit() {
+    // Concurrent client-side read-modify-write edits to one row: snapshot isolation
+    // must conflict any colliding commit so no edit is lost → final rev == work.
+    let url = unique_url();
+    let code = run_cli(&argv(&[
+        "document-editing",
+        "--url",
+        &url,
+        "--writers",
+        "4",
+        "--ops",
+        "60",
+        "--json",
+    ]));
+    assert_eq!(code, exit::OK, "every concurrent edit must be preserved");
+}
+
+#[test]
+fn seeded_lost_update_violation_exits_two() {
+    // The negative case: inject a real lost update (one acked increment dropped)
+    // and prove the no-lost-update checker catches it and fails the run with the
+    // correctness exit code (2) — not a clean exit, however fast the run was.
+    let url = unique_url();
+    let code = run_cli(&argv(&[
+        "counter",
+        "--url",
+        &url,
+        "--writers",
+        "2",
+        "--ops",
+        "50",
+        "--inject-fault",
+        "lost-update",
+        "--json",
+    ]));
+    assert_eq!(
+        code,
+        exit::CORRECTNESS,
+        "a seeded lost update must fail the correctness gate"
+    );
+}
+
+#[test]
+fn unknown_fault_kind_is_a_config_error() {
+    assert_eq!(
+        run_cli(&argv(&[
+            "counter",
+            "--url",
+            "file:///tmp/x.db",
+            "--inject-fault",
+            "bogus",
+        ])),
+        exit::CONFIG
+    );
+}
+
+#[test]
 fn missing_url_is_a_config_error() {
     assert_eq!(run_cli(&argv(&["exp1"])), exit::CONFIG);
 }

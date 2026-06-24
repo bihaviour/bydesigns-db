@@ -53,6 +53,8 @@ twill-bench write-heavy --url file://./b.db     # shipped
 twill-bench mixed-oltp --url file://./b.db      # shipped
 twill-bench counter --url file://./b.db         # correctness profile (shipped)
 twill-bench bank-transfer --url file://./b.db   # correctness profile (shipped)
+twill-bench inventory --url file://./b.db       # correctness profile (shipped)
+twill-bench document-editing --url file://./b.db # correctness profile (shipped)
 twill-bench compare --baseline base.json --candidate cand.json   # shipped
 twill-bench burst                               # NEEDS DESIGN (controller in the loop)
 twill-bench scale-to-zero                       # NEEDS DESIGN (spec 09 Exp 5)
@@ -108,7 +110,7 @@ twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)<
 <li><span class="req-tag must">MUST</span> detect: missing rows, duplicate rows, lost updates, dirty reads, non-repeatable reads, phantom reads, serializable violations, and transaction-consistency breaks.</li>
 <li><span class="req-tag must">MUST</span> exit non-zero (code 2) when any invariant is violated, regardless of latency.</li>
 </ul>
-<p>Two named, result-checking <em>workload profiles</em> now ship (<code>counter</code>, <code>bank-transfer</code>): each drives a contended fixed-work load, then reads the durable state back and asserts an invariant, setting a correctness verdict that the CLI turns into exit code 2 on violation. They build on what <code>exp3</code> proved informally — first-committer-wins conflicts are counted and retried (over pgwire the conflict surfaces as SQLSTATE <code>40001</code>), and the conformance and group-commit suites prove durability and isolation at the crate level — and lift it into an explicit pass/fail assertion over the result set.</p>
+<p>All four named, result-checking <em>workload profiles</em> now ship (<code>counter</code>, <code>bank-transfer</code>, <code>inventory</code>, <code>document-editing</code>): each drives a contended fixed-work load, then reads the durable state back and asserts an invariant, setting a correctness verdict that the CLI turns into exit code 2 on violation. They build on what <code>exp3</code> proved informally — first-committer-wins conflicts are counted and retried (over pgwire the conflict surfaces as SQLSTATE <code>40001</code>), and the conformance and group-commit suites prove durability and isolation at the crate level — and lift it into an explicit pass/fail assertion over the result set. Because all four are <em>fixed-work</em> (each writer does exactly <code>--ops</code> operations), the expected result is known exactly, so the assertion is a precise equality rather than a heuristic. A test-only <code>--inject-fault lost-update</code> hook deliberately drops one acked write so the negative test can prove the checker itself bites — a seeded violation must exit 2, not pass.</p>
 
 <h3>Workload profiles</h3>
 <div class="table-wrap">
@@ -117,8 +119,8 @@ twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)<
 <tbody>
 <tr><td><strong>bank-transfer</strong> <span class="req-tag must">IMPLEMENTED</span></td><td>concurrent atomic transfers between two accounts</td><td>ACID, balance invariant (sum conserved), transaction correctness</td></tr>
 <tr><td><strong>counter</strong> <span class="req-tag must">IMPLEMENTED</span></td><td>thousands of concurrent increments</td><td>atomicity, zero lost updates (generalizes <code>exp3</code>)</td></tr>
-<tr><td><strong>inventory</strong></td><td>concurrent stock decrements</td><td>no negative inventory, optimistic-lock conflict handling</td></tr>
-<tr><td><strong>document-editing</strong></td><td>concurrent updates to one document</td><td>conflict rate, merge/retry latency, retry behaviour</td></tr>
+<tr><td><strong>inventory</strong> <span class="req-tag must">IMPLEMENTED</span></td><td>concurrent stock decrements (read → refuse-oversell → decrement, in a txn)</td><td>no negative inventory (no oversell), optimistic-lock conflict handling</td></tr>
+<tr><td><strong>document-editing</strong> <span class="req-tag must">IMPLEMENTED</span></td><td>concurrent client-side read-modify-write edits to one document</td><td>no lost edit under concurrent RMW, conflict rate, merge/retry latency</td></tr>
 </tbody>
 </table>
 </div>
@@ -169,7 +171,7 @@ twill-bench custom --profile workload.yaml      # NEEDS DESIGN (profile loader)<
 <tr><td>Group-commit + contention experiments</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>maps to spec 09 Exp 1–3; conflict retry proven</td></tr>
 <tr><td>Crash-safety gate</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>spec 09 Exp 4, in <code>crates/storage</code> (CI gate), not yet a bench subcommand</td></tr>
 <tr><td>Request-mix scenarios (read/write/mixed)</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>read-heavy</code>/<code>write-heavy</code>/<code>mixed-oltp</code> — ratio-controlled SELECT/INSERT/UPDATE/DELETE over a seeded working set</td></tr>
-<tr><td>Correctness workload profiles</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>counter</code>/<code>bank-transfer</code> — assert the invariant, exit code 2 on violation</td></tr>
+<tr><td>Correctness workload profiles</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>counter</code>/<code>bank-transfer</code>/<code>inventory</code>/<code>document-editing</code> — assert the invariant, exit code 2 on violation; a seeded-violation negative test (<code>--inject-fault</code>) proves the checker bites</td></tr>
 <tr><td>Release comparison</td><td><span class="req-tag must">IMPLEMENTED</span></td><td><code>compare</code> post-processes two archived JSON records into a PASS/regression verdict</td></tr>
 <tr><td>Exit-code contract, <code>--json</code> sole payload, p90/p95</td><td><span class="req-tag must">IMPLEMENTED</span></td><td>0–4 exit table, <code>--json</code>, widened percentiles + ok/conflict/failure split</td></tr>
 <tr><td>Cold-read / scale-to-zero scenario (Exp 5)</td><td><span class="req-tag may">NEEDS DESIGN</span></td><td>spec 09 SHOULD; needs controller in the loop</td></tr>

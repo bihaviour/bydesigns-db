@@ -5,7 +5,7 @@
 //! [`Report::correctness`], which the CLI turns into [`exit::CORRECTNESS`](crate::exit::CORRECTNESS)
 //! (exit code 2) when the invariant is violated, however good the latency was.
 //!
-//! Both profiles are fixed-work (each writer does `--ops` operations) so the
+//! All four profiles are fixed-work (each writer does `--ops` operations) so the
 //! expected result is known exactly:
 //!
 //!   * **counter** — N writers each increment one shared row `--ops` times; the
@@ -14,19 +14,34 @@
 //!   * **bank-transfer** — N writers move random amounts between two accounts in
 //!     atomic transactions; the summed balance MUST equal the seeded total
 //!     (value is conserved — no torn or partial transfer).
+//!   * **inventory** — N writers each decrement one shared stock row `--ops`
+//!     times in a transaction that reads, refuses to oversell, then decrements;
+//!     seeded with exactly `writers × ops` units, the shelf MUST land at exactly
+//!     `0` — no decrement lost, no stock driven negative.
+//!   * **document-editing** — N writers each apply `--ops` edits to one shared
+//!     document, each edit a client-side read-modify-write (read `rev`, write
+//!     `rev + 1`); the final `rev` MUST equal `writers × ops`. Two writers that
+//!     read the same revision would silently lose an edit unless snapshot
+//!     isolation conflicts the second commit — that the total holds proves it does.
 //!
 //! Conflicts are retried (the contended path never gives up), so a violation can
 //! only come from a real isolation/durability bug, not from losing a race.
+//!
+//! To prove the checkers themselves bite, `--inject-fault lost-update` (test-only)
+//! makes `counter` deliberately drop one acked increment, so the negative test can
+//! confirm a violated invariant maps to [`exit::CORRECTNESS`](crate::exit::CORRECTNESS).
 
 use crate::hist::Histogram;
 use crate::workload::Rng;
 use crate::{
-    resolve_target, run_nonce, url_scheme, BenchError, Correctness, Opts, Outcome, Report, Target,
-    Writer, TABLE_COUNTER,
+    resolve_target, run_nonce, url_scheme, BenchError, Correctness, Fault, Opts, Outcome, Report,
+    Target, Writer, TABLE_COUNTER,
 };
 use std::time::Instant;
 
 const TABLE_ACCOUNTS: &str = "bench_accounts";
+const TABLE_INVENTORY: &str = "bench_inventory";
+const TABLE_DOCUMENT: &str = "bench_document";
 /// Seeded balance per account — large enough that random transfers never drive a
 /// balance negative within a run, so the only invariant under test is conservation.
 const ACCOUNT_START: i64 = 1_000_000;
@@ -70,6 +85,16 @@ pub(crate) fn run_counter(opts: &Opts) -> Result<Report, BenchError> {
     });
 
     let (hist, conflicts) = merge_tallies(tallies)?;
+
+    // Test-only fault injection: deliberately drop one acked increment so the
+    // negative test can prove the no-lost-update checker fails the run (exit 2) on
+    // a real anomaly — an acked write that didn't survive — rather than only ever
+    // exercising the PASS path on a correct engine.
+    if opts.inject_fault == Some(Fault::LostUpdate) {
+        let _ = setup.exec(&format!(
+            "UPDATE {TABLE_COUNTER} SET n = n - 1 WHERE id = 1"
+        ));
+    }
 
     // Assert: the durable counter equals exactly the work performed.
     let expected = (opts.writers as i64) * (ops as i64);
@@ -236,6 +261,199 @@ fn transfer(conn: &mut Writer, rng: &mut Rng) -> Unit {
             }
         }
     }
+    commit(conn)
+}
+
+/// `inventory`: N writers each decrement one shared stock row, in a transaction
+/// that reads the shelf, refuses to oversell, then decrements. Seeded with exactly
+/// `writers × ops` units; assert the shelf lands at exactly `0` (no decrement lost,
+/// no stock driven negative).
+pub(crate) fn run_inventory(opts: &Opts) -> Result<Report, BenchError> {
+    let target = resolve_target(opts)?;
+
+    let mut setup = target.open()?;
+    ddl(
+        &mut setup,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {TABLE_INVENTORY} (id INTEGER PRIMARY KEY, qty INTEGER)"
+        ),
+    )?;
+    // Seed exactly enough stock that every decrement succeeds and the shelf lands
+    // at exactly zero — so a lost decrement (final > 0) or an oversell (a negative,
+    // refused structurally by the read-guard) is the only way the invariant breaks.
+    let stock = (opts.writers as i64) * (opts.ops as i64);
+    reset_row(
+        &mut setup,
+        &format!("UPDATE {TABLE_INVENTORY} SET qty = {stock} WHERE id = 1"),
+        &format!("INSERT INTO {TABLE_INVENTORY} VALUES (1, {stock})"),
+    )?;
+
+    let ops = opts.ops;
+    let (tallies, elapsed) = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..opts.writers)
+            .map(|_| {
+                let target = target.clone();
+                scope.spawn(move || fixed_work(&target, ops, decrement))
+            })
+            .collect();
+        let start = Instant::now();
+        let tallies: Vec<Result<WorkTally, BenchError>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        (tallies, start.elapsed())
+    });
+
+    let (hist, conflicts) = merge_tallies(tallies)?;
+
+    // Assert: every unit was sold exactly once — the shelf is empty, never negative.
+    let qty = setup
+        .query_i64(&format!("SELECT qty FROM {TABLE_INVENTORY} WHERE id = 1"))
+        .map_err(BenchError::Run)?;
+    let correctness = Correctness {
+        name: "no-oversell",
+        passed: qty == 0,
+        detail: format!("expected 0, got {qty}"),
+    };
+
+    Ok(report(
+        opts,
+        "inventory",
+        elapsed,
+        &hist,
+        conflicts,
+        correctness,
+    ))
+}
+
+/// `document-editing`: N writers each apply `--ops` edits to one shared document,
+/// each edit a client-side read-modify-write (read `rev`, write `rev + 1`); assert
+/// the final `rev` equals `writers × ops` (no lost edit under concurrent RMW).
+pub(crate) fn run_document_editing(opts: &Opts) -> Result<Report, BenchError> {
+    let target = resolve_target(opts)?;
+
+    let mut setup = target.open()?;
+    ddl(
+        &mut setup,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {TABLE_DOCUMENT} (id INTEGER PRIMARY KEY, rev INTEGER)"
+        ),
+    )?;
+    reset_row(
+        &mut setup,
+        &format!("UPDATE {TABLE_DOCUMENT} SET rev = 0 WHERE id = 1"),
+        &format!("INSERT INTO {TABLE_DOCUMENT} VALUES (1, 0)"),
+    )?;
+
+    let ops = opts.ops;
+    let (tallies, elapsed) = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..opts.writers)
+            .map(|_| {
+                let target = target.clone();
+                scope.spawn(move || fixed_work(&target, ops, edit))
+            })
+            .collect();
+        let start = Instant::now();
+        let tallies: Vec<Result<WorkTally, BenchError>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        (tallies, start.elapsed())
+    });
+
+    let (hist, conflicts) = merge_tallies(tallies)?;
+
+    // Assert: every edit landed — the revision counts exactly the work performed.
+    let expected = (opts.writers as i64) * (ops as i64);
+    let rev = setup
+        .query_i64(&format!("SELECT rev FROM {TABLE_DOCUMENT} WHERE id = 1"))
+        .map_err(BenchError::Run)?;
+    let correctness = Correctness {
+        name: "no-lost-edit",
+        passed: rev == expected,
+        detail: format!("expected {expected}, got {rev}"),
+    };
+
+    Ok(report(
+        opts,
+        "document-editing",
+        elapsed,
+        &hist,
+        conflicts,
+        correctness,
+    ))
+}
+
+/// One stock decrement: read the shelf inside a transaction, refuse to oversell
+/// (the "no negative inventory" guard), then decrement. A conflict rolls the whole
+/// unit back and retries, so the decrement is all-or-nothing.
+fn decrement(conn: &mut Writer) -> Unit {
+    if let Outcome::Fatal(m) = conn.exec("BEGIN") {
+        return Unit::Fatal(m);
+    }
+    let qty = match conn.query_i64(&format!("SELECT qty FROM {TABLE_INVENTORY} WHERE id = 1")) {
+        Ok(q) => q,
+        Err(m) => {
+            let _ = conn.exec("ROLLBACK");
+            return Unit::Fatal(m);
+        }
+    };
+    if qty < 1 {
+        // Seeded with exactly enough stock, so an empty shelf before all units are
+        // sold means a decrement was double-applied — a real oversell bug, not a
+        // race. Surface it rather than overselling into the negative.
+        let _ = conn.exec("ROLLBACK");
+        return Unit::Fatal(format!(
+            "oversold: stock reached {qty} before all decrements applied"
+        ));
+    }
+    match conn.exec(&format!(
+        "UPDATE {TABLE_INVENTORY} SET qty = qty - 1 WHERE id = 1"
+    )) {
+        Outcome::Ok => {}
+        Outcome::Conflict => {
+            let _ = conn.exec("ROLLBACK");
+            return Unit::Conflict;
+        }
+        Outcome::Fatal(m) => {
+            let _ = conn.exec("ROLLBACK");
+            return Unit::Fatal(m);
+        }
+    }
+    commit(conn)
+}
+
+/// One document edit: a client-side read-modify-write. Read the current revision,
+/// then write `rev + 1` computed *in the client* — so two writers that read the
+/// same revision would both write the same next one, losing an edit, unless the
+/// engine conflicts the second commit. The conflict rolls back and retries.
+fn edit(conn: &mut Writer) -> Unit {
+    if let Outcome::Fatal(m) = conn.exec("BEGIN") {
+        return Unit::Fatal(m);
+    }
+    let rev = match conn.query_i64(&format!("SELECT rev FROM {TABLE_DOCUMENT} WHERE id = 1")) {
+        Ok(r) => r,
+        Err(m) => {
+            let _ = conn.exec("ROLLBACK");
+            return Unit::Fatal(m);
+        }
+    };
+    match conn.exec(&format!(
+        "UPDATE {TABLE_DOCUMENT} SET rev = {} WHERE id = 1",
+        rev + 1
+    )) {
+        Outcome::Ok => {}
+        Outcome::Conflict => {
+            let _ = conn.exec("ROLLBACK");
+            return Unit::Conflict;
+        }
+        Outcome::Fatal(m) => {
+            let _ = conn.exec("ROLLBACK");
+            return Unit::Fatal(m);
+        }
+    }
+    commit(conn)
+}
+
+/// COMMIT the current transaction, mapping a conflict into a rollback + retry
+/// signal (so the caller's fixed-work loop re-runs the whole unit).
+fn commit(conn: &mut Writer) -> Unit {
     match conn.exec("COMMIT") {
         Outcome::Ok => Unit::Ok,
         Outcome::Conflict => {
