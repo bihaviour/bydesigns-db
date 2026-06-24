@@ -26,9 +26,10 @@
 //!     group-commit curve, and contention wall.
 //!   * **request-mix scenarios** (`read-heavy`/`write-heavy`/`mixed-oltp`) — named
 //!     workload shapes driving a ratio-controlled SELECT/INSERT/UPDATE/DELETE mix.
-//!   * **correctness profiles** (`counter`/`bank-transfer`) — drive a contended
-//!     workload, then assert an ACID invariant over the result (no lost update,
-//!     conserved balance) and exit non-zero on violation.
+//!   * **correctness profiles** (`counter`/`bank-transfer`/`inventory`/
+//!     `document-editing`) — drive a contended workload, then assert an ACID
+//!     invariant over the result (no lost update, conserved balance, no oversell,
+//!     no lost edit) and exit non-zero on violation.
 //!   * **release comparison** (`compare`) — diff two archived JSON records into a
 //!     PASS/regression verdict.
 
@@ -145,6 +146,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         "mixed-oltp" => workload::run_scenario(workload::Scenario::MixedOltp, &opts),
         "counter" => correctness::run_counter(&opts),
         "bank-transfer" => correctness::run_bank_transfer(&opts),
+        "inventory" => correctness::run_inventory(&opts),
+        "document-editing" => correctness::run_document_editing(&opts),
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
@@ -211,13 +214,31 @@ fn parse_transport(s: &str) -> Result<Transport, String> {
     }
 }
 
+/// Test-only fault injection for validating the correctness checkers themselves.
+/// `--inject-fault lost-update` makes a correctness profile deliberately drop one
+/// acked write, so the negative test can prove a violated invariant maps to
+/// [`exit::CORRECTNESS`] rather than only ever exercising the PASS path on a
+/// correct engine. Undocumented in `--help`: it is a QA hook, not a user feature.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    LostUpdate,
+}
+
+fn parse_fault(s: &str) -> Result<Fault, String> {
+    match s {
+        "lost-update" => Ok(Fault::LostUpdate),
+        other => Err(format!("invalid --inject-fault '{other}'")),
+    }
+}
+
 pub(crate) struct Opts {
     pub url: String,
     pub writers: usize,
     pub warmup: Duration,
     pub duration: Duration,
     /// Per-writer operation count for the fixed-work correctness profiles
-    /// (`counter`/`bank-transfer`), where the expected result must be known.
+    /// (`counter`/`bank-transfer`/`inventory`/`document-editing`), where the
+    /// expected result must be known exactly.
     pub ops: u64,
     /// Pre-seeded row count for the request-mix scenarios' working set.
     pub rows: u64,
@@ -228,6 +249,9 @@ pub(crate) struct Opts {
     /// `Some(addr)` drives an already-running `engine-server` over pgwire;
     /// `None` (with `--transport pgwire`) spins one up in-process.
     pub server: Option<String>,
+    /// Test-only fault to inject into a correctness profile (see [`Fault`]);
+    /// `None` in every real run.
+    pub inject_fault: Option<Fault>,
 }
 
 impl Opts {
@@ -242,6 +266,7 @@ impl Opts {
         let mut transport = Transport::Embedded;
         let mut json = false;
         let mut server = None;
+        let mut inject_fault = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -269,6 +294,7 @@ impl Opts {
                 "--label" => label = val()?,
                 "--transport" => transport = parse_transport(&val()?)?,
                 "--server" => server = Some(val()?),
+                "--inject-fault" => inject_fault = Some(parse_fault(&val()?)?),
                 other => return Err(format!("unknown flag {other}")),
             }
             i += 2;
@@ -290,6 +316,7 @@ impl Opts {
             transport,
             json,
             server,
+            inject_fault,
         })
     }
 }
@@ -717,6 +744,8 @@ fn print_help() {
          CORRECTNESS PROFILES (assert an invariant; exit 2 on violation):\n\
          \x20 counter         N writers increment one row; asserts zero lost updates\n\
          \x20 bank-transfer   concurrent transfers; asserts the summed balance is conserved\n\
+         \x20 inventory       concurrent stock decrements; asserts no oversell (no negative stock)\n\
+         \x20 document-editing concurrent edits to one row (read-modify-write); asserts no lost edit\n\
          \n\
          RELEASE COMPARISON:\n\
          \x20 compare --baseline <FILE> --candidate <FILE> [--threshold <FRAC>]\n\
