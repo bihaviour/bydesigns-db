@@ -686,6 +686,12 @@ pub(crate) struct Lifecycle {
     pub admission_wait_us: u64,
     /// Lease heartbeats observed over the run.
     pub lease_renews: u64,
+    /// Backend page versions fetched across the cold reads — the numerator of
+    /// `storage_reads_per_query`, pulled from `EngineStats.storage` (the
+    /// `StorageStats` snapshot) after each warm read. `0` on the embedded
+    /// `file://` path (the in-memory store serves the read with no backend
+    /// fetch); nonzero on an object store with a cold cache.
+    pub page_reads: u64,
     /// Cold reads driven (one per cycle) — the denominator for per-query figures.
     pub queries: u64,
 }
@@ -705,6 +711,36 @@ impl Lifecycle {
     fn compute_seconds_per_query(&self) -> f64 {
         if self.queries > 0 {
             (self.compute_active_us as f64 / 1e6) / self.queries as f64
+        } else {
+            0.0
+        }
+    }
+    /// `storage_reads_per_query` = backend page reads / cold reads driven — how
+    /// much the storage layer was hit per query. `0.0` when the warm in-memory
+    /// store satisfied every read without a backend fetch (the `file://` path).
+    fn storage_reads_per_query(&self) -> f64 {
+        if self.queries > 0 {
+            self.page_reads as f64 / self.queries as f64
+        } else {
+            0.0
+        }
+    }
+    /// `avg_worker_lifetime` (seconds) = total resident time / workers spawned.
+    /// Each cold start materializes a worker that lives (active + idle) until it
+    /// scales to zero, so `cold_starts` is the worker count. `0.0` if none ran.
+    fn avg_worker_lifetime_s(&self) -> f64 {
+        if self.cold_starts > 0 {
+            ((self.compute_active_us + self.compute_idle_us) as f64 / 1e6) / self.cold_starts as f64
+        } else {
+            0.0
+        }
+    }
+    /// `worker_reuse_ratio` = warm starts / all starts; the share of `start`
+    /// calls that hit an already-warm instance. `0.0` if nothing started.
+    fn worker_reuse_ratio(&self) -> f64 {
+        let starts = (self.cold_starts + self.warm_starts) as f64;
+        if starts > 0.0 {
+            self.warm_starts as f64 / starts
         } else {
             0.0
         }
@@ -788,9 +824,19 @@ impl Report {
                     l.lease_renews,
                 );
                 println!(
-                    "efficiency   utilization={:.3}  compute_s/query={:.6}",
+                    "reuse        worker_reuse_ratio={:.3}  storage_reads={}",
+                    l.worker_reuse_ratio(),
+                    l.page_reads,
+                );
+                // The serverless-efficiency report (spec 15): operational cost,
+                // pure arithmetic over the controller + storage snapshot deltas.
+                println!(
+                    "efficiency   utilization={:.3}  compute_s/query={:.6}  \
+                     storage_reads/query={:.3}  avg_worker_lifetime={:.3}s",
                     l.utilization(),
                     l.compute_seconds_per_query(),
+                    l.storage_reads_per_query(),
+                    l.avg_worker_lifetime_s(),
                 );
             }
         }
@@ -807,21 +853,29 @@ impl Report {
         let lifecycle = match &self.lifecycle {
             Some(l) => format!(
                 "{{\"twill_cold_start_total\":{},\"twill_warm_start_total\":{},\
+                 \"twill_worker_reuse_ratio\":{:.6},\
                  \"twill_scale_to_zero_total\":{},\"twill_peak_workers\":{},\
                  \"twill_compute_active_seconds_total\":{:.6},\
                  \"twill_compute_idle_seconds_total\":{:.6},\"twill_admission_wait_us\":{},\
-                 \"twill_lease_renew_total\":{},\"utilization\":{:.6},\
-                 \"compute_seconds_per_query\":{:.6}}}",
+                 \"twill_lease_renew_total\":{},\"twill_storage_page_reads_total\":{},\
+                 \"utilization\":{:.6},\"compute_seconds_per_query\":{:.6},\
+                 \"storage_reads_per_query\":{:.6},\"scale_to_zero_count\":{},\
+                 \"avg_worker_lifetime\":{:.6}}}",
                 l.cold_starts,
                 l.warm_starts,
+                l.worker_reuse_ratio(),
                 l.scale_to_zero,
                 l.peak_workers,
                 l.compute_active_us as f64 / 1e6,
                 l.compute_idle_us as f64 / 1e6,
                 l.admission_wait_us,
                 l.lease_renews,
+                l.page_reads,
                 l.utilization(),
                 l.compute_seconds_per_query(),
+                l.storage_reads_per_query(),
+                l.scale_to_zero,
+                l.avg_worker_lifetime_s(),
             ),
             None => "null".to_string(),
         };
@@ -930,4 +984,68 @@ fn print_help() {
          (or reproduce with pgbench) for real-host numbers. Use file:// for a smoke\n\
          run; an object-store URL on a real host for the W1 tail that gates placement."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Lifecycle;
+
+    /// The serverless-efficiency report (spec 15 / #53 step 3) is pure arithmetic
+    /// over the controller + storage snapshot deltas. Pin every derived figure so
+    /// a vocabulary or formula change is a visible test change, not a silent drift.
+    #[test]
+    fn serverless_efficiency_figures_are_exact() {
+        // 4 cold starts, each ~3s active + ~1s idle resident; 4 cold reads, 8
+        // backend page reads total; one warm reuse mixed in.
+        let l = Lifecycle {
+            cold_starts: 4,
+            warm_starts: 1,
+            scale_to_zero: 4,
+            peak_workers: 1,
+            compute_active_us: 12_000_000,
+            compute_idle_us: 4_000_000,
+            admission_wait_us: 0,
+            lease_renews: 2,
+            page_reads: 8,
+            queries: 4,
+        };
+        // utilization = active / (active + idle) = 12 / 16.
+        assert!((l.utilization() - 0.75).abs() < 1e-9);
+        // compute_seconds_per_query = 12s / 4 = 3s.
+        assert!((l.compute_seconds_per_query() - 3.0).abs() < 1e-9);
+        // storage_reads_per_query = 8 reads / 4 = 2.
+        assert!((l.storage_reads_per_query() - 2.0).abs() < 1e-9);
+        // avg_worker_lifetime = (active + idle) / workers = 16s / 4 = 4s.
+        assert!((l.avg_worker_lifetime_s() - 4.0).abs() < 1e-9);
+        // worker_reuse_ratio = warm / (cold + warm) = 1 / 5.
+        assert!((l.worker_reuse_ratio() - 0.2).abs() < 1e-9);
+    }
+
+    /// Every per-unit figure divides by a counter; an empty run (no workers, no
+    /// queries) must yield `0.0`, never a NaN/∞ that would poison the JSON record.
+    #[test]
+    fn serverless_efficiency_figures_are_zero_safe() {
+        let l = Lifecycle {
+            cold_starts: 0,
+            warm_starts: 0,
+            scale_to_zero: 0,
+            peak_workers: 0,
+            compute_active_us: 0,
+            compute_idle_us: 0,
+            admission_wait_us: 0,
+            lease_renews: 0,
+            page_reads: 0,
+            queries: 0,
+        };
+        for v in [
+            l.utilization(),
+            l.compute_seconds_per_query(),
+            l.storage_reads_per_query(),
+            l.avg_worker_lifetime_s(),
+            l.worker_reuse_ratio(),
+        ] {
+            assert_eq!(v, 0.0);
+            assert!(v.is_finite());
+        }
+    }
 }

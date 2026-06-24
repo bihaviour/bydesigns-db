@@ -64,6 +64,13 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
     let start = ctrl.stats();
     let mut hist = Histogram::new();
     let mut queries = 0u64;
+    // Backend page reads observed across the cold reads — the storage-side
+    // numerator of the serverless-efficiency report (`storage_reads_per_query`).
+    // Each cold start gets a fresh storage with zeroed counters, so the per-read
+    // snapshot is exactly that instance's reads; summing across cycles totals the
+    // run. `0` on `file://` (the in-memory store serves the read), nonzero on an
+    // object store with a cold cache.
+    let mut page_reads = 0u64;
     let run_start = Instant::now();
 
     for c in 0..opts.cycles {
@@ -77,7 +84,7 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
         let lease = ctrl
             .start(&url)
             .map_err(|e| BenchError::Run(format!("cycle {c}: cold start: {e}")))?;
-        let got = cold_read(&url)?;
+        let (got, reads) = cold_read(&url)?;
         let cold_us = t0.elapsed().as_micros() as u64;
         if got != opts.rows {
             return Err(BenchError::Run(format!(
@@ -87,6 +94,7 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
             )));
         }
         hist.record(cold_us);
+        page_reads += reads;
         queries += 1;
         drop(lease); // release so the reaper can idle it out → scale to zero
     }
@@ -114,6 +122,7 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
         lease_renews: end
             .lease_renew_total
             .saturating_sub(start.lease_renew_total),
+        page_reads,
         queries,
     };
 
@@ -164,15 +173,18 @@ fn seed(url: &str, tag: u128, rows: u64) -> Result<(), BenchError> {
 
 /// Open a fresh connection (sharing the just-warmed instance via the engine's
 /// registry — no second cold start) and count the seeded rows, exercising the
-/// read path on the cold instance. Dropping the connection lets the instance
-/// idle out.
-fn cold_read(url: &str) -> Result<u64, BenchError> {
+/// read path on the cold instance. Returns the row count and the backend page
+/// reads the read incurred, pulled from the engine's `EngineStats` snapshot
+/// (the storage-side input to the serverless-efficiency report). Dropping the
+/// connection lets the instance idle out.
+fn cold_read(url: &str) -> Result<(u64, u64), BenchError> {
     let mut conn =
         Connection::open(url).map_err(|e| BenchError::Connection(format!("open {url}: {e}")))?;
     let rs = conn
         .query(&format!("SELECT k FROM {TABLE}"))
         .map_err(|e| BenchError::Run(format!("cold read: {e}")))?;
-    Ok(rs.rows.len() as u64)
+    let page_reads = conn.stats().storage.page_reads;
+    Ok((rs.rows.len() as u64, page_reads))
 }
 
 /// Block until the controller has scaled `url` to zero (status `Cold` or never
