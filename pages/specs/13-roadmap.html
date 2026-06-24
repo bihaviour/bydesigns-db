@@ -17,7 +17,7 @@
 <div class="spec-meta">
 <span class="badge badge-id">13</span>
 <span class="badge badge-status status-draft">Draft v0.1</span>
-<span class="spec-date">Updated 2026-06-20</span>
+<span class="spec-date">Updated 2026-06-24</span>
 </div>
 <h1>Roadmap &amp; Build Sequence</h1>
 <p class="lede">A strictly additive, four-phase delivery plan that ships the smallest embeddable thing first and bolts on disaggregation, server mode, and the lifecycle controller in turn — so storage choice stays a connection-string flip rather than a rewrite, and every phase exits to a working, demonstrable product.</p>
@@ -29,7 +29,7 @@
 <p>It does <strong>not</strong> redefine component internals — those live in the per-component specs (<a href="02-engine-core.html">Engine Core</a>, <a href="03-storage-interface.html">Storage Interface</a>, <a href="04-object-storage-backend.html">Object-Storage Backend</a>, and the rest). This page is the schedule and the critical path; the component pages are the blueprints.</p>
 <div class="callout note">
 <p class="callout-title">What this plan governs</p>
-<p>Six phases (embedded library → object storage → server mode → controller → optional capabilities → SQL surface completeness), a build-vs-buy shopping list that says which slots to build and which to inherit, the inter-phase critical path, a per-phase Definition of Done, and a milestone table. Phases gate on the experiments defined in the <a href="09-benchmark-plan.html">Benchmark Plan</a>.</p>
+<p>Six implemented phases (embedded library → object storage → server mode → controller → optional capabilities → SQL surface completeness) plus a proposed Phase 7 (row-level security &amp; session authorization), a build-vs-buy shopping list that says which slots to build and which to inherit, the inter-phase critical path, a per-phase Definition of Done, and a milestone table. Phases gate on the experiments defined in the <a href="09-benchmark-plan.html">Benchmark Plan</a>.</p>
 </div>
 </section>
 
@@ -262,6 +262,45 @@ const rows = await sql`select 1 as n`;</code></pre>
 </section>
 
 <section>
+<h2>Phase 7 — Row-level security &amp; session authorization <span class="badge badge-status status-draft">Proposed (spec 17)</span></h2>
+<p><span class="pill blue">frontend + executor</span> <span class="pill amber">proposed</span> <span class="pill green">seam unchanged</span> Bring Supabase-style row-level security to Twill, resolving the open authorization question carried over from <a href="12-capabilities.html">Capabilities</a>. RLS is split along the build-in-vs-compose seam: the <em>per-row enforcement predicate</em> is an execution capability built <strong>into</strong> the engine, while <em>JWT verification, identity, and policy authoring</em> stay composed <strong>around</strong> it. Enforcement is the database's job; identity is the boundary's job — exactly the division Postgres+Supabase use. Like Phase 6 it is additive <code>sql.rs</code>→<code>exec.rs</code> growth (reusing 6E's <code>SET</code> handling and the Phase-3 per-statement principal) plus one backward-compatible catalog fact, so the storage seam never moves; unlike Phase 6 it adds a security guarantee, so it carries its own gate. The full design is in <a href="17-row-level-security.html">Row-Level Security (Proposal)</a>.</p>
+<div class="callout warning">
+<p class="callout-title">Proposed, not yet committed</p>
+<p>Phases 1–6 are implemented; Phase 7 is a <span class="badge badge-status status-draft">Proposal v0.1</span> awaiting engineering sign-off. It is recorded here as the additive slot the RLS proposal targets, not as ratified scope. The deciding-rule classification, rejected alternatives, and normative requirements live in <a href="17-row-level-security.html">spec 17</a>.</p>
+</div>
+<h3>Why enforcement must be in-core</h3>
+<p>A predicate enforced <em>above</em> the engine only protects the one path through that layer; the moment any other client speaks to the engine — a second pg-wire tool, a direct embedded FFI call, a branch opened for debugging — the filter is gone and every row is visible. Row-level security is only a <em>security</em> property if it is enforced at the lowest common chokepoint every query passes through. In this architecture that chokepoint is the executor, not any composed layer above it — the same reasoning that put MVCC visibility in the executor rather than a client library. Composed <em>identity</em> is fine (every path must still present a principal); composed <em>enforcement</em> is not.</p>
+<h3>Invariants the phase preserves</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> build only enforcement (the per-row predicate + the session-principal read) into the engine; JWT verification, secret handling, role management, and policy-authoring UX stay composed (better-auth / the wire boundary), never the engine core.</li>
+<li><span class="req-tag must">MUST</span> leave the <code>Storage</code> trait unchanged — <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>, the C1–C8 conformance suite and the branching battery stay green; policies are additive WAL catalog facts, not a side file.</li>
+<li><span class="req-tag should">SHOULD</span> keep the C ABI frozen at <code>ENGINE_ABI_VERSION</code> <code>3</code> by flowing the session context through the existing 6E <code>SET</code> path rather than a new hot-path export.</li>
+<li><span class="req-tag must-not">MUST NOT</span> rely on a composed layer for enforcement; a policy some client path can skip is not a guarantee.</li>
+</ul>
+<h3>Deliverables</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> add a per-connection, per-transaction <strong>session context</strong> — a small bag of claims plus an active role, set via the existing <code>SET</code> path and readable inside the executor through tiny <code>auth.uid()</code>/<code>auth.role()</code>/<code>auth.claim()</code> accessors; scoped to the connection, never process-global, and treated as already-trusted opaque input the engine never re-verifies.</li>
+<li><span class="req-tag must">MUST</span> implement policy DDL — <code>ALTER TABLE … ENABLE ROW LEVEL SECURITY</code> and <code>CREATE POLICY … FOR … TO … USING (…) WITH CHECK (…)</code> — persisted as an additive <code>CreatePolicy</code> WAL fact (predicate AST + command + roles), exposed via <code>Connection::catalog</code> and rebuilt by replay, autocommit-only like other DDL.</li>
+<li><span class="req-tag must">MUST</span> implement <strong>executor enforcement</strong>: AND the matching policies' <code>USING</code> predicate into every read of a protected table — base scans, join inputs, subqueries, and the row set feeding <code>RETURNING</code> — over the same MVCC snapshot, and reject any write failing <code>WITH CHECK</code> before its WAL op is emitted, so a denied write never becomes durable.</li>
+<li><span class="req-tag should">SHOULD</span> default-deny once RLS is enabled and no policy grants access, matching Postgres semantics (enable = "deny all" until a policy opens a hole).</li>
+<li><span class="req-tag may">MAY</span> provide a privileged owner/maintenance bypass (compaction, replay), gated explicitly and off by default.</li>
+</ul>
+<h3>Specs it draws on</h3>
+<p><a href="17-row-level-security.html">Row-Level Security (Proposal)</a> (the placement, design, and normative requirements) · <a href="12-capabilities.html">Capabilities</a> (the deciding rule and the open authorization question this resolves) · <a href="07-server-mode.html">Server Mode &amp; Wire Protocol</a> ("auth per-connection, authorization per-statement" — the principal the executor reads) · <a href="02-engine-core.html">Engine Core</a> (the parser → executor the predicate extends, over the same MVCC snapshot).</p>
+<h3>Exit criteria &amp; gate</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> pass a <strong>security-focused bypass battery</strong>: an unfiltered-access attempt across <em>every</em> client path (FFI, pgwire, branch) returns only authorized rows; denied writes never reach the WAL; enforcement is identical in embedded and server mode.</li>
+<li><span class="req-tag must">MUST</span> show policies <strong>branch and PITR-restore with the database</strong>: a branch inherits then independently diverges its parent's policies with no pages copied, and point-in-time recovery restores the policy set in effect at an LSN.</li>
+<li><span class="req-tag must">MUST</span> demonstrate unmodified <strong>PostgREST + a composed identity layer</strong> (better-auth or a JWT shim) delivering the Supabase experience end-to-end: one REST surface, safe for untrusted clients, filtered by engine-enforced policies — with FK-embedding sub-queries filtered by the embedded table's policies too.</li>
+<li><span class="req-tag should">SHOULD</span> keep <code>STORAGE_TRAIT_VERSION</code> at <code>2</code> and the C ABI frozen, proving (as Phase 6 did) the capability is pure frontend/executor growth over an unmoved seam, with engine tests that would fail without it and a green <code>bun test</code> after a release rebuild.</li>
+</ul>
+<div class="callout note">
+<p class="callout-title">Open questions still on the proposal</p>
+<p>Per-row predicate cost (caching / index-aware pushdown), the exact <code>auth.*</code> accessor surface, role-model depth (flat Supabase-style roles vs. hierarchies, which edges toward the deliberately out-of-scope <code>GRANT</code> surface), and how the privileged bypass is itself authenticated — all tracked in <a href="17-row-level-security.html">spec 17 §Open questions</a> and to be settled before sign-off promotes this from Proposal to In review.</p>
+</div>
+</section>
+
+<section>
 <h2>Build-vs-buy shopping list</h2>
 <p>Per slot: whether to build from scratch, and the existing piece to start from (2026). The two <span class="pill build">build</span> slots — the storage trait and the Bun binding — are the load-bearing original work; almost everything else is inherited or adapted.</p>
 <div class="table-wrap">
@@ -344,8 +383,9 @@ P3 engine-server + pgwire   P4 controller (idle-stop, branch, CAS fence)
                    ▼
 P5 (optional) vector-in-core · compose better-auth / PostgREST / DuckDB
 P6 SQL surface completeness — 6A–6E   [frontend only; parallel to P5, seam unchanged]
+P7 (proposed) row-level security        [frontend + executor; builds on 6E SET + P3 principal]
 </pre>
-<p class="diagram-caption">Backbone is serial (P1 → P2 → {P3, P4}); the CAS log built in P2 is the shared prerequisite for both server-mode fencing and the controller's fence token. P5 and P6 are additive layers on the shipped engine — capabilities and SQL surface — that move no seam.</p>
+<p class="diagram-caption">Backbone is serial (P1 → P2 → {P3, P4}); the CAS log built in P2 is the shared prerequisite for both server-mode fencing and the controller's fence token. P5, P6, and the proposed P7 are additive layers on the shipped engine — capabilities, SQL surface, and engine-native authorization — that move no seam.</p>
 </div>
 </section>
 
@@ -365,6 +405,8 @@ P6 SQL surface completeness — 6A–6E   [frontend only; parallel to P5, seam u
 <dd>Vector type + HNSW index behind the <code>Storage</code> trait, branching with the DB; better-auth / PostgREST / DuckDB composed against the shared object-storage floor without modifying the engine core.</dd>
 <dt>Phase 6 DoD</dt>
 <dd>Stages 6A–6E land independently, each with engine tests that would fail without it and a green <code>bun test</code> after a release rebuild; the C1–C8 conformance suite, the branching battery, and the Exp 4 crash gate stay green throughout; the compatibility corpus passes as the regression gate. <code>STORAGE_TRAIT_VERSION</code> stays 2 and the C ABI stays frozen.</dd>
+<dt>Phase 7 DoD (proposed)</dt>
+<dd>Session-context primitive, <code>CREATE POLICY</code> / <code>ENABLE ROW LEVEL SECURITY</code> DDL, and executor enforcement ship as additive frontend/executor work plus the <code>CreatePolicy</code> WAL fact; the bypass battery proves every client path (FFI, pgwire, branch) returns only authorized rows and denied writes never reach the WAL; policies branch and PITR-restore with the database; unmodified PostgREST + a composed identity layer deliver the Supabase experience end-to-end. <code>STORAGE_TRAIT_VERSION</code> stays 2 and the C ABI stays frozen.</dd>
 </dl>
 </section>
 
@@ -418,6 +460,13 @@ P6 SQL surface completeness — 6A–6E   [frontend only; parallel to P5, seam u
 <td>Per-stage tests + compatibility corpus</td>
 <td>Real Postgres/SQLite apps run unmodified</td>
 </tr>
+<tr>
+<td><strong>M7 — RLS</strong> (proposed)</td>
+<td>Engine-native row-level security + composed identity</td>
+<td>17, 12, 07, 02</td>
+<td>Bypass battery + branch/PITR + PostgREST e2e</td>
+<td>Supabase-style auth; untrusted clients safe</td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -462,6 +511,7 @@ P6 SQL surface completeness — 6A–6E   [frontend only; parallel to P5, seam u
 <a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">the experiments that gate Phases 2–4 (Exp 1/2/4, Exp 2/3 server, Exp 5 + thundering-herd).</span></a>
 <a class="xref" href="12-capabilities.html"><span class="xref-title">Capabilities: Build-in vs Compose</span><span class="xref-desc">the optional Phase 5 work: vector search in-core, and composing better-auth / PostgREST / DuckDB.</span></a>
 <a class="xref" href="16-sql-compatibility.html"><span class="xref-title">SQL Compatibility &amp; Mapping</span><span class="xref-desc">the Phase 6 stage-by-stage SQL gap map and the dialect decisions shimmed at the pgwire boundary.</span></a>
+<a class="xref" href="17-row-level-security.html"><span class="xref-title">Row-Level Security (Proposal)</span><span class="xref-desc">the proposed Phase 7: engine-native per-row enforcement with composed identity, additive over the unmoved seam.</span></a>
 <a class="xref" href="01-architecture-overview.html"><span class="xref-title">Architecture Overview</span><span class="xref-desc">the three-slot layer map this roadmap delivers slot by slot, phase by phase.</span></a>
 </div>
 </section>
