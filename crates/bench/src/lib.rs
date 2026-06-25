@@ -37,6 +37,7 @@
 //!   * **release comparison** (`compare`) — diff two archived JSON records into a
 //!     PASS/regression verdict.
 
+pub mod burst;
 pub mod compare;
 pub mod correctness;
 pub mod hist;
@@ -154,6 +155,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         "inventory" => correctness::run_inventory(&opts),
         "document-editing" => correctness::run_document_editing(&opts),
         "scale-to-zero" => lifecycle::run_scale_to_zero(&opts),
+        "burst" => burst::run_burst(&opts),
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
@@ -262,9 +264,16 @@ pub(crate) struct Opts {
     /// `scale-to-zero` lifecycle scenario.
     pub cycles: u64,
     /// Idle timeout before the controller's reaper tears a warm instance down,
-    /// for the `scale-to-zero` scenario. Short for a smoke run; spec 09's
-    /// Experiment 5 uses a long (≈10 min) window on a real deployment.
+    /// for the `scale-to-zero` and `burst` scenarios. Short for a smoke run; spec
+    /// 09's Experiment 5 uses a long (≈10 min) window on a real deployment.
     pub idle: Duration,
+    /// Peak offered request rate (rps) for the `burst` scenario — the 20k tier of
+    /// the `idle→500→5k→20k→idle` shape; the lower tiers scale with it.
+    pub peak_rps: f64,
+    /// Ramp duration between `burst` plateaus (the rate-change leg).
+    pub ramp: Duration,
+    /// Dwell at each active `burst` plateau (the hold at a tier rate).
+    pub dwell: Duration,
 }
 
 impl Opts {
@@ -308,6 +317,9 @@ struct RawOpts {
     inject_fault: Option<Fault>,
     cycles: u64,
     idle_ms: u64,
+    peak_rps: f64,
+    ramp_ms: u64,
+    dwell_ms: u64,
 }
 
 impl Default for RawOpts {
@@ -326,6 +338,9 @@ impl Default for RawOpts {
             inject_fault: None,
             cycles: 20,
             idle_ms: 100,
+            peak_rps: 20_000.0,
+            ramp_ms: 50,
+            dwell_ms: 150,
         }
     }
 }
@@ -342,6 +357,9 @@ impl RawOpts {
             "--rows" => self.rows = parse_num(&value, key)?,
             "--cycles" => self.cycles = parse_num(&value, key)?,
             "--idle-ms" => self.idle_ms = parse_num(&value, key)?,
+            "--peak-rps" => self.peak_rps = parse_num(&value, key)?,
+            "--ramp-ms" => self.ramp_ms = parse_num(&value, key)?,
+            "--dwell-ms" => self.dwell_ms = parse_num(&value, key)?,
             "--label" => self.label = value,
             "--transport" => self.transport = parse_transport(&value)?,
             "--server" => self.server = Some(value),
@@ -373,6 +391,13 @@ impl RawOpts {
             inject_fault: self.inject_fault,
             cycles: self.cycles.max(1),
             idle: Duration::from_millis(self.idle_ms.max(1)),
+            peak_rps: if self.peak_rps > 0.0 {
+                self.peak_rps
+            } else {
+                1.0
+            },
+            ramp: Duration::from_millis(self.ramp_ms),
+            dwell: Duration::from_millis(self.dwell_ms.max(1)),
         })
     }
 }
@@ -571,6 +596,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
         json_only: opts.json,
         correctness: None,
         lifecycle: None,
+        burst: None,
     })
 }
 
@@ -770,6 +796,9 @@ pub(crate) struct Report {
     /// Present for the `scale-to-zero` scenario; the controller-sourced
     /// lifecycle deltas + derived serverless-efficiency figures.
     pub lifecycle: Option<Lifecycle>,
+    /// Present for the `burst` scenario; the offered/realized rate tracking,
+    /// peak worker count, and per-ramp scaling-latency distribution.
+    pub burst: Option<burst::Burst>,
 }
 
 impl Report {
@@ -839,6 +868,29 @@ impl Report {
                     l.avg_worker_lifetime_s(),
                 );
             }
+            if let Some(b) = &self.burst {
+                // The burst-specific view: the offered/realized rate tracking, the
+                // worker count the load drove up, and the per-ramp scaling latency.
+                let sp = |q: f64| b.scaling.value_at_quantile(q);
+                println!(
+                    "burst        peak_rps={:.0}  cycles={}  connections={}",
+                    b.peak_rps, b.cycles, b.connections,
+                );
+                println!(
+                    "rate         offered={}  realized={}  tracking={:.3}",
+                    b.offered,
+                    b.realized,
+                    b.rate_tracking(),
+                );
+                println!("scale-up     peak_warm_instances={}", b.max_warm_instances);
+                println!(
+                    "scaling µs   p50={}  p90={}  p99={}  max={}  (per-ramp cold start)",
+                    sp(0.50),
+                    sp(0.90),
+                    sp(0.99),
+                    b.scaling.max(),
+                );
+            }
         }
         // Machine-readable record (one JSON line) for archiving / plotting.
         let correctness = match &self.correctness {
@@ -879,12 +931,35 @@ impl Report {
             ),
             None => "null".to_string(),
         };
+        // The burst section: rate tracking + the per-ramp scaling-latency
+        // percentiles. The cold/warm-start counts and peak workers ride the
+        // `lifecycle` object above under the settled `twill_*` names.
+        let burst = match &self.burst {
+            Some(b) => format!(
+                "{{\"peak_rps\":{:.1},\"cycles\":{},\"connections\":{},\
+                 \"offered\":{},\"realized\":{},\"rate_tracking\":{:.6},\
+                 \"peak_warm_instances\":{},\"scaling_p50_us\":{},\"scaling_p90_us\":{},\
+                 \"scaling_p99_us\":{},\"scaling_max_us\":{}}}",
+                b.peak_rps,
+                b.cycles,
+                b.connections,
+                b.offered,
+                b.realized,
+                b.rate_tracking(),
+                b.max_warm_instances,
+                b.scaling.value_at_quantile(0.50),
+                b.scaling.value_at_quantile(0.90),
+                b.scaling.value_at_quantile(0.99),
+                b.scaling.max(),
+            ),
+            None => "null".to_string(),
+        };
         println!(
             "{{\"experiment\":\"{}\",\"label\":\"{}\",\"transport\":\"{}\",\"backend\":\"{}\",\
              \"git\":\"{}\",\"writers\":{},\"duration_s\":{:.3},\"commits\":{},\"conflicts\":{},\
              \"failures\":{},\"throughput_per_s\":{:.1},\"p50_us\":{},\"p90_us\":{},\"p95_us\":{},\
              \"p99_us\":{},\"p999_us\":{},\"min_us\":{},\"max_us\":{},\"mean_us\":{:.1},\
-             \"correctness\":{},\"lifecycle\":{}}}",
+             \"correctness\":{},\"lifecycle\":{},\"burst\":{}}}",
             self.experiment,
             self.label,
             self.transport,
@@ -906,6 +981,7 @@ impl Report {
             self.hist.mean(),
             correctness,
             lifecycle,
+            burst,
         );
     }
 }
@@ -960,6 +1036,9 @@ fn print_help() {
          LIFECYCLE SCENARIOS (controller-driven; serverless-efficiency report):\n\
          \x20 scale-to-zero   query → idle past the reaper → query (spec 09 Exp 5 cold read);\n\
          \x20                 reports the cold-boot distribution + controller-sourced efficiency\n\
+         \x20 burst           idle→500→5k→20k rps→idle, repeated: a closed-loop rate driver\n\
+         \x20                 swings the controller through load to measure cold/warm starts,\n\
+         \x20                 peak workers, and per-ramp scaling latency from pulled snapshots\n\
          \n\
          RELEASE COMPARISON:\n\
          \x20 compare --baseline <FILE> --candidate <FILE> [--threshold <FRAC>]\n\
@@ -973,8 +1052,11 @@ fn print_help() {
          \x20 --duration-ms <MS>   timed window for experiments/scenarios (default 1000)\n\
          \x20 --ops <N>            per-writer ops for the correctness profiles (default 200)\n\
          \x20 --rows <N>           pre-seeded working-set size for the mix scenarios (default 1000)\n\
-         \x20 --cycles <N>         scale-to-zero cold-boot samples (default 20)\n\
+         \x20 --cycles <N>         scale-to-zero cold-boot samples / burst cycles (default 20)\n\
          \x20 --idle-ms <MS>       idle window before the reaper scales to zero (default 100)\n\
+         \x20 --peak-rps <N>       burst peak offered rate, the 20k tier (default 20000)\n\
+         \x20 --ramp-ms <MS>       burst ramp duration between plateaus (default 50)\n\
+         \x20 --dwell-ms <MS>      burst hold at each active plateau (default 150)\n\
          \x20 --label <TEXT>       free-form tag recorded in the output\n\
          \x20 --json               emit only the one-line JSON record (for scripting)\n\
          \n\

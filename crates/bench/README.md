@@ -110,6 +110,34 @@ A deployed server runs its own controller out of the bench's reach, so the
 `--server`/`--transport pgwire` form is rejected; run it embedded against any
 backend URL (`file://` for a smoke run, an object store for the spec-09 tail).
 
+### Autoscaling-stress scenario (`burst`)
+
+`burst` (issue #79) drives the controller through **load swings** rather than a
+fixed work count: it holds a *target request rate* and lets the worker count
+respond. A **closed-loop token-bucket pacer** holds the offered rate (with
+bounded, seeded jitter) regardless of how fast the system responds, while a
+deterministic load-shape schedule swings it `idle → 500 → 5k → 20k rps → idle`,
+repeated. Offered load fans out across `--writers` connections under the one
+pacer so the bench process isn't the bottleneck at the peak. Like
+`scale-to-zero` it is controller-driven and in-process, *pulling* the
+`ControllerStats` snapshot: the report carries the cold/warm-start counts, peak
+workers, and admission wait (the shared `twill_*` lifecycle section) plus a
+burst section — offered/realized rate tracking, the peak resident worker count
+(scale-up), and the per-ramp scaling (cold-start) latency distribution. The run
+fails (non-zero exit) if the instance never warmed under load, never scaled back
+to zero on an idle plateau, or lost an acked write across a teardown.
+
+```bash
+# idle→500→5k→20k→idle, twice; --peak-rps moves the ceiling and the lower tiers
+# scale with it. --idle-ms is the reaper window between bursts.
+$BIN burst --url file:///tmp/bench.db --peak-rps 20000 --cycles 2 --writers 8 \
+    --ramp-ms 50 --dwell-ms 150 --idle-ms 100
+```
+
+The `--server`/`--transport pgwire` form is rejected (the bench can't pull a
+deployed server's controller in-process); that deployed form is the spec-09
+scale form against a real controller-driven deployment.
+
 ### Release comparison (CI regression gate)
 
 Diff two archived JSON records into a PASS/regression verdict — pure
@@ -131,10 +159,12 @@ Flags: `--url` (required for runs), `--transport embedded|pgwire`,
 `--server HOST:PORT` (implies pgwire), `--writers`, `--warmup-ms` (default 200),
 `--duration-ms` (default 1000, experiments/scenarios), `--ops` (default 200,
 correctness profiles), `--rows` (default 1000, mix working set / cold-read set),
-`--cycles` (default 20, scale-to-zero cold-boot samples), `--idle-ms` (default
-100, scale-to-zero reaper window), `--label`, `--json`. The JSON record carries
-the `transport` so embedded and server runs are distinguishable when archived
-together.
+`--cycles` (default 20, scale-to-zero cold-boot samples / burst cycles),
+`--idle-ms` (default 100, scale-to-zero & burst reaper window), `--peak-rps`
+(default 20000, burst peak offered rate), `--ramp-ms` (default 50, burst ramp
+between plateaus), `--dwell-ms` (default 150, burst hold at each active
+plateau), `--label`, `--json`. The JSON record carries the `transport` so
+embedded and server runs are distinguishable when archived together.
 
 ### Exit codes
 
