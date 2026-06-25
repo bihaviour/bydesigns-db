@@ -469,6 +469,7 @@ pub(crate) fn run_burst(opts: &Opts) -> Result<Report, BenchError> {
         lifecycle: Some(lifecycle),
         soak: None,
         burst: Some(burst),
+        mix_realized: None,
     })
 }
 

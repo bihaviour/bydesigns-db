@@ -48,6 +48,14 @@ pub mod hist;
 pub mod lifecycle;
 pub mod longrun;
 pub mod pgclient;
+/// The YAML workload-profile loader for the `custom` scenario (issue #81). It is
+/// gated behind the `custom-profile` cargo feature so a default `twill-bench`
+/// build carries no profile-parsing code at all (guardrail 1 of #78 / spec 15:
+/// keep CLI-only concerns feature-gated and out of a default build); the parser
+/// is hand-rolled (no external YAML dependency), in keeping with the workspace's
+/// minimal-dependency ethos.
+#[cfg(feature = "custom-profile")]
+pub mod profile;
 pub mod workload;
 
 use engine::{Connection, EngineStatus, Value};
@@ -162,6 +170,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         "scale-to-zero" => lifecycle::run_scale_to_zero(&opts),
         "long-run" => longrun::run_long_run(&opts),
         "burst" => burst::run_burst(&opts),
+        "custom" => run_custom(&opts),
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
@@ -187,6 +196,26 @@ pub fn run_cli(args: &[String]) -> i32 {
             e.code()
         }
     }
+}
+
+/// Dispatch the `custom` subcommand to the feature-gated profile loader. When
+/// the `custom-profile` feature is off, the loader is not compiled in, so the
+/// command reports a clear rebuild hint (exit code 3) — the wall that keeps the
+/// YAML profile path out of a default build (#78 guardrail 1 / #81 C2).
+#[cfg(feature = "custom-profile")]
+fn run_custom(opts: &Opts) -> Result<Report, BenchError> {
+    profile::run_custom(opts)
+}
+
+#[cfg(not(feature = "custom-profile"))]
+fn run_custom(_opts: &Opts) -> Result<Report, BenchError> {
+    Err(BenchError::Config(
+        "the `custom` subcommand requires the YAML profile loader, which is gated \
+         behind the `custom-profile` cargo feature (kept off a default build so it \
+         carries no profile-parsing code); rebuild with: \
+         cargo build -p twill-bench --features custom-profile"
+            .into(),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -252,6 +281,7 @@ fn parse_fault(s: &str) -> Result<Fault, String> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Opts {
     pub url: String,
     pub writers: usize,
@@ -296,6 +326,12 @@ pub(crate) struct Opts {
     pub ramp: Duration,
     /// Dwell at each active `burst` plateau (the hold at a tier rate).
     pub dwell: Duration,
+    /// Path to a YAML workload profile for the `custom` scenario (issue #81).
+    /// When set, the profile carries the run's shape and `--url` may be omitted
+    /// (the profile may supply it). Only consumed by the feature-gated loader, so
+    /// without that feature the field is parsed-but-unread (the rebuild-hint path).
+    #[cfg_attr(not(feature = "custom-profile"), allow(dead_code))]
+    pub profile: Option<String>,
 }
 
 impl Opts {
@@ -344,6 +380,7 @@ struct RawOpts {
     peak_rps: f64,
     ramp_ms: u64,
     dwell_ms: u64,
+    profile: Option<String>,
 }
 
 impl Default for RawOpts {
@@ -367,6 +404,7 @@ impl Default for RawOpts {
             peak_rps: 20_000.0,
             ramp_ms: 50,
             dwell_ms: 150,
+            profile: None,
         }
     }
 }
@@ -392,6 +430,7 @@ impl RawOpts {
             "--transport" => self.transport = parse_transport(&value)?,
             "--server" => self.server = Some(value),
             "--inject-fault" => self.inject_fault = Some(parse_fault(&value)?),
+            "--profile" => self.profile = Some(value),
             other => return Err(format!("unknown flag {other}")),
         }
         Ok(())
@@ -404,9 +443,18 @@ impl RawOpts {
             self.transport = Transport::Pgwire;
         }
         Ok(Opts {
-            url: self
-                .url
-                .ok_or("--url is required (e.g. file:///tmp/bench.db or s3://bucket/db)")?,
+            // `--url` is required for every run *except* `custom`, whose profile
+            // may carry the URL itself; an empty string here defers the
+            // "missing url" check to the profile loader (issue #81 C4).
+            url: match self.url {
+                Some(u) => u,
+                None if self.profile.is_some() => String::new(),
+                None => {
+                    return Err(
+                        "--url is required (e.g. file:///tmp/bench.db or s3://bucket/db)".into(),
+                    )
+                }
+            },
             writers: self.writers.max(1),
             warmup: Duration::from_millis(self.warmup_ms),
             duration: Duration::from_millis(self.duration_ms),
@@ -428,6 +476,7 @@ impl RawOpts {
             },
             ramp: Duration::from_millis(self.ramp_ms),
             dwell: Duration::from_millis(self.dwell_ms.max(1)),
+            profile: self.profile,
         })
     }
 }
@@ -531,6 +580,10 @@ impl Writer {
 pub(crate) struct Tally {
     pub conflicts: u64,
     pub hist: Histogram,
+    /// Realized op counts `[select, insert, update, delete]` over the timed
+    /// window — populated by the mix driver (`workload.rs`), left zero by the
+    /// experiment writers, which issue a single fixed op kind.
+    pub op_counts: [u64; 4],
 }
 
 /// Resolve the run target, spinning up an in-process pgwire server if needed.
@@ -628,6 +681,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
         lifecycle: None,
         soak: None,
         burst: None,
+        mix_realized: None,
     })
 }
 
@@ -711,7 +765,11 @@ fn writer_loop(
         one(&mut conn, Some(&mut hist), &mut conflicts)?;
     }
 
-    Ok(Tally { conflicts, hist })
+    Ok(Tally {
+        conflicts,
+        hist,
+        op_counts: [0; 4],
+    })
 }
 
 /// The result of any correctness profile: a named ACID invariant, whether it
@@ -804,6 +862,32 @@ impl Lifecycle {
     }
 }
 
+/// The configured-vs-realized op mix of a `custom` profile run (issue #81): the
+/// profile's weights and the op counts the driver actually issued in the timed
+/// window. Present only on a `custom` report — it is how the run proves the
+/// realized mix tracked the requested shape.
+pub(crate) struct MixRealized {
+    /// Configured weights `[select, insert, update, delete]` from the profile.
+    pub configured: [u64; 4],
+    /// Realized op counts `[select, insert, update, delete]` over the run.
+    pub realized: [u64; 4],
+}
+
+impl MixRealized {
+    /// Realized fraction of each op kind over the run; all zero if nothing ran.
+    fn fractions(&self) -> [f64; 4] {
+        let total: u64 = self.realized.iter().sum();
+        if total == 0 {
+            return [0.0; 4];
+        }
+        let mut f = [0.0; 4];
+        for (slot, &c) in f.iter_mut().zip(self.realized.iter()) {
+            *slot = c as f64 / total as f64;
+        }
+        f
+    }
+}
+
 pub(crate) struct Report {
     pub experiment: &'static str,
     pub label: String,
@@ -833,6 +917,9 @@ pub(crate) struct Report {
     /// Present for the `burst` scenario; the offered/realized rate tracking,
     /// peak worker count, and per-ramp scaling-latency distribution.
     pub burst: Option<burst::Burst>,
+    /// Present for the `custom` profile scenario (issue #81); the configured vs
+    /// realized op mix, proving the driven shape tracked the requested ratios.
+    pub mix_realized: Option<MixRealized>,
 }
 
 impl Report {
@@ -938,6 +1025,29 @@ impl Report {
                     b.scaling.max(),
                 );
             }
+            if let Some(m) = &self.mix_realized {
+                // The configured-vs-realized op mix (issue #81): the profile's
+                // requested ratios beside the fractions the driver actually drove.
+                let total: u64 = m.configured.iter().sum::<u64>().max(1);
+                let f = m.fractions();
+                let kinds = ["select", "insert", "update", "delete"];
+                let cfg = (0..4)
+                    .map(|i| {
+                        format!(
+                            "{}={:.0}%",
+                            kinds[i],
+                            m.configured[i] as f64 / total as f64 * 100.0
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let got = (0..4)
+                    .map(|i| format!("{}={:.1}%", kinds[i], f[i] * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("mix want     {cfg}");
+                println!("mix got      {got}");
+            }
         }
         // Machine-readable record (one JSON line) for archiving / plotting.
         let correctness = match &self.correctness {
@@ -1006,12 +1116,28 @@ impl Report {
             ),
             None => "null".to_string(),
         };
+        // The custom-profile section (#81): the configured weights and the
+        // realized op counts, both as `[select, insert, update, delete]`.
+        let mix_realized = match &self.mix_realized {
+            Some(m) => format!(
+                "{{\"configured\":[{},{},{},{}],\"realized\":[{},{},{},{}]}}",
+                m.configured[0],
+                m.configured[1],
+                m.configured[2],
+                m.configured[3],
+                m.realized[0],
+                m.realized[1],
+                m.realized[2],
+                m.realized[3],
+            ),
+            None => "null".to_string(),
+        };
         println!(
             "{{\"experiment\":\"{}\",\"label\":\"{}\",\"transport\":\"{}\",\"backend\":\"{}\",\
              \"git\":\"{}\",\"writers\":{},\"duration_s\":{:.3},\"commits\":{},\"conflicts\":{},\
              \"failures\":{},\"throughput_per_s\":{:.1},\"p50_us\":{},\"p90_us\":{},\"p95_us\":{},\
              \"p99_us\":{},\"p999_us\":{},\"min_us\":{},\"max_us\":{},\"mean_us\":{:.1},\
-             \"correctness\":{},\"lifecycle\":{},\"soak\":{},\"burst\":{}}}",
+             \"correctness\":{},\"lifecycle\":{},\"soak\":{},\"burst\":{},\"mix\":{}}}",
             self.experiment,
             self.label,
             self.transport,
@@ -1035,6 +1161,7 @@ impl Report {
             lifecycle,
             soak,
             burst,
+            mix_realized,
         );
     }
 }
@@ -1097,6 +1224,10 @@ fn print_help() {
          \x20 long-run        steady load + periodic stats()/resource samples over --duration;\n\
          \x20                 fits a slope on memory/fds/p99 and fails on a leak/drift trend\n\
          \n\
+         CUSTOM PROFILE (workload as data; feature-gated YAML loader):\n\
+         \x20 custom --profile <FILE>  drive a YAML-described mix (duration, connections, mix,\n\
+         \x20                 rows, seed); build with --features custom-profile to enable it\n\
+         \n\
          RELEASE COMPARISON:\n\
          \x20 compare --baseline <FILE> --candidate <FILE> [--threshold <FRAC>]\n\
          \n\
@@ -1116,6 +1247,7 @@ fn print_help() {
          \x20 --peak-rps <N>       burst peak offered rate, the 20k tier (default 20000)\n\
          \x20 --ramp-ms <MS>       burst ramp duration between plateaus (default 50)\n\
          \x20 --dwell-ms <MS>      burst hold at each active plateau (default 150)\n\
+         \x20 --profile <FILE>     YAML workload profile for `custom` (feature-gated loader)\n\
          \x20 --label <TEXT>       free-form tag recorded in the output\n\
          \x20 --json               emit only the one-line JSON record (for scripting)\n\
          \n\

@@ -530,5 +530,6 @@ fn report(
         lifecycle: None,
         soak: None,
         burst: None,
+        mix_realized: None,
     }
 }

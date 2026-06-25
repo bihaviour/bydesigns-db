@@ -1,0 +1,26 @@
+# twill-bench custom workload profile (issue #81).
+#
+# Run it with the feature-gated loader:
+#   cargo run -p twill-bench --features custom-profile -- \
+#     custom --profile crates/bench/workload.example.yaml --url file:///tmp/bench.db
+#
+# A profile makes the *whole shape* of a run data, not code: the run knobs plus
+# the op mix. It expresses exactly the mix-driver vocabulary (the four op kinds'
+# weights) — there is no custom SQL. A CLI `--url` overrides the `url` below;
+# `--transport pgwire` drives the same profile over the wire.
+
+label: saas-oltp          # free-form tag recorded in the output (optional)
+url: file:///tmp/bench.db # backend URL (optional; --url overrides it)
+duration_ms: 5000         # timed measurement window (must be > 0)
+warmup_ms: 500            # discarded warm-up window
+connections: 8            # concurrent writers
+rows: 10000               # pre-seeded working-set size
+seed: 1                   # fixed PRNG seed → a reproducible op stream (optional)
+
+# Per-op weights over the four op kinds. Arbitrary positive integers (they need
+# not sum to 100); at least one must be non-zero.
+mix:
+  select: 70
+  insert: 20
+  update: 8
+  delete: 2

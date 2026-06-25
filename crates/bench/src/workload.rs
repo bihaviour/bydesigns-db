@@ -58,6 +58,20 @@ pub enum Op {
     Delete,
 }
 
+impl Op {
+    /// Index into a `[select, insert, update, delete]` tally array — the order
+    /// the [`Mix`] weights and the realized-mix report use throughout.
+    #[inline]
+    pub fn index(self) -> usize {
+        match self {
+            Op::Select => 0,
+            Op::Insert => 1,
+            Op::Update => 2,
+            Op::Delete => 3,
+        }
+    }
+}
+
 /// Integer request-ratio weights over the four op kinds. Drawing an op walks the
 /// cumulative weight, so the long-run mix matches the configured ratios.
 #[derive(Clone, Copy)]
@@ -80,6 +94,12 @@ impl Mix {
 
     fn total(&self) -> u64 {
         (self.select + self.insert + self.update + self.delete).max(1)
+    }
+
+    /// The configured weights as a `[select, insert, update, delete]` array,
+    /// for the realized-vs-configured mix report on a `custom` run.
+    pub fn weights(&self) -> [u64; 4] {
+        [self.select, self.insert, self.update, self.delete]
     }
 
     /// Pick an op kind for `r` in `[0, total())`.
@@ -124,26 +144,74 @@ impl Rng {
     }
 }
 
-/// Run a request-mix scenario: seed the working set, then drive the mix from all
-/// writers over a timed window and report the latency distribution.
-pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, BenchError> {
-    let mix = scenario.mix();
-    let target = resolve_target(opts)?;
-    let tag = run_tag();
+/// The shape of one request-mix run, independent of where it came from. The
+/// named scenarios fill this from the CLI [`Opts`]; the feature-gated `custom`
+/// profile loader (issue #81) fills it from a parsed YAML profile. Both then go
+/// through the *same* [`run_mix_core`] driver — there is no second execution
+/// path, which is the whole point of making the workload *data, not code*.
+pub(crate) struct MixRun {
+    /// Reported scenario/profile name (`read-heavy`, …, or `custom`).
+    pub name: &'static str,
+    /// Op-ratio weights drawn per request.
+    pub mix: Mix,
+    /// Concurrent writers (a profile's `connections`).
+    pub writers: usize,
+    /// Pre-seeded working-set size.
+    pub rows: u64,
+    /// Discarded warm-up window.
+    pub warmup: Duration,
+    /// Timed measurement window.
+    pub duration: Duration,
+    /// Fixed PRNG seed for a reproducible op stream; `None` → derive from the
+    /// time-based run tag (the named scenarios' default).
+    pub seed: Option<u64>,
+    /// Free-form label recorded in the report.
+    pub label: String,
+}
 
-    // Setup: schema + a deterministic working set of `--rows` keys [0, rows) the
+/// Run a named request-mix scenario: a thin wrapper that fills a [`MixRun`] from
+/// the CLI options and drives it. Custom profiles share the same core.
+pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, BenchError> {
+    let run = MixRun {
+        name: scenario.name(),
+        mix: scenario.mix(),
+        writers: opts.writers,
+        rows: opts.rows,
+        warmup: opts.warmup,
+        duration: opts.duration,
+        seed: None,
+        label: opts.label.clone(),
+    };
+    let (report, _realized) = run_mix_core(&run, opts)?;
+    Ok(report)
+}
+
+/// Drive a request-mix run: seed the working set, then drive the mix from all
+/// writers over a timed window and report the latency distribution. Returns the
+/// report plus the realized `[select, insert, update, delete]` op counts (the
+/// `custom` path surfaces them; the named scenarios discard them). The transport
+/// / URL / output knobs come from `opts`; the workload shape comes from `run`.
+pub(crate) fn run_mix_core(run: &MixRun, opts: &Opts) -> Result<(Report, [u64; 4]), BenchError> {
+    let mix = run.mix;
+    let target = resolve_target(opts)?;
+    // The op stream's seed: a fixed `seed` makes the realized mix reproducible
+    // (the custom-profile path), otherwise derive it from the time-based run tag
+    // so successive default runs draw independent streams.
+    let seed_base = run.seed.unwrap_or(run_tag() as u64);
+
+    // Setup: schema + a deterministic working set of `rows` keys [0, rows) the
     // read/update/delete ops target. Inserts use keys >= rows (tag-disjoint).
     let mut setup = target.open()?;
-    seed_working_set(&mut setup, opts.rows)?;
+    seed_working_set(&mut setup, run.rows)?;
 
     let (tallies, elapsed) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..opts.writers)
+        let handles: Vec<_> = (0..run.writers)
             .map(|w| {
                 let target = target.clone();
-                let warmup = opts.warmup;
-                let duration = opts.duration;
-                let rows = opts.rows;
-                scope.spawn(move || mix_writer(&target, w, tag, mix, rows, warmup, duration))
+                let warmup = run.warmup;
+                let duration = run.duration;
+                let rows = run.rows;
+                scope.spawn(move || mix_writer(&target, w, seed_base, mix, rows, warmup, duration))
             })
             .collect();
         let start = Instant::now();
@@ -154,19 +222,23 @@ pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, Be
 
     let mut merged = Histogram::new();
     let mut conflicts = 0u64;
+    let mut realized = [0u64; 4];
     for t in tallies {
         let t = t?;
         merged.merge(&t.hist);
         conflicts += t.conflicts;
+        for (slot, c) in realized.iter_mut().zip(t.op_counts.iter()) {
+            *slot += c;
+        }
     }
     let ops = merged.count();
 
-    Ok(Report {
-        experiment: scenario.name(),
-        label: opts.label.clone(),
+    let report = Report {
+        experiment: run.name,
+        label: run.label.clone(),
         transport: opts.transport.name(),
         url_scheme: url_scheme(&opts.url),
-        writers: opts.writers,
+        writers: run.writers,
         duration_s: elapsed.as_secs_f64(),
         commits: ops,
         conflicts,
@@ -179,7 +251,9 @@ pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, Be
         lifecycle: None,
         soak: None,
         burst: None,
-    })
+        mix_realized: None,
+    };
+    Ok((report, realized))
 }
 
 fn seed_working_set(w: &mut Writer, rows: u64) -> Result<(), BenchError> {
@@ -203,14 +277,14 @@ fn seed_working_set(w: &mut Writer, rows: u64) -> Result<(), BenchError> {
 fn mix_writer(
     target: &Target,
     writer: usize,
-    tag: u128,
+    seed_base: u64,
     mix: Mix,
     rows: u64,
     warmup: Duration,
     duration: Duration,
 ) -> Result<Tally, BenchError> {
     let mut conn = target.open()?;
-    let mut rng = Rng::new(tag as u64 ^ ((writer as u64).wrapping_mul(0x100_0000_01b3)));
+    let mut rng = Rng::new(seed_base ^ ((writer as u64).wrapping_mul(0x100_0000_01b3)));
     // Inserts carve a per-writer key band above the seeded working set so they
     // never collide across writers or with the seed.
     let mut insert_seq: u64 = 0;
@@ -220,7 +294,8 @@ fn mix_writer(
                rng: &mut Rng,
                insert_seq: &mut u64,
                hist: Option<&mut Histogram>,
-               conflicts: &mut u64|
+               conflicts: &mut u64,
+               op_counts: &mut [u64; 4]|
      -> Result<(), BenchError> {
         let op = mix.pick(rng.next_u64());
         let t0 = Instant::now();
@@ -267,8 +342,11 @@ fn mix_writer(
                 }
             }
         }
+        // Count the op only in the timed window (where `hist` is recording), so
+        // the realized mix is measured over the same window as the latencies.
         if let Some(h) = hist {
             h.record(t0.elapsed().as_micros() as u64);
+            op_counts[op.index()] += 1;
         }
         Ok(())
     };
@@ -276,12 +354,21 @@ fn mix_writer(
     // Warm-up window: drive load but discard measurements.
     let warm_until = Instant::now() + warmup;
     let mut scratch = 0u64;
+    let mut scratch_counts = [0u64; 4];
     while Instant::now() < warm_until {
-        one(&mut conn, &mut rng, &mut insert_seq, None, &mut scratch)?;
+        one(
+            &mut conn,
+            &mut rng,
+            &mut insert_seq,
+            None,
+            &mut scratch,
+            &mut scratch_counts,
+        )?;
     }
 
     let mut hist = Histogram::new();
     let mut conflicts = 0u64;
+    let mut op_counts = [0u64; 4];
     let until = Instant::now() + duration;
     while Instant::now() < until {
         one(
@@ -290,10 +377,15 @@ fn mix_writer(
             &mut insert_seq,
             Some(&mut hist),
             &mut conflicts,
+            &mut op_counts,
         )?;
     }
 
-    Ok(Tally { conflicts, hist })
+    Ok(Tally {
+        conflicts,
+        hist,
+        op_counts,
+    })
 }
 
 #[cfg(test)]

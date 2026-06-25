@@ -145,6 +145,7 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
         lifecycle: Some(lifecycle),
         soak: None,
         burst: None,
+        mix_realized: None,
     })
 }
 
