@@ -467,6 +467,7 @@ pub(crate) fn run_burst(opts: &Opts) -> Result<Report, BenchError> {
         json_only: opts.json,
         correctness: None,
         lifecycle: Some(lifecycle),
+        soak: None,
         burst: Some(burst),
     })
 }

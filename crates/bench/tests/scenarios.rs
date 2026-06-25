@@ -218,6 +218,80 @@ fn scale_to_zero_rejects_the_pgwire_form() {
 }
 
 #[test]
+fn long_run_flat_control_passes() {
+    // A short soak with no seeded growth: the interval sampler captures a series,
+    // the trend checker fits a slope over memory/fds/p99, and a steady run trends
+    // up on nothing past its floor → clean exit. Short duration + fast sampling
+    // keeps it quick while still producing enough samples to fit a line.
+    let url = unique_url();
+    let code = run_cli(&argv(&[
+        "long-run",
+        "--url",
+        &url,
+        "--writers",
+        "2",
+        "--warmup-ms",
+        "20",
+        "--duration-ms",
+        "600",
+        "--sample-interval-ms",
+        "20",
+        "--json",
+    ]));
+    assert_eq!(
+        code,
+        exit::OK,
+        "a flat soak control run must not be flagged as a leak/drift"
+    );
+}
+
+#[test]
+fn long_run_seeded_leak_exits_two() {
+    // The negative case (#80 L5): the test-only `leak` fault seeds monotonic
+    // growth into the sampled series, so the trend checker must detect it and
+    // fail the run with the correctness exit code (2) — proving the checker
+    // bites, not only that the PASS path works.
+    let url = unique_url();
+    let code = run_cli(&argv(&[
+        "long-run",
+        "--url",
+        &url,
+        "--writers",
+        "2",
+        "--warmup-ms",
+        "20",
+        "--duration-ms",
+        "600",
+        "--sample-interval-ms",
+        "20",
+        "--inject-fault",
+        "leak",
+        "--json",
+    ]));
+    assert_eq!(
+        code,
+        exit::CORRECTNESS,
+        "a seeded leak/drift must fail the soak drift gate"
+    );
+}
+
+#[test]
+fn long_run_rejects_the_pgwire_form() {
+    // The soak samples this process's own resources; a deployed server runs out
+    // of reach, so the pgwire/server form is a config error (like scale-to-zero).
+    assert_eq!(
+        run_cli(&argv(&[
+            "long-run",
+            "--url",
+            "file:///tmp/x.db",
+            "--transport",
+            "pgwire",
+        ])),
+        exit::CONFIG
+    );
+}
+
+#[test]
 fn seeded_lost_update_violation_exits_two() {
     // The negative case: inject a real lost update (one acked increment dropped)
     // and prove the no-lost-update checker catches it and fails the run with the

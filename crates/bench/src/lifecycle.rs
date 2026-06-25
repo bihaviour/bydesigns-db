@@ -143,6 +143,7 @@ pub(crate) fn run_scale_to_zero(opts: &Opts) -> Result<Report, BenchError> {
         json_only: opts.json,
         correctness: None,
         lifecycle: Some(lifecycle),
+        soak: None,
         burst: None,
     })
 }
