@@ -19,7 +19,7 @@ measured identically:
 
 ## Run
 
-The subcommands group into four families (spec 15 "Command structure").
+The subcommands group into families (spec 15 "Command structure").
 
 ### Experiments (spec 09 — one lever each)
 
@@ -110,6 +110,36 @@ A deployed server runs its own controller out of the bench's reach, so the
 `--server`/`--transport pgwire` form is rejected; run it embedded against any
 backend URL (`file://` for a smoke run, an object store for the spec-09 tail).
 
+### Soak scenario (interval-sampled time series; leak/drift verdict)
+
+`long-run` is a multi-hour/day **stability** test (issue #80): it catches what
+only shows up over time — memory leaks, fd/connection leaks, scheduler drift,
+slow latency degradation. Unlike every other scenario (a single start→end
+delta), it captures a **time series**: an interval sampler pulls a `stats()`
+snapshot plus a process resource probe (RSS / open fds / threads from Linux
+`/proc/self`, degrading to zeros where `/proc` is absent) every
+`--sample-interval-ms`, then fits a least-squares slope over the post-warm-up
+window for **memory, fds, and p99**. A metric is flagged as a leak/drift only
+when its projected growth crosses *both* a relative threshold
+(`--drift-threshold`, default 10%) and an absolute noise floor — so short-run
+jitter never trips it, but an unbounded climb does. A detected leak/drift fails
+the run with the correctness exit code (2), exactly like a violated invariant.
+
+```bash
+# Steady read load over a 1000-row working set; sample every 2s for an hour.
+$BIN long-run --url file:///tmp/bench.db --rows 1000 \
+  --duration-ms 3600000 --sample-interval-ms 2000 --warmup-ms 30000
+```
+
+The load is a deliberately **steady-state** point-read workload over a
+pre-seeded set: a soak is a stability baseline, and an unbounded ingest load
+would grow the WAL and the in-memory MVCC store on its own (no vacuum this
+phase), drowning the very signal the soak exists to find. Like `scale-to-zero`,
+it samples this process's own resources, so the `--server`/`--transport pgwire`
+form is rejected — run it embedded. The JSON record carries a `soak` section
+with the per-metric `first`/`last`/`slope`/`peak`/`growth_frac` and the
+PASS/FAIL `drift_pass` verdict.
+
 ### Release comparison (CI regression gate)
 
 Diff two archived JSON records into a PASS/regression verdict — pure
@@ -132,8 +162,10 @@ Flags: `--url` (required for runs), `--transport embedded|pgwire`,
 `--duration-ms` (default 1000, experiments/scenarios), `--ops` (default 200,
 correctness profiles), `--rows` (default 1000, mix working set / cold-read set),
 `--cycles` (default 20, scale-to-zero cold-boot samples), `--idle-ms` (default
-100, scale-to-zero reaper window), `--label`, `--json`. The JSON record carries
-the `transport` so embedded and server runs are distinguishable when archived
+100, scale-to-zero reaper window), `--sample-interval-ms` (default 1000,
+long-run time-series sample period), `--drift-threshold` (default 0.10, long-run
+leak/drift trip fraction), `--label`, `--json`. The JSON record carries the
+`transport` so embedded and server runs are distinguishable when archived
 together.
 
 ### Exit codes

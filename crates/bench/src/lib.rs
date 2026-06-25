@@ -20,7 +20,7 @@
 //!
 //! Either transport runs against any `--url` backend (`file://` for a smoke run,
 //! an object-store URL on a real host for the W1 tail that gates the
-//! architecture). Subcommands group into four families (spec 15 "Command
+//! architecture). Subcommands group into families (spec 15 "Command
 //! structure"):
 //!   * **experiments** (`exp1`/`exp2`/`exp3`) — the spec-09 latency floor,
 //!     group-commit curve, and contention wall.
@@ -34,6 +34,10 @@
 //!     measurement (spec 09 Experiment 5): drive query → idle past the reaper →
 //!     query, pull the [`controller`] stats snapshot at the run boundaries, and
 //!     report the cold-boot distribution + the serverless-efficiency figures.
+//!   * **soak scenario** (`long-run`) — a stability test (issue #80): drive a
+//!     steady load while an interval sampler captures a `stats()` + resource
+//!     time series, then fit a slope over memory/fds/p99 and fail on a
+//!     leak/drift trend (exit 2), the correctness-class verdict.
 //!   * **release comparison** (`compare`) — diff two archived JSON records into a
 //!     PASS/regression verdict.
 
@@ -41,6 +45,7 @@ pub mod compare;
 pub mod correctness;
 pub mod hist;
 pub mod lifecycle;
+pub mod longrun;
 pub mod pgclient;
 pub mod workload;
 
@@ -154,6 +159,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         "inventory" => correctness::run_inventory(&opts),
         "document-editing" => correctness::run_document_editing(&opts),
         "scale-to-zero" => lifecycle::run_scale_to_zero(&opts),
+        "long-run" => longrun::run_long_run(&opts),
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
@@ -165,8 +171,10 @@ pub fn run_cli(args: &[String]) -> i32 {
         Ok(report) => {
             report.print();
             // A profile that drove the data but broke an invariant is a failure,
-            // however fast it ran (spec 15 — correctness gates the exit code).
-            if report.correctness.as_ref().is_some_and(|c| !c.passed) {
+            // however fast it ran (spec 15 — correctness gates the exit code). A
+            // soak run that detected a leak/drift is the same class of failure
+            // (issue #80 L5: drift → exit 2, #51-consistent).
+            if report.failed_correctness() {
                 exit::CORRECTNESS
             } else {
                 exit::OK
@@ -228,11 +236,16 @@ fn parse_transport(s: &str) -> Result<Transport, String> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fault {
     LostUpdate,
+    /// Seed monotonic growth into the `long-run` sampled series so the trend
+    /// checker has an unambiguous leak/drift to catch (issue #80 L5 negative
+    /// test). Like `LostUpdate`, a QA hook — undocumented in `--help`.
+    Leak,
 }
 
 fn parse_fault(s: &str) -> Result<Fault, String> {
     match s {
         "lost-update" => Ok(Fault::LostUpdate),
+        "leak" => Ok(Fault::Leak),
         other => Err(format!("invalid --inject-fault '{other}'")),
     }
 }
@@ -265,6 +278,15 @@ pub(crate) struct Opts {
     /// for the `scale-to-zero` scenario. Short for a smoke run; spec 09's
     /// Experiment 5 uses a long (≈10 min) window on a real deployment.
     pub idle: Duration,
+    /// Interval between time-series samples for the `long-run` soak scenario
+    /// (issue #80 L1). Short for a smoke run; a real soak samples on the order of
+    /// seconds over a multi-hour/day window.
+    pub sample_interval: Duration,
+    /// Relative drift/leak threshold for `long-run` (issue #80 L3): a gated
+    /// metric is flagged when its projected growth over the analyzed window
+    /// exceeds this fraction of its baseline (and an absolute floor). Default
+    /// `0.10` (10%).
+    pub drift_threshold: f64,
 }
 
 impl Opts {
@@ -308,6 +330,8 @@ struct RawOpts {
     inject_fault: Option<Fault>,
     cycles: u64,
     idle_ms: u64,
+    sample_interval_ms: u64,
+    drift_threshold: f64,
 }
 
 impl Default for RawOpts {
@@ -326,6 +350,8 @@ impl Default for RawOpts {
             inject_fault: None,
             cycles: 20,
             idle_ms: 100,
+            sample_interval_ms: 1000,
+            drift_threshold: 0.10,
         }
     }
 }
@@ -342,6 +368,8 @@ impl RawOpts {
             "--rows" => self.rows = parse_num(&value, key)?,
             "--cycles" => self.cycles = parse_num(&value, key)?,
             "--idle-ms" => self.idle_ms = parse_num(&value, key)?,
+            "--sample-interval-ms" => self.sample_interval_ms = parse_num(&value, key)?,
+            "--drift-threshold" => self.drift_threshold = parse_num(&value, key)?,
             "--label" => self.label = value,
             "--transport" => self.transport = parse_transport(&value)?,
             "--server" => self.server = Some(value),
@@ -373,6 +401,8 @@ impl RawOpts {
             inject_fault: self.inject_fault,
             cycles: self.cycles.max(1),
             idle: Duration::from_millis(self.idle_ms.max(1)),
+            sample_interval: Duration::from_millis(self.sample_interval_ms.max(1)),
+            drift_threshold: self.drift_threshold.max(0.0),
         })
     }
 }
@@ -571,6 +601,7 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
         json_only: opts.json,
         correctness: None,
         lifecycle: None,
+        soak: None,
     })
 }
 
@@ -770,9 +801,20 @@ pub(crate) struct Report {
     /// Present for the `scale-to-zero` scenario; the controller-sourced
     /// lifecycle deltas + derived serverless-efficiency figures.
     pub lifecycle: Option<Lifecycle>,
+    /// Present for the `long-run` soak scenario; the sampled time-series summary
+    /// (per-metric first/last/slope/peak) + the PASS/FAIL drift verdict (#80).
+    pub soak: Option<longrun::Soak>,
 }
 
 impl Report {
+    /// Whether this run failed a correctness-class gate (exit code 2): a violated
+    /// ACID invariant on a correctness profile, or a detected leak/drift on a
+    /// soak run. Both fail the run however fast it was.
+    fn failed_correctness(&self) -> bool {
+        self.correctness.as_ref().is_some_and(|c| !c.passed)
+            || self.soak.as_ref().is_some_and(|s| !s.passed())
+    }
+
     fn print(&self) {
         let p = |q: f64| self.hist.value_at_quantile(q);
         if !self.json_only {
@@ -839,6 +881,11 @@ impl Report {
                     l.avg_worker_lifetime_s(),
                 );
             }
+            if let Some(s) = &self.soak {
+                // The full-run percentile distribution is the `hist` printed
+                // above; this is the time-series trend view it cannot carry.
+                s.print_human();
+            }
         }
         // Machine-readable record (one JSON line) for archiving / plotting.
         let correctness = match &self.correctness {
@@ -879,12 +926,17 @@ impl Report {
             ),
             None => "null".to_string(),
         };
+        // The soak section (#80): the sampled time-series summary + drift verdict.
+        let soak = match &self.soak {
+            Some(s) => s.to_json(),
+            None => "null".to_string(),
+        };
         println!(
             "{{\"experiment\":\"{}\",\"label\":\"{}\",\"transport\":\"{}\",\"backend\":\"{}\",\
              \"git\":\"{}\",\"writers\":{},\"duration_s\":{:.3},\"commits\":{},\"conflicts\":{},\
              \"failures\":{},\"throughput_per_s\":{:.1},\"p50_us\":{},\"p90_us\":{},\"p95_us\":{},\
              \"p99_us\":{},\"p999_us\":{},\"min_us\":{},\"max_us\":{},\"mean_us\":{:.1},\
-             \"correctness\":{},\"lifecycle\":{}}}",
+             \"correctness\":{},\"lifecycle\":{},\"soak\":{}}}",
             self.experiment,
             self.label,
             self.transport,
@@ -906,6 +958,7 @@ impl Report {
             self.hist.mean(),
             correctness,
             lifecycle,
+            soak,
         );
     }
 }
@@ -961,6 +1014,10 @@ fn print_help() {
          \x20 scale-to-zero   query → idle past the reaper → query (spec 09 Exp 5 cold read);\n\
          \x20                 reports the cold-boot distribution + controller-sourced efficiency\n\
          \n\
+         SOAK SCENARIO (interval-sampled time series; drift/leak verdict → exit 2):\n\
+         \x20 long-run        steady load + periodic stats()/resource samples over --duration;\n\
+         \x20                 fits a slope on memory/fds/p99 and fails on a leak/drift trend\n\
+         \n\
          RELEASE COMPARISON:\n\
          \x20 compare --baseline <FILE> --candidate <FILE> [--threshold <FRAC>]\n\
          \n\
@@ -975,6 +1032,8 @@ fn print_help() {
          \x20 --rows <N>           pre-seeded working-set size for the mix scenarios (default 1000)\n\
          \x20 --cycles <N>         scale-to-zero cold-boot samples (default 20)\n\
          \x20 --idle-ms <MS>       idle window before the reaper scales to zero (default 100)\n\
+         \x20 --sample-interval-ms <MS>  long-run time-series sample period (default 1000)\n\
+         \x20 --drift-threshold <FRAC>   long-run leak/drift trip fraction (default 0.10)\n\
          \x20 --label <TEXT>       free-form tag recorded in the output\n\
          \x20 --json               emit only the one-line JSON record (for scripting)\n\
          \n\

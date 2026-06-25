@@ -177,6 +177,7 @@ pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, Be
         json_only: opts.json,
         correctness: None,
         lifecycle: None,
+        soak: None,
     })
 }
 
