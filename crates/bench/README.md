@@ -168,6 +168,48 @@ form is rejected — run it embedded. The JSON record carries a `soak` section
 with the per-metric `first`/`last`/`slope`/`peak`/`growth_frac` and the
 PASS/FAIL `drift_pass` verdict.
 
+### Custom profile (workload as data; feature-gated YAML loader)
+
+`custom` (issue #81) makes the **whole shape** of a run data, not code: a YAML
+profile describes the duration, connection count, working-set size, seed, and the
+op mix, and the loader drives it through the *same* request-mix driver the named
+scenarios use (no second execution path). The report adds a `mix` section — the
+configured weights beside the realized op counts — so a run proves the driven
+shape tracked the requested ratios. It expresses exactly the mix-driver
+vocabulary (the four op kinds' weights plus the run knobs); there is **no custom
+SQL** in v1.
+
+The loader is gated behind the **`custom-profile` cargo feature**, so a default
+`twill-bench` build carries no profile-parsing code (a CLI-only concern stays
+walled off — `pages/specs/15-twill-bench.html`); without the feature, `custom`
+prints a rebuild hint. The parser is hand-rolled, so the feature pulls in **no
+third-party dependency**.
+
+```yaml
+# workload.yaml (see crates/bench/workload.example.yaml)
+label: saas-oltp          # optional output tag
+url: file:///tmp/bench.db # optional; --url overrides it
+duration_ms: 5000         # required, > 0
+warmup_ms: 500
+connections: 8            # required, >= 1
+rows: 10000
+seed: 1                   # optional: a reproducible op stream
+mix:                      # arbitrary positive weights, >= 1 non-zero
+  select: 70
+  insert: 20
+  update: 8
+  delete: 2
+```
+
+```bash
+# Build with the feature and drive the profile (over either transport).
+cargo run -p twill-bench --features custom-profile -- \
+  custom --profile crates/bench/workload.example.yaml --url file:///tmp/bench.db
+```
+
+A malformed or contradictory profile (weights all zero, missing url, unknown
+op/field, bad syntax) is rejected with the config-error exit code (3).
+
 ### Release comparison (CI regression gate)
 
 Diff two archived JSON records into a PASS/regression verdict — pure
@@ -195,8 +237,9 @@ correctness profiles), `--rows` (default 1000, mix working set / cold-read set),
 between plateaus), `--dwell-ms` (default 150, burst hold at each active
 plateau), `--sample-interval-ms` (default 1000, long-run time-series sample
 period), `--drift-threshold` (default 0.10, long-run leak/drift trip fraction),
-`--label`, `--json`. The JSON record carries the `transport` so embedded and
-server runs are distinguishable when archived together.
+`--profile FILE` (YAML workload profile for `custom`; needs the `custom-profile`
+feature), `--label`, `--json`. The JSON record carries the `transport` so
+embedded and server runs are distinguishable when archived together.
 
 ### Exit codes
 

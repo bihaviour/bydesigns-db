@@ -99,6 +99,14 @@ jobs:
         run: cargo test -p twill-storage --test crash_safety
       - name: cargo test (workspace)
         run: cargo test --workspace --all-targets
+      # Feature-gate wall for the twill-bench `custom` profile loader (#81 C2):
+      # a default build must compile *without* the YAML loader, and the gated
+      # build must compile and pass its tests *with* it. Running both halves here
+      # keeps the wall up — the loader can never leak into a default build.
+      - name: twill-bench builds without the custom-profile feature
+        run: cargo build -p twill-bench
+      - name: twill-bench tests with the custom-profile feature
+        run: cargo test -p twill-bench --features custom-profile
       - name: Build release libengine
         run: cargo build -p twill-engine --release
       - uses: oven-sh/setup-bun@v2

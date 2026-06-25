@@ -15,6 +15,14 @@ path = "src/lib.rs"
 name = "twill-bench"
 path = "src/main.rs"
 
+[features]
+# `custom` subcommand: the YAML workload-profile loader (issue #81). Gated so a
+# default `twill-bench` build carries no profile-parsing code at all (#78
+# guardrail 1 / spec 15: keep CLI-only concerns feature-gated). The parser is
+# hand-rolled, so the feature adds no third-party dependency — the gate is the
+# wall, demonstrated by the with/without-feature build matrix in CI.
+custom-profile = []
+
 [dependencies]
 engine = { package = "twill-engine", path = "../engine" }
 twill-server = { path = "../server" }
