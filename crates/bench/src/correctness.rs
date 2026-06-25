@@ -529,5 +529,6 @@ fn report(
         correctness: Some(correctness),
         lifecycle: None,
         soak: None,
+        burst: None,
     }
 }

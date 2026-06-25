@@ -178,6 +178,7 @@ pub(crate) fn run_scenario(scenario: Scenario, opts: &Opts) -> Result<Report, Be
         correctness: None,
         lifecycle: None,
         soak: None,
+        burst: None,
     })
 }
 

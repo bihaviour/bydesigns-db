@@ -548,6 +548,7 @@ pub(crate) fn run_long_run(opts: &Opts) -> Result<Report, BenchError> {
         correctness: None,
         lifecycle: None,
         soak: Some(soak),
+        burst: None,
     })
 }
 

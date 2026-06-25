@@ -150,6 +150,58 @@ fn scale_to_zero_drives_cold_starts_cleanly() {
 }
 
 #[test]
+fn burst_scales_up_and_down_with_no_durable_loss() {
+    // The `burst` autoscaling-stress scenario (issue #79 / spec 15): a closed-loop
+    // rate driver swings a scaled-down shape (idle→tiers→idle, low peak) at an
+    // in-process controller. A clean exit proves the scenario's own gates held —
+    // the worker count rose under load (scale-up) and fell back to zero on the
+    // idle plateaus (scale-down), and every acked INSERT survived the
+    // scale-to-zero teardowns (zero acked-write loss). Small peak/dwell/idle keep
+    // it fast while still driving the full up/down/up cycle the issue specifies.
+    let url = unique_url();
+    let code = run_cli(&argv(&[
+        "burst",
+        "--url",
+        &url,
+        "--peak-rps",
+        "200",
+        "--cycles",
+        "2",
+        "--writers",
+        "4",
+        "--ramp-ms",
+        "20",
+        "--dwell-ms",
+        "60",
+        "--idle-ms",
+        "30",
+        "--json",
+    ]));
+    assert_eq!(
+        code,
+        exit::OK,
+        "burst must scale up and down with no acked-write loss"
+    );
+}
+
+#[test]
+fn burst_rejects_the_pgwire_form() {
+    // Like scale-to-zero, burst owns an in-process controller; a deployed server
+    // runs its own out of the bench's reach, so the pgwire/server form is a config
+    // error (that path is the spec-09 scale form against a real deployment).
+    assert_eq!(
+        run_cli(&argv(&[
+            "burst",
+            "--url",
+            "file:///tmp/x.db",
+            "--transport",
+            "pgwire",
+        ])),
+        exit::CONFIG
+    );
+}
+
+#[test]
 fn scale_to_zero_rejects_the_pgwire_form() {
     // The scenario owns an in-process controller; a deployed server runs its own,
     // out of the bench's reach, so the pgwire/server form is a config error.
