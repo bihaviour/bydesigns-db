@@ -85,7 +85,7 @@ function main() {
     name: `@twilldb/engine-${t.pkg}`,
     version: VERSION,
     description: `Prebuilt twill-db engine native library for ${t.os}/${t.cpu}.`,
-    license: "AGPL-3.0-only",
+    license: "BUSL-1.1",
     repository: { type: "git", url: REPO },
     os: [t.os],
     cpu: [t.cpu],
