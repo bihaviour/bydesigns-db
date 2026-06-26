@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server: Drizzle ORM · Twill DB</title>
+<meta name="description" content="Use Drizzle ORM against Twill's engine-server over the Postgres wire protocol: client setup, schema, queries, transactions, and the migration/introspection caveat.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Server: Drizzle ORM</h1>
+<p class="lede">Drizzle is a thin, SQL-first query builder, which makes it a good fit for Twill's focused SQL surface: the queries it generates are close to the SQL you'd write by hand. Point it at <a href="connect-server.html">engine-server</a> through a standard Postgres driver.</p>
+</header>
+
+<section>
+<h2>Prerequisites</h2>
+<p>A running server, and <code>npm i drizzle-orm postgres</code> (the <code>postgres-js</code> driver; <code>pg</code> works too via <code>drizzle-orm/node-postgres</code>).</p>
+</section>
+
+<section>
+<h2>Step 1 — the client</h2>
+<pre data-lang="ts"><code>import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+
+const client = postgres("postgresql://postgres@127.0.0.1:5433/main?sslmode=disable", {
+  ssl: false,
+  prepare: true, // use the extended (prepared) protocol — supported by the server
+});
+
+export const db = drizzle(client);</code></pre>
+<p><strong>Breakdown:</strong> <code>ssl: false</code> matches the cleartext listener; <code>prepare: true</code> uses Parse/Bind/Execute, which the server implements. <code>drizzle(client)</code> wraps the driver in the query builder.</p>
+</section>
+
+<section>
+<h2>Step 2 — the schema</h2>
+<pre data-lang="ts"><code>import { pgTable, integer, text } from "drizzle-orm/pg-core";
+
+export const notes = pgTable("notes", {
+  id: integer("id").primaryKey(),
+  body: text("body").notNull(),
+  ts: text("ts").notNull(),
+});</code></pre>
+<p><strong>Breakdown:</strong> declare tables with column types the engine supports (integer/text here). This is the type-safe handle Drizzle uses to build queries — it does not by itself create the table (see the caveat below).</p>
+</section>
+
+<section>
+<h2>Step 3 — queries &amp; transactions</h2>
+<pre data-lang="ts"><code>import { eq, desc } from "drizzle-orm";
+
+// select
+const recent = await db.select().from(notes).orderBy(desc(notes.id)).limit(50);
+
+// insert
+await db.insert(notes).values({ id: 1, body: "hello", ts: new Date().toISOString() });
+
+// transaction — the engine runs it for real, COMMIT blocks until durable
+await db.transaction(async (tx) => {
+  await tx.update(notes).set({ body: "edited" }).where(eq(notes.id, 1));
+});</code></pre>
+<p><strong>Breakdown:</strong> Drizzle compiles these to parameterized SQL within the supported subset. Keep an eye on advanced constructs (window functions, exotic joins) — if a built query exceeds the surface, the engine returns a clean <code>ENGINE_ERR_SQL</code> rather than mis-running it; check it against the <a href="sql-reference.html">SQL reference</a>.</p>
+</section>
+
+<section>
+<h2>The caveat: schema management</h2>
+<div class="callout warning">
+<p class="callout-title">Author DDL yourself; be careful with <code>drizzle-kit</code></p>
+<p>Drizzle's runtime query builder maps cleanly onto the engine. But <code>drizzle-kit</code> <em>introspect</em> / <em>push</em> leans on full Postgres catalog behaviour that exceeds the current surface. Prefer creating schema with plain <code>CREATE TABLE</code> you control — via a migration you author, or <code>db.execute(sql\`...\`)</code> — and validate generated DDL against the <a href="sql-reference.html">SQL reference</a>. Track surface growth on the <a href="../release/index.html">roadmap</a> (Phase 6).</p>
+</div>
+<pre data-lang="ts"><code>import { sql } from "drizzle-orm";
+await db.execute(sql`CREATE TABLE IF NOT EXISTS notes (
+  id INTEGER PRIMARY KEY, body TEXT NOT NULL, ts TEXT NOT NULL
+)`);</code></pre>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-server-prisma.html"><span class="xref-title">Prisma</span><span class="xref-desc">The other major ORM, same approach.</span></a>
+<a class="xref" href="connect-server-node.html"><span class="xref-title">Raw Node/Bun client</span><span class="xref-desc">Underneath the ORM.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

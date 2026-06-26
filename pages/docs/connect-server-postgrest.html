@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server: PostgREST · Twill DB</title>
+<meta name="description" content="Run unmodified PostgREST over Twill's engine-server to get an auto-generated REST API — including foreign-key resource embedding — with zero engine changes.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Server: PostgREST</h1>
+<p class="lede">PostgREST auto-generates a REST API from a Postgres schema. Twill runs it <strong>unmodified</strong> — the server convincingly emulates enough Postgres (version probe, catalog reflection, query-template rewriting) that an off-the-shelf PostgREST serves full CRUD plus foreign-key embedding over the engine, with zero engine changes.</p>
+</header>
+
+<section>
+<h2>How it works (the composition)</h2>
+<p>This is the most advanced "compose around the engine" example. PostgREST thinks it's talking to Postgres because the server (<code>crates/server</code>) does three things on its behalf:</p>
+<ul>
+<li><strong>Version probe</strong> — answers PostgREST's startup checks so it proceeds (<code>introspect.rs</code>).</li>
+<li><strong>Catalog reflection</strong> — reflects the engine's tables <em>and foreign-key relationships</em> into the binary catalog format PostgREST loads into its schema cache (<code>reflect.rs</code>).</li>
+<li><strong>Data-path rewriting</strong> — rewrites PostgREST's fixed query templates (GET/POST/PATCH/DELETE and FK-embedding reads) into engine-runnable SQL, assembling nested JSON itself with a nested-loop join (<code>datapath.rs</code>).</li>
+</ul>
+<p>So the engine never sees <code>LEFT JOIN LATERAL</code>, <code>row_to_json</code>, or <code>json_agg</code> — the server handles those. The result: relationships reflect into PostgREST's schema cache and embedding (<code>?select=col,rel(col)</code>, both many-to-one and one-to-many) works end-to-end.</p>
+</section>
+
+<section>
+<h2>Step 1 — start the engine server</h2>
+<pre data-lang="bash"><code>cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db</code></pre>
+</section>
+
+<section>
+<h2>Step 2 — create schema with foreign keys</h2>
+<p>The engine tracks FK <em>metadata</em> (from inline <code>REFERENCES</code> / table-level <code>FOREIGN KEY</code>), which is what PostgREST needs to expose embedding. (It is metadata only — the engine does not enforce referential integrity in this phase.)</p>
+<pre data-lang="sql"><code>CREATE TABLE authors (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+CREATE TABLE books (
+  id        INTEGER PRIMARY KEY,
+  title     TEXT NOT NULL,
+  author_id INTEGER REFERENCES authors(id)
+);</code></pre>
+</section>
+
+<section>
+<h2>Step 3 — point PostgREST at the server</h2>
+<pre data-lang="bash"><code># postgrest.conf
+db-uri = "postgresql://postgres@127.0.0.1:5433/main?sslmode=disable"
+db-schemas = "public"
+db-anon-role = "postgres"</code></pre>
+<pre data-lang="bash"><code>postgrest postgrest.conf   # unmodified PostgREST 14.x</code></pre>
+<p><strong>Breakdown:</strong> the <code>db-uri</code> is the same cleartext DSN every client uses. PostgREST connects, reflects the schema cache (tables + FKs), and starts serving.</p>
+</section>
+
+<section>
+<h2>Step 4 — use the REST API</h2>
+<pre data-lang="bash"><code># list
+curl 'http://localhost:3000/books'
+
+# filter + select columns
+curl 'http://localhost:3000/books?title=eq.Dune&select=id,title'
+
+# FK embedding — many-to-one (book → its author)
+curl 'http://localhost:3000/books?select=title,authors(name)'
+
+# FK embedding — one-to-many (author → their books)
+curl 'http://localhost:3000/authors?select=name,books(title)'
+
+# create
+curl -X POST 'http://localhost:3000/books' \
+  -H 'content-type: application/json' \
+  -d '{"id":1,"title":"Dune","author_id":1}'</code></pre>
+<p><strong>Breakdown:</strong> the embedding queries (<code>select=…,rel(col)</code>) are decomposed by the server into per-relation engine queries whose nested JSON it assembles — a nested-loop join in composition glue, invisible to the engine.</p>
+</section>
+
+<section>
+<h2>Scope</h2>
+<div class="callout note">
+<p class="callout-title">Built against captured PostgREST SQL</p>
+<p>The rewrite targets PostgREST 14.x's actual query templates. Standard CRUD and FK embedding are supported; very advanced PostgREST features outside those captured templates may not be. This is composition glue living entirely in <code>crates/server</code> — the engine core is untouched. For the broader composition philosophy see <a href="auth.html">Auth (better-auth)</a> and <a href="olap.html">Analytics (DuckDB)</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="auth.html"><span class="xref-title">Auth (better-auth)</span><span class="xref-desc">Another composition, on the embedded plane.</span></a>
+<a class="xref" href="connect-server.html"><span class="xref-title">Back to server overview</span><span class="xref-desc">All clients &amp; ORMs.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

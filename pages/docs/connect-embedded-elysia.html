@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedded with Elysia · Twill DB</title>
+<meta name="description" content="A step-by-step breakdown of embedding Twill DB in an Elysia app on Bun: register the handle with decorate, validate bodies with the type system, and run transactions.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Embedded with Elysia</h1>
+<p class="lede">Elysia is a Bun-native framework with a built-in schema/validation system. The integration is the same shared handle as everywhere else — the Elysia-specific part is registering it with <code>decorate</code> so it's available as <code>ctx.db</code>, and validating request bodies declaratively.</p>
+</header>
+
+<section>
+<h2>What we're building</h2>
+<p>The notes API — <code>GET /notes</code> and <code>POST /notes</code> — on Elysia, with body validation. Prerequisites: <code>bun add @twilldb/bun elysia</code> and the shared <a href="connect-embedded.html"><code>db.ts</code></a> from the overview.</p>
+</section>
+
+<section>
+<h2>Step 1 — register the handle with <code>decorate</code></h2>
+<p>You can import the shared <code>db</code> directly, but Elysia's idiom is to <code>decorate</code> the context so handlers receive it as <code>ctx.db</code>. This keeps handlers decoupled and makes testing easy (swap the decorated value).</p>
+<pre data-lang="ts"><code>// app.ts
+import { Elysia, t } from "elysia";
+import { db } from "./db";
+
+const app = new Elysia()
+  .decorate("db", db);</code></pre>
+<p><strong>Breakdown:</strong> <code>decorate("db", db)</code> attaches the one shared handle to every request context. It's the same instance for all requests — <code>decorate</code> registers a value once, it does not create one per request.</p>
+</section>
+
+<section>
+<h2>Step 2 — a read route</h2>
+<pre data-lang="ts"><code>app.get("/notes", ({ db }) =>
+  db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50"),
+);</code></pre>
+<p><strong>Breakdown:</strong> the handler destructures <code>db</code> from the context. Returning the array directly is enough — Elysia serializes it to JSON. Queries are synchronous, so no <code>await</code>.</p>
+</section>
+
+<section>
+<h2>Step 3 — a validated write route</h2>
+<p>Elysia's <code>t</code> schema validates the body <em>before</em> your handler runs, so by the time you reach the insert, <code>body.body</code> is guaranteed to be a string.</p>
+<pre data-lang="ts"><code>app.post(
+  "/notes",
+  ({ db, body }) => {
+    db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [
+      body.body,
+      new Date().toISOString(),
+    ]);
+    return { ok: true };
+  },
+  {
+    body: t.Object({ body: t.String({ minLength: 1 }) }),
+  },
+);
+
+app.listen(3000);</code></pre>
+<p><strong>Breakdown:</strong></p>
+<ul>
+<li>The third argument's <code>body</code> schema is the validation gate — a malformed request is rejected with a <code>422</code> automatically, before the handler.</li>
+<li>The validated value is still bound through <code>?</code> placeholders — validation checks <em>shape</em>, parameter binding prevents <em>injection</em>. You want both.</li>
+<li><code>app.listen(3000)</code> starts the Bun server.</li>
+</ul>
+</section>
+
+<section>
+<h2>Step 4 — transactions and error mapping</h2>
+<p>Use <code>db.transaction()</code> for atomic multi-statement writes, and Elysia's <code>onError</code> to translate engine errors.</p>
+<pre data-lang="ts"><code>import { EngineError } from "@twilldb/bun";
+
+app
+  .onError(({ error, set }) => {
+    if (error instanceof EngineError) {
+      set.status = error.retryable ? 409 : 400;
+      return { error: error.message };
+    }
+    set.status = 500;
+    return { error: "internal" };
+  })
+  .post(
+    "/transfer",
+    ({ db, body }) => {
+      db.transaction((tx) => {
+        tx.query("UPDATE accounts SET balance = balance - ? WHERE id = ?", [body.amount, body.from]);
+        tx.query("UPDATE accounts SET balance = balance + ? WHERE id = ?", [body.amount, body.to]);
+      });
+      return { ok: true };
+    },
+    { body: t.Object({ from: t.Number(), to: t.Number(), amount: t.Number() }) },
+  );</code></pre>
+<p><strong>Breakdown:</strong> a throw inside the transaction callback rolls back the engine and surfaces in <code>onError</code>; <code>EngineError.retryable</code> distinguishes a retryable write conflict (<code>409</code>) from a hard error (<code>400</code>).</p>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-embedded-nextjs.html"><span class="xref-title">Next.js</span><span class="xref-desc">Server-runtime route handlers + the singleton guard.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-title">Embedded API reference</span><span class="xref-desc">Every method in the wrapper.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

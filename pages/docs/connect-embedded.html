@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect as embedded — overview · Twill DB</title>
+<meta name="description" content="Embed Twill DB in-process with @twilldb/bun. The shared pattern (open once, share the handle) plus per-framework breakdowns for Bun, Hono, Elysia, and Next.js.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Connect as embedded — overview</h1>
+<p class="lede">The embedded plane runs the engine <em>inside your process</em> via <code>@twilldb/bun</code> (a typed wrapper over <code>bun:ffi</code> and the C ABI). Queries are function calls — no socket, no round-trip. This page covers the one pattern every framework shares; then each framework has its own page that breaks the integration down step by step.</p>
+</header>
+
+<section>
+<h2>Install</h2>
+<p>Add the package; it auto-discovers the native <code>libengine</code> built into <code>target/{release,debug}</code>, or set <code>TWILLDB_ENGINE_PATH</code> to point at a specific build.</p>
+<pre data-lang="bash"><code>bun add @twilldb/bun</code></pre>
+<p>For the complete embedded API (every method, parameter binding, prepared statements, error handling), see <a href="connect-bun.html">Embedded (bun:ffi)</a>. This section is about wiring that API into a web framework.</p>
+</section>
+
+<section>
+<h2>The one rule: open once, share the handle</h2>
+<p>A <code>Database</code> handle is a long-lived resource. Open it <strong>once</strong> at module scope and reuse it for every request — never per request. Put it in a single module and import it everywhere; multiple connections to the same <code>file://</code> URL in one process share one underlying database, so snapshot isolation holds across the whole app.</p>
+<pre data-lang="ts"><code>// db.ts — a single shared module, imported by every route in every framework.
+import { open, type Database } from "@twilldb/bun";
+
+// Opened once when this module is first imported.
+export const db: Database = open(process.env.TWILLDB_URL ?? "file://./app.db");
+
+// Create schema on boot (DDL runs in autocommit).
+db.exec(`CREATE TABLE IF NOT EXISTS notes (
+  id   INTEGER PRIMARY KEY,
+  body TEXT NOT NULL,
+  ts   TEXT NOT NULL
+)`);</code></pre>
+<p>Every framework page below imports this exact <code>db.ts</code>. The only thing that changes is how the framework hands you the request and where you register the handle.</p>
+<div class="callout warning">
+<p class="callout-title">Embedded means one process</p>
+<p>The embedded handle lives in <em>this</em> process's memory. If you run multiple instances (or serverless workers) that must share writes, either keep a single instance, switch to <a href="connect-server.html">server mode</a> over the wire, or point all instances at the same <code>s3://</code> backend, where the durable single-writer lease coordinates them. Embedded <code>file://</code> is single-process by design.</p>
+</div>
+</section>
+
+<section>
+<h2>Pick your framework</h2>
+<p>Each page below is a full breakdown of one example app — the wiring, the routes, transactions, and the framework-specific gotchas.</p>
+<div class="doc-card-grid">
+<a class="doc-card" href="connect-embedded-bun.html"><div class="ic">🟦</div><h3>Bun (HTTP)</h3><p>The smallest integration — <code>Bun.serve</code> calling the shared handle directly. Start here to see the bare mechanics.</p></a>
+<a class="doc-card" href="connect-embedded-hono.html"><div class="ic">🔥</div><h3>Hono</h3><p>Close over the handle in route handlers; JSON body parsing and parameterized writes.</p></a>
+<a class="doc-card" href="connect-embedded-elysia.html"><div class="ic">🦊</div><h3>Elysia</h3><p>Register the handle with <code>decorate</code> and validate request bodies with the type system.</p></a>
+<a class="doc-card" href="connect-embedded-nextjs.html"><div class="ic">▲</div><h3>Next.js</h3><p>Server-runtime only — route handlers and server actions, with the <code>globalThis</code> singleton guard.</p></a>
+</div>
+</section>
+
+<section>
+<h2>What every page shares</h2>
+<p>Three things are identical across frameworks, so they're explained once here and referenced from each page:</p>
+<ul>
+<li><strong>Transactions.</strong> Wrap multi-statement writes in <code>db.transaction(fn)</code> — it issues <code>BEGIN</code>, runs your function, then <code>COMMIT</code> (blocking until the WAL is durable), or <code>ROLLBACK</code> + rethrow on error.
+<pre data-lang="ts"><code>db.transaction((tx) => {
+  tx.query("UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, 1]);
+  tx.query("UPDATE accounts SET balance = balance + ? WHERE id = ?", [100, 2]);
+}); // commits durably here, or rolls back if either statement throws</code></pre></li>
+<li><strong>Parameter binding.</strong> Always use positional <code>?</code> placeholders with a params array — never string-concatenate user input.</li>
+<li><strong>Clean shutdown.</strong> Release the handle when the process exits: <code>process.on("beforeExit", () =&gt; db.close())</code>.</li>
+</ul>
+<p>Because the data is just engine rows, any of these apps can fork its database copy-on-write (<a href="branching.html">Branching</a>) or run disaggregated on object storage (<a href="storage.html">Storage backends</a>) with no code change beyond the connection string.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

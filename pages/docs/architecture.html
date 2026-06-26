@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture · Twill DB</title>
+<meta name="description" content="How Twill DB is built: one engine, a pluggable storage seam, and two front doors (embedded FFI + Postgres wire). The mental model you need before connecting.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Architecture</h1>
+<p class="lede">You only need one idea to use Twill DB well: <strong>there is a single engine, it never touches disk directly, and it reaches durable state through one narrow storage seam.</strong> Everything else — embedded vs server, local file vs object storage, branching, scale-to-zero — falls out of that one decision. This page is the mental model; the rest of the docs are the how-to.</p>
+</header>
+
+<section>
+<h2>One engine, two front doors</h2>
+<p>Twill DB is <em>one</em> compiled engine (<code>libengine</code>). You reach it through one of two interfaces, and you pick durable storage with a <em>connection string</em> — never a rebuild.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Front door</th><th>How you call it</th><th>Latency</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><strong>Embedded</strong></td><td>In-process via <code>bun:ffi</code> over the C ABI</td><td>Function call (no socket)</td><td>One app owning its database</td></tr>
+<tr><td><strong>Server</strong></td><td>Over the Postgres wire protocol (pgwire)</td><td>Network round-trip</td><td>Many clients; existing Postgres tools/ORMs</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout success">
+<p class="callout-title">The same engine, the same SQL, the same data</p>
+<p>Server mode is just "the embedded engine wrapped in a wire listener." Nothing about SQL, transactions, MVCC, or durability changes between the two doors — only how the call arrives. There is no second engine to learn or maintain.</p>
+</div>
+</section>
+
+<section>
+<h2>The seam: backend chosen by URL scheme</h2>
+<p>The engine writes durable state only through one trait, <code>Storage</code>. Which concrete backend is wired in is decided purely by the scheme of the URL you pass at open time:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>URL scheme</th><th>Backend</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><code>file://</code></td><td><code>LocalFileStorage</code></td><td>Pure embedded, zero network — a crash-safe local database file.</td></tr>
+<tr><td><code>s3://</code> · <code>r2://</code> · <code>gs://</code></td><td><code>ObjectStorage</code></td><td>Storage-disaggregated: durability bottoms out on object storage; scale-to-zero capable.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Unknown schemes are rejected, never silently defaulted. The engine above the seam is byte-for-byte identical for both backends — see <a href="storage.html">Storage backends</a> for the operational differences.</p>
+<div class="diagram"><pre>
+   your app (Bun / Node)          psql · Bun.sql · Drizzle · Prisma · PostgREST
+        │ bun:ffi (C ABI)                       │ Postgres wire
+        ▼                                        ▼
+  ┌───────────────────────────────────────────────────────┐
+  │                    ENGINE  (libengine)                  │
+  │   SQL → MVCC snapshot isolation → WAL → group commit    │
+  │  ─────────────  trait Storage  (THE SEAM)  ───────────  │
+  └───────────────────────────────────────────────────────┘
+        │                                        │
+        ▼ file://                                ▼ s3:// / r2:// / gs://
+  LocalFileStorage                         ObjectStorage (LSM + CAS log)
+  (local, zero network)                    (disaggregated, scale-to-zero)
+</pre>
+<p class="diagram-caption">Two front doors above, one seam in the middle, two storage backends below — and the connection string is the only switch.</p>
+</div>
+</section>
+
+<section>
+<h2>The five concepts worth knowing</h2>
+<p>You don't need engine internals to use Twill DB, but these five terms show up across the docs and explain the guarantees you get.</p>
+<ul class="reqs">
+<li><span class="req-tag must">WAL</span> <strong>Write-ahead log.</strong> Every change is appended to a durable log <em>before</em> a commit is acknowledged. A commit only returns once its records are <code>fsync</code>'d — never from an in-memory buffer. That is the durability guarantee.</li>
+<li><span class="req-tag must">LSN</span> <strong>Log sequence number.</strong> A strictly increasing, gap-free integer stamped on every change — the database's clock. It makes "what did the data look like then?" answerable, which powers snapshots, branching, and recovery.</li>
+<li><span class="req-tag must">MVCC</span> <strong>Snapshot isolation.</strong> Readers capture an LSN and see a consistent snapshot; readers never block writers and writers never block readers.</li>
+<li><span class="req-tag should">Branch</span> <strong>Copy-on-write fork.</strong> A branch is a new LSN pointer over shared immutable history plus a private overlay for diverged writes. Creating one copies no data. See <a href="branching.html">Branching</a>.</li>
+<li><span class="req-tag should">Scale-to-zero</span> <strong>Idle to nothing.</strong> With an object-storage backend, compute can stop when idle (only bytes bill at rest) and warm on the next request by replaying the WAL. See <a href="scale-to-zero.html">Scale-to-zero</a>.</li>
+</ul>
+</section>
+
+<section>
+<h2>What's built in vs composed around</h2>
+<p>Twill DB keeps its core small on purpose. Exactly one capability is built <em>into</em> the engine; everything else is composed <em>around</em> it as ordinary libraries or wire-protocol clients — so the core never accumulates feature-specific code.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th>Where it lives</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td><strong>Built in</strong></td><td>Inside the engine</td><td>Vector search — the <code>vector(N)</code> type, HNSW index, and <code>&lt;-&gt;</code>/<code>&lt;=&gt;</code>/<code>&lt;#&gt;</code> distance operators</td></tr>
+<tr><td><strong>Composed around</strong></td><td>Outside the engine (adapters, clients, the server)</td><td>Auth (<a href="auth.html">better-auth</a>), REST (PostgREST), analytics (<a href="olap.html">DuckDB</a>), every ORM</td></tr>
+</tbody>
+</table>
+</div>
+<p>This is why integration is easy and the engine stays stable: the same row store serves all of them, and anything stored through any door is just rows — so it inherits durability, branching, and scale-to-zero automatically. The two integration planes are documented in <a href="connect-embedded.html">Connect as embedded</a> and <a href="connect-server.html">Connect as server</a>.</p>
+</section>
+
+<section>
+<h2>Where to go next</h2>
+<div class="doc-card-grid">
+<a class="doc-card" href="getting-started.html"><div class="ic">⚡</div><h3>Quickstart</h3><p>Build the library and run your first SQL in a few minutes.</p></a>
+<a class="doc-card" href="connect.html"><div class="ic">🔌</div><h3>Connect</h3><p>The connection model: schemes, embedded vs server, choosing a backend.</p></a>
+<a class="doc-card" href="storage.html"><div class="ic">🗄️</div><h3>Storage backends</h3><p><code>file://</code>, <code>s3://</code>, <code>r2://</code>, <code>gs://</code> — what changes and what doesn't.</p></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

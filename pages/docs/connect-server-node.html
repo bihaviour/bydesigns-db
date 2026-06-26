@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server: Node / Bun client · Twill DB</title>
+<meta name="description" content="Connect to Twill's engine-server over the Postgres wire protocol from Node (node-postgres) or Bun (Bun.sql): parameterized queries, transactions, and pooling.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Server: Node / Bun client</h1>
+<p class="lede">Two standard Postgres clients, no Twill-specific driver: Bun ships <code>Bun.sql</code>; Node uses <code>pg</code> (node-postgres). Both connect to <a href="connect-server.html">engine-server</a> with an ordinary DSN and <code>sslmode=disable</code>.</p>
+</header>
+
+<section>
+<h2>Prerequisites</h2>
+<p>A running server (<code>--listen 127.0.0.1:5433 --db file://./srv.db</code>). On Node: <code>npm i pg</code>. On Bun: nothing — <code>Bun.sql</code> is built in.</p>
+</section>
+
+<section>
+<h2>Bun — <code>Bun.sql</code></h2>
+<pre data-lang="ts"><code>import { SQL } from "bun";
+
+const sql = new SQL("postgresql://postgres@127.0.0.1:5433/main?sslmode=disable");
+
+// Tagged-template values are sent as bind parameters (extended protocol).
+const rows = await sql`SELECT id, body FROM notes ORDER BY id DESC LIMIT 50`;
+
+await sql`INSERT INTO notes (body, ts) VALUES (${"hello"}, ${new Date().toISOString()})`;</code></pre>
+<p><strong>Breakdown:</strong> the <code>${...}</code> interpolations are <em>not</em> string concatenation — <code>Bun.sql</code> turns them into Parse/Bind parameters, which the server's extended protocol handles. That's both safe (no injection) and what lets the engine plan the statement.</p>
+</section>
+
+<section>
+<h2>Node — node-postgres (<code>pg</code>)</h2>
+<pre data-lang="ts"><code>import { Client } from "pg";
+
+const client = new Client({
+  host: "127.0.0.1",
+  port: 5433,
+  user: "postgres",
+  database: "main",
+  ssl: false, // cleartext — the listener does not terminate TLS
+});
+
+await client.connect();
+
+const { rows } = await client.query(
+  "SELECT id, body FROM notes WHERE id = $1",
+  [1],
+);
+
+await client.query(
+  "INSERT INTO notes (body, ts) VALUES ($1, $2)",
+  ["hello", new Date().toISOString()],
+);
+
+await client.end();</code></pre>
+<p><strong>Breakdown:</strong> node-postgres uses <code>$1, $2…</code> numbered placeholders bound from the array — the server supports this placeholder form. <code>ssl: false</code> matches the cleartext listener.</p>
+</section>
+
+<section>
+<h2>Transactions</h2>
+<pre data-lang="ts"><code>// node-postgres
+await client.query("BEGIN");
+try {
+  await client.query("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [100, 1]);
+  await client.query("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [100, 2]);
+  await client.query("COMMIT"); // returns once the engine's WAL is durable
+} catch (e) {
+  await client.query("ROLLBACK");
+  throw e;
+}</code></pre>
+<p><strong>Breakdown:</strong> the engine runs real transactions; <code>COMMIT</code> blocks until durable. A <code>40001</code>-class serialization/conflict error (another writer committed first) is safe to retry — re-run the whole transaction.</p>
+</section>
+
+<section>
+<h2>Pooling</h2>
+<p>For a web app, use <code>pg.Pool</code> (Node) or rely on <code>Bun.sql</code>'s built-in pool. Because the engine serializes writers, place a transaction-mode pooler in front for serverless bursts — see <a href="connection-pooling.html">Connection pooling</a>.</p>
+<pre data-lang="ts"><code>import { Pool } from "pg";
+const pool = new Pool({ host: "127.0.0.1", port: 5433, user: "postgres", database: "main", ssl: false, max: 10 });
+const { rows } = await pool.query("SELECT count(*) FROM notes");</code></pre>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-server-drizzle.html"><span class="xref-title">Drizzle ORM</span><span class="xref-desc">A query builder on top of this driver.</span></a>
+<a class="xref" href="connect-embedded.html"><span class="xref-title">Or embed instead</span><span class="xref-desc">In-process, function-call latency.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

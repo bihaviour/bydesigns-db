@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changelog · Twill DB</title>
+<meta name="description" content="The human-readable version history of Twill DB — what landed in each release and why it matters, newest first.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+<script>window.SITE_BASE="../";window.SITE_SECTION="changelog";</script>
+</head>
+<body>
+
+<div class="hero-wrap">
+  <div class="hero">
+    <span class="eyebrow"><span class="dot"></span>Current: v0.4.0</span>
+    <h1>Changelog</h1>
+    <p class="sub">What changed in each release of Twill DB, newest first — written to be read, not just diffed. Every version ships the whole workspace in lockstep, so the wrapper and the native binary it loads are always an ABI-matched pair. For the roadmap and spec status, see <a href="../release/index.html">Release</a>.</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/bihaviour/twill-db/releases" target="_blank" rel="noopener">GitHub releases →</a>
+      <a class="btn btn-ghost" href="../release/index.html">Roadmap &amp; specs</a>
+    </div>
+  </div>
+</div>
+
+<main class="site-main">
+
+  <section>
+    <div class="callout warning">
+      <p class="callout-title">Pre-1.0 — read before upgrading</p>
+      <p>Twill DB is <code>0.x</code>: interfaces, the SQL surface, and on-disk/storage formats may change between releases, and backward compatibility is not guaranteed until <code>1.0.0</code>. Pin an exact version. Versions track the Cargo workspace version; the three distribution channels (npm, GitHub Releases, GHCR) all ship at the same tag.</p>
+    </div>
+  </section>
+
+  <!-- ===================== UNRELEASED ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="kicker">In progress</span>
+      <h2>Unreleased — since v0.4.0 <span class="chip progress">◐ building</span></h2>
+      <p>Work landed on <code>main</code> after the v0.4.0 tag. It will roll into the next version bump.</p>
+    </div>
+    <ul class="reqs">
+      <li><span class="req-tag stage">SQL 6A</span><span><strong>Expression &amp; single-table completeness.</strong> <code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, string concat <code>||</code>, <code>RETURNING</code>, upsert (<code>ON CONFLICT</code>), and <code>INSERT … SELECT</code> — the everyday expression surface an app actually issues.</span></li>
+      <li><span class="req-tag stage">SQL 6B</span><span><strong>Multi-table &amp; aggregation.</strong> Joins, qualified names, <code>DISTINCT</code>, set operations, derived tables/CTEs, non-correlated <em>and</em> correlated subqueries, views, join-driven DML, and grouped aggregation. The largest stage.</span></li>
+      <li><span class="req-tag should">Observability</span><span><strong>Storage <code>stats()</code> surface</strong> — a read-only, backend-neutral counters snapshot consumed by Twill Bench (and a future OTLP exporter). Additive: <code>STORAGE_TRAIT_VERSION</code> → <strong>3</strong>, with all C1–C8 conformance and branching tests still green.</span></li>
+      <li><span class="req-tag stage">Bench</span><span><strong>Twill Bench scenarios.</strong> Request-mix profiles, correctness profiles (counter, bank-transfer, inventory, document-editing), a <code>compare --baseline --candidate</code> diff, the serverless-efficiency report, scale-to-zero (Exp 5) cold-read, a <code>burst</code> autoscaling-stress scenario, a long-run soak, and a feature-gated custom workload loader.</span></li>
+      <li><span class="req-tag may">Proposal</span><span><strong>Row-Level Security (Phase 7)</strong> added to the roadmap as a proposed spec — design only, not yet implemented.</span></li>
+    </ul>
+  </section>
+
+  <!-- ===================== 0.4.0 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Release</span>
+      <h2>v0.4.0 — Distribution &amp; benchmarking <span class="chip shipped">✓ current</span></h2>
+      <p>The release that makes Twill DB installable and measurable: a real distribution story plus the validation tooling to back the performance and correctness claims.</p>
+    </div>
+    <h3>Highlights</h3>
+    <ul>
+      <li><strong>Multi-channel distribution.</strong> Three channels at one version — <code>@twilldb/bun</code> + per-platform binary packages on <strong>npm</strong>; prebuilt <code>libengine.{so,dylib,dll}</code> + <code>engine.h</code> on <strong>GitHub Releases</strong>; the <code>engine-server</code> container on <strong>GHCR</strong>.</li>
+      <li><strong>Twill Bench CLI foundation (spec 15).</strong> One driver that answers <em>is it fast</em>, <em>is the data still correct under stress</em>, and <em>how efficiently did the serverless architecture use compute</em> — over both transports (embedded FFI + pgwire) and both backends (<code>file://</code> / <code>s3://</code>).</li>
+      <li><strong>SQL Compatibility &amp; Mapping spec (spec 16).</strong> A precise map of the PostgreSQL/SQLite surface onto Twill, setting up the additive Phase 6 frontend growth.</li>
+    </ul>
+    <h3>Also</h3>
+    <ul>
+      <li>Privacy-first Google Analytics 4 with a Consent Mode v2 cookie banner on the docs site.</li>
+      <li>CI builds both macOS targets on Apple-Silicon runners.</li>
+      <li>Phase-5 composition groundwork: better-auth adapter, pooler guidance, DuckDB analytics, and PostgREST reflection/data-path.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 0.3.2 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Release</span>
+      <h2>v0.3.2 — Durability proof &amp; throughput</h2>
+      <p>Hardening the most important promise — that an acknowledged commit survives a crash — and adding the lever that keeps commits fast.</p>
+    </div>
+    <ul>
+      <li><strong>Crash-safety gate (Experiment 4).</strong> A fault-injecting object store fires at a chosen CAS-append; the reopened store must show zero acked-write loss and zero torn/half state across a seed sweep. This runs as an explicit CI step before any tool stores real data.</li>
+      <li><strong>Group commit.</strong> Concurrent commits coalesce into one durable append via a leader/follower coordinator — amortizing the <code>fsync</code>/CAS round-trip across the batch without ever acking before durable.</li>
+      <li><strong>Benchmark harness</strong> across embedded FFI and pgwire, plus hot-row contention tests.</li>
+      <li><strong>Docs:</strong> a "Copy as Markdown" button and <code>/llms.txt</code> so the documentation drops cleanly into an AI agent; the Twill DB wordmark as the site brand.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 0.3.1 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Release</span>
+      <h2>v0.3.1 — Website, brand &amp; supply chain</h2>
+    </div>
+    <ul>
+      <li><strong>Project website + documentation</strong> repurposed onto GitHub Pages under <code>pages/</code> (home, docs, specs, release; one shared design system, no build step).</li>
+      <li><strong>Rebrand</strong> from <code>bydesigns-db</code> to <strong>Twill DB</strong> (<code>twill-db</code>).</li>
+      <li><strong>Supply-chain hardening:</strong> Dependabot config and CodeQL scanning.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 0.3.0 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Release</span>
+      <h2>v0.3.0 — Branching, lifecycle &amp; vector search</h2>
+      <p>The release that turned an embeddable engine into a serverless platform: instant clones, scale-to-zero, and an in-core vector capability — all additive, because the seam never moved.</p>
+    </div>
+    <ul>
+      <li><strong>Copy-on-write branching (Phase 4).</strong> A branch is a storage-seam concern — a parent read-through below the fork LSN plus a private write overlay — so the same O(1), copies-nothing semantics serve <code>file://</code> and object stores alike.</li>
+      <li><strong>Durable single-writer lease.</strong> Acquire / renew / release fenced by a monotonic CAS epoch — the split-brain guard.</li>
+      <li><strong>Lifecycle controller (<code>twill-controller</code>).</strong> A <code>Cold→Warming→Active→Idle→Stopping→Cold</code> machine with an idle reaper, lease heartbeat, and thundering-herd admission — true scale-to-zero, with the engine core staying thread-free.</li>
+      <li><strong>In-core vector search (Phase 5).</strong> A <code>vector(N)</code> type, an HNSW index (<code>CREATE INDEX … USING hnsw</code>), the distance operators <code>&lt;-&gt;</code>/<code>&lt;=&gt;</code>/<code>&lt;#&gt;</code>, and top-k KNN. Because the index rides the same WAL/replay path as rows, it branches and re-warms with the database.</li>
+      <li><strong>Versions:</strong> <code>ENGINE_ABI_VERSION</code> → <strong>3</strong>, <code>STORAGE_TRAIT_VERSION</code> → <strong>2</strong>. All additive.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 0.2.0 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Release</span>
+      <h2>v0.2.0 — Foundations: the engine and its two doors</h2>
+      <p>The first published release. It established the whole architecture: one engine, one pluggable seam, two front doors, two backends.</p>
+    </div>
+    <ul>
+      <li><strong>Embedded engine core (Phase 1).</strong> SQL → MVCC snapshot isolation → crash-safe WAL with deterministic replay, the pluggable <code>Storage</code> trait (the seam), <code>LocalFileStorage</code>, and the frozen C ABI bound into Bun via <code>bun:ffi</code>.</li>
+      <li><strong>Object-storage backend (Phase 2).</strong> A second <code>Storage</code> impl — an LSM page store + S3-CAS commit log — making the database disaggregated and scale-to-zero capable while staying embedded. Flip the connection string from <code>file://</code> to <code>s3://</code>/<code>r2://</code>/<code>gs://</code> and the same binary bottoms out on object storage.</li>
+      <li><strong>Server mode + pgwire (Phase 3).</strong> The same engine behind a Postgres-wire listener — <code>psql</code>, <code>Bun.sql</code>, <code>pgbench</code>, and PostgREST connect with no bespoke driver.</li>
+    </ul>
+  </section>
+
+  <section>
+    <div class="callout note">
+      <p class="callout-title">Versioning &amp; compatibility markers</p>
+      <p>Two internal version numbers track compatibility and appear throughout these notes: <code>ENGINE_ABI_VERSION</code> (the frozen C embedding contract — the Bun wrapper refuses a mismatched binary) and <code>STORAGE_TRAIT_VERSION</code> (the storage seam). They are bumped only on a contract change, and the project's discipline is that growth stays <em>additive</em> so the seam never moves. Current: ABI <strong>3</strong>, Trait <strong>3</strong>.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="inner">
+    <div>Twill DB — a serverless OLTP engine. Licensed under AGPL-3.0.</div>
+    <div class="foot-links">
+      <a href="../docs/index.html">Docs</a>
+      <a href="../release/index.html">Release</a>
+      <a href="../changelog/index.html">Changelog</a>
+      <a href="../author/index.html">Author</a>
+      <a href="https://github.com/bihaviour/twill-db" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+<script src="../assets/app.js"></script>
+</body>
+</html>

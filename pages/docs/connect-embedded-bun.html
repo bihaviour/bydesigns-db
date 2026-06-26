@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedded with Bun (HTTP) · Twill DB</title>
+<meta name="description" content="A step-by-step breakdown of embedding Twill DB in a plain Bun.serve HTTP app: open the handle once, run parameterized queries, and handle errors.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Embedded with Bun (HTTP)</h1>
+<p class="lede">The smallest possible integration: <code>Bun.serve</code> calling the shared engine handle directly. No framework, no abstraction — just the bare mechanics, so you can see exactly what every other framework page is really doing underneath.</p>
+</header>
+
+<section>
+<h2>What we're building</h2>
+<p>A tiny notes API with two endpoints — <code>GET /notes</code> (list) and <code>POST /notes</code> (create) — backed by an embedded <code>file://</code> database. Prerequisites: <code>bun add @twilldb/bun</code> and the shared <a href="connect-embedded.html"><code>db.ts</code></a> module from the overview.</p>
+</section>
+
+<section>
+<h2>Step 1 — the shared handle</h2>
+<p>The database is opened once in its own module so every part of the app imports the <em>same</em> handle. Opening per request would be wrong: it's a long-lived resource, and one process should hold one handle.</p>
+<pre data-lang="ts"><code>// db.ts
+import { open, type Database } from "@twilldb/bun";
+
+export const db: Database = open(process.env.TWILLDB_URL ?? "file://./app.db");
+
+db.exec(`CREATE TABLE IF NOT EXISTS notes (
+  id   INTEGER PRIMARY KEY,
+  body TEXT NOT NULL,
+  ts   TEXT NOT NULL
+)`);</code></pre>
+<p><strong>Breakdown:</strong> <code>open()</code> picks the backend from the URL scheme (<code>file://</code> here). <code>db.exec()</code> runs a statement that returns no rows; <code>CREATE TABLE</code> runs in autocommit, so the schema exists before the first request. <code>IF NOT EXISTS</code> makes boot idempotent across restarts.</p>
+</section>
+
+<section>
+<h2>Step 2 — the server</h2>
+<p><code>Bun.serve</code> takes a single <code>fetch(req)</code> function. We import the shared handle and branch on method + path.</p>
+<pre data-lang="ts"><code>// server.ts
+import { db } from "./db";
+
+Bun.serve({
+  port: 3000,
+  async fetch(req) {
+    const url = new URL(req.url);
+
+    // GET /notes — list the 50 most recent
+    if (url.pathname === "/notes" && req.method === "GET") {
+      const rows = db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50");
+      return Response.json(rows);
+    }
+
+    // POST /notes — create one
+    if (url.pathname === "/notes" && req.method === "POST") {
+      const { body } = (await req.json()) as { body: string };
+      if (!body) return new Response("body required", { status: 400 });
+      db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [body, new Date().toISOString()]);
+      return Response.json({ ok: true }, { status: 201 });
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+});
+console.log("listening on http://localhost:3000");</code></pre>
+<p><strong>Breakdown:</strong></p>
+<ul>
+<li><code>db.query(sql)</code> with no params buffers and returns all rows as an array of plain objects (column → value).</li>
+<li><code>db.query(sql, params)</code> binds positional <code>?</code> placeholders to the array — this is how you pass user input safely. Never string-concatenate it into SQL.</li>
+<li>Values come back as strings (or <code>null</code>); cast in your app if you need numbers/dates. <code>Response.json(rows)</code> serializes the array directly.</li>
+</ul>
+</section>
+
+<section>
+<h2>Step 3 — run it</h2>
+<pre data-lang="bash"><code>bun run ./server.ts
+
+# in another shell
+curl localhost:3000/notes
+curl -X POST localhost:3000/notes -H 'content-type: application/json' -d '{"body":"hello"}'</code></pre>
+</section>
+
+<section>
+<h2>Step 4 — transactions &amp; error handling</h2>
+<p>For multi-statement writes that must be atomic, wrap them in <code>db.transaction()</code>. It commits durably on normal return and rolls back + rethrows on error — so you translate the throw into an HTTP status.</p>
+<pre data-lang="ts"><code>import { EngineError } from "@twilldb/bun";
+
+try {
+  db.transaction((tx) => {
+    tx.query("UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, 1]);
+    tx.query("UPDATE accounts SET balance = balance + ? WHERE id = ?", [100, 2]);
+  });
+} catch (e) {
+  if (e instanceof EngineError && e.retryable) {
+    // write conflict or transient storage error — safe to retry
+    return new Response("conflict, retry", { status: 409 });
+  }
+  throw e;
+}</code></pre>
+<p><strong>Breakdown:</strong> <code>EngineError</code> carries the numeric status and a <code>retryable</code> flag (true for write-conflict / transient storage errors). A conflict means another writer committed first — retrying the whole transaction is the correct response.</p>
+</section>
+
+<section>
+<h2>Clean shutdown</h2>
+<pre data-lang="ts"><code>process.on("beforeExit", () => db.close());</code></pre>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-embedded-hono.html"><span class="xref-title">Hono</span><span class="xref-desc">The same app with a real router.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-title">Embedded API reference</span><span class="xref-desc">Every method: prepare, bind, step, branch.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

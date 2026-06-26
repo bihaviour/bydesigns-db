@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage: gs:// (Google Cloud) · Twill DB</title>
+<meta name="description" content="The gs:// storage backend — ObjectStorage on Google Cloud Storage: disaggregated, scale-to-zero durability. How to open it and configure service-account credentials.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Storage: <code>gs://</code> (Google Cloud)</h1>
+<p class="lede">The same disaggregated <code>ObjectStorage</code> backend as <a href="storage-s3.html">s3://</a>, pointed at <strong>Google Cloud Storage</strong>. Durability, scale-to-zero, branching, and the engine/API are identical — only the credentials and the egress-cost profile differ. See the shared model in the <a href="storage.html">overview</a>.</p>
+</header>
+
+<section>
+<h2>When to use it</h2>
+<ul>
+<li>You're already on Google Cloud (e.g. running the server on Cloud Run next to a GCS bucket).</li>
+<li>You want disaggregated, scale-to-zero storage and prefer GCP's IAM/service-account model.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open it</h2>
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
+using db = open("gs://my-bucket/mydb");</code></pre>
+<pre data-lang="bash"><code>cargo run -p twill-server -- --listen 0.0.0.0:5433 --db gs://my-bucket/mydb</code></pre>
+<p><strong>Breakdown:</strong> <code>gs://&lt;bucket&gt;/&lt;db-prefix&gt;</code> names the GCS bucket and key prefix. The scheme is the only thing selecting this backend.</p>
+</section>
+
+<section>
+<h2>Credentials</h2>
+<p>Authenticate with a service account. Point the standard Google variable at the key file, or rely on the ambient credentials of the GCP runtime (Cloud Run, GKE Workload Identity, etc.).</p>
+<pre data-lang="bash"><code>export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+# On Cloud Run / GKE you can instead use the attached service account
+# (Application Default Credentials) with no key file.</code></pre>
+<div class="callout warning">
+<p class="callout-title">Secrets stay in the environment</p>
+<p>Keep the service-account key out of the repo and the connection string. Prefer Workload Identity / attached service accounts over key files where the runtime supports it.</p>
+</div>
+</section>
+
+<section>
+<h2>What you gain (same as S3)</h2>
+<ul>
+<li><strong>Scale-to-zero</strong> — stateless compute idling to nothing; cold starts warm by WAL replay. See <a href="scale-to-zero.html">Scale-to-zero</a>.</li>
+<li><strong>Durable single-writer lease</strong> — CAS-epoch fencing against split brain.</li>
+<li><strong>Copy-on-write branching</strong> — child key-prefix overlays, no page copies. See <a href="branching.html">Branching</a>.</li>
+</ul>
+</section>
+
+<section>
+<h2>Cost note</h2>
+<p>Like S3, GCS bills egress per GB, so cache misses on a cold cache incur transfer cost. For read-heavy or frequently-cold-started databases, weigh that against <a href="storage-r2.html">r2://</a>'s zero egress — the engine behaves the same on all three.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

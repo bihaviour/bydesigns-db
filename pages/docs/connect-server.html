@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect as server — overview · Twill DB</title>
+<meta name="description" content="Run Twill DB behind a Postgres-wire listener so anything that speaks Postgres can connect. Start the server, learn the DSN, the SQL-subset rule, then pick your language client or ORM.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Connect as server — overview</h1>
+<p class="lede">Run the engine behind a Postgres-wire listener and <strong>anything that speaks Postgres can connect</strong> — no Twill-specific driver. This page covers what's shared across every client: starting the server, the connection string, and the one rule that governs all of them. Then each language and ORM has its own page with a full breakdown.</p>
+</header>
+
+<section>
+<h2>Start the server</h2>
+<p>One binary serves either storage backend, chosen by the <code>--db</code> URL.</p>
+<pre data-lang="bash"><code># Local file backend on port 5433
+cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db
+
+# Or disaggregated on object storage
+cargo run -p twill-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/mydb</code></pre>
+<p>The container image (<code>ghcr.io/bihaviour/twill-db</code>) runs the same binary for self-host / managed deployments.</p>
+</section>
+
+<section>
+<h2>The connection string</h2>
+<p>Every client uses an ordinary Postgres DSN. The database name is accepted but nominal — the server serves the database given by <code>--db</code>.</p>
+<pre data-lang="bash"><code>postgresql://postgres@127.0.0.1:5433/main?sslmode=disable</code></pre>
+<div class="callout warning">
+<p class="callout-title">Always <code>sslmode=disable</code></p>
+<p>The listener speaks Protocol 3.0 startup with trust auth over <strong>cleartext</strong>. TLS termination and SCRAM auth are deliberate non-goals for now — terminate TLS at a proxy if you need it on an untrusted network. Connect with <code>sslmode=disable</code> (or the driver's equivalent) everywhere.</p>
+</div>
+</section>
+
+<section>
+<h2>The one rule: connected ≠ every query runs</h2>
+<p>Twill implements both the simple <em>and</em> the full extended query protocol (Parse / Bind / Describe / Execute), which is exactly what prepared-statement clients and ORMs use — so they <strong>connect</strong> with no special driver. But the engine's SQL surface is a focused (growing) subset of Postgres. The rule of thumb:</p>
+<ul class="reqs">
+<li><span class="req-tag must">Connect</span> The wire protocol gets any Postgres tool talking to the engine.</li>
+<li><span class="req-tag should">Run</span> Whether a given query executes depends on the supported <a href="sql-reference.html">SQL subset</a>. Anything unsupported returns a clean <code>ENGINE_ERR_SQL</code> — reject, never mis-parse.</li>
+<li><span class="req-tag may">Schema</span> Runtime CRUD generally maps cleanly; ORM <em>migration/introspection</em> tooling that probes full Postgres catalog behaviour is the rough edge. Prefer authoring schema with plain validated SQL.</li>
+</ul>
+</section>
+
+<section>
+<h2>Pick your client</h2>
+<div class="doc-card-grid">
+<a class="doc-card" href="connect-server-node.html"><div class="ic">🟩</div><h3>Node / Bun</h3><p><code>Bun.sql</code> and <code>pg</code> (node-postgres) — parameterized queries and pooling.</p></a>
+<a class="doc-card" href="connect-server-python.html"><div class="ic">🐍</div><h3>Python</h3><p><code>psycopg</code> v3 — cursors, parameter style, transactions.</p></a>
+<a class="doc-card" href="connect-server-go.html"><div class="ic">🐹</div><h3>Go</h3><p><code>pgx</code> — connect, query, and pooling with <code>pgxpool</code>.</p></a>
+<a class="doc-card" href="connect-server-drizzle.html"><div class="ic">💧</div><h3>Drizzle ORM</h3><p>Query builder over <code>postgres-js</code>, plus the migration caveat.</p></a>
+<a class="doc-card" href="connect-server-prisma.html"><div class="ic">▲</div><h3>Prisma</h3><p>Datasource setup and the manage-schema-yourself approach.</p></a>
+<a class="doc-card" href="connect-server-postgrest.html"><div class="ic">🔗</div><h3>PostgREST</h3><p>Auto-generated REST API over the engine, unmodified — with FK embedding.</p></a>
+</div>
+</section>
+
+<section>
+<h2>Connections &amp; scale</h2>
+<p>The engine is single-writer with one OS thread per connection. For serverless or many-client workloads, put a transaction-mode pooler (PgBouncer / pgcat) in front to absorb connection bursts — see <a href="connection-pooling.html">Connection pooling</a>. The storage backend (and thus scale-to-zero) is independent of the client — see <a href="storage.html">Storage backends</a>.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

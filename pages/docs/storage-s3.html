@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage: s3:// (S3 / MinIO) · Twill DB</title>
+<meta name="description" content="The s3:// storage backend — ObjectStorage on AWS S3 or any S3-compatible store (MinIO): disaggregated, scale-to-zero durability via an LSM page store and a CAS commit log. How to open it and configure credentials.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Storage: <code>s3://</code> (S3 / MinIO)</h1>
+<p class="lede">The disaggregated backend (<code>ObjectStorage</code>) on AWS S3 or any S3-compatible store such as MinIO. Durability bottoms out on object storage; compute becomes stateless and scale-to-zero capable — while your engine, SQL, and API stay identical to <a href="storage-file.html">file://</a>. See the shared model in the <a href="storage.html">overview</a>.</p>
+</header>
+
+<section>
+<h2>How it works</h2>
+<p>Object stores can't do in-place edits or <code>fsync</code>, so this backend is built differently underneath — but the seam above it is unchanged:</p>
+<ul>
+<li><strong>LSM page store</strong> — writes accumulate in immutable layers (delta/image) that merge over time.</li>
+<li><strong>CAS commit log</strong> — a commit is an atomic <em>compare-and-swap</em> conditional write, which provides ordered durability <strong>and</strong> single-writer fencing without any separate coordination service.</li>
+<li><strong>Local cache</strong> — hot pages stay in-process, keeping object-storage latency off the read hot path.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open it</h2>
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
+using db = open("s3://my-bucket/mydb");</code></pre>
+<pre data-lang="bash"><code>cargo run -p twill-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/mydb</code></pre>
+<p><strong>Breakdown:</strong> <code>s3://&lt;bucket&gt;/&lt;db-prefix&gt;</code> names the bucket and a key prefix for this database. The same URL works for the embedded handle and the server — only the scheme distinguishes backends.</p>
+</section>
+
+<section>
+<h2>Credentials &amp; configuration</h2>
+<p>Provide standard AWS credentials via the environment — never in the URL or the repo.</p>
+<pre data-lang="bash"><code>export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-east-1
+# Temporary credentials also honoured:
+# export AWS_SESSION_TOKEN=...</code></pre>
+<h3>MinIO / S3-compatible endpoints</h3>
+<p>For a non-AWS S3-compatible store (MinIO, Ceph, etc.), point the client at the custom endpoint via your deployment configuration and use path-style addressing as that store requires. Credentials use the same <code>AWS_*</code> variables.</p>
+<div class="callout warning">
+<p class="callout-title">Secrets stay in the environment</p>
+<p>Keep bucket credentials in environment configuration, never in connection strings, code, tests, or commits. The secret-scanning hook treats a hit as a stop.</p>
+</div>
+</section>
+
+<section>
+<h2>What you gain</h2>
+<ul>
+<li><strong>Scale-to-zero</strong> — stateless compute can stop when idle (only bytes bill at rest); the next request warms by replaying the WAL. See <a href="scale-to-zero.html">Scale-to-zero &amp; lifecycle</a>.</li>
+<li><strong>Durable single-writer lease</strong> — a monotonic CAS epoch fences stale writers (the split-brain guard), so multiple instances can be pointed at one database safely.</li>
+<li><strong>Branching that copies nothing</strong> — a branch is a child key-prefix overlay over shared immutable layers. See <a href="branching.html">Branching</a>.</li>
+</ul>
+</section>
+
+<section>
+<h2>Cost note</h2>
+<p>On a disaggregated engine a cache miss reads <em>out</em> of object storage, billed as egress on S3. A cold cache therefore costs more here than on a zero-egress provider — if your workload is read-heavy or frequently cold-started, compare with <a href="storage-r2.html">r2://</a> (zero egress).</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

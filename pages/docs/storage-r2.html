@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage: r2:// (Cloudflare) · Twill DB</title>
+<meta name="description" content="The r2:// storage backend — ObjectStorage on Cloudflare R2: disaggregated, scale-to-zero durability with zero egress, the structural advantage for cold-read-heavy workloads.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Storage: <code>r2://</code> (Cloudflare)</h1>
+<p class="lede">The same disaggregated <code>ObjectStorage</code> backend as <a href="storage-s3.html">s3://</a>, pointed at <strong>Cloudflare R2</strong>. R2 is S3-compatible, so everything works identically — with one structural advantage: <strong>zero egress fees</strong>, which directly lowers the cost of cache misses and cold starts. See the shared model in the <a href="storage.html">overview</a>.</p>
+</header>
+
+<section>
+<h2>Why R2 specifically</h2>
+<p>On a disaggregated engine, a cache miss is a read <em>out</em> of object storage — billed as egress on S3/GCS. So a cold cache costs more on those providers. R2 charges <strong>zero egress</strong>, which removes that cost structurally. That makes it a natural fit for:</p>
+<ul>
+<li>Read-heavy workloads with a large working set that doesn't fully fit in cache.</li>
+<li>Frequently cold-started / scale-to-zero databases (each cold start re-reads pages).</li>
+<li>Many branches read concurrently off one base.</li>
+</ul>
+<p>The engine, durability model, and API are otherwise identical to the S3 backend.</p>
+</section>
+
+<section>
+<h2>Open it</h2>
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
+using db = open("r2://my-bucket/mydb");</code></pre>
+<pre data-lang="bash"><code>cargo run -p twill-server -- --listen 0.0.0.0:5433 --db r2://my-bucket/mydb</code></pre>
+</section>
+
+<section>
+<h2>Credentials</h2>
+<p>R2 uses S3-style access keys (create an R2 API token in the Cloudflare dashboard), supplied via the standard variables. The R2 S3 endpoint is your account-specific URL; set it through your deployment configuration.</p>
+<pre data-lang="bash"><code>export AWS_ACCESS_KEY_ID=...        # R2 access key id
+export AWS_SECRET_ACCESS_KEY=...    # R2 secret access key
+# R2 S3 endpoint: https://&lt;account-id&gt;.r2.cloudflarestorage.com  (set via deploy config)</code></pre>
+<div class="callout warning">
+<p class="callout-title">Secrets stay in the environment</p>
+<p>Keep R2 tokens in environment configuration, never in the connection string or the repo.</p>
+</div>
+</section>
+
+<section>
+<h2>What you gain (same as S3, plus zero egress)</h2>
+<ul>
+<li><strong>Scale-to-zero</strong> — stateless compute idling to nothing; cold starts warm by WAL replay. See <a href="scale-to-zero.html">Scale-to-zero</a>.</li>
+<li><strong>Durable single-writer lease</strong> — CAS-epoch fencing against split brain.</li>
+<li><strong>Copy-on-write branching</strong> — child key-prefix overlays, no page copies. See <a href="branching.html">Branching</a>.</li>
+<li><strong>Zero egress</strong> — cache misses and cold reads don't incur per-GB transfer charges.</li>
+</ul>
+</section>
+
+<section>
+<h2>Note on deployment</h2>
+<p>R2 also pairs with the exploratory WASM / Cloudflare Workers deployment track (a parallel deliverable, not the native critical path). On the native server/embedded path documented here, R2 is simply selected by the <code>r2://</code> scheme.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

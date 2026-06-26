@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server: Prisma · Twill DB</title>
+<meta name="description" content="Use Prisma against Twill's engine-server over the Postgres wire protocol: datasource setup, runtime queries, and the manage-schema-yourself approach for the focused SQL surface.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Server: Prisma</h1>
+<p class="lede">Prisma connects to <a href="connect-server.html">engine-server</a> as a Postgres datasource. Its runtime CRUD generally maps onto the engine; the thing to plan for is schema management, because Prisma's migration engine assumes full PostgreSQL.</p>
+</header>
+
+<section>
+<h2>Step 1 — the datasource</h2>
+<pre data-lang="bash"><code># .env — note sslmode=disable (cleartext listener)
+DATABASE_URL="postgresql://postgres@127.0.0.1:5433/main?sslmode=disable"</code></pre>
+<pre data-lang="prisma"><code>// schema.prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Note {
+  id   Int    @id
+  body String
+  ts   String
+}</code></pre>
+<p><strong>Breakdown:</strong> the <code>postgresql</code> provider speaks the wire protocol the server implements. Model fields use types the engine supports (<code>Int</code>, <code>String</code>).</p>
+</section>
+
+<section>
+<h2>Step 2 — runtime queries</h2>
+<pre data-lang="ts"><code>import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+const recent = await prisma.note.findMany({ take: 50, orderBy: { id: "desc" } });
+
+await prisma.note.create({ data: { id: 1, body: "hello", ts: new Date().toISOString() } });
+
+await prisma.$transaction([
+  prisma.note.update({ where: { id: 1 }, data: { body: "edited" } }),
+]);</code></pre>
+<p><strong>Breakdown:</strong> <code>findMany</code>, <code>create</code>, <code>update</code>, and <code>$transaction</code> compile to parameterized SQL the engine runs. As with any client, a query that exceeds the surface returns a clean <code>ENGINE_ERR_SQL</code> — verify advanced filters against the <a href="sql-reference.html">SQL reference</a>.</p>
+</section>
+
+<section>
+<h2>The caveat: don't use <code>prisma migrate</code> (yet)</h2>
+<div class="callout warning">
+<p class="callout-title">Manage schema with plain SQL, then point Prisma at it</p>
+<p>Prisma's migration engine emits advanced DDL and probes catalog features beyond the current surface, so <code>prisma migrate</code> and <code>db push</code> are the rough edge. The reliable approach: create tables with plain SQL you've validated, then use Prisma purely as a runtime client over the existing schema. Treat unsupported syntax as the boundary — never a silent mis-parse. Surface growth is tracked on the <a href="../release/index.html">roadmap</a> (Phase 6).</p>
+</div>
+<pre data-lang="bash"><code># 1) Create schema out-of-band (psql or any client)
+psql "postgresql://postgres@127.0.0.1:5433/main?sslmode=disable" \
+  -c "CREATE TABLE IF NOT EXISTS \"Note\" (id INTEGER PRIMARY KEY, body TEXT NOT NULL, ts TEXT NOT NULL)"
+
+# 2) Generate the client only (no migrate)
+npx prisma generate</code></pre>
+<p><strong>Breakdown:</strong> match the table/column names to your Prisma models (Prisma quotes <code>"Note"</code> by default). <code>prisma generate</code> builds the typed client without touching the database, so you skip the migration engine entirely.</p>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-server-postgrest.html"><span class="xref-title">PostgREST</span><span class="xref-desc">A zero-code REST API instead of an ORM.</span></a>
+<a class="xref" href="connect-server-drizzle.html"><span class="xref-title">Drizzle</span><span class="xref-desc">A SQL-first alternative that fits the subset well.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

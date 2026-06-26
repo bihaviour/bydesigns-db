@@ -18,10 +18,28 @@ Notes for agents:
 ## Docs
 
 - [Documentation overview](https://bihaviour.github.io/twill-db/docs/index.html): Entry point to the user documentation — connect, branch, scale to zero, operate.
+- [Architecture](https://bihaviour.github.io/twill-db/docs/architecture.html): The mental model — one engine, one pluggable storage seam, two front doors (embedded FFI + Postgres wire); WAL/LSN/MVCC/branch/scale-to-zero in brief.
 - [Quickstart](https://bihaviour.github.io/twill-db/docs/getting-started.html): Build the native library, open an embedded database from Bun, run SQL, and start a Postgres-wire server.
 - [Connect to your database](https://bihaviour.github.io/twill-db/docs/connect.html): The connection model — URL schemes, embedded vs server access, and how to choose a storage backend.
 - [Connect from Bun (embedded)](https://bihaviour.github.io/twill-db/docs/connect-bun.html): The full embedded API over bun:ffi — open, exec, parameterized query, prepared statements, transactions, branching, error handling.
+- [Connect as embedded — overview](https://bihaviour.github.io/twill-db/docs/connect-embedded.html): The shared embedded pattern via @twilldb/bun — open-once-share-the-handle, transactions, clean shutdown — and links to the per-framework breakdowns.
+- [Embedded with Bun (HTTP)](https://bihaviour.github.io/twill-db/docs/connect-embedded-bun.html): Step-by-step breakdown of a Bun.serve notes API on the embedded engine — shared handle, parameterized queries, transactions, retryable errors.
+- [Embedded with Hono](https://bihaviour.github.io/twill-db/docs/connect-embedded-hono.html): Step-by-step Hono integration — shared handle in route handlers, JSON bodies, parameterized writes, onError mapping, transactions.
+- [Embedded with Elysia](https://bihaviour.github.io/twill-db/docs/connect-embedded-elysia.html): Step-by-step Elysia integration — register the handle with decorate, validate bodies with t.Object, transactions and error mapping.
+- [Embedded with Next.js](https://bihaviour.github.io/twill-db/docs/connect-embedded-nextjs.html): Step-by-step Next.js integration — Node-runtime requirement, the globalThis singleton guard, route handlers, server actions/components.
 - [Connect with a Postgres client](https://bihaviour.github.io/twill-db/docs/connect-postgres.html): Start engine-server and connect with psql, Bun's SQL client, generic Postgres drivers, or PostgREST over the supported pgwire subset.
+- [Connect as server — overview](https://bihaviour.github.io/twill-db/docs/connect-server.html): Start engine-server, the cleartext DSN, and the connected-vs-runs SQL-subset rule; links to per-client breakdowns.
+- [Server: Node / Bun client](https://bihaviour.github.io/twill-db/docs/connect-server-node.html): Bun.sql and node-postgres (pg) — parameterized queries, transactions, pooling over pgwire.
+- [Server: Python client](https://bihaviour.github.io/twill-db/docs/connect-server-python.html): psycopg v3 — cursors, %s parameter binding, transactions, psycopg_pool.
+- [Server: Go client](https://bihaviour.github.io/twill-db/docs/connect-server-go.html): pgx v5 — connect, QueryRow/Query, transactions, pgxpool.
+- [Server: Drizzle ORM](https://bihaviour.github.io/twill-db/docs/connect-server-drizzle.html): client setup over postgres-js, schema, queries, transactions, and the drizzle-kit migration caveat.
+- [Server: Prisma](https://bihaviour.github.io/twill-db/docs/connect-server-prisma.html): datasource setup, runtime CRUD, and the manage-schema-yourself approach (avoid prisma migrate for now).
+- [Server: PostgREST](https://bihaviour.github.io/twill-db/docs/connect-server-postgrest.html): unmodified PostgREST over the engine — version probe, catalog/FK reflection, query-template rewriting, FK embedding.
+- [Storage backends — overview](https://bihaviour.github.io/twill-db/docs/storage.html): Choosing durable storage by URL scheme; what's shared across backends (WAL durability, MVCC, branching, lease); credentials in env.
+- [Storage: file:// (local)](https://bihaviour.github.io/twill-db/docs/storage-file.html): LocalFileStorage — crash-safe local file, CRC-checked WAL with torn-frame recovery, the single-process rule, local branching.
+- [Storage: s3:// (S3 / MinIO)](https://bihaviour.github.io/twill-db/docs/storage-s3.html): ObjectStorage on AWS S3 or S3-compatible — LSM page store + CAS commit log, AWS_* credentials, MinIO endpoints, scale-to-zero.
+- [Storage: r2:// (Cloudflare)](https://bihaviour.github.io/twill-db/docs/storage-r2.html): ObjectStorage on Cloudflare R2 — S3-compatible with zero egress, the structural win for cold-read-heavy and scale-to-zero workloads.
+- [Storage: gs:// (Google Cloud)](https://bihaviour.github.io/twill-db/docs/storage-gs.html): ObjectStorage on Google Cloud Storage — service-account / ADC credentials, scale-to-zero, branching.
 - [Connection pooling](https://bihaviour.github.io/twill-db/docs/connection-pooling.html): Place a transaction-mode pooler (PgBouncer or pgcat) in front of engine-server to absorb serverless connection bursts, with the single-writer caveats.
 - [Branching](https://bihaviour.github.io/twill-db/docs/branching.html): Copy-on-write branches — an instant LSN pointer over shared immutable layers, write isolation, the embedded API, and the limits.
 - [Scale-to-zero & lifecycle](https://bihaviour.github.io/twill-db/docs/scale-to-zero.html): How stateless compute idles to nothing on object storage — the controller state machine, cold-start budget, lease heartbeat, keep-warm, cost trade-off.
@@ -50,5 +68,6 @@ Notes for agents:
 ## Optional
 
 - [Home](https://bihaviour.github.io/twill-db/index.html): Project overview and the three headline properties.
-- [Release & roadmap](https://bihaviour.github.io/twill-db/release/index.html): Releases and the upcoming roadmap.
+- [Release & roadmap](https://bihaviour.github.io/twill-db/release/index.html): Releases, the upcoming roadmap, and the status of every design specification (Backlog / In progress / Live).
+- [Changelog](https://bihaviour.github.io/twill-db/changelog/index.html): Human-readable per-version history (newest first) — what landed in each release and why it matters.
 - [Source repository](https://github.com/bihaviour/twill-db): The Rust workspace, Bun client, and this website.

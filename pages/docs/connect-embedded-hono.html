@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedded with Hono · Twill DB</title>
+<meta name="description" content="A step-by-step breakdown of embedding Twill DB in a Hono app on Bun: share the handle across routes, parse JSON bodies, parameterize writes, and map errors to status codes.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Embedded with Hono</h1>
+<p class="lede">Hono runs on Bun directly, so the engine is just a value your route handlers close over. This is the same notes API as the <a href="connect-embedded-bun.html">plain-Bun</a> page, but with a real router — and it shows the idiomatic place to put the shared handle.</p>
+</header>
+
+<section>
+<h2>What we're building</h2>
+<p>A notes API — <code>GET /notes</code> and <code>POST /notes</code> — on Hono. Prerequisites: <code>bun add @twilldb/bun hono</code> and the shared <a href="connect-embedded.html"><code>db.ts</code></a> from the overview.</p>
+</section>
+
+<section>
+<h2>Step 1 — import the shared handle</h2>
+<p>Hono handlers are closures, so the simplest correct pattern is to <code>import</code> the one shared <code>db</code> directly. It was opened once in <code>db.ts</code>; every handler uses that same instance.</p>
+<pre data-lang="ts"><code>// app.ts
+import { Hono } from "hono";
+import { db } from "./db";
+
+const app = new Hono();</code></pre>
+<p><strong>Breakdown:</strong> there's no per-request setup and no connection pool to manage — embedded means the "connection" is a function call into in-process memory. The handle is created when <code>db.ts</code> is first imported and lives for the process lifetime.</p>
+</section>
+
+<section>
+<h2>Step 2 — a read route</h2>
+<pre data-lang="ts"><code>app.get("/notes", (c) => {
+  const rows = db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50");
+  return c.json(rows);
+});</code></pre>
+<p><strong>Breakdown:</strong> <code>db.query(sql)</code> returns all rows as an array of objects; <code>c.json(rows)</code> serializes it. No <code>await</code> is needed — embedded queries are synchronous function calls, not network promises.</p>
+</section>
+
+<section>
+<h2>Step 3 — a write route with a parameterized insert</h2>
+<pre data-lang="ts"><code>app.post("/notes", async (c) => {
+  const { body } = await c.req.json<{ body: string }>();
+  if (!body) return c.json({ error: "body required" }, 400);
+
+  db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [body, new Date().toISOString()]);
+  return c.json({ ok: true }, 201);
+});
+
+export default app; // bun run ./app.ts</code></pre>
+<p><strong>Breakdown:</strong></p>
+<ul>
+<li><code>c.req.json&lt;T&gt;()</code> reads and types the request body.</li>
+<li>The <code>?</code> placeholders are bound positionally from the array — the user's <code>body</code> is passed as data, never spliced into the SQL string.</li>
+<li><code>export default app</code> lets Bun serve it directly with <code>bun run ./app.ts</code> (Bun reads the default export's <code>fetch</code>).</li>
+</ul>
+</section>
+
+<section>
+<h2>Step 4 — map engine errors with middleware</h2>
+<p>Centralize error translation so each handler stays clean. A write conflict (another writer committed first) is retryable and maps naturally to <code>409</code>.</p>
+<pre data-lang="ts"><code>import { EngineError } from "@twilldb/bun";
+
+app.onError((err, c) => {
+  if (err instanceof EngineError) {
+    if (err.retryable) return c.json({ error: "conflict, retry" }, 409);
+    return c.json({ error: err.message, status: err.status }, 400);
+  }
+  return c.json({ error: "internal" }, 500);
+});</code></pre>
+<p><strong>Breakdown:</strong> <code>EngineError.retryable</code> is true for write-conflict and transient storage errors. Anything thrown inside a <code>db.transaction()</code> callback also lands here, after the engine has already rolled back.</p>
+</section>
+
+<section>
+<h2>Step 5 — an atomic multi-statement write</h2>
+<pre data-lang="ts"><code>app.post("/transfer", async (c) => {
+  const { from, to, amount } = await c.req.json<{ from: number; to: number; amount: number }>();
+  db.transaction((tx) => {
+    tx.query("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, from]);
+    tx.query("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, to]);
+  });
+  return c.json({ ok: true });
+});</code></pre>
+<p><strong>Breakdown:</strong> <code>db.transaction(fn)</code> wraps the two updates in <code>BEGIN</code>/<code>COMMIT</code>; the commit blocks until the WAL is durable, then returns. If either statement throws, the engine rolls back and the throw propagates to <code>app.onError</code>.</p>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-embedded-elysia.html"><span class="xref-title">Elysia</span><span class="xref-desc">The same app with typed validation.</span></a>
+<a class="xref" href="connect-embedded-nextjs.html"><span class="xref-title">Next.js</span><span class="xref-desc">The server-runtime singleton pattern.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
