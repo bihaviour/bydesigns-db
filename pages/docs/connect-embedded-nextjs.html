@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedded with Next.js · Twill DB</title>
+<meta name="description" content="A step-by-step breakdown of embedding Twill DB in Next.js: the Node-runtime requirement, the globalThis singleton guard against bundler duplication, route handlers, and server actions.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Embedded with Next.js</h1>
+<p class="lede">Next.js can use the embedded engine in its <strong>server runtime only</strong> — route handlers, server actions, and server components — never in the browser or on the Edge runtime. Two rules make it reliable: pin the Node.js runtime, and guard the handle against bundler module duplication with a <code>globalThis</code> singleton.</p>
+</header>
+
+<section>
+<h2>Two rules before any code</h2>
+<ul class="reqs">
+<li><span class="req-tag must">Node runtime</span> The engine is a native library loaded over the C ABI; it needs the Node.js server runtime. Set <code>export const runtime = "nodejs"</code> in any route that touches the database. It cannot run on the Edge runtime or in client components.</li>
+<li><span class="req-tag must">Singleton guard</span> In development, Next.js hot-reload and bundling can evaluate a module more than once, which would open the database repeatedly. Stash the handle on <code>globalThis</code> so there is exactly one per process — the same pattern ORMs use.</li>
+</ul>
+<div class="callout warning">
+<p class="callout-title">Server-only, and one server process</p>
+<p>The handle lives in the server process's memory. This works for a single long-lived Node server. On platforms that run many isolated serverless instances (each its own process) that must share writes, use <a href="connect-server.html">server mode</a> over the wire, or point every instance at the same <code>s3://</code> backend where the durable single-writer lease coordinates them. See <a href="connect-embedded.html">the overview</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Step 1 — the guarded singleton</h2>
+<pre data-lang="ts"><code>// lib/db.ts
+import { open, type Database } from "@twilldb/bun";
+
+const g = globalThis as unknown as { __twilldb?: Database };
+
+export const db: Database =
+  g.__twilldb ?? (g.__twilldb = open(process.env.TWILLDB_URL ?? "file://./app.db"));
+
+// Run schema once, on first import.
+db.exec(`CREATE TABLE IF NOT EXISTS notes (
+  id   INTEGER PRIMARY KEY,
+  body TEXT NOT NULL,
+  ts   TEXT NOT NULL
+)`);</code></pre>
+<p><strong>Breakdown:</strong> the first import opens the database and caches it on <code>globalThis.__twilldb</code>; every later import (including after a hot reload) reuses that cached handle instead of opening a second one. Without this guard you'd leak handles in dev.</p>
+</section>
+
+<section>
+<h2>Step 2 — a Route Handler</h2>
+<p>App-router route handlers live at <code>app/api/&lt;name&gt;/route.ts</code>. Pin the Node runtime and use the shared handle.</p>
+<pre data-lang="ts"><code>// app/api/notes/route.ts
+import { db } from "@/lib/db";
+import { NextResponse } from "next/server";
+
+export const runtime = "nodejs"; // required — the C ABI needs the Node runtime
+
+export async function GET() {
+  const rows = db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50");
+  return NextResponse.json(rows);
+}
+
+export async function POST(req: Request) {
+  const { body } = await req.json();
+  if (!body) return NextResponse.json({ error: "body required" }, { status: 400 });
+
+  db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [body, new Date().toISOString()]);
+  return NextResponse.json({ ok: true }, { status: 201 });
+}</code></pre>
+<p><strong>Breakdown:</strong> the queries are identical to every other framework — only the handler signature is Next-specific. <code>runtime = "nodejs"</code> is the line people forget; without it Next may try the Edge runtime and the native load fails.</p>
+</section>
+
+<section>
+<h2>Step 3 — a Server Action (and reading in a Server Component)</h2>
+<p>Server actions and server components run on the server, so they can call the handle directly. Use a transaction for atomic writes and <code>revalidatePath</code> to refresh the UI.</p>
+<pre data-lang="ts"><code>// app/notes/actions.ts
+"use server";
+import { db } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+
+export async function addNote(formData: FormData) {
+  const body = String(formData.get("body") ?? "");
+  if (!body) return;
+  db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [body, new Date().toISOString()]);
+  revalidatePath("/notes");
+}</code></pre>
+<pre data-lang="tsx"><code>// app/notes/page.tsx  (a Server Component)
+import { db } from "@/lib/db";
+import { addNote } from "./actions";
+
+export const runtime = "nodejs";
+
+export default function NotesPage() {
+  const notes = db.query<{ id: string; body: string }>("SELECT * FROM notes ORDER BY id DESC LIMIT 50");
+  return (
+    &lt;main&gt;
+      &lt;form action={addNote}&gt;
+        &lt;input name="body" /&gt;&lt;button&gt;Add&lt;/button&gt;
+      &lt;/form&gt;
+      &lt;ul&gt;{notes.map((n) =&gt; &lt;li key={n.id}&gt;{n.body}&lt;/li&gt;)}&lt;/ul&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+<p><strong>Breakdown:</strong> the server component reads synchronously at render time; the form posts to the server action, which writes and calls <code>revalidatePath</code> so the next render shows the new row. All of it runs server-side — none of this code or the handle is ever sent to the browser.</p>
+</section>
+
+<section>
+<h2>Step 4 — error handling</h2>
+<pre data-lang="ts"><code>import { EngineError } from "@twilldb/bun";
+
+try {
+  db.transaction((tx) => { /* ...multi-statement write... */ });
+} catch (e) {
+  if (e instanceof EngineError && e.retryable) {
+    return NextResponse.json({ error: "conflict, retry" }, { status: 409 });
+  }
+  throw e;
+}</code></pre>
+<p><strong>Breakdown:</strong> same contract as the other frameworks — <code>EngineError.retryable</code> flags a write conflict you can safely retry.</p>
+</section>
+
+<section>
+<h2>A note on Bun vs Node</h2>
+<p><code>@twilldb/bun</code> loads the native library through <code>bun:ffi</code>, so the embedded path targets the Bun runtime. If your Next.js app runs under Bun, the examples above work as written. Running embedded under plain Node would require a NAPI binding, which is a tracked exploratory item rather than a shipped channel — see the <a href="../release/index.html">roadmap</a>. On a Node-only deployment today, use <a href="connect-server.html">server mode</a> over pgwire instead.</p>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-server.html"><span class="xref-title">Connect as server</span><span class="xref-desc">For Node-only or multi-instance deployments.</span></a>
+<a class="xref" href="storage.html"><span class="xref-title">Storage backends</span><span class="xref-desc">Move from file:// to s3:// with no code change.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

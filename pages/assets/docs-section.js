@@ -17,7 +17,11 @@ window.SECTION = {
       { file: "connection-pooling.html", title: "Connection pooling" },
     ]},
     { label: "Connect as embedded", items: [
-      { file: "connect-embedded.html", title: "Frameworks (Next.js, Hono…)" },
+      { file: "connect-embedded.html",        title: "Frameworks — overview" },
+      { file: "connect-embedded-bun.html",    title: "Bun (HTTP)" },
+      { file: "connect-embedded-hono.html",   title: "Hono" },
+      { file: "connect-embedded-elysia.html", title: "Elysia" },
+      { file: "connect-embedded-nextjs.html", title: "Next.js" },
     ]},
     { label: "Connect as server", items: [
       { file: "connect-server.html", title: "Clients & ORMs (Drizzle, Prisma…)" },
