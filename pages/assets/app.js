@@ -20,10 +20,10 @@
 
   // ---- Top site header (Home / Docs / Specs / Release) ----------------------
   var NAV = [
-    { key: "home",    label: "Home",    href: "index.html" },
-    { key: "docs",    label: "Docs",    href: "docs/index.html" },
-    { key: "specs",   label: "Specs",   href: "specs/index.html" },
-    { key: "release", label: "Release", href: "release/index.html" },
+    { key: "home",      label: "Home",      href: "index.html" },
+    { key: "docs",      label: "Docs",      href: "docs/index.html" },
+    { key: "release",   label: "Release",   href: "release/index.html" },
+    { key: "changelog", label: "Changelog", href: "changelog/index.html" },
   ];
 
   function buildHeader() {

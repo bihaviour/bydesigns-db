@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect as embedded — frameworks · Twill DB</title>
+<meta name="description" content="Embed Twill DB in-process with @twilldb/bun: worked examples for Next.js, Hono, Elysia, and plain Bun/Node, plus the one rule for sharing a handle safely.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Connect as embedded — frameworks</h1>
+<p class="lede">The embedded plane runs the engine <em>inside your process</em> via <code>@twilldb/bun</code> (a typed wrapper over <code>bun:ffi</code> and the C ABI). Queries are function calls — no socket, no round-trip. This page shows the integration shape for the common web frameworks; for the full API surface see <a href="connect-bun.html">Embedded (bun:ffi)</a>.</p>
+</header>
+
+<section>
+<h2>The one rule: open once, share the handle</h2>
+<p>A <code>Database</code> handle is a long-lived resource. Open it <strong>once</strong> at module scope and reuse it for every request — do not open per request. Multiple connections to the same <code>file://</code> URL in one process share one underlying database, so snapshot isolation holds across the app.</p>
+<pre data-lang="ts"><code>// db.ts — a single shared module, imported everywhere.
+import { open, type Database } from "@twilldb/bun";
+
+// Opened once when the module is first imported.
+export const db: Database = open(process.env.TWILLDB_URL ?? "file://./app.db");
+
+// Create schema on boot (DDL runs in autocommit).
+db.exec(`CREATE TABLE IF NOT EXISTS notes (
+  id   INTEGER PRIMARY KEY,
+  body TEXT NOT NULL,
+  ts   TEXT NOT NULL
+)`);</code></pre>
+<div class="callout warning">
+<p class="callout-title">Embedded means one process</p>
+<p>The embedded handle lives in <em>this</em> process's memory. If you run multiple server instances (or serverless workers) that must share writes, either use a single instance, or switch to <a href="connect-server.html">server mode</a> over the wire — or point all instances at the same <code>s3://</code> backend, where the durable single-writer lease coordinates them. Embedded <code>file://</code> is single-process by design.</p>
+</div>
+</section>
+
+<section>
+<h2>Plain Bun (HTTP)</h2>
+<p>The smallest possible integration — <code>Bun.serve</code> calling the shared handle directly.</p>
+<pre data-lang="ts"><code>import { db } from "./db";
+
+Bun.serve({
+  port: 3000,
+  fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === "/notes" && req.method === "GET") {
+      const rows = db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50");
+      return Response.json(rows);
+    }
+    return new Response("not found", { status: 404 });
+  },
+});</code></pre>
+</section>
+
+<section>
+<h2>Hono</h2>
+<p>Hono runs on Bun directly, so the engine is just a value you close over in your handlers.</p>
+<pre data-lang="ts"><code>import { Hono } from "hono";
+import { db } from "./db";
+
+const app = new Hono();
+
+app.get("/notes", (c) => {
+  const rows = db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50");
+  return c.json(rows);
+});
+
+app.post("/notes", async (c) => {
+  const { body } = await c.req.json<{ body: string }>();
+  // Parameter binding is positional with "?" placeholders.
+  db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [body, new Date().toISOString()]);
+  return c.json({ ok: true }, 201);
+});
+
+export default app; // bun run ./app.ts</code></pre>
+</section>
+
+<section>
+<h2>Elysia</h2>
+<p>Same idea — register the handle once and use it inside routes. Elysia's <code>decorate</code> makes it available as <code>ctx.db</code>.</p>
+<pre data-lang="ts"><code>import { Elysia, t } from "elysia";
+import { db } from "./db";
+
+new Elysia()
+  .decorate("db", db)
+  .get("/notes", ({ db }) => db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50"))
+  .post(
+    "/notes",
+    ({ db, body }) => {
+      db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [body.body, new Date().toISOString()]);
+      return { ok: true };
+    },
+    { body: t.Object({ body: t.String() }) },
+  )
+  .listen(3000);</code></pre>
+</section>
+
+<section>
+<h2>Next.js</h2>
+<p>Next.js can use the embedded engine in the <strong>server runtime only</strong> (route handlers, server actions, RSC) — never in the browser, and not on the Edge runtime. Use the Node.js runtime and guard against bundler module duplication by stashing the handle on <code>globalThis</code> in development (the same pattern ORMs use).</p>
+<pre data-lang="ts"><code>// lib/db.ts
+import { open, type Database } from "@twilldb/bun";
+
+const g = globalThis as unknown as { __twilldb?: Database };
+export const db: Database =
+  g.__twilldb ?? (g.__twilldb = open(process.env.TWILLDB_URL ?? "file://./app.db"));</code></pre>
+<pre data-lang="ts"><code>// app/api/notes/route.ts
+import { db } from "@/lib/db";
+import { NextResponse } from "next/server";
+
+export const runtime = "nodejs"; // required: the C ABI needs the Node/Bun runtime
+
+export async function GET() {
+  return NextResponse.json(db.query("SELECT * FROM notes ORDER BY id DESC LIMIT 50"));
+}
+
+export async function POST(req: Request) {
+  const { body } = await req.json();
+  db.query("INSERT INTO notes (body, ts) VALUES (?, ?)", [body, new Date().toISOString()]);
+  return NextResponse.json({ ok: true }, { status: 201 });
+}</code></pre>
+<div class="callout note">
+<p class="callout-title">Bun vs Node</p>
+<p><code>@twilldb/bun</code> loads the native library through <code>bun:ffi</code>, so the embedded path targets the Bun runtime. Running embedded under plain Node would require a NAPI binding, which is a tracked exploratory item, not a shipped channel — see the <a href="../release/index.html">roadmap</a>. If you are on Node today, use <a href="connect-server.html">server mode</a> over pgwire instead.</p>
+</div>
+</section>
+
+<section>
+<h2>Transactions &amp; clean shutdown</h2>
+<p>Wrap multi-statement writes in <code>db.transaction()</code> — it issues <code>BEGIN</code>, runs your function, then <code>COMMIT</code> (blocking until the WAL is durable), or <code>ROLLBACK</code> + rethrow on error.</p>
+<pre data-lang="ts"><code>db.transaction((tx) => {
+  tx.query("UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, 1]);
+  tx.query("UPDATE accounts SET balance = balance + ? WHERE id = ?", [100, 2]);
+}); // commits durably here, or rolls back if either statement throws
+
+// On process shutdown, release the handle.
+process.on("beforeExit", () => db.close());</code></pre>
+<p>Because the data is just engine rows, this same app can fork its database copy-on-write (<a href="branching.html">Branching</a>) or run disaggregated on object storage (<a href="storage.html">Storage backends</a>) with no code change beyond the connection string.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

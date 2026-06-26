@@ -18,7 +18,7 @@
 <header class="page-header">
 <div class="spec-meta">
 <span class="badge badge-status status-review">User guide</span>
-<span class="spec-date">Twill DB v0.3</span>
+<span class="spec-date">Twill DB v0.4</span>
 </div>
 <h1>Documentation</h1>
 <p class="lede">Everything you need to use Twill DB — open a database with a connection string, embed it in your app or run it as a Postgres-wire server, branch your data copy-on-write, and let it scale to zero. New here? Start with the <a href="getting-started.html">Quickstart</a>.</p>
@@ -45,6 +45,10 @@
 <section>
 <h2>Browse the docs</h2>
 <div class="doc-card-grid">
+<a class="doc-card" href="architecture.html">
+<div class="ic">🏛️</div><h3>Architecture</h3>
+<p>The mental model: one engine, one storage seam, two front doors. Read this first.</p>
+</a>
 <a class="doc-card" href="getting-started.html">
 <div class="ic">⚡</div><h3>Quickstart</h3>
 <p>Build the library, open your first embedded database, run SQL, and start a server — in a few minutes.</p>
@@ -53,13 +57,17 @@
 <div class="ic">🔌</div><h3>Connect to your database</h3>
 <p>The connection model: URL schemes, embedded vs server, and how to choose a backend.</p>
 </a>
-<a class="doc-card" href="connect-bun.html">
-<div class="ic">📦</div><h3>Connect from Bun</h3>
-<p>Use the <code>@twilldb/bun</code> wrapper over <code>bun:ffi</code> — open, query, parameter-bind, transact, and branch.</p>
+<a class="doc-card" href="connect-embedded.html">
+<div class="ic">📦</div><h3>Connect as embedded</h3>
+<p>Framework examples — Next.js, Hono, Elysia, and plain Bun — over <code>@twilldb/bun</code>.</p>
 </a>
-<a class="doc-card" href="connect-postgres.html">
-<div class="ic">🐘</div><h3>Connect with a Postgres client</h3>
-<p>Point <code>psql</code>, <code>Bun.sql</code>, drivers, or PostgREST at the engine-server over the wire protocol.</p>
+<a class="doc-card" href="connect-server.html">
+<div class="ic">🐘</div><h3>Connect as server</h3>
+<p>Postgres-wire clients per language (Node/Bun, Python, Go) and ORMs (Drizzle, Prisma).</p>
+</a>
+<a class="doc-card" href="storage.html">
+<div class="ic">🗄️</div><h3>Storage backends</h3>
+<p><code>file://</code> local, and <code>s3://</code> / <code>r2://</code> / <code>gs://</code> disaggregated — chosen by the URL.</p>
 </a>
 <a class="doc-card" href="connection-pooling.html">
 <div class="ic">🪣</div><h3>Connection pooling</h3>
@@ -86,7 +94,7 @@
 
 <section>
 <h2>Looking for design intent?</h2>
-<p>This section is the <em>user</em> documentation. If you want to understand how and why the engine is built the way it is — the storage seam, MVCC, the S3-CAS commit log, the lifecycle controller — read the <a href="../specs/index.html">Development Guidelines</a> (the fourteen design specifications and implementation maps). To see what has shipped and what is next, see <a href="../release/index.html">Releases &amp; Roadmap</a>.</p>
+<p>This section is the <em>user</em> documentation. If you want to understand how and why the engine is built the way it is — the storage seam, MVCC, the S3-CAS commit log, the lifecycle controller — the design specifications are indexed with their status on the <a href="../release/index.html">Release</a> page. To see what shipped in each version, see the <a href="../changelog/index.html">Changelog</a>.</p>
 </section>
 
 <nav class="page-nav" id="page-nav"></nav>

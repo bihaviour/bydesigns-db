@@ -13,11 +13,12 @@
 
 <div class="hero-wrap">
   <div class="hero">
-    <span class="eyebrow"><span class="dot"></span>Current: v0.3.0</span>
+    <span class="eyebrow"><span class="dot"></span>Current: v0.4.0</span>
     <h1>Releases &amp; roadmap</h1>
-    <p class="sub">Twill DB is built additively: the smallest embeddable thing first, then disaggregation, then server mode, then the lifecycle controller, then vector search — each one a working, demonstrable capability. This page records what has shipped and what is planned next.</p>
+    <p class="sub">Twill DB is built additively: the smallest embeddable thing first, then disaggregation, then server mode, then the lifecycle controller, then vector search, now SQL-surface completeness — each one a working, demonstrable capability. This page records what has shipped, what is planned next, and the status of every design specification. For the human-readable version history, see the <a href="../changelog/index.html">Changelog</a>.</p>
     <div class="cta-row">
-      <a class="btn btn-primary" href="https://github.com/bihaviour/twill-db/releases" target="_blank" rel="noopener">GitHub releases →</a>
+      <a class="btn btn-primary" href="../changelog/index.html">Changelog →</a>
+      <a class="btn btn-ghost" href="https://github.com/bihaviour/twill-db/releases" target="_blank" rel="noopener">GitHub releases</a>
       <a class="btn btn-ghost" href="../specs/13-roadmap.html">Full build sequence</a>
     </div>
   </div>
@@ -39,9 +40,9 @@
       <p>Every capability is implemented and gated by tests; the storage seam has never moved, so each one was purely additive. The project grows further by composition.</p>
     </div>
     <div class="stat-strip">
-      <div class="stat"><div class="v">v0.3.0</div><div class="l">current workspace version</div></div>
+      <div class="stat"><div class="v">v0.4.0</div><div class="l">current workspace version</div></div>
       <div class="stat"><div class="v">ABI 3</div><div class="l">frozen C embedding contract</div></div>
-      <div class="stat"><div class="v">Trait 2</div><div class="l">storage seam version</div></div>
+      <div class="stat"><div class="v">Trait 3</div><div class="l">storage seam version</div></div>
       <div class="stat"><div class="v">5 / 5</div><div class="l">capabilities shipped</div></div>
     </div>
   </section>
@@ -164,6 +165,52 @@
   </section>
 
   <section>
+    <div class="sec-head">
+      <span class="kicker">Specifications</span>
+      <h2>Design specs &amp; status</h2>
+      <p>The design specifications are the source of truth for <em>why</em> the engine is built the way it is. Each is tracked against its implementation status: <span class="chip shipped">● Live</span> shipped and gated by tests, <span class="chip progress">◐ In progress</span> actively building, <span class="chip planned">○ Backlog</span> proposed or planned. Implementation maps for shipped phases follow the table.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Specification</th><th>Scope</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>01</td><td><a href="../specs/01-architecture-overview.html">Architecture Overview</a></td><td>The three slots, the seam, dual delivery modes</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>02</td><td><a href="../specs/02-engine-core.html">Engine Core</a></td><td>Parser → plan → executor, MVCC, WAL, C ABI</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>03</td><td><a href="../specs/03-storage-interface.html">Storage Interface</a></td><td>The narrow <code>Storage</code> trait — the seam</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>04</td><td><a href="../specs/04-object-storage-backend.html">Object-Storage Backend</a></td><td>LSM page store + S3-CAS commit log</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>05</td><td><a href="../specs/05-local-cache.html">Local Cache</a></td><td>Shared-buffer cache keeping the hot path in-process</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>06</td><td><a href="../specs/06-lifecycle-controller.html">Lifecycle &amp; Controller</a></td><td>Cold start, idle stop, branch-on-LSN, fencing</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>07</td><td><a href="../specs/07-server-mode.html">Server Mode &amp; Wire Protocol</a></td><td><code>engine-server</code> over pgwire (simple + extended)</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>08</td><td><a href="../specs/08-bun-integration.html">Bun Integration</a></td><td>Embedded via <code>bun:ffi</code>; server via <code>Bun.sql</code></td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>09</td><td><a href="../specs/09-benchmark-plan.html">Benchmark &amp; Validation Plan</a></td><td>The five experiments locating W1 / W2 per tool</td><td><span class="chip progress">◐ In progress</span></td></tr>
+          <tr><td>10</td><td><a href="../specs/10-hot-row-contention.html">Hot-Row Contention Strategy</a></td><td>Serialize same-row writes; shard; route outliers</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>11</td><td><a href="../specs/11-deployment-targets.html">Deployment Targets</a></td><td>Native (container) shipped; WASM/Workers exploratory</td><td><span class="chip progress">◐ In progress</span></td></tr>
+          <tr><td>12</td><td><a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a></td><td>Vectors/HNSW in-core; auth/REST/OLAP composed around</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>13</td><td><a href="../specs/13-roadmap.html">Roadmap &amp; Build Sequence</a></td><td>The additive build order and milestones</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>14</td><td><a href="../specs/14-tradeoffs-risks.html">Tradeoffs &amp; Risk Register</a></td><td>Write latency, single-writer ceiling, cold start</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>15</td><td><a href="../specs/15-twill-bench.html">Twill Bench CLI</a></td><td>Benchmark + correctness + serverless-efficiency CLI</td><td><span class="chip progress">◐ In progress</span></td></tr>
+          <tr><td>16</td><td><a href="../specs/16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a></td><td>PostgreSQL/SQLite → Twill surface (Phase 6: 6A/6B live)</td><td><span class="chip progress">◐ In progress</span></td></tr>
+          <tr><td>17</td><td><a href="../specs/17-row-level-security.html">Row-Level Security</a></td><td>Proposal (Phase 7) — not yet implemented</td><td><span class="chip planned">○ Backlog</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Implementation maps</h3>
+    <p>Each shipped phase has a map tying the spec to the actual modules and tests. All <span class="chip shipped">● Live</span>.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Phase</th><th>Map</th><th>Lands</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td><a href="../specs/phase-1-embedded.html">Embedded Library</a></td><td>libengine + C ABI + LocalFileStorage + Bun client</td></tr>
+          <tr><td>2</td><td><a href="../specs/phase-2-object-storage.html">Object Storage</a></td><td>ObjectStorage (LSM + S3-CAS)</td></tr>
+          <tr><td>3</td><td><a href="../specs/phase-3-server.html">Server + pgwire</a></td><td>engine-server</td></tr>
+          <tr><td>4</td><td><a href="../specs/phase-4-branching-lifecycle.html">Branching &amp; Lifecycle</a></td><td>BranchStorage + lease + twill-controller</td></tr>
+          <tr><td>5</td><td><a href="../specs/phase-5-capabilities.html">Capabilities: Vector Search</a></td><td>vector(N) + HNSW + KNN</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
     <div class="callout note">
       <p class="callout-title">How releases are versioned</p>
       <p>Releases are versioned from the Cargo workspace version (<code>Cargo.toml</code> → <code>[workspace.package] version</code>). CI tags a release automatically on <code>main</code> once code quality, security, complexity, and unit tests are all green; the <code>/release</code> skill is the manual equivalent. Everything ships at one version, in lockstep.</p>
@@ -195,8 +242,8 @@
     <div>Twill DB — a serverless OLTP engine. Licensed under AGPL-3.0.</div>
     <div class="foot-links">
       <a href="../docs/index.html">Docs</a>
-      <a href="../specs/index.html">Specs</a>
       <a href="../release/index.html">Release</a>
+      <a href="../changelog/index.html">Changelog</a>
       <a href="../author/index.html">Author</a>
       <a href="https://github.com/bihaviour/twill-db" target="_blank" rel="noopener">GitHub</a>
     </div>

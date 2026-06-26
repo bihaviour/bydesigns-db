@@ -18,10 +18,14 @@ Notes for agents:
 ## Docs
 
 - [Documentation overview](https://bihaviour.github.io/twill-db/docs/index.html): Entry point to the user documentation — connect, branch, scale to zero, operate.
+- [Architecture](https://bihaviour.github.io/twill-db/docs/architecture.html): The mental model — one engine, one pluggable storage seam, two front doors (embedded FFI + Postgres wire); WAL/LSN/MVCC/branch/scale-to-zero in brief.
 - [Quickstart](https://bihaviour.github.io/twill-db/docs/getting-started.html): Build the native library, open an embedded database from Bun, run SQL, and start a Postgres-wire server.
 - [Connect to your database](https://bihaviour.github.io/twill-db/docs/connect.html): The connection model — URL schemes, embedded vs server access, and how to choose a storage backend.
 - [Connect from Bun (embedded)](https://bihaviour.github.io/twill-db/docs/connect-bun.html): The full embedded API over bun:ffi — open, exec, parameterized query, prepared statements, transactions, branching, error handling.
+- [Connect as embedded — frameworks](https://bihaviour.github.io/twill-db/docs/connect-embedded.html): Embedding the engine in Next.js, Hono, Elysia, and plain Bun via @twilldb/bun — the open-once-share-the-handle pattern, transactions, and clean shutdown.
 - [Connect with a Postgres client](https://bihaviour.github.io/twill-db/docs/connect-postgres.html): Start engine-server and connect with psql, Bun's SQL client, generic Postgres drivers, or PostgREST over the supported pgwire subset.
+- [Connect as server — clients & ORMs](https://bihaviour.github.io/twill-db/docs/connect-server.html): Postgres-wire client examples for Node/Bun, Python, and Go, plus Drizzle and Prisma — with the SQL-subset caveats that apply.
+- [Storage backends](https://bihaviour.github.io/twill-db/docs/storage.html): Choosing durable storage by URL scheme — file:// local embedded vs s3:///r2:///gs:// disaggregated; credentials, scale-to-zero, and why R2's zero egress matters.
 - [Connection pooling](https://bihaviour.github.io/twill-db/docs/connection-pooling.html): Place a transaction-mode pooler (PgBouncer or pgcat) in front of engine-server to absorb serverless connection bursts, with the single-writer caveats.
 - [Branching](https://bihaviour.github.io/twill-db/docs/branching.html): Copy-on-write branches — an instant LSN pointer over shared immutable layers, write isolation, the embedded API, and the limits.
 - [Scale-to-zero & lifecycle](https://bihaviour.github.io/twill-db/docs/scale-to-zero.html): How stateless compute idles to nothing on object storage — the controller state machine, cold-start budget, lease heartbeat, keep-warm, cost trade-off.
@@ -50,5 +54,6 @@ Notes for agents:
 ## Optional
 
 - [Home](https://bihaviour.github.io/twill-db/index.html): Project overview and the three headline properties.
-- [Release & roadmap](https://bihaviour.github.io/twill-db/release/index.html): Releases and the upcoming roadmap.
+- [Release & roadmap](https://bihaviour.github.io/twill-db/release/index.html): Releases, the upcoming roadmap, and the status of every design specification (Backlog / In progress / Live).
+- [Changelog](https://bihaviour.github.io/twill-db/changelog/index.html): Human-readable per-version history (newest first) — what landed in each release and why it matters.
 - [Source repository](https://github.com/bihaviour/twill-db): The Rust workspace, Bun client, and this website.

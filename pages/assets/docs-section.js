@@ -6,14 +6,24 @@ window.SECTION = {
   brand: { title: "Documentation", sub: "Use & operate Twill DB" },
   groups: [
     { label: "Get started", items: [
-      { file: "index.html",          title: "Introduction" },
+      { file: "index.html",           title: "Introduction" },
+      { file: "architecture.html",    title: "Architecture" },
       { file: "getting-started.html", title: "Quickstart" },
     ]},
     { label: "Connect", items: [
       { file: "connect.html",            title: "Connect to your database" },
-      { file: "connect-bun.html",        title: "Connect from Bun (embedded)" },
-      { file: "connect-postgres.html",   title: "Connect with a Postgres client" },
+      { file: "connect-bun.html",        title: "Embedded (bun:ffi)" },
+      { file: "connect-postgres.html",   title: "Postgres client" },
       { file: "connection-pooling.html", title: "Connection pooling" },
+    ]},
+    { label: "Connect as embedded", items: [
+      { file: "connect-embedded.html", title: "Frameworks (Next.js, Hono…)" },
+    ]},
+    { label: "Connect as server", items: [
+      { file: "connect-server.html", title: "Clients & ORMs (Drizzle, Prisma…)" },
+    ]},
+    { label: "Storage", items: [
+      { file: "storage.html", title: "Backends (file:// · s3 · r2 · gs)" },
     ]},
     { label: "Guides", items: [
       { file: "branching.html",     title: "Branching" },

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect as server — clients &amp; ORMs · Twill DB</title>
+<meta name="description" content="Connect to engine-server over the Postgres wire protocol: worked examples for Node/Bun, Python, and Go clients, plus Drizzle and Prisma — and the SQL-subset caveats that apply.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Connect as server — clients &amp; ORMs</h1>
+<p class="lede">Run the engine behind a Postgres-wire listener and <strong>anything that speaks Postgres can connect</strong> — no Twill-specific driver. This is the integration plane for other languages and for ORMs like Drizzle and Prisma. The rule of thumb: the wire protocol gets a tool <em>connected</em>; whether every query runs depends on the supported <a href="sql-reference.html">SQL subset</a>.</p>
+</header>
+
+<section>
+<h2>Start the server</h2>
+<p>One binary serves either backend, chosen by the <code>--db</code> URL.</p>
+<pre data-lang="bash"><code># Local file backend on port 5433
+cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db
+
+# Or disaggregated on object storage
+cargo run -p twill-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/mydb</code></pre>
+<div class="callout warning">
+<p class="callout-title">Cleartext, no TLS in this phase</p>
+<p>The listener speaks Protocol 3.0 startup with trust auth over <strong>cleartext</strong> — always connect with <code>sslmode=disable</code>. TLS termination and SCRAM auth are deliberate non-goals for now; terminate TLS at a proxy if you need it on an untrusted network. The full simple <em>and</em> extended query protocols (Parse/Bind/Describe/Execute) are supported, which is what lets prepared-statement clients and ORMs work.</p>
+</div>
+</section>
+
+<section>
+<h2>psql &amp; connection strings</h2>
+<p>Every client uses an ordinary Postgres DSN. The database name is accepted but nominal — the server serves the database given by <code>--db</code>.</p>
+<pre data-lang="bash"><code>psql "postgresql://postgres@127.0.0.1:5433/main?sslmode=disable"
+
+# or component form
+psql -h 127.0.0.1 -p 5433 -U postgres -d main
+# (set sslmode=disable, e.g. PGSSLMODE=disable)</code></pre>
+</section>
+
+<section>
+<h2>Node / Bun</h2>
+<p>Bun ships <code>Bun.sql</code>; on Node use <code>pg</code> (node-postgres). Both work unchanged.</p>
+<pre data-lang="ts"><code>// Bun — built-in Bun.sql
+import { SQL } from "bun";
+const sql = new SQL("postgresql://postgres@127.0.0.1:5433/main?sslmode=disable");
+
+const rows = await sql`SELECT id, body FROM notes ORDER BY id DESC LIMIT 50`;
+await sql`INSERT INTO notes (body, ts) VALUES (${"hello"}, ${new Date().toISOString()})`;</code></pre>
+<pre data-lang="ts"><code>// Node — node-postgres (pg)
+import { Client } from "pg";
+const client = new Client({
+  host: "127.0.0.1", port: 5433, user: "postgres", database: "main", ssl: false,
+});
+await client.connect();
+const { rows } = await client.query("SELECT id, body FROM notes WHERE id = $1", [1]);
+await client.end();</code></pre>
+</section>
+
+<section>
+<h2>Python</h2>
+<p><code>psycopg</code> (v3) or any DB-API driver connects the same way.</p>
+<pre data-lang="python"><code>import psycopg
+
+with psycopg.connect(
+    "host=127.0.0.1 port=5433 user=postgres dbname=main sslmode=disable"
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, body FROM notes WHERE id = %s", (1,))
+        print(cur.fetchall())
+        cur.execute("INSERT INTO notes (body, ts) VALUES (%s, %s)", ("hi", "2026-06-26"))
+    conn.commit()</code></pre>
+</section>
+
+<section>
+<h2>Go</h2>
+<p><code>pgx</code> (or <code>database/sql</code> with <code>lib/pq</code>) connects with a standard URL.</p>
+<pre data-lang="go"><code>package main
+
+import (
+	"context"
+	"fmt"
+	"github.com/jackc/pgx/v5"
+)
+
+func main() {
+	conn, err := pgx.Connect(context.Background(),
+		"postgres://postgres@127.0.0.1:5433/main?sslmode=disable")
+	if err != nil { panic(err) }
+	defer conn.Close(context.Background())
+
+	var id int
+	var body string
+	err = conn.QueryRow(context.Background(),
+		"SELECT id, body FROM notes WHERE id = $1", 1).Scan(&id, &body)
+	if err != nil { panic(err) }
+	fmt.Println(id, body)
+}</code></pre>
+</section>
+
+<section>
+<h2>Drizzle ORM</h2>
+<p>Use the <code>postgres-js</code> or <code>node-postgres</code> driver and point Drizzle at the listener. Drizzle issues parameterized statements through the extended protocol, which the server supports.</p>
+<pre data-lang="ts"><code>import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import { pgTable, integer, text } from "drizzle-orm/pg-core";
+
+const client = postgres("postgresql://postgres@127.0.0.1:5433/main?sslmode=disable", {
+  ssl: false,
+  prepare: true,
+});
+export const db = drizzle(client);
+
+export const notes = pgTable("notes", {
+  id: integer("id").primaryKey(),
+  body: text("body").notNull(),
+});
+
+const rows = await db.select().from(notes).limit(50);</code></pre>
+<div class="callout note">
+<p class="callout-title">Migrations &amp; introspection</p>
+<p>Drizzle's query builder maps cleanly onto the supported SQL. Be cautious with <code>drizzle-kit</code> <em>introspection/push</em>, which leans on full Postgres catalog behaviour — prefer authoring schema with plain <code>CREATE TABLE</code> (via <code>db.execute(...)</code> or migrations you control) and check generated DDL against the <a href="sql-reference.html">SQL reference</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Prisma</h2>
+<p>Set the <code>postgresql</code> provider and a <code>DATABASE_URL</code> with <code>sslmode=disable</code>.</p>
+<pre data-lang="bash"><code>DATABASE_URL="postgresql://postgres@127.0.0.1:5433/main?sslmode=disable"</code></pre>
+<pre data-lang="prisma"><code>// schema.prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Note {
+  id   Int    @id
+  body String
+}</code></pre>
+<pre data-lang="ts"><code>import { PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
+const notes = await prisma.note.findMany({ take: 50, orderBy: { id: "desc" } });</code></pre>
+<div class="callout warning">
+<p class="callout-title">Prisma expects full Postgres</p>
+<p>Prisma's runtime queries (CRUD, filters, pagination) generally map onto the engine, but <code>prisma migrate</code> emits advanced DDL and probes catalog features that exceed the current surface. Manage schema with plain SQL you've validated, point Prisma at the existing tables, and treat unsupported syntax (returned as a clean <code>ENGINE_ERR_SQL</code>) as the boundary — never a silent mis-parse. Track surface growth on the <a href="../release/index.html">roadmap</a> (Phase 6).</p>
+</div>
+</section>
+
+<section>
+<h2>PostgREST &amp; other tools</h2>
+<p>Tools that auto-generate over a Postgres schema also work: the server answers version probes, reflects tables <em>and</em> foreign-key relationships into the catalog, and rewrites the tool's query templates into engine-runnable SQL. Unmodified <strong>PostgREST</strong> serves full CRUD plus FK resource embedding over the engine with zero engine changes. For composition specifics see <a href="auth.html">Auth (better-auth)</a> and <a href="olap.html">Analytics (DuckDB)</a>.</p>
+</section>
+
+<section>
+<h2>Connections &amp; scale</h2>
+<p>The engine is single-writer with one OS thread per connection. For serverless or many-client workloads, put a transaction-mode pooler (PgBouncer / pgcat) in front to absorb connection bursts — see <a href="connection-pooling.html">Connection pooling</a>.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
