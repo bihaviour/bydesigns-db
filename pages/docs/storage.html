@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Storage backends · Twill DB</title>
-<meta name="description" content="Choose a durable storage backend by connection-string scheme: file:// for local embedded, and s3:// / r2:// / gs:// for disaggregated, scale-to-zero object storage. The engine is identical for all of them.">
+<title>Storage backends — overview · Twill DB</title>
+<meta name="description" content="Twill DB selects durable storage by connection-string scheme: file:// for local embedded, and s3:// / r2:// / gs:// for disaggregated, scale-to-zero object storage. The engine is identical for all of them.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -20,20 +20,20 @@
 <span class="badge badge-status status-review">User guide</span>
 <span class="spec-date">Twill DB v0.4</span>
 </div>
-<h1>Storage backends</h1>
-<p class="lede">Twill DB's durable storage is pluggable, and you select it with nothing but the <strong>scheme of the connection string</strong>. <code>file://</code> is pure-embedded with zero network; <code>s3://</code> / <code>r2://</code> / <code>gs://</code> is storage-disaggregated and scale-to-zero. The engine, the SQL, the C ABI, and your application code are identical either way — only the URL changes.</p>
+<h1>Storage backends — overview</h1>
+<p class="lede">Twill DB's durable storage is pluggable, and you select it with nothing but the <strong>scheme of the connection string</strong>. The engine, the SQL, the C ABI, and your application code are identical for every backend — only the URL changes. This page is the shared model; each backend then has its own page.</p>
 </header>
 
 <section>
 <h2>At a glance</h2>
 <div class="table-wrap">
 <table>
-<thead><tr><th>Scheme</th><th>Backend</th><th>Durability floor</th><th>Network</th><th>Scale-to-zero</th></tr></thead>
+<thead><tr><th>Scheme</th><th>Backend</th><th>Durability floor</th><th>Network</th><th>Scale-to-zero</th><th>Page</th></tr></thead>
 <tbody>
-<tr><td><code>file://</code></td><td><code>LocalFileStorage</code></td><td>Local disk (CRC-checked WAL)</td><td>None</td><td>n/a (local)</td></tr>
-<tr><td><code>s3://</code></td><td><code>ObjectStorage</code></td><td>S3 / S3-compatible (MinIO)</td><td>Object API</td><td>Yes</td></tr>
-<tr><td><code>r2://</code></td><td><code>ObjectStorage</code></td><td>Cloudflare R2</td><td>Object API (zero egress)</td><td>Yes</td></tr>
-<tr><td><code>gs://</code></td><td><code>ObjectStorage</code></td><td>Google Cloud Storage</td><td>Object API</td><td>Yes</td></tr>
+<tr><td><code>file://</code></td><td><code>LocalFileStorage</code></td><td>Local disk (CRC-checked WAL)</td><td>None</td><td>n/a (local)</td><td><a href="storage-file.html">file://</a></td></tr>
+<tr><td><code>s3://</code></td><td><code>ObjectStorage</code></td><td>S3 / S3-compatible (MinIO)</td><td>Object API</td><td>Yes</td><td><a href="storage-s3.html">s3://</a></td></tr>
+<tr><td><code>r2://</code></td><td><code>ObjectStorage</code></td><td>Cloudflare R2</td><td>Object API (zero egress)</td><td>Yes</td><td><a href="storage-r2.html">r2://</a></td></tr>
+<tr><td><code>gs://</code></td><td><code>ObjectStorage</code></td><td>Google Cloud Storage</td><td>Object API</td><td>Yes</td><td><a href="storage-gs.html">gs://</a></td></tr>
 </tbody>
 </table>
 </div>
@@ -44,73 +44,32 @@
 </section>
 
 <section>
-<h2><code>file://</code> — local, embedded</h2>
-<p>A crash-safe local database file with zero network. Best for development, single-node apps, offline/edge, tests, and the fastest possible hot path. The WAL is written as CRC-checked, length-prefixed frames and recovers by discarding a torn trailing frame, so every acknowledged commit survives a crash.</p>
-<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
-using db = open("file://./app.db");           // relative path
-// using db = open("file:///var/lib/twill/app.db"); // absolute path</code></pre>
-<pre data-lang="bash"><code># Same backend, served over the wire
-cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db</code></pre>
-<div class="callout note">
-<p class="callout-title">Single process</p>
-<p>A <code>file://</code> database is owned by one process. Multiple connections <em>within</em> that process share one database (snapshot isolation holds across handles), but separate processes must not open the same file concurrently. For multi-client access, use <a href="connect-server.html">server mode</a> or an object-storage backend.</p>
-</div>
-</section>
-
-<section>
-<h2><code>s3://</code> / <code>r2://</code> / <code>gs://</code> — disaggregated</h2>
-<p>Durability bottoms out on object storage. Internally this backend is an LSM page store plus a compare-and-swap (CAS) commit log: commits are an atomic conditional write, which provides ordered durability <em>and</em> single-writer fencing without any separate coordination service. A local cache keeps hot pages in-process so object-storage latency stays off the read hot path.</p>
-<pre data-lang="ts"><code>using db = open("s3://my-bucket/mydb");
-using r2 = open("r2://my-bucket/mydb");
-using gs = open("gs://my-bucket/mydb");</code></pre>
-<p>What you gain by moving here:</p>
+<h2>What's shared across all backends</h2>
+<p>These hold no matter which scheme you choose — the backend pages only cover what <em>differs</em>.</p>
 <ul>
-<li><strong>Scale-to-zero</strong> — compute is stateless, so it can stop when idle and only object-storage bytes bill at rest; the next request warms by replaying the WAL. See <a href="scale-to-zero.html">Scale-to-zero &amp; lifecycle</a>.</li>
-<li><strong>Durable single-writer lease</strong> — a monotonic CAS epoch fences stale writers, the split-brain guard that makes "single writer" safe across instances.</li>
-<li><strong>Branching that copies nothing</strong> — a branch shares immutable history and writes to a private overlay (a child key-prefix in object storage). See <a href="branching.html">Branching</a>.</li>
+<li><strong>Selection is the URL.</strong> <code>open_storage</code> dispatches on the scheme; unknown schemes are rejected, never silently defaulted.</li>
+<li><strong>Durability is WAL-centric.</strong> <code>append_wal</code> returns the commit LSN only after the records are durable — never an ack from a buffer.</li>
+<li><strong>MVCC read floor.</strong> A read at an LSN returns the greatest version at or below it; readers never block writers.</li>
+<li><strong>Branching &amp; the lease are seam concerns.</strong> Copy-on-write <a href="branching.html">branching</a> and the durable single-writer lease are implemented at the storage seam, so they work the same way across backends (a sibling file for <code>file://</code>, a child key-prefix for object stores).</li>
 </ul>
 </section>
 
 <section>
-<h2>Credentials &amp; configuration</h2>
-<p>Bucket credentials belong in the <strong>environment</strong>, never in the connection string or in code. Use the standard provider variables for your target.</p>
-<pre data-lang="bash"><code># AWS S3 / MinIO (S3-compatible)
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_REGION=us-east-1
-# For MinIO / custom endpoints, set the endpoint via your deployment config.
-
-# Cloudflare R2
-export AWS_ACCESS_KEY_ID=...          # R2 uses S3-style keys
-export AWS_SECRET_ACCESS_KEY=...
-
-# Google Cloud Storage
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json</code></pre>
+<h2>Credentials never go in the URL</h2>
 <div class="callout warning">
-<p class="callout-title">Never commit secrets</p>
-<p>Connection strings in code, tests, and examples should use <code>file://</code> only. Real bucket credentials are environment configuration. A secret-scanning hook and CI check exist to catch slips — treat a hit as a stop.</p>
+<p class="callout-title">Secrets live in the environment</p>
+<p>Connection strings in code, tests, and examples should use <code>file://</code> only. Real bucket credentials are environment configuration (provider variables), never the connection string or the repo. A secret-scanning hook and CI check exist to catch slips — treat a hit as a stop. Each object-storage page lists the exact variables for that provider.</p>
 </div>
 </section>
 
 <section>
-<h2>Why R2's zero egress matters here</h2>
-<p>On a disaggregated engine, a cache miss is a read <em>out</em> of object storage — billed as egress on S3/GCS. A cold cache therefore costs more on those providers. Cloudflare R2 charges <strong>zero egress</strong>, which removes that cost structurally, making it a natural fit for read-heavy or frequently-cold-started databases. The trade-off is otherwise identical: same engine, same code path.</p>
-</section>
-
-<section>
-<h2>Choosing a backend</h2>
-<div class="table-wrap">
-<table>
-<thead><tr><th>If you want…</th><th>Use</th></tr></thead>
-<tbody>
-<tr><td>Fastest hot path, single node, dev/test/edge</td><td><code>file://</code></td></tr>
-<tr><td>Stateless compute that idles to zero cost</td><td><code>s3://</code> / <code>r2://</code> / <code>gs://</code></td></tr>
-<tr><td>Many short-lived databases / branches off one base</td><td>object storage (branches copy nothing)</td></tr>
-<tr><td>Lowest cold-read cost</td><td><code>r2://</code> (zero egress)</td></tr>
-</tbody>
-</table>
+<h2>Choose a backend</h2>
+<div class="doc-card-grid">
+<a class="doc-card" href="storage-file.html"><div class="ic">💾</div><h3><code>file://</code> — local</h3><p>Zero network, fastest hot path. Dev, single-node, offline/edge, tests.</p></a>
+<a class="doc-card" href="storage-s3.html"><div class="ic">☁️</div><h3><code>s3://</code> — S3 / MinIO</h3><p>Disaggregated on AWS S3 or any S3-compatible store. Scale-to-zero.</p></a>
+<a class="doc-card" href="storage-r2.html"><div class="ic">🟠</div><h3><code>r2://</code> — Cloudflare</h3><p>Disaggregated with zero egress — best for cold-read-heavy workloads.</p></a>
+<a class="doc-card" href="storage-gs.html"><div class="ic">🔵</div><h3><code>gs://</code> — Google Cloud</h3><p>Disaggregated on Google Cloud Storage.</p></a>
 </div>
-<p>For the design rationale behind the seam and the object-storage internals, the <a href="../release/index.html">Release</a> page links the relevant specifications.</p>
 </section>
 
 <nav class="page-nav" id="page-nav"></nav>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server: Python client · Twill DB</title>
+<meta name="description" content="Connect to Twill's engine-server from Python with psycopg v3: cursors, parameter binding, transactions, and connection pooling over the Postgres wire protocol.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Server: Python client</h1>
+<p class="lede">Any Python DB-API Postgres driver connects to <a href="connect-server.html">engine-server</a>. The examples use <code>psycopg</code> (v3), the current standard; <code>psycopg2</code> and <code>asyncpg</code> work the same way at the protocol level.</p>
+</header>
+
+<section>
+<h2>Prerequisites</h2>
+<p>A running server, and <code>pip install "psycopg[binary]"</code>.</p>
+</section>
+
+<section>
+<h2>Connect and query</h2>
+<pre data-lang="python"><code>import psycopg
+
+# Context managers close the connection/cursor cleanly.
+with psycopg.connect(
+    "host=127.0.0.1 port=5433 user=postgres dbname=main sslmode=disable"
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, body FROM notes ORDER BY id DESC LIMIT 50")
+        for row in cur.fetchall():
+            print(row)
+    # exiting the `with conn` block commits</code></pre>
+<p><strong>Breakdown:</strong> <code>sslmode=disable</code> matches the cleartext listener. The <code>with</code> blocks handle resource cleanup and the outer one commits on a clean exit — psycopg opens an implicit transaction, which the engine runs for real.</p>
+</section>
+
+<section>
+<h2>Parameter binding</h2>
+<p>Use <code>%s</code> placeholders with a tuple — this is psycopg's server-side binding, not Python string formatting. Never build SQL with f-strings.</p>
+<pre data-lang="python"><code>with conn.cursor() as cur:
+    cur.execute("SELECT id, body FROM notes WHERE id = %s", (1,))
+    note = cur.fetchone()
+
+    cur.execute(
+        "INSERT INTO notes (body, ts) VALUES (%s, %s)",
+        ("hello", "2026-06-26T00:00:00Z"),
+    )
+conn.commit()</code></pre>
+<p><strong>Breakdown:</strong> <code>%s</code> is psycopg's placeholder regardless of the value type; the driver sends them as bind parameters over the extended protocol. The trailing comma in <code>(1,)</code> makes it a one-element tuple.</p>
+</section>
+
+<section>
+<h2>Transactions</h2>
+<pre data-lang="python"><code>with psycopg.connect("host=127.0.0.1 port=5433 user=postgres dbname=main sslmode=disable") as conn:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (100, 1))
+            cur.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (100, 2))
+        conn.commit()   # blocks until the engine's WAL is durable
+    except psycopg.errors.SerializationFailure:
+        conn.rollback()  # another writer won the race — safe to retry</code></pre>
+<p><strong>Breakdown:</strong> a write conflict surfaces as a serialization failure; rolling back and retrying the whole transaction is the correct response, because the engine enforces snapshot isolation with first-committer-wins.</p>
+</section>
+
+<section>
+<h2>Pooling</h2>
+<pre data-lang="python"><code>from psycopg_pool import ConnectionPool
+
+pool = ConnectionPool("host=127.0.0.1 port=5433 user=postgres dbname=main sslmode=disable", max_size=10)
+with pool.connection() as conn, conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM notes")
+    print(cur.fetchone())</code></pre>
+<p>For serverless bursts, add a transaction-mode pooler in front of the server — see <a href="connection-pooling.html">Connection pooling</a>.</p>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-server-go.html"><span class="xref-title">Go</span><span class="xref-desc">The same over pgx.</span></a>
+<a class="xref" href="sql-reference.html"><span class="xref-title">SQL reference</span><span class="xref-desc">What runs on the engine.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

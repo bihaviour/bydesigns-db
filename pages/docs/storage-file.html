@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage: file:// (local) · Twill DB</title>
+<meta name="description" content="The file:// storage backend — LocalFileStorage: a crash-safe local database with zero network. When to use it, how to open it, the durability model, and the single-process rule.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Storage: <code>file://</code> (local)</h1>
+<p class="lede">The pure-embedded backend (<code>LocalFileStorage</code>): a crash-safe local database file with zero network. It's the default for development and the fastest possible hot path — and it shares the exact engine, SQL, and API with the object-storage backends. See the shared model in the <a href="storage.html">overview</a>.</p>
+</header>
+
+<section>
+<h2>When to use it</h2>
+<ul>
+<li>Development, tests, and CI (examples use <code>file://</code> only).</li>
+<li>Single-node apps that own their data.</li>
+<li>Offline / edge, where there is no object store to reach.</li>
+<li>Anywhere you want the lowest read/commit latency and no network at all.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open it</h2>
+<pre data-lang="ts"><code>import { open } from "@twilldb/bun";
+
+using db = open("file://./app.db");                 // relative path
+// using db = open("file:///var/lib/twill/app.db"); // absolute path (three slashes)</code></pre>
+<pre data-lang="bash"><code># Same backend, served over the wire
+cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db</code></pre>
+<p><strong>Breakdown:</strong> a relative <code>file://./name</code> resolves against the working directory; an absolute path uses three slashes (<code>file:///abs/path</code>). The scheme is the only thing that selects this backend.</p>
+</section>
+
+<section>
+<h2>Durability model</h2>
+<p>The WAL is written as <strong>CRC-checked, length-prefixed frames</strong>. On open after a crash, recovery replays the log and <em>discards a torn trailing frame</em> (a partially written final record), so every <strong>acknowledged</strong> commit survives — and a half-written one never corrupts state. A commit returns only after its records are <code>fsync</code>'d; there is no ack-from-buffer.</p>
+<div class="callout success">
+<p class="callout-title">Gated by tests</p>
+<p>This is enforced by the storage conformance suite (durability-after-ack, deterministic recovery, torn-trailing-frame), so the local backend's crash-safety is a tested property, not a hope.</p>
+</div>
+</section>
+
+<section>
+<h2>The single-process rule</h2>
+<div class="callout warning">
+<p class="callout-title">One process owns the file</p>
+<p>A <code>file://</code> database is owned by one process. Multiple connections <em>within</em> that process share one database (snapshot isolation holds across handles, via a process-global registry), but separate processes must not open the same file concurrently. For multi-client access, use <a href="connect-server.html">server mode</a>, or move to an object-storage backend where the durable single-writer lease coordinates instances.</p>
+</div>
+</section>
+
+<section>
+<h2>Branching on <code>file://</code></h2>
+<p>Branching still works locally: a branch's diverged writes go to a <strong>sibling file</strong> next to the base, while shared history is read from the base below the fork LSN. Creating a branch copies no pages. See <a href="branching.html">Branching</a>.</p>
+</section>
+
+<section>
+<h2>Moving to disaggregated later</h2>
+<p>Switching to object storage is a one-string change — your application code, SQL, and the C ABI are unchanged. Start here, and when you need stateless/scale-to-zero compute, point at <a href="storage-s3.html">s3://</a>, <a href="storage-r2.html">r2://</a>, or <a href="storage-gs.html">gs://</a>.</p>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

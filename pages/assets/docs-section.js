@@ -24,10 +24,20 @@ window.SECTION = {
       { file: "connect-embedded-nextjs.html", title: "Next.js" },
     ]},
     { label: "Connect as server", items: [
-      { file: "connect-server.html", title: "Clients & ORMs (Drizzle, Prisma…)" },
+      { file: "connect-server.html",           title: "Clients & ORMs — overview" },
+      { file: "connect-server-node.html",      title: "Node / Bun" },
+      { file: "connect-server-python.html",    title: "Python" },
+      { file: "connect-server-go.html",        title: "Go" },
+      { file: "connect-server-drizzle.html",   title: "Drizzle ORM" },
+      { file: "connect-server-prisma.html",    title: "Prisma" },
+      { file: "connect-server-postgrest.html", title: "PostgREST" },
     ]},
     { label: "Storage", items: [
-      { file: "storage.html", title: "Backends (file:// · s3 · r2 · gs)" },
+      { file: "storage.html",      title: "Backends — overview" },
+      { file: "storage-file.html", title: "file:// (local)" },
+      { file: "storage-s3.html",   title: "s3:// (S3 / MinIO)" },
+      { file: "storage-r2.html",   title: "r2:// (Cloudflare)" },
+      { file: "storage-gs.html",   title: "gs:// (Google Cloud)" },
     ]},
     { label: "Guides", items: [
       { file: "branching.html",     title: "Branching" },

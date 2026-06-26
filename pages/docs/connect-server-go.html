@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server: Go client · Twill DB</title>
+<meta name="description" content="Connect to Twill's engine-server from Go with pgx: connect, parameterized queries, transactions, and pooling with pgxpool over the Postgres wire protocol.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Server: Go client</h1>
+<p class="lede">Go connects to <a href="connect-server.html">engine-server</a> with <code>pgx</code> (the modern driver) or <code>database/sql</code> + <code>lib/pq</code>. The examples use <code>pgx</code> v5.</p>
+</header>
+
+<section>
+<h2>Prerequisites</h2>
+<p>A running server, and <code>go get github.com/jackc/pgx/v5</code>.</p>
+</section>
+
+<section>
+<h2>Connect and query</h2>
+<pre data-lang="go"><code>package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+)
+
+func main() {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx,
+		"postgres://postgres@127.0.0.1:5433/main?sslmode=disable")
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close(ctx)
+
+	var id int
+	var body string
+	err = conn.QueryRow(ctx,
+		"SELECT id, body FROM notes WHERE id = $1", 1).Scan(&id, &body)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(id, body)
+}</code></pre>
+<p><strong>Breakdown:</strong> <code>sslmode=disable</code> matches the cleartext listener. <code>$1</code> numbered placeholders are bound from the trailing args and sent over the extended protocol. <code>QueryRow(...).Scan(...)</code> reads a single row into typed Go variables.</p>
+</section>
+
+<section>
+<h2>Multiple rows</h2>
+<pre data-lang="go"><code>rows, err := conn.Query(ctx, "SELECT id, body FROM notes ORDER BY id DESC LIMIT 50")
+if err != nil { panic(err) }
+defer rows.Close()
+
+for rows.Next() {
+	var id int
+	var body string
+	if err := rows.Scan(&id, &body); err != nil { panic(err) }
+	fmt.Println(id, body)
+}
+if err := rows.Err(); err != nil { panic(err) }</code></pre>
+</section>
+
+<section>
+<h2>Transactions</h2>
+<pre data-lang="go"><code>tx, err := conn.Begin(ctx)
+if err != nil { panic(err) }
+
+_, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", 100, 1)
+if err != nil { tx.Rollback(ctx); panic(err) }
+
+_, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", 100, 2)
+if err != nil { tx.Rollback(ctx); panic(err) }
+
+if err := tx.Commit(ctx); err != nil { // returns once the WAL is durable
+	panic(err)
+}</code></pre>
+<p><strong>Breakdown:</strong> the engine runs the transaction for real; <code>Commit</code> blocks until durable. Inspect the returned <code>*pgconn.PgError</code> code for a serialization/conflict (<code>40001</code>) and retry the whole transaction if so.</p>
+</section>
+
+<section>
+<h2>Pooling</h2>
+<pre data-lang="go"><code>import "github.com/jackc/pgx/v5/pgxpool"
+
+pool, err := pgxpool.New(ctx, "postgres://postgres@127.0.0.1:5433/main?sslmode=disable")
+if err != nil { panic(err) }
+defer pool.Close()
+
+var n int
+_ = pool.QueryRow(ctx, "SELECT count(*) FROM notes").Scan(&n)</code></pre>
+<p>For serverless bursts, front the server with a transaction-mode pooler — see <a href="connection-pooling.html">Connection pooling</a>.</p>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-server-prisma.html"><span class="xref-title">Prisma</span><span class="xref-desc">ORM setup &amp; schema caveats.</span></a>
+<a class="xref" href="connection-pooling.html"><span class="xref-title">Connection pooling</span><span class="xref-desc">Absorb connection bursts.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
