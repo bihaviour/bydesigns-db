@@ -105,6 +105,9 @@ dependencies = [
 [[package]]
 name = "twilldb-cli"
 version = "0.4.0"
+dependencies = [
+ "twill-engine",
+]
 
 [[package]]
 name = "unicode-ident"

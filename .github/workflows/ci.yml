@@ -115,6 +115,14 @@ jobs:
         run: cargo build -p twill-bench
       - name: twill-bench tests with the custom-profile feature
         run: cargo test -p twill-bench --features custom-profile
+      # Feature-gate wall for the twilldb management half (spec 19 / #110): a
+      # default `twilldb` build must stay the lean, dependency-free scaffolder
+      # (no engine linked), and the gated build must compile and pass its
+      # management tests — keeping the `manage` feature the wall it is meant to be.
+      - name: twilldb builds without the manage feature (lean scaffolder)
+        run: cargo build -p twilldb-cli
+      - name: twilldb management tests with the manage feature
+        run: cargo test -p twilldb-cli --features manage
       - name: Build release libengine
         run: cargo build -p twill-engine --release
       - uses: oven-sh/setup-bun@v2

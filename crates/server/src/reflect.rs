@@ -263,6 +263,7 @@ mod tests {
                 CatalogColumn {
                     name: "id".into(),
                     pg_type: "bigint",
+                    ty: engine::ColumnType::Integer,
                     not_null: true,
                     primary_key: true,
                     position: 1,
@@ -270,6 +271,7 @@ mod tests {
                 CatalogColumn {
                     name: "title".into(),
                     pg_type: "text",
+                    ty: engine::ColumnType::Text,
                     not_null: false,
                     primary_key: false,
                     position: 2,
@@ -308,6 +310,7 @@ mod tests {
                 columns: vec![CatalogColumn {
                     name: "id".into(),
                     pg_type: "bigint",
+                    ty: engine::ColumnType::Integer,
                     not_null: true,
                     primary_key: true,
                     position: 1,
@@ -320,6 +323,7 @@ mod tests {
                     CatalogColumn {
                         name: "id".into(),
                         pg_type: "bigint",
+                        ty: engine::ColumnType::Integer,
                         not_null: true,
                         primary_key: true,
                         position: 1,
@@ -327,6 +331,7 @@ mod tests {
                     CatalogColumn {
                         name: "author_id".into(),
                         pg_type: "bigint",
+                        ty: engine::ColumnType::Integer,
                         not_null: false,
                         primary_key: false,
                         position: 2,

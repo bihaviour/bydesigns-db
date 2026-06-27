@@ -16,11 +16,11 @@
 <header class="page-header">
 <div class="spec-meta">
 <span class="badge badge-id">19</span>
-<span class="badge badge-status status-draft">Proposal v0.4</span>
+<span class="badge badge-status status-draft">Proposal v0.4 · Milestone 1 implemented</span>
 <span class="spec-date">Updated 2026-06-27</span>
 </div>
 <h1>Database Management CLI</h1>
-<p class="lede">A proposal to grow <code>twilldb</code> from a project <em>scaffolder</em> (spec 18) into a database <em>management</em> CLI — run SQL and inspect data, author and apply migrations, generate client types, and manage copy-on-write branches — in the spirit of the Supabase CLI, but shaped by Twill's embeddable, single-writer, branchable architecture. This page is the design intent; the implementation is tracked separately and is <strong>not built yet</strong>.</p>
+<p class="lede">Growing <code>twilldb</code> from a project <em>scaffolder</em> (spec 18) into a database <em>management</em> CLI — run SQL and inspect data, author and apply migrations, generate client types, and manage copy-on-write branches — in the spirit of the Supabase CLI, but shaped by Twill's embeddable, single-writer, branchable architecture. This page is the design intent. <strong>Milestone 1 is implemented</strong> (issue #110): the embedded (<code>file://</code>) <code>sql</code>, <code>shell</code>, <code>tables</code>/<code>describe</code>, <code>migrate new</code>/<code>up</code>/<code>status</code>, <code>gen types</code>, <code>seed</code>, and <code>stats</code> commands, all behind the <code>manage</code> cargo feature; Milestones 2 (branches &amp; serve) and 3 (the <code>postgres://</code> transport) remain proposed.</p>
 </header>
 
 <section>

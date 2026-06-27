@@ -19,3 +19,22 @@ path = "src/main.rs"
 [lib]
 name = "twilldb_cli"
 path = "src/lib.rs"
+
+[features]
+# `manage` half (spec 19): the database *management* commands (sql / shell /
+# tables / describe / migrate / gen types / seed / stats). Gated so a default
+# `twilldb` build stays the lean, dependency-free scaffolder (spec 18) — the
+# same wall `twill-bench`'s `custom-profile` feature uses. The feature links
+# `twill-engine` and opens a real database over the embedded (`file://`/`s3://`)
+# transport; the engine itself carries no heavy third-party deps, so even the
+# management build stays auditable. CI builds both with and without the feature.
+manage = ["dep:engine"]
+
+[dependencies]
+# Only pulled in by the `manage` feature; the default scaffolder links nothing.
+engine = { package = "twill-engine", path = "../engine", optional = true }
+
+[[test]]
+name = "manage"
+path = "tests/manage.rs"
+required-features = ["manage"]

@@ -10,6 +10,7 @@ window.SECTION = {
       { file: "architecture.html",    title: "Architecture" },
       { file: "getting-started.html", title: "Quickstart" },
       { file: "scaffolding.html",     title: "Scaffold a project (CLI)" },
+      { file: "manage.html",          title: "Manage a database (CLI)" },
     ]},
     { label: "Connect", items: [
       { file: "connect.html",            title: "Connect to your database" },

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manage a database (twilldb CLI) · Twill DB docs</title>
+<meta name="description" content="Run SQL, inspect the schema, author and apply migrations, and generate TypeScript types with the twilldb management CLI — over the embedded file:// transport.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">~4 minutes</span>
+</div>
+<h1>Manage a database</h1>
+<p class="lede">The same <code>twilldb</code> binary that <a href="scaffolding.html">scaffolds a project</a> can also <em>talk to a real database</em>: run SQL, inspect the schema, author and apply migrations, generate TypeScript types, and load seed data. Where the scaffolder only writes files, the management commands open a <code>Connection</code> in-process — so they need the engine linked in, behind a cargo feature.</p>
+</header>
+
+<section>
+<h2>Get the management build</h2>
+<p>Management links the engine, so it is gated behind a <code>manage</code> cargo feature. The release binaries ship with it on; from a checkout, enable it explicitly:</p>
+<pre data-lang="bash"><code>cargo run -p twilldb-cli --features manage -- &lt;command&gt; …
+# or put it on your PATH:
+cargo install --path crates/cli --features manage</code></pre>
+<p>A default <code>twilldb</code> build stays the lean, dependency-free scaffolder — none of the engine is linked. If you run a management command without the feature, the CLI tells you how to get it.</p>
+</section>
+
+<section>
+<h2>The connection string picks the transport</h2>
+<p>Every management command takes a connection string, and the scheme chooses how the CLI reaches the database — exactly like the engine chooses its storage backend:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Scheme</th><th>Transport</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>file://</code> (and <code>s3://</code>, <code>r2://</code>, <code>gs://</code>)</td><td><strong>Embedded</strong> — opens the engine in this process</td><td>local dev, CI, one-off scripts, an offline/stopped database</td></tr>
+<tr><td><code>postgres://</code></td><td><strong>pgwire</strong> — connects to a running <code>engine-server</code></td><td>a live or shared deployment <span class="req-tag may">coming soon</span></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">The CLI is a writer when it opens a database embedded</p>
+<p>Twill is single-writer-per-database, enforced by a durable lease. When the CLI opens <code>file://</code> it <em>is</em> that writer — so point it at a <strong>local or stopped</strong> database, not one an app or server currently holds, or the two will contend for the lease. To manage a <strong>live</strong> deployment, use the <code>postgres://</code> transport so the server stays the sole writer and the CLI is just a client. (The <code>postgres://</code> transport is on the roadmap; embedded is available today.)</p>
+</div>
+</section>
+
+<section>
+<h2>Run SQL &amp; inspect</h2>
+<pre data-lang="bash"><code># run one statement or query (table output)
+twilldb sql file://./app.db "SELECT id, title FROM notes"
+
+# machine-readable output for scripts
+twilldb sql file://./app.db "SELECT count(*) AS n FROM notes" --json
+# → [{"n":42}]
+
+# list tables, then describe one (columns, nullability, PK, foreign keys)
+twilldb tables   file://./app.db
+twilldb describe file://./app.db notes
+
+# an interactive REPL — end statements with ; and use dot-commands
+twilldb shell file://./app.db
+twilldb&gt; .tables
+twilldb&gt; .schema notes
+twilldb&gt; SELECT * FROM notes LIMIT 5;
+twilldb&gt; .quit</code></pre>
+<p>A <code>SELECT</code> prints an aligned table (or JSON with <code>--json</code>); an <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> reports the affected-row count. The REPL accepts multi-line statements and the <code>.tables</code>, <code>.schema [table]</code>, <code>.help</code>, and <code>.quit</code>/<code>.exit</code> dot-commands.</p>
+</section>
+
+<section>
+<h2>Migrations</h2>
+<p>Migrations are an ordered directory of immutable <code>*.sql</code> files plus a <code>_twilldb_migrations</code> tracking table created in the database on first apply. The model is intentionally close to Supabase / dbmate / golang-migrate.</p>
+<pre data-lang="bash"><code># create migrations/&lt;timestamp&gt;_add_notes.sql
+twilldb migrate new add_notes
+
+# apply every pending migration in order, recording each
+twilldb migrate up file://./app.db
+
+# show applied vs pending, and warn if an applied file was edited
+twilldb migrate status file://./app.db</code></pre>
+<p>Each file is split into statements and applied in order; <code>migrate up</code> records the file's version, name, checksum, and apply time, so a second run is a no-op. If an already-applied file's checksum no longer matches, <code>status</code> and <code>up</code> flag <strong>drift</strong> — a previously-applied migration was edited. Use <code>--dir &lt;path&gt;</code> to point at a migrations directory other than <code>./migrations</code>.</p>
+<div class="callout note">
+<p class="callout-title">A migration is the unit of ordering, not always of atomicity</p>
+<p>Twill runs <code>CREATE</code>/<code>ALTER</code>/<code>DROP</code> in autocommit — DDL cannot run inside an explicit transaction. So a DML-only file is applied inside one transaction, but a file containing DDL runs statement-by-statement in autocommit, and a mid-file failure leaves earlier statements applied. Keep one concern per migration (schema changes separate from large data backfills) so a partial failure is easy to reason about. A copy-on-write preview-and-swap (<code>migrate up --branch</code>) is on the roadmap.</p>
+</div>
+</section>
+
+<section>
+<h2>Generate TypeScript types</h2>
+<p><code>gen types</code> reflects the live schema and emits a TypeScript interface per table for the <a href="connect-bun.html"><code>@twilldb/bun</code></a> client, so your <code>db.query&lt;Row&gt;()</code> calls stay statically typed against the real schema:</p>
+<pre data-lang="bash"><code>twilldb gen types file://./app.db --out src/db-types.ts</code></pre>
+<p>Storage classes map to TS as you'd expect: <code>integer</code>/<code>real</code> → <code>number</code>, <code>text</code> → <code>string</code>, <code>blob</code> → <code>Uint8Array</code>, and a <code>vector(N)</code> column → <code>number[]</code>. A nullable column is widened with <code>| null</code>. Without <code>--out</code> the types print to stdout.</p>
+</section>
+
+<section>
+<h2>Seed data &amp; stats</h2>
+<pre data-lang="bash"><code># run a SQL script (e.g. fixtures or reference data)
+twilldb seed file://./app.db seed.sql
+
+# print the engine + storage observability counters
+twilldb stats file://./app.db</code></pre>
+<p><code>stats</code> reports the same engine and storage counters the server surfaces over <code>SHOW twill.stats</code> — commits, durable WAL appends, the committed LSN, write-lane contention, and the storage backend's read/cache/fsync counters.</p>
+</section>
+
+<section>
+<h2>Next steps</h2>
+<div class="xref-grid">
+<a class="xref" href="scaffolding.html"><span class="xref-title">Scaffold a project</span><span class="xref-desc">The other half of the same CLI — generate a runnable starter app.</span></a>
+<a class="xref" href="branching.html"><span class="xref-title">Branching</span><span class="xref-desc">Copy-on-write branches — the basis for the preview-and-swap migrations to come.</span></a>
+<a class="xref" href="sql-reference.html"><span class="xref-title">SQL reference</span><span class="xref-desc">The SQL surface the sql/shell/migration commands run.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-title">Embedded (bun:ffi)</span><span class="xref-desc">The client gen types targets — open, query, transactions.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB — user documentation. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

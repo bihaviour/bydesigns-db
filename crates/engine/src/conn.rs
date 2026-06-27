@@ -95,6 +95,11 @@ pub struct CatalogColumn {
     pub name: String,
     /// The Postgres type name a client expects (`integer`, `text`, …).
     pub pg_type: &'static str,
+    /// The engine's storage class for this column. Carries the `vector(N)`
+    /// dimension that `pg_type` flattens to `text`, so a consumer (e.g. the
+    /// management CLI's `gen types`) can map a vector to `number[]` rather than
+    /// `string`. The pgwire reflection path keys off `pg_type` and ignores this.
+    pub ty: ColumnType,
     pub not_null: bool,
     pub primary_key: bool,
     /// 1-based ordinal position in the table.
@@ -233,6 +238,7 @@ impl Connection {
                     .map(|(i, c)| CatalogColumn {
                         name: c.name,
                         pg_type: pg_type_name(c.ty),
+                        ty: c.ty,
                         not_null: c.not_null,
                         primary_key: c.primary_key,
                         position: (i + 1) as i32,

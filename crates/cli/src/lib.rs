@@ -7,6 +7,8 @@
 //! assert exit codes without spawning a process — the same shape as
 //! `twill-bench`.
 
+#[cfg(feature = "manage")]
+pub mod manage;
 pub mod prompt;
 pub mod scaffold;
 
@@ -48,12 +50,36 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         "new" => run_new(rest),
         "init" => run_init(rest),
+        // Management half (spec 19), behind the `manage` feature. The verbs are
+        // recognized either way so a lean build can explain how to get them.
+        "sql" | "shell" | "tables" | "describe" | "migrate" | "gen" | "seed" | "stats" => {
+            run_manage(cmd, rest)
+        }
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
             exit::USAGE
         }
     }
+}
+
+/// Dispatch a management subcommand. With the `manage` feature this links the
+/// engine and runs the command; without it, the command is recognized but
+/// unavailable, so we explain how to get the management build.
+#[cfg(feature = "manage")]
+fn run_manage(cmd: &str, rest: &[String]) -> i32 {
+    manage::dispatch(cmd, rest)
+}
+
+#[cfg(not(feature = "manage"))]
+fn run_manage(cmd: &str, _rest: &[String]) -> i32 {
+    eprintln!(
+        "error: `{cmd}` is a database-management command, not included in this build.\n\
+         This is the lean scaffolder build (spec 18). Rebuild with the management\n\
+         half enabled:  cargo install twilldb-cli --features manage\n\
+         (the release binaries ship with it on)."
+    );
+    exit::USAGE
 }
 
 /// Parsed `--flags`, shared by `new` and `init`. `None` means "not specified on
@@ -330,6 +356,16 @@ fn print_help() {
          \x20 twilldb new api --client php\n\
          \x20 twilldb new search --vector\n\
          \x20 twilldb new app --backend s3\n\
-         \x20 twilldb init"
+         \x20 twilldb init\n\
+         \n\
+         management commands (open a real database; spec 19):\n\
+         \x20 twilldb sql <url> \"<query>\"    run a statement/query (--json for JSON)\n\
+         \x20 twilldb shell <url>            interactive SQL REPL\n\
+         \x20 twilldb tables|describe <url>  inspect the schema\n\
+         \x20 twilldb migrate new|up|status  author and apply migrations\n\
+         \x20 twilldb gen types <url>        TypeScript types for @twilldb/bun\n\
+         \x20 twilldb seed|stats <url>       run a seed script / show stats\n\
+         <url> is file:// (embedded — the CLI is the single writer, so use it on a\n\
+         local or stopped database). These need the management build (--features manage)."
     );
 }
