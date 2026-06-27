@@ -33,6 +33,7 @@ window.SECTION = {
       { file: "16-sql-compatibility.html",  title: "SQL Compatibility & Mapping" },
       { file: "17-row-level-security.html", title: "Row-Level Security (Proposal)" },
       { file: "18-cli-tooling.html",        title: "Scaffolding CLI & Distribution" },
+      { file: "19-cli-management.html",     title: "Database Management CLI (Proposal)" },
     ]},
     { label: "Implementation Maps", items: [
       { file: "phase-1-embedded.html",            title: "Phase 1 — Embedded Library" },
