@@ -295,33 +295,6 @@ impl WalOp {
         let op = match tag {
             OP_CREATE => decode_create(&mut c)?,
             OP_ALTER_ADD => decode_alter_add(&mut c)?,
-            OP_ALTER_DROP => WalOp::AlterDropColumn {
-                table: c.str()?,
-                column: c.str()?,
-            },
-            OP_ALTER_RENAME_COL => WalOp::AlterRenameColumn {
-                table: c.str()?,
-                from: c.str()?,
-                to: c.str()?,
-            },
-            OP_ALTER_RENAME_TABLE => WalOp::AlterRenameTable {
-                table: c.str()?,
-                to: c.str()?,
-            },
-            OP_CREATE_VIEW => WalOp::CreateView {
-                name: c.str()?,
-                sql: c.str()?,
-            },
-            OP_DROP_VIEW => WalOp::DropView { name: c.str()? },
-            OP_CREATE_POLICY => decode_create_policy(&mut c)?,
-            OP_DROP_POLICY => WalOp::DropPolicy {
-                table: c.str()?,
-                name: c.str()?,
-            },
-            OP_SET_RLS => WalOp::SetRls {
-                table: c.str()?,
-                enabled: c.u8()? != 0,
-            },
             OP_DROP => WalOp::DropTable { name: c.str()? },
             OP_CREATE_INDEX => decode_create_index(&mut c)?,
             OP_DROP_INDEX => WalOp::DropIndex { name: c.str()? },
@@ -331,10 +304,48 @@ impl WalOp {
                 vid: c.u64()?,
             },
             OP_COMMIT => WalOp::Commit,
-            other => return Err(EngineError::internal(format!("bad WAL op tag {other}"))),
+            // Schema-evolution, view, and RLS catalog facts — split into a helper
+            // so this dispatcher stays within the project's complexity gate.
+            other => decode_catalog_op(other, &mut c)?,
         };
         Ok(op)
     }
+}
+
+/// Decode the schema-evolution / view / row-level-security catalog ops (the
+/// less-common tags), kept out of [`WalOp::decode`] so that dispatcher stays
+/// within the cyclomatic-complexity gate. Errors on an unknown tag.
+fn decode_catalog_op(tag: u8, c: &mut Cursor) -> Result<WalOp> {
+    Ok(match tag {
+        OP_ALTER_DROP => WalOp::AlterDropColumn {
+            table: c.str()?,
+            column: c.str()?,
+        },
+        OP_ALTER_RENAME_COL => WalOp::AlterRenameColumn {
+            table: c.str()?,
+            from: c.str()?,
+            to: c.str()?,
+        },
+        OP_ALTER_RENAME_TABLE => WalOp::AlterRenameTable {
+            table: c.str()?,
+            to: c.str()?,
+        },
+        OP_CREATE_VIEW => WalOp::CreateView {
+            name: c.str()?,
+            sql: c.str()?,
+        },
+        OP_DROP_VIEW => WalOp::DropView { name: c.str()? },
+        OP_CREATE_POLICY => decode_create_policy(c)?,
+        OP_DROP_POLICY => WalOp::DropPolicy {
+            table: c.str()?,
+            name: c.str()?,
+        },
+        OP_SET_RLS => WalOp::SetRls {
+            table: c.str()?,
+            enabled: c.u8()? != 0,
+        },
+        other => return Err(EngineError::internal(format!("bad WAL op tag {other}"))),
+    })
 }
 
 /// Decode a `CreateTable` op body (name + columns + FKs + checks/uniques).
