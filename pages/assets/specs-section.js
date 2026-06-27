@@ -39,6 +39,7 @@ window.SECTION = {
       { file: "phase-3-server.html",              title: "Phase 3 — Server + pgwire" },
       { file: "phase-4-branching-lifecycle.html", title: "Phase 4 — Branching & Lifecycle" },
       { file: "phase-5-capabilities.html",        title: "Phase 5 — Capabilities: Vector Search" },
+      { file: "phase-6-sql-completeness.html",    title: "Phase 6 — SQL Surface Completeness" },
     ]},
   ],
 };
