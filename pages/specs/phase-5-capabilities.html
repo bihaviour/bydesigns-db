@@ -94,11 +94,19 @@
 <section>
 <h2>Deliberate scope boundaries (documented, not accidental)</h2>
 <ul>
-<li><strong>The index is derived, not paged.</strong> Spec 12 says "store the graph as pages, not a side file"; the engine's rows are themselves WAL-derived in-memory state, not pages, so the <em>consistent</em> realization is a WAL-derived index — same durability path, same branch/scale-to-zero semantics, never a side file. The literal page layout is a Phase-2-style cold-read optimization, not a Phase-5 requirement.</li>
-<li><strong>Deletes are tombstones.</strong> A removed vid is filtered from results but its node stays in the graph (navigation is unaffected; it is a valid point in space). Incremental-vs-full rebuild under heavy delete churn is a spec "MAY" / open question, deferred.</li>
-<li><strong>HNSW is approximate by design.</strong> Recall is governed by <code>ef_search</code>; for the test-scale data the search is effectively exhaustive, so results are exact.</li>
+<li><strong>The index is derived, not a side file.</strong> Spec 12 says "store the graph as pages, not a side file"; the engine's rows are themselves WAL-derived in-memory state, so the <em>consistent</em> realization is a WAL-derived index — same durability path, same branch/scale-to-zero semantics, never a side file. The literal page layout is a cold-read optimization, now realized additively (see <em>Vector hardening</em> below), not a separate durable graph.</li>
 <li><strong>Composed engines are adopted, not vendored.</strong> better-auth/PostgREST/DuckDB are external; Phase 5 builds only the glue (the vector capability and the materialization job), per spec 12's "build only thin glue".</li>
 <li><strong>SQL subset unchanged otherwise.</strong> Joins, GROUP BY, subqueries, and <code>DISTINCT</code> remain out of scope; <code>ORDER BY</code> ranks by expressions, not output aliases.</li>
+</ul>
+</section>
+
+<section>
+<h2>Vector hardening (<a href="https://github.com/bihaviour/twill-db/issues/89">#89</a>)</h2>
+<p>The three "MAY"/open-question items above are now implemented — additively, with the storage seam untouched (<code>STORAGE_TRAIT_VERSION</code> stays 3, <code>ENGINE_ABI_VERSION</code> stays 3). Branching and scale-to-zero still rebuild each branch's graph from its own WAL (the warm is the replay), gated by <code>tests/vector.rs::branch_branches_the_vector_index</code>.</p>
+<ul>
+<li><strong>VH-3 — recall tuning surface (<a href="https://github.com/bihaviour/twill-db/issues/99">#99</a>).</strong> <code>ef_search</code> is now a per-session knob: <code>SET twill.vector_ef_search = N</code> (and <code>TO N</code> / <code>TO DEFAULT</code>), <code>RESET twill.vector_ef_search</code>, and <code>SHOW twill.vector_ef_search</code>. The value threads through <code>run_select</code> → <code>knn_select</code> → <code>VectorIndex::search</code> as a pure parameter binding — no shared or durable state, so branching/scale-to-zero are unaffected. The recall/latency trade-off is documented with a measured curve in <a href="12-capabilities.html">spec 12</a>.</li>
+<li><strong>VH-2 — incremental maintenance under delete churn (<a href="https://github.com/bihaviour/twill-db/issues/98">#98</a>).</strong> A committed delete/supersede marks its index node <em>head-deleted</em> (still navigable, still returned so older snapshots stay correct; the executor re-checks MVCC visibility). Two levers then keep recall up: KNN over-fetch widens by the dead/live ratio, and once head-deleted density crosses ~20% of a graph of ≥64 nodes a <em>compacting rebuild</em> fires automatically (off the read path, on the single-writer commit path) dropping the dead nodes. The compaction records a floor LSN; a snapshot below it falls back to a brute-force scan, so snapshot isolation is preserved across compaction (<code>tests/vector.rs::old_snapshot_survives_compaction</code>).</li>
+<li><strong>VH-1 — page-laid-out index (<a href="https://github.com/bihaviour/twill-db/issues/97">#97</a>).</strong> A freshly built graph is checkpointed as fixed-size, LSN-versioned page images through the existing <code>put_page</code>/<code>get_page</code> contract (the trait never learns "index page vs row page"). A cold open adopts the checkpoint when it exactly reflects the replayed head, loading the graph in bounded page reads instead of replaying every vector through HNSW insertion; a missing, stale, or branch-private checkpoint simply takes the rebuild-from-rows path, so correctness never depends on the pages.</li>
 </ul>
 </section>
 

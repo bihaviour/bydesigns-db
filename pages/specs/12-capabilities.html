@@ -323,13 +323,47 @@ object storage  (S3 / R2 / GCS)
 <dt>vector.metric</dt><dd>distance metric for the HNSW index — <code>cosine</code> | <code>l2</code> | <code>inner_product</code>.</dd>
 <dt>hnsw.m</dt><dd>graph out-degree; higher = better recall, larger graph, more pages to keep resident.</dd>
 <dt>hnsw.ef_construction</dt><dd>build-time candidate-list size; build quality vs build cost.</dd>
-<dt>hnsw.ef_search</dt><dd>query-time candidate-list size; recall vs latency, the primary online tuning knob.</dd>
+<dt>hnsw.ef_search</dt><dd>query-time candidate-list size; recall vs latency, the primary online tuning knob. Set at index creation (<code>WITH (ef_search = …)</code>) and overridable per session at runtime with <code>SET twill.vector_ef_search = N</code> (<a href="https://github.com/bihaviour/twill-db/issues/99">#99</a>) — see the measured curve below.</dd>
 <dt>cache.vector_working_set</dt><dd>cache budget reserved for the HNSW graph, separate from the row page budget.</dd>
 <dt>auth.database</dt><dd>which database/branch better-auth persists into (defaults to the application DB).</dd>
 <dt>rest.enabled</dt><dd>whether a PostgREST layer is provisioned in front of server mode (absent in embedded deployments).</dd>
 <dt>olap.snapshot_interval</dt><dd>cadence of columnar materialization to S3; bounds analytic staleness.</dd>
 <dt>olap.format</dt><dd>columnar publish format — <code>parquet</code> or <code>iceberg</code>.</dd>
 </dl>
+</section>
+
+<section>
+<h2>Tuning recall: <code>ef_search</code> and the recall/latency curve</h2>
+<p>HNSW is approximate; <code>ef_search</code> (the query-time candidate-list width) trades recall for latency. It is fixed at index creation and overridable per session at runtime:</p>
+<pre><code>SET twill.vector_ef_search = 128;   -- widen search for this connection
+SHOW twill.vector_ef_search;        -- inspect the current override
+RESET twill.vector_ef_search;       -- back to each index's configured default</code></pre>
+<p>The override is a pure per-connection parameter binding — no shared or durable state — so it never touches branching or scale-to-zero. It threads through the planner's KNN path (<code>knn_select</code>) into <code>VectorIndex::search</code>; a query whose <code>ef_search</code> is below the over-fetch floor (<code>k × 4</code>) sees no change, which is why very small values plateau.</p>
+<p>Measured recall@10 vs. brute-force ground truth over 2,000 random 16-d vectors, 100 queries, on a deliberately sparse graph (<code>m=5, ef_construction=20</code>) so the knob has visible headroom (regenerate with <code>cargo test -p twill-engine --test vector recall_curve -- --ignored --nocapture</code>):</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th><code>ef_search</code></th><th>recall@10</th><th>mean latency (µs/query)</th></tr></thead>
+<tbody>
+<tr><td>8</td><td>0.873</td><td>~54</td></tr>
+<tr><td>16</td><td>0.873</td><td>~46</td></tr>
+<tr><td>32</td><td>0.873</td><td>~46</td></tr>
+<tr><td>64</td><td>0.926</td><td>~60</td></tr>
+<tr><td>128</td><td>0.961</td><td>~98</td></tr>
+<tr><td>256</td><td>0.978</td><td>~165</td></tr>
+</tbody>
+</table>
+</div>
+<p>Recall is monotonic in <code>ef_search</code> while latency rises roughly linearly past the over-fetch floor — pick the smallest value that meets the recall target for your latency budget. (Latencies are end-to-end through the SQL path on a dev build and are relative, not absolute; a denser graph saturates recall at every <code>ef_search</code>.)</p>
+</section>
+
+<section>
+<h2>Maintaining recall under delete churn</h2>
+<p>Deletes are tombstoned: a committed delete marks its index node <em>head-deleted</em> but leaves it in the graph (it is still a valid navigation point, and an older MVCC snapshot may still legitimately see the row, so the executor re-checks visibility per result). Under heavy churn the graph would otherwise bloat with dead nodes and recall would erode. Two levers counter this (<a href="https://github.com/bihaviour/twill-db/issues/98">#98</a>):</p>
+<ul>
+<li><strong>Adaptive over-fetch.</strong> The KNN path widens its candidate fetch by the dead/live ratio, so a query still surfaces <code>k</code> <em>live</em> results even when most of the graph is tombstoned.</li>
+<li><strong>Auto-compaction.</strong> Once head-deleted nodes reach ~20% of a graph of ≥64 nodes, a compacting rebuild fires automatically on the single-writer commit path (never the read path), dropping the dead nodes. It records a floor LSN; a reader whose snapshot predates the floor falls back to a brute-force scan, so compaction never breaks snapshot isolation.</li>
+</ul>
+<p>Acceptance (<code>tests/vector.rs</code>): after inserting 500 vectors and deleting 70%, top-1 recall on the live set stays exact with no manual rebuild step, and a snapshot taken before the compaction still sees the rows it dropped.</p>
 </section>
 
 <section>
@@ -378,8 +412,8 @@ object storage  (S3 / R2 / GCS)
 <section>
 <h2>Open questions &amp; risks</h2>
 <ul class="reqs">
-<li><span class="req-tag may">MAY</span> — HNSW page layout: what page granularity and node-packing minimize serial round-trips on cold traversal? Needs benchmarking against the <a href="09-benchmark-plan.html">benchmark plan</a> (cold-read experiment extended to graph traversal).</li>
-<li><span class="req-tag may">MAY</span> — incremental vs full HNSW rebuild on heavy update churn; how does graph quality degrade with deletes, and when must the index be rebuilt?</li>
+<li><span class="req-tag may">MAY</span> — HNSW page layout: what page granularity and node-packing minimize serial round-trips on cold traversal? <em>Resolved (<a href="https://github.com/bihaviour/twill-db/issues/97">#97</a>): the graph is checkpointed as fixed-size LSN-versioned pages through the existing <code>put_page</code>/<code>get_page</code> contract and adopted on a matching cold open, with rebuild-from-rows as the always-correct fallback — see <a href="phase-5-capabilities.html">Vector hardening</a>.</em></li>
+<li><span class="req-tag may">MAY</span> — incremental vs full HNSW rebuild on heavy update churn; how does graph quality degrade with deletes, and when must the index be rebuilt? <em>Resolved (<a href="https://github.com/bihaviour/twill-db/issues/98">#98</a>): stat-driven auto-compaction past a ~20% head-deleted threshold plus dead-ratio over-fetch — see "Maintaining recall under delete churn" above.</em></li>
 <li><span class="req-tag may">MAY</span> — columnar staleness bound: what snapshot interval keeps DuckDB analytics "fresh enough" without overwhelming the materialization job, and should CDC replace batch?</li>
 <li><span class="req-tag may">MAY</span> — does any other high-value capability (full-text search, geospatial) belong in-core by the rule, or are they better composed?</li>
 <li><span class="req-tag may">MAY</span> — pg-wire surface completeness: which catalog/type details must server mode expose so the long tail of pg-wire tools (not just PostgREST) attach unmodified?</li>

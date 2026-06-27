@@ -5,7 +5,7 @@
 
 use crate::db::{commit_error, Database};
 use crate::error::{EngineError, Result};
-use crate::exec::{run_delete, run_insert, run_select, run_update, ResultSet, WriteCtx};
+use crate::exec::{run_delete, run_insert, run_select_tuned, run_update, ResultSet, WriteCtx};
 use crate::session::SessionContext;
 use crate::sql::{self, SessionSet, Stmt};
 use crate::value::{ColumnType, Value};
@@ -49,6 +49,11 @@ pub struct Connection {
     last_error: CString,
     pub last_changes: i64,
     pub last_lsn: i64,
+    /// VH-3: per-session HNSW `ef_search` override (`SET twill.vector_ef_search`).
+    /// `None` means each index uses its configured default. Pure parameter
+    /// binding — no durable or shared state, so it never affects branching or
+    /// scale-to-zero.
+    vector_ef_search: Option<usize>,
     /// The authorization principal for this connection (Phase 7 RLS): the role
     /// and trusted claims policies are evaluated against. Per-connection, so two
     /// handles on the same `Database` never see each other's principal.
@@ -177,12 +182,20 @@ impl Connection {
             last_error: CString::default(),
             last_changes: 0,
             last_lsn: 0,
+            vector_ef_search: None,
             session: SessionContext::default(),
         })
     }
 
     pub fn in_transaction(&self) -> bool {
         self.txn.is_some()
+    }
+
+    /// VH-1 observability: how many vector indexes this connection's database
+    /// warmed from a page checkpoint on cold open (rather than rebuilding from the
+    /// rows). Equivalent result either way; this confirms the page path engaged.
+    pub fn vector_pages_loaded(&self) -> u64 {
+        self.db.index_pages_loaded()
     }
 
     /// Apply a parsed session-context mutation to this connection's principal
@@ -296,6 +309,7 @@ impl Connection {
             last_error: CString::default(),
             last_changes: 0,
             last_lsn: 0,
+            vector_ef_search: None,
             // A fresh branch handle starts with an empty principal — a debug
             // branch does not inherit the parent connection's session, so RLS
             // still enforces against the branch's own (default) role.
@@ -377,7 +391,8 @@ impl Connection {
             Stmt::Select(sel) => {
                 let (snapshot, writer) = self.read_snapshot();
                 let store = self.db.store.read().unwrap();
-                let rs = run_select(&store, sel, snapshot, writer, params)?;
+                let rs =
+                    run_select_tuned(&store, sel, snapshot, writer, params, self.vector_ef_search)?;
                 self.last_changes = 0;
                 Ok(rs)
             }
@@ -398,6 +413,23 @@ impl Connection {
             }
             // Accepted-and-ignored session statements (stage 6E).
             Stmt::Noop => Ok(ResultSet::default()),
+            // VH-3: the per-session HNSW recall knob.
+            Stmt::SetVectorEf(value) => {
+                self.vector_ef_search = *value;
+                self.last_changes = 0;
+                Ok(ResultSet::default())
+            }
+            Stmt::Show(name) if name.eq_ignore_ascii_case(sql::VECTOR_EF_SEARCH_GUC) => {
+                let value = match self.vector_ef_search {
+                    Some(n) => n.to_string(),
+                    None => String::new(),
+                };
+                Ok(ResultSet {
+                    columns: vec![sql::VECTOR_EF_SEARCH_GUC.to_string()],
+                    types: vec![ColumnType::Text],
+                    rows: vec![vec![Value::Text(value)]],
+                })
+            }
             Stmt::Show(name) => Ok(show_result(name)),
             Stmt::Explain(inner) => Ok(explain_result(inner)),
         }
@@ -1016,9 +1048,15 @@ impl Connection {
         ];
         let commit_lsn =
             block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
-        let mut store = self.db.store.write().unwrap();
-        store.create_index(def);
-        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        {
+            let mut store = self.db.store.write().unwrap();
+            store.create_index(def);
+            store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        }
+        // VH-1: checkpoint the freshly built graph as pages so a cold reopen can
+        // load it without replaying every vector through HNSW insertion. The lane
+        // is held (autocommit DDL), so this is an exclusive, consistent point.
+        self.db.checkpoint_vector_index(name, commit_lsn.0);
         Ok(Some(commit_lsn.0))
     }
 

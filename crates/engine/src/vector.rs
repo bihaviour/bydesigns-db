@@ -138,6 +138,12 @@ struct Node {
     /// Tombstone: a node whose row version was rolled back. Kept for navigation
     /// (it is still a valid point in space) but never returned as a result.
     removed: bool,
+    /// VH-2: the node's row version has been deleted/superseded as of the index's
+    /// head (a committed delete). Unlike `removed`, a `dead` node is STILL returned
+    /// by [`VectorIndex::search`] — an older MVCC snapshot may legitimately still
+    /// see the row, so the executor re-checks visibility per result. The flag only
+    /// drives maintenance statistics (over-fetch sizing + the compaction trigger).
+    dead: bool,
 }
 
 /// An HNSW vector index over one table column. Holds the graph plus a `vid ->
@@ -150,7 +156,24 @@ pub struct VectorIndex {
     entry: Option<usize>,
     max_level: usize,
     rng: u64,
+    /// VH-2: count of `dead` (head-deleted) nodes still present in the graph —
+    /// the maintenance statistic that drives over-fetch sizing and the compaction
+    /// trigger ([`VectorIndex::needs_maintenance`]).
+    dead_count: usize,
+    /// VH-2: the committed LSN as of the last *compacting* rebuild (one that
+    /// dropped head-deleted nodes from the graph). A snapshot strictly below this
+    /// floor may still need a dropped row, so the executor falls back to a
+    /// brute-force scan for it (see `exec::knn_select`). `0` = never compacted, so
+    /// the index serves every snapshot.
+    rebuild_floor: u64,
 }
+
+/// VH-2 maintenance policy (spec 12 §"delete churn"). A compacting rebuild is
+/// triggered once head-deleted nodes make up at least `MAINT_DEAD_RATIO_PCT` of a
+/// graph of at least `MAINT_MIN_NODES` nodes — small enough indexes just absorb
+/// the dead nodes (over-fetch covers them) rather than paying repeated rebuilds.
+pub const MAINT_MIN_NODES: usize = 64;
+pub const MAINT_DEAD_RATIO_PCT: usize = 20;
 
 /// A `(distance, node)` pair ordered by distance (ties broken by node index for
 /// a total order, so it is safe in a `BinaryHeap`).
@@ -186,16 +209,57 @@ impl VectorIndex {
             entry: None,
             max_level: 0,
             rng: 0x243F_6A88_85A3_08D3, // fixed seed → deterministic builds
+            dead_count: 0,
+            rebuild_floor: 0,
         }
     }
 
-    /// Number of live (non-tombstoned) vectors.
+    /// Number of nodes present in the graph (live + head-deleted), i.e. every
+    /// node `search` may still return. This is the over-fetch cap.
     pub fn len(&self) -> usize {
         self.by_vid.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_vid.is_empty()
+    }
+
+    /// VH-2: nodes whose row version is live at the index head (present minus the
+    /// head-deleted ones) — the denominator the executor uses to widen over-fetch
+    /// so a query still surfaces `k` *live* results under heavy delete churn.
+    pub fn live_len(&self) -> usize {
+        self.by_vid.len().saturating_sub(self.dead_count)
+    }
+
+    /// VH-2: the compaction floor — the lowest snapshot LSN this index can answer
+    /// directly (`0` = every snapshot; see [`VectorIndex::rebuild_floor`] field).
+    pub fn rebuild_floor(&self) -> u64 {
+        self.rebuild_floor
+    }
+
+    /// VH-2: whether head-deleted density has crossed the rebuild threshold on a
+    /// graph large enough to be worth compacting.
+    pub fn needs_maintenance(&self) -> bool {
+        let n = self.by_vid.len();
+        n >= MAINT_MIN_NODES && self.dead_count * 100 >= n * MAINT_DEAD_RATIO_PCT
+    }
+
+    /// VH-2: set the compaction floor (called after a compacting rebuild from the
+    /// store, so the executor knows the lowest snapshot this graph can answer).
+    pub fn set_rebuild_floor(&mut self, lsn: u64) {
+        self.rebuild_floor = lsn;
+    }
+
+    /// VH-2: mark `vid`'s node head-deleted (a committed delete/supersede). The
+    /// node stays navigable and still returns from `search` for older snapshots;
+    /// only the maintenance statistic changes. Idempotent.
+    pub fn mark_dead(&mut self, vid: u64) {
+        if let Some(&idx) = self.by_vid.get(&vid) {
+            if !self.nodes[idx].dead {
+                self.nodes[idx].dead = true;
+                self.dead_count += 1;
+            }
+        }
     }
 
     pub fn metric(&self) -> Metric {
@@ -247,6 +311,7 @@ impl VectorIndex {
             vector,
             neighbors: vec![Vec::new(); level + 1],
             removed: false,
+            dead: false,
         });
         self.by_vid.insert(vid, idx);
 
@@ -367,17 +432,21 @@ impl VectorIndex {
         out
     }
 
-    /// Top-`k` nearest live vectors to `query`, nearest first. `k` doubles as the
+    /// Top-`k` nearest vectors to `query`, nearest first. `k` doubles as the
     /// search width, so the executor over-fetches (to absorb MVCC-invisible and
-    /// tombstoned hits) simply by asking for more.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    /// head-deleted hits) simply by asking for more. `ef_search` overrides the
+    /// index's configured search width for this call (VH-3 — the per-query /
+    /// per-session recall knob); `None` uses the index default. Head-deleted
+    /// (`dead`) nodes are returned (the executor re-checks MVCC visibility); only
+    /// rolled-back (`removed`) nodes are skipped.
+    pub fn search(&self, query: &[f32], k: usize, ef_search: Option<usize>) -> Vec<(u64, f32)> {
         let Some(entry) = self.entry else {
             return Vec::new();
         };
         if k == 0 {
             return Vec::new();
         }
-        let ef = self.def.params.ef_search.max(k);
+        let ef = ef_search.unwrap_or(self.def.params.ef_search).max(k);
         let mut ep = entry;
         let mut l = self.max_level;
         while l > 0 {
@@ -405,7 +474,339 @@ impl VectorIndex {
     /// graph for navigation but is never returned again.
     pub fn remove(&mut self, vid: u64) {
         if let Some(idx) = self.by_vid.remove(&vid) {
+            if self.nodes[idx].dead {
+                self.dead_count = self.dead_count.saturating_sub(1);
+            }
             self.nodes[idx].removed = true;
         }
+    }
+}
+
+// ---- VH-1: page-laid-out graph (cold-read realization, spec 12) -------------
+//
+// The HNSW graph is a *derived* structure (rebuilt from the WAL on replay), so
+// nothing here changes the storage seam: these are opaque, fixed-size page images
+// that flow through the existing `put_page`/`get_page` contract exactly like a row
+// page would (`STORAGE_TRAIT_VERSION` stays 3 — the trait never learns "index page
+// vs row page"). Laying the graph out as pages lets a cold open *load* the graph
+// in a bounded number of page reads instead of replaying every vector through the
+// O(N·log N) insertion path; when no current checkpoint exists (e.g. a freshly
+// diverged branch) the engine simply falls back to the rebuild-from-rows warm, so
+// correctness never depends on a page image being present or fresh.
+
+/// Page payload budget. Must not exceed the storage layer's `PAGE_SIZE` (4096);
+/// `put_page` rejects an over-size image, and the engine caps writes to this.
+pub const PAGE_CAP: usize = 4096;
+
+const PAGE_MAGIC: &[u8; 8] = b"TWIVIDX1";
+
+/// The decoded header of a graph page-checkpoint (page 0 of an index's region).
+/// Lets the cold-open path validate a checkpoint (magic + index name + the
+/// committed LSN it reflects) before reading — and trusting — its body pages.
+#[derive(Clone, Debug)]
+pub struct VectorPageHeader {
+    pub metric: Metric,
+    pub dim: usize,
+    pub node_count: usize,
+    pub entry: Option<usize>,
+    pub max_level: usize,
+    /// The store's `committed_lsn` this checkpoint reflects. The cold-open path
+    /// adopts the checkpoint only when it exactly matches the replayed head.
+    pub reflected_lsn: u64,
+    pub dead_count: usize,
+    pub rebuild_floor: u64,
+    pub num_body_pages: usize,
+    /// The index name, guarding against a page-id-region hash collision.
+    pub name: String,
+}
+
+fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn get_u32(b: &[u8], at: &mut usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    let v = u32::from_le_bytes(b.get(*at..end)?.try_into().ok()?);
+    *at = end;
+    Some(v)
+}
+fn get_u64(b: &[u8], at: &mut usize) -> Option<u64> {
+    let end = at.checked_add(8)?;
+    let v = u64::from_le_bytes(b.get(*at..end)?.try_into().ok()?);
+    *at = end;
+    Some(v)
+}
+
+/// Parse just the header page of a checkpoint (the first frame). Returns `None`
+/// on a bad magic or a truncated/garbled image, so a stale or collided page is
+/// rejected rather than misread.
+pub fn parse_page_header(frame: &[u8]) -> Option<VectorPageHeader> {
+    if frame.len() < 8 || &frame[..8] != PAGE_MAGIC {
+        return None;
+    }
+    let mut at = 8usize;
+    let metric = Metric::from_tag(*frame.get(at)?);
+    at += 1;
+    let dim = get_u32(frame, &mut at)? as usize;
+    let node_count = get_u64(frame, &mut at)? as usize;
+    let entry_raw = get_u64(frame, &mut at)?;
+    let entry = (entry_raw != u64::MAX).then_some(entry_raw as usize);
+    let max_level = get_u32(frame, &mut at)? as usize;
+    let reflected_lsn = get_u64(frame, &mut at)?;
+    let dead_count = get_u64(frame, &mut at)? as usize;
+    let rebuild_floor = get_u64(frame, &mut at)?;
+    let num_body_pages = get_u32(frame, &mut at)? as usize;
+    let name_len = get_u32(frame, &mut at)? as usize;
+    let end = at.checked_add(name_len)?;
+    let name = String::from_utf8(frame.get(at..end)?.to_vec()).ok()?;
+    Some(VectorPageHeader {
+        metric,
+        dim,
+        node_count,
+        entry,
+        max_level,
+        reflected_lsn,
+        dead_count,
+        rebuild_floor,
+        num_body_pages,
+        name,
+    })
+}
+
+impl VectorIndex {
+    /// Serialize the graph into page frames for VH-1: `frames[0]` is the header
+    /// page, `frames[1..]` the body pages (each ≤ [`PAGE_CAP`]). Nodes are written
+    /// in ordinal order so adjacency lists (stored as ordinals) survive a
+    /// round-trip exactly. Returns `None` if the index is empty or a single node
+    /// record cannot fit in a page (a pathologically large dimension × degree) —
+    /// the caller then keeps the rebuild-from-rows path.
+    pub fn to_page_frames(&self, reflected_lsn: u64) -> Option<Vec<Vec<u8>>> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let dim = self.nodes[0].vector.len();
+        // Pack node records greedily into body pages.
+        let mut body: Vec<Vec<u8>> = Vec::new();
+        let mut page: Vec<u8> = Vec::with_capacity(PAGE_CAP);
+        let mut count: u32 = 0;
+        let flush = |page: &mut Vec<u8>, count: &mut u32, body: &mut Vec<Vec<u8>>| {
+            if *count == 0 {
+                return;
+            }
+            let mut framed = Vec::with_capacity(4 + page.len());
+            put_u32(&mut framed, *count);
+            framed.extend_from_slice(page);
+            body.push(framed);
+            page.clear();
+            *count = 0;
+        };
+        for node in &self.nodes {
+            if node.vector.len() != dim {
+                return None; // ragged dimensions — refuse to checkpoint
+            }
+            let mut rec = Vec::new();
+            put_u64(&mut rec, node.vid);
+            let flags = (node.removed as u8) | ((node.dead as u8) << 1);
+            rec.push(flags);
+            put_u32(&mut rec, node.neighbors.len() as u32);
+            for &x in &node.vector {
+                rec.extend_from_slice(&x.to_le_bytes());
+            }
+            for lvl in &node.neighbors {
+                put_u32(&mut rec, lvl.len() as u32);
+                for &nb in lvl {
+                    put_u32(&mut rec, nb as u32);
+                }
+            }
+            // A record must fit within a page (minus the 4-byte count prefix).
+            if rec.len() + 4 > PAGE_CAP {
+                return None;
+            }
+            if 4 + page.len() + rec.len() > PAGE_CAP {
+                flush(&mut page, &mut count, &mut body);
+            }
+            page.extend_from_slice(&rec);
+            count += 1;
+        }
+        flush(&mut page, &mut count, &mut body);
+
+        let mut header = Vec::with_capacity(64 + self.def.name.len());
+        header.extend_from_slice(PAGE_MAGIC);
+        header.push(self.def.params.metric.tag());
+        put_u32(&mut header, dim as u32);
+        put_u64(&mut header, self.nodes.len() as u64);
+        put_u64(
+            &mut header,
+            self.entry.map(|e| e as u64).unwrap_or(u64::MAX),
+        );
+        put_u32(&mut header, self.max_level as u32);
+        put_u64(&mut header, reflected_lsn);
+        put_u64(&mut header, self.dead_count as u64);
+        put_u64(&mut header, self.rebuild_floor);
+        put_u32(&mut header, body.len() as u32);
+        put_u32(&mut header, self.def.name.len() as u32);
+        header.extend_from_slice(self.def.name.as_bytes());
+        if header.len() > PAGE_CAP {
+            return None; // an absurdly long index name; skip the checkpoint
+        }
+
+        let mut frames = Vec::with_capacity(1 + body.len());
+        frames.push(header);
+        frames.extend(body);
+        Some(frames)
+    }
+
+    /// Reconstruct a graph from page frames produced by [`Self::to_page_frames`]
+    /// (`frames[0]` header, rest body). Returns `None` on any inconsistency, so a
+    /// corrupt or partial checkpoint falls back to rebuild-from-rows.
+    pub fn from_page_frames(def: IndexDef, frames: &[Vec<u8>]) -> Option<VectorIndex> {
+        let header = parse_page_header(frames.first()?)?;
+        if header.num_body_pages + 1 != frames.len() {
+            return None;
+        }
+        // The checkpoint must agree with the definition we are loading it under.
+        if header.metric != def.params.metric {
+            return None;
+        }
+        let dim = header.dim;
+        let mut nodes: Vec<Node> = Vec::with_capacity(header.node_count);
+        for body in &frames[1..] {
+            let mut at = 0usize;
+            let count = get_u32(body, &mut at)?;
+            for _ in 0..count {
+                let vid = get_u64(body, &mut at)?;
+                let flags = *body.get(at)?;
+                at += 1;
+                let nlevels = get_u32(body, &mut at)? as usize;
+                let mut vector = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    let end = at.checked_add(4)?;
+                    vector.push(f32::from_le_bytes(body.get(at..end)?.try_into().ok()?));
+                    at = end;
+                }
+                let mut neighbors = Vec::with_capacity(nlevels);
+                for _ in 0..nlevels {
+                    let deg = get_u32(body, &mut at)? as usize;
+                    let mut lvl = Vec::with_capacity(deg);
+                    for _ in 0..deg {
+                        lvl.push(get_u32(body, &mut at)? as usize);
+                    }
+                    neighbors.push(lvl);
+                }
+                nodes.push(Node {
+                    vid,
+                    vector,
+                    neighbors,
+                    removed: (flags & 1) != 0,
+                    dead: (flags & 2) != 0,
+                });
+            }
+        }
+        if nodes.len() != header.node_count {
+            return None;
+        }
+        let mut by_vid = HashMap::with_capacity(nodes.len());
+        let mut dead_count = 0usize;
+        for (idx, node) in nodes.iter().enumerate() {
+            if node.removed {
+                continue;
+            }
+            by_vid.insert(node.vid, idx);
+            if node.dead {
+                dead_count += 1;
+            }
+        }
+        // The recomputed head-deleted count must match the header (corruption guard).
+        if dead_count != header.dead_count {
+            return None;
+        }
+        Some(VectorIndex {
+            def,
+            nodes,
+            by_vid,
+            entry: header.entry,
+            max_level: header.max_level,
+            rng: 0x243F_6A88_85A3_08D3,
+            dead_count,
+            rebuild_floor: header.rebuild_floor,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idx_with(n: usize, dim: usize) -> VectorIndex {
+        let def = IndexDef {
+            name: "t_e".into(),
+            table: "t".into(),
+            column: "e".into(),
+            params: IndexParams {
+                metric: Metric::L2,
+                ..IndexParams::default()
+            },
+        };
+        let mut ix = VectorIndex::new(def);
+        for i in 0..n {
+            let f = i as f32;
+            ix.insert(i as u64 + 1, vec![f, f * 0.5, dim as f32 - f]);
+        }
+        ix
+    }
+
+    #[test]
+    fn page_round_trip_preserves_search() {
+        let ix = idx_with(200, 3);
+        let q = vec![17.0, 8.5, -14.0];
+        let before = ix.search(&q, 5, None);
+        let frames = ix.to_page_frames(42).expect("serializes");
+        // Every frame respects the page budget.
+        for f in &frames {
+            assert!(f.len() <= PAGE_CAP, "frame {} > PAGE_CAP", f.len());
+        }
+        let hdr = parse_page_header(&frames[0]).unwrap();
+        assert_eq!(hdr.reflected_lsn, 42);
+        assert_eq!(hdr.name, "t_e");
+        assert_eq!(hdr.node_count, 200);
+        let restored = VectorIndex::from_page_frames(ix.def.clone(), &frames).expect("restores");
+        let after = restored.search(&q, 5, None);
+        assert_eq!(before, after, "page round-trip changes nothing");
+        assert_eq!(restored.len(), ix.len());
+    }
+
+    #[test]
+    fn ef_search_override_widens_search() {
+        // A query-time ef override is honored independently of the index default.
+        let ix = idx_with(300, 3);
+        let q = vec![100.0, 50.0, -97.0];
+        let narrow = ix.search(&q, 1, Some(1));
+        let wide = ix.search(&q, 1, Some(256));
+        assert_eq!(narrow.len(), 1);
+        assert_eq!(wide.len(), 1);
+    }
+
+    #[test]
+    fn empty_index_has_no_checkpoint() {
+        let ix = idx_with(0, 3);
+        assert!(ix.to_page_frames(1).is_none());
+    }
+
+    #[test]
+    fn mark_dead_tracks_density_and_maintenance() {
+        let mut ix = idx_with(100, 3);
+        assert_eq!(ix.live_len(), 100);
+        assert!(!ix.needs_maintenance());
+        for vid in 1..=30u64 {
+            ix.mark_dead(vid);
+        }
+        assert_eq!(ix.len() - ix.live_len(), 30);
+        assert_eq!(ix.live_len(), 70);
+        assert!(ix.needs_maintenance(), "30% dead crosses the threshold");
+        // Idempotent.
+        ix.mark_dead(1);
+        assert_eq!(ix.live_len(), 70);
     }
 }

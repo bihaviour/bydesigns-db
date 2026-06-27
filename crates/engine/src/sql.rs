@@ -10,6 +10,9 @@ use crate::lex::{lex, Tok};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexParams, Metric};
 
+/// The session GUC that overrides HNSW `ef_search` per connection (VH-3).
+pub const VECTOR_EF_SEARCH_GUC: &str = "twill.vector_ef_search";
+
 // ---- AST ------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -85,6 +88,11 @@ pub enum Stmt {
     /// An accepted-and-ignored session statement — `SET`/`PRAGMA`/`VACUUM`/
     /// `ANALYZE`/`RESET`/`DISCARD` (stage 6E dialect shim).
     Noop,
+    /// `SET twill.vector_ef_search = N` / `RESET twill.vector_ef_search` (VH-3):
+    /// the per-session HNSW recall knob. `Some(n)` sets the search width for
+    /// subsequent KNN queries on this connection; `None` resets it to each index's
+    /// configured default.
+    SetVectorEf(Option<usize>),
     /// `SHOW name` — returns a one-row result for the setting (stage 6E).
     Show(String),
     /// `EXPLAIN [ANALYZE] <statement>` — returns a one-line plan (stage 6E).
@@ -877,11 +885,11 @@ impl Parser {
             Ok(Some(self.statement().map(|s| Stmt::Explain(Box::new(s)))))
         } else if self.is_kw("show") {
             self.bump();
-            // `SHOW name` / `SHOW TRANSACTION ISOLATION LEVEL` / `SHOW ALL`.
+            // `SHOW name` / `SHOW TRANSACTION ISOLATION LEVEL` / `SHOW ALL`. A
+            // dotted GUC name (`twill.vector_ef_search`) reads as one segment.
             let mut parts = Vec::new();
-            while let Some(w) = self.peek_word() {
-                parts.push(w.to_string());
-                self.bump();
+            while self.peek_word().is_some() {
+                parts.push(self.dotted_name());
             }
             Ok(Some(Ok(Stmt::Show(parts.join(" ")))))
         } else if self.is_kw("set") {
@@ -900,9 +908,11 @@ impl Parser {
         }
     }
 
-    /// `SET [SESSION|LOCAL] …` (stage 6E dialect shim, extended for Phase 7 RLS).
-    /// `SET ROLE`, `SET twill.jwt.claims`, and `SET twill.rls.bypass` mutate the
-    /// session principal; every other `SET` is accepted-and-ignored ([`Stmt::Noop`]).
+    /// `SET [SESSION|LOCAL] …` (stage 6E dialect shim, extended for Phase 7 RLS
+    /// and VH-3 vector tuning). `SET ROLE`, `SET twill.jwt.claims`, and
+    /// `SET twill.rls.bypass` mutate the session principal; `SET
+    /// twill.vector_ef_search` sets the per-session HNSW recall knob; every other
+    /// `SET` is accepted-and-ignored ([`Stmt::Noop`]).
     fn set_stmt(&mut self) -> Result<Stmt> {
         self.expect_kw("set")?;
         let _ = self.eat_kw("session") || self.eat_kw("local");
@@ -929,6 +939,14 @@ impl Parser {
             "twill.rls.bypass" => {
                 Stmt::SetSession(SessionSet::Bypass(self.read_set_value().truthy()))
             }
+            // VH-3: the per-session HNSW recall knob (`Default`/non-numeric → reset).
+            VECTOR_EF_SEARCH_GUC => {
+                let value = match self.read_set_value() {
+                    SetVal::Word(w) => w.parse::<usize>().ok().map(|n| n.max(1)),
+                    _ => None,
+                };
+                Stmt::SetVectorEf(value)
+            }
             // Unrecognized GUC: accept and ignore.
             _ => Stmt::Noop,
         };
@@ -936,8 +954,9 @@ impl Parser {
         Ok(stmt)
     }
 
-    /// `RESET <name>` — `RESET ROLE` / `RESET twill.jwt.claims` clear the matching
-    /// session state; every other `RESET` is accepted-and-ignored.
+    /// `RESET <name>` — `RESET ROLE` / `RESET twill.jwt.claims` /
+    /// `RESET twill.vector_ef_search` clear the matching session state; every
+    /// other `RESET` is accepted-and-ignored.
     fn reset_stmt(&mut self) -> Result<Stmt> {
         self.expect_kw("reset")?;
         if self.eat_kw("role") {
@@ -948,6 +967,7 @@ impl Parser {
         let stmt = match name.as_str() {
             "twill.jwt.claims" | "request.jwt.claims" => Stmt::SetSession(SessionSet::Claims(None)),
             "twill.rls.bypass" => Stmt::SetSession(SessionSet::Bypass(false)),
+            VECTOR_EF_SEARCH_GUC => Stmt::SetVectorEf(None),
             _ => Stmt::Noop,
         };
         self.skip_to_end();

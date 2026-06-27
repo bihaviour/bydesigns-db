@@ -300,6 +300,304 @@ fn hnsw_finds_exact_nearest_over_a_larger_set() {
     let _ = fs::remove_file(&p);
 }
 
+/// VH-3 (#99): `ef_search` is tunable per session via `SET twill.vector_ef_search`,
+/// reflected by `SHOW`, cleared by `RESET`, and honored by the KNN path.
+#[test]
+fn ef_search_is_tunable_per_session() {
+    let p = db_path("eftune");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+    db.exec("CREATE TABLE pts (id INTEGER PRIMARY KEY, e VECTOR(4))")
+        .unwrap();
+    db.exec("CREATE INDEX pts_e ON pts USING hnsw (e) WITH (metric = 'l2', ef_search = 16)")
+        .unwrap();
+    for i in 0..100i64 {
+        let a = (i % 10) as f32;
+        let b = (i / 10) as f32;
+        db.exec(&format!("INSERT INTO pts VALUES ({i}, [{a}, {b}, 0, 0])"))
+            .unwrap();
+    }
+
+    // Default: SHOW reports the unset (empty) session value.
+    let rs = db.query("SHOW twill.vector_ef_search").unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some(""));
+
+    // A session override is recorded and reflected.
+    db.exec("SET twill.vector_ef_search = 200").unwrap();
+    let rs = db.query("SHOW twill.vector_ef_search").unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("200"));
+
+    // The wider search still answers correctly (id 73 sits at (3,7,0,0)).
+    let rs = db
+        .query("SELECT id FROM pts ORDER BY e <-> [3, 7, 0, 0] LIMIT 1")
+        .unwrap();
+    assert_eq!(ids(&rs), ["73"]);
+
+    // `TO` syntax and a tiny width are also accepted.
+    db.exec("SET twill.vector_ef_search TO 1").unwrap();
+    let rs = db.query("SHOW twill.vector_ef_search").unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some("1"));
+
+    // RESET clears the override back to the index default.
+    db.exec("RESET twill.vector_ef_search").unwrap();
+    let rs = db.query("SHOW twill.vector_ef_search").unwrap();
+    assert_eq!(cell(&rs, 0, 0).as_deref(), Some(""));
+
+    let _ = fs::remove_file(&p);
+}
+
+/// VH-2 (#98): under heavy delete churn the index auto-compacts (no manual step)
+/// and top-k recall against the live set stays exact.
+#[test]
+fn index_recall_holds_under_delete_churn() {
+    let p = db_path("churn");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+    db.exec("CREATE TABLE pts (id INTEGER PRIMARY KEY, e VECTOR(4))")
+        .unwrap();
+    db.exec("CREATE INDEX pts_e ON pts USING hnsw (e) WITH (metric = 'l2')")
+        .unwrap();
+
+    // 500 lattice points (25×20), inserted in one transaction (one fsync).
+    db.begin().unwrap();
+    for i in 0..500i64 {
+        let a = (i % 25) as f32;
+        let b = (i / 25) as f32;
+        db.exec(&format!("INSERT INTO pts VALUES ({i}, [{a}, {b}, 0, 0])"))
+            .unwrap();
+    }
+    db.commit().unwrap();
+
+    // Delete 70% (ids 0..350). Live rows are ids 350..500. Compaction triggers
+    // automatically inside commit — no VACUUM, no rebuild call.
+    db.begin().unwrap();
+    db.exec("DELETE FROM pts WHERE id < 350").unwrap();
+    db.commit().unwrap();
+
+    // Every live point's own coordinates resolve to exactly itself (top-1 recall
+    // on the live set), proving the post-churn graph still navigates correctly.
+    for id in [350i64, 401, 437, 472, 499] {
+        let a = (id % 25) as f32;
+        let b = (id / 25) as f32;
+        let rs = db
+            .query(&format!(
+                "SELECT id FROM pts ORDER BY e <-> [{a},{b},0,0] LIMIT 1"
+            ))
+            .unwrap();
+        assert_eq!(ids(&rs), [id.to_string()], "nearest to live id {id}");
+    }
+
+    // A deleted point's slot now resolves to a live neighbour, never the dead row.
+    let rs = db
+        .query("SELECT id FROM pts ORDER BY e <-> [0,0,0,0] LIMIT 3")
+        .unwrap();
+    for got in ids(&rs) {
+        assert!(got.parse::<i64>().unwrap() >= 350, "no dead row returned");
+    }
+
+    let _ = fs::remove_file(&p);
+}
+
+/// VH-2 (#98): an MVCC snapshot taken before a compacting rebuild still sees the
+/// rows the compaction dropped — the KNN path falls back to a brute-force scan
+/// below the compaction floor, preserving snapshot isolation.
+#[test]
+fn old_snapshot_survives_compaction() {
+    let p = db_path("churnmvcc");
+    let url = url_for(&p);
+    let mut writer = Connection::open(&url).unwrap();
+    let mut reader = Connection::open(&url).unwrap();
+
+    writer
+        .exec("CREATE TABLE pts (id INTEGER PRIMARY KEY, e VECTOR(4))")
+        .unwrap();
+    writer
+        .exec("CREATE INDEX pts_e ON pts USING hnsw (e) WITH (metric = 'l2')")
+        .unwrap();
+    writer.begin().unwrap();
+    for i in 0..500i64 {
+        let a = (i % 25) as f32;
+        let b = (i / 25) as f32;
+        writer
+            .exec(&format!("INSERT INTO pts VALUES ({i}, [{a}, {b}, 0, 0])"))
+            .unwrap();
+    }
+    writer.commit().unwrap();
+
+    // The reader captures a snapshot that can still see id 100 (at (0,4,0,0)).
+    reader.begin().unwrap();
+    let rs = reader
+        .query("SELECT id FROM pts ORDER BY e <-> [0,4,0,0] LIMIT 1")
+        .unwrap();
+    assert_eq!(ids(&rs), ["100"]);
+
+    // The writer deletes 70% (including id 100) → the index compacts past the
+    // reader's snapshot.
+    writer.begin().unwrap();
+    writer.exec("DELETE FROM pts WHERE id < 350").unwrap();
+    writer.commit().unwrap();
+
+    // The reader's older snapshot still sees id 100 (brute-force fallback below the
+    // compaction floor keeps snapshot isolation intact).
+    let rs = reader
+        .query("SELECT id FROM pts ORDER BY e <-> [0,4,0,0] LIMIT 1")
+        .unwrap();
+    assert_eq!(ids(&rs), ["100"], "old snapshot still sees the dropped row");
+    reader.rollback().unwrap();
+
+    // A fresh read at the head no longer sees id 100 (it was deleted).
+    let rs = reader
+        .query("SELECT id FROM pts ORDER BY e <-> [0,4,0,0] LIMIT 1")
+        .unwrap();
+    assert_ne!(ids(&rs), ["100"], "head no longer sees the deleted row");
+
+    let _ = fs::remove_file(&p);
+}
+
+/// VH-1 (#97): a freshly built index is checkpointed as pages, and a cold reopen
+/// loads the graph from those pages (through `get_page`) rather than rebuilding it
+/// — while a write after the checkpoint correctly falls back to the rebuild path.
+#[test]
+fn index_warms_from_page_checkpoint() {
+    let p = db_path("pagewarm");
+    let url = url_for(&p);
+    {
+        let mut db = Connection::open(&url).unwrap();
+        seed_items(&mut db);
+        db.exec("CREATE INDEX items_e ON items USING hnsw (embedding) WITH (metric = 'l2')")
+            .unwrap();
+    } // checkpoint reflects the head; no writes follow it.
+
+    // Cold reopen adopts the page checkpoint (no rebuild from rows).
+    let mut db = Connection::open(&url).unwrap();
+    assert_eq!(
+        db.vector_pages_loaded(),
+        1,
+        "index warmed from its page checkpoint"
+    );
+    let rs = db
+        .query("SELECT id FROM items ORDER BY embedding <-> [1,0,0] LIMIT 2")
+        .unwrap();
+    assert_eq!(ids(&rs), ["1", "4"]);
+    drop(db);
+
+    // A write after the checkpoint makes it stale; the next cold reopen rebuilds
+    // from the WAL rows instead (still correct).
+    {
+        let mut db = Connection::open(&url).unwrap();
+        db.exec("INSERT INTO items VALUES (7, [0.02, 0.02, 0.98])")
+            .unwrap();
+    }
+    let mut db = Connection::open(&url).unwrap();
+    assert_eq!(
+        db.vector_pages_loaded(),
+        0,
+        "stale checkpoint is rejected; index rebuilt from rows"
+    );
+    let rs = db
+        .query("SELECT id FROM items ORDER BY embedding <-> [0.02,0.02,0.98] LIMIT 1")
+        .unwrap();
+    assert_eq!(ids(&rs), ["7"]);
+
+    let _ = fs::remove_file(&p);
+}
+
+/// VH-3 (#99): the documented recall/latency curve. Builds an HNSW index and an
+/// index-free twin over the same vectors, then sweeps `ef_search` measuring
+/// recall@10 (overlap with the brute-force ground truth) and per-query latency.
+/// `#[ignore]`d (slow, and the numbers are environment-relative) — run with
+/// `cargo test -p twill-engine --test vector recall_curve -- --ignored --nocapture`
+/// to regenerate the table in `pages/specs/12-capabilities.html`.
+#[test]
+#[ignore]
+fn recall_curve() {
+    use std::time::Instant;
+
+    const N: usize = 2000;
+    const DIM: usize = 16;
+    const QUERIES: usize = 100;
+    const K: usize = 10;
+
+    // Deterministic SplitMix64 vector generator (no rand dependency).
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || -> f32 {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let vec_lit = |v: &[f32]| {
+        let parts: Vec<String> = v.iter().map(|x| format!("{x:.5}")).collect();
+        format!("[{}]", parts.join(","))
+    };
+
+    let p = db_path("recallcurve");
+    let mut db = Connection::open(&url_for(&p)).unwrap();
+    db.exec("CREATE TABLE idx (id INTEGER PRIMARY KEY, e VECTOR(16))")
+        .unwrap();
+    db.exec("CREATE TABLE noidx (id INTEGER PRIMARY KEY, e VECTOR(16))")
+        .unwrap();
+    // A deliberately sparse graph (small m / ef_construction) so the recall knob
+    // has visible headroom — a denser graph saturates recall at every ef_search.
+    db.exec("CREATE INDEX idx_e ON idx USING hnsw (e) WITH (metric = 'l2', m = 5, ef_construction = 20)")
+        .unwrap();
+
+    let mut vectors = Vec::with_capacity(N);
+    db.begin().unwrap();
+    for i in 0..N {
+        let v: Vec<f32> = (0..DIM).map(|_| next()).collect();
+        let lit = vec_lit(&v);
+        db.exec(&format!("INSERT INTO idx VALUES ({i}, {lit})"))
+            .unwrap();
+        db.exec(&format!("INSERT INTO noidx VALUES ({i}, {lit})"))
+            .unwrap();
+        vectors.push(v);
+    }
+    db.commit().unwrap();
+
+    let queries: Vec<Vec<f32>> = (0..QUERIES)
+        .map(|_| (0..DIM).map(|_| next()).collect())
+        .collect();
+
+    // Brute-force ground truth from the index-free twin.
+    let truth: Vec<Vec<String>> = queries
+        .iter()
+        .map(|q| {
+            let rs = db
+                .query(&format!(
+                    "SELECT id FROM noidx ORDER BY e <-> {} LIMIT {K}",
+                    vec_lit(q)
+                ))
+                .unwrap();
+            ids(&rs)
+        })
+        .collect();
+
+    println!("\nef_search  recall@{K}   mean_latency_us");
+    for ef in [8usize, 16, 32, 64, 128, 256] {
+        db.exec(&format!("SET twill.vector_ef_search = {ef}"))
+            .unwrap();
+        let mut hits = 0usize;
+        let start = Instant::now();
+        for (qi, q) in queries.iter().enumerate() {
+            let rs = db
+                .query(&format!(
+                    "SELECT id FROM idx ORDER BY e <-> {} LIMIT {K}",
+                    vec_lit(q)
+                ))
+                .unwrap();
+            let got = ids(&rs);
+            hits += got.iter().filter(|g| truth[qi].contains(g)).count();
+        }
+        let elapsed = start.elapsed();
+        let recall = hits as f64 / (QUERIES * K) as f64;
+        let mean_us = elapsed.as_micros() as f64 / QUERIES as f64;
+        println!("{ef:>8}   {recall:>7.3}   {mean_us:>14.1}");
+    }
+
+    let _ = fs::remove_file(&p);
+}
+
 #[test]
 fn create_index_requires_a_vector_column() {
     let p = db_path("nonvec");

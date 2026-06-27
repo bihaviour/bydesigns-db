@@ -66,6 +66,14 @@ impl RowVersion {
     }
 }
 
+/// VH-2: whether a row version is superseded by a *committed* delete as of the
+/// index head — the predicate that classifies a vector index node as head-deleted.
+/// A pending delete ([`PENDING`]) does not count: it is not yet visible to anyone
+/// but its own in-flight writer.
+fn is_dead_at_head(r: &RowVersion) -> bool {
+    r.delete_lsn != 0 && r.delete_lsn != PENDING
+}
+
 #[derive(Clone, Debug)]
 pub struct Table {
     pub schema: TableSchema,
@@ -189,7 +197,7 @@ impl Store {
     }
 
     /// Register an index definition with an empty graph (replay path — the
-    /// graph is filled by [`Store::rebuild_indexes`] once all rows are present).
+    /// graph is filled by [`Store::rebuild_one_index`] once all rows are present).
     pub fn register_index(&mut self, def: IndexDef) {
         self.indexes
             .insert(Self::key(&def.name), VectorIndex::new(def));
@@ -215,8 +223,58 @@ impl Store {
         })
     }
 
+    /// Names (lowercased keys) of every registered index — the warm path iterates
+    /// these to load or rebuild each graph after replay (VH-1).
+    pub fn index_names(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
+    /// The definition of index `name`, if registered.
+    pub fn index_def(&self, name: &str) -> Option<IndexDef> {
+        self.indexes.get(&Self::key(name)).map(|ix| ix.def.clone())
+    }
+
+    /// VH-1: adopt an externally reconstructed graph (loaded from page frames on a
+    /// cold open) in place of the registered index of the same name.
+    pub fn adopt_index(&mut self, ix: VectorIndex) {
+        self.indexes.insert(Self::key(&ix.def.name), ix);
+    }
+
+    /// VH-1: rebuild a single index from the recovered rows (the warm-from-WAL
+    /// fallback when no current page checkpoint exists), compacting it if churn
+    /// already crossed the threshold.
+    pub fn rebuild_one_index(&mut self, name: &str) {
+        let key = Self::key(name);
+        if let Some(ix) = self.indexes.get_mut(&key) {
+            let def = ix.def.clone();
+            *ix = VectorIndex::new(def);
+        }
+        self.populate_index(&key);
+        if self
+            .indexes
+            .get(&key)
+            .is_some_and(VectorIndex::needs_maintenance)
+        {
+            let floor = self.committed_lsn;
+            self.compact_index(&key, floor);
+        }
+    }
+
+    /// VH-1: serialize index `name`'s graph into page frames stamped with the
+    /// committed LSN they reflect, for a checkpoint through `put_page`. `None` if
+    /// the index is absent or its graph cannot be paged (see
+    /// [`VectorIndex::to_page_frames`]).
+    pub fn index_page_frames(&self, name: &str, reflected_lsn: u64) -> Option<Vec<Vec<u8>>> {
+        self.indexes
+            .get(&Self::key(name))?
+            .to_page_frames(reflected_lsn)
+    }
+
     /// Fill one index's graph from every row version of its table that carries a
     /// vector (MVCC visibility is resolved later, at query time, against the vids).
+    /// A version already superseded by a committed delete at the index head is
+    /// added but immediately marked head-deleted (VH-2), so the over-fetch sizing
+    /// and compaction trigger see accurate churn after a cold rebuild.
     fn populate_index(&mut self, name: &str) {
         let key = Self::key(name);
         let Some(ix) = self.indexes.get(&key) else {
@@ -230,9 +288,49 @@ impl Store {
         let Some(col) = t.schema.column_index(&column) else {
             return;
         };
-        let entries: Vec<(u64, Vec<f32>)> = t
+        let entries: Vec<(u64, Vec<f32>, bool)> = t
             .rows
             .iter()
+            .filter_map(|r| {
+                r.values
+                    .get(col)
+                    .and_then(Value::as_vector)
+                    .map(|v| (r.vid, v.to_vec(), is_dead_at_head(r)))
+            })
+            .collect();
+        if let Some(ix) = self.indexes.get_mut(&key) {
+            for (vid, vec, dead) in entries {
+                ix.insert(vid, vec);
+                if dead {
+                    ix.mark_dead(vid);
+                }
+            }
+        }
+    }
+
+    /// VH-2: rebuild one index's graph from only the rows that are *not* deleted at
+    /// the head (committed deletes are dropped; live and still-pending versions are
+    /// kept), stamping `floor_lsn` as the index's compaction floor. The dropped
+    /// rows are still retained by the row store, so a reader whose snapshot predates
+    /// `floor_lsn` is routed to a brute-force scan by `exec::knn_select` — keeping
+    /// snapshot isolation intact while the head graph stays compact.
+    fn compact_index(&mut self, name: &str, floor_lsn: u64) {
+        let key = Self::key(name);
+        let Some(ix) = self.indexes.get(&key) else {
+            return;
+        };
+        let def = ix.def.clone();
+        let table = Self::key(&def.table);
+        let Some(t) = self.tables.get(&table) else {
+            return;
+        };
+        let Some(col) = t.schema.column_index(&def.column) else {
+            return;
+        };
+        let kept: Vec<(u64, Vec<f32>)> = t
+            .rows
+            .iter()
+            .filter(|r| !is_dead_at_head(r))
             .filter_map(|r| {
                 r.values
                     .get(col)
@@ -240,23 +338,37 @@ impl Store {
                     .map(|v| (r.vid, v.to_vec()))
             })
             .collect();
-        if let Some(ix) = self.indexes.get_mut(&key) {
-            for (vid, vec) in entries {
-                ix.insert(vid, vec);
-            }
+        let mut fresh = VectorIndex::new(def);
+        for (vid, vec) in kept {
+            fresh.insert(vid, vec);
         }
+        fresh.set_rebuild_floor(floor_lsn.max(ix.rebuild_floor()));
+        self.indexes.insert(key, fresh);
     }
 
-    /// Rebuild every index graph from final table state. Called once after WAL
-    /// replay — the cold-start "warm" of the vector index (spec 12 §scale-to-zero).
-    pub fn rebuild_indexes(&mut self) {
-        let names: Vec<String> = self.indexes.keys().cloned().collect();
-        for n in &names {
-            if let Some(ix) = self.indexes.get_mut(n) {
-                let def = ix.def.clone();
-                *ix = VectorIndex::new(def);
+    /// VH-2: reflect a batch of committed deletes on `table` into its vector
+    /// indexes — mark the vids head-deleted, then compact any index whose churn
+    /// crossed the threshold (at `commit_lsn`, the new compaction floor).
+    fn apply_index_deletes(&mut self, table: &str, vids: &[u64], commit_lsn: u64) {
+        let names: Vec<String> = self
+            .indexes
+            .iter()
+            .filter(|(_, ix)| ix.def.table.eq_ignore_ascii_case(table))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for name in names {
+            if let Some(ix) = self.indexes.get_mut(&name) {
+                for &vid in vids {
+                    ix.mark_dead(vid);
+                }
             }
-            self.populate_index(n);
+            if self
+                .indexes
+                .get(&name)
+                .is_some_and(VectorIndex::needs_maintenance)
+            {
+                self.compact_index(&name, commit_lsn);
+            }
         }
     }
 
@@ -426,7 +538,11 @@ impl Store {
     /// group-commit batch is durable (see [`crate::group_commit`]), so reader
     /// visibility moves forward atomically for the batch.
     pub fn finalize_owner(&mut self, owner: u64, commit_lsn: u64) {
-        for t in self.tables.values_mut() {
+        // Collect the vids this owner just committed-deleted, per table, so the
+        // vector indexes can be updated after the version stamps are published.
+        let mut deleted_by_table: Vec<(String, Vec<u64>)> = Vec::new();
+        for (key, t) in self.tables.iter_mut() {
+            let mut deleted: Vec<u64> = Vec::new();
             for r in &mut t.rows {
                 if r.owner != owner {
                     continue;
@@ -436,9 +552,19 @@ impl Store {
                 }
                 if r.delete_lsn == PENDING {
                     r.delete_lsn = commit_lsn;
+                    deleted.push(r.vid);
                 }
                 r.owner = 0;
             }
+            if !deleted.is_empty() {
+                deleted_by_table.push((key.clone(), deleted));
+            }
+        }
+        // VH-2: a committed delete makes its index node head-deleted; under enough
+        // churn this triggers a compacting rebuild (single-writer path, so the
+        // occasional rebuild cost is paid here, off the read path).
+        for (table, vids) in deleted_by_table {
+            self.apply_index_deletes(&table, &vids, commit_lsn);
         }
     }
 
