@@ -153,12 +153,92 @@ fn new_refuses_non_empty_dir() {
 fn unavailable_client_is_a_usage_error() {
     let base = scratch("unavail");
     let mut r = req("p", base.join("p"));
-    r.client = Client::Php;
+    r.client = Client::Rust; // rust is still roadmap-only
     let err = scaffold::generate(&r, true).unwrap_err();
     assert!(matches!(err, GenError::Unavailable(_)), "got {err:?}");
     assert_eq!(err.code(), exit::USAGE);
     // Nothing should have been written.
     assert!(!base.join("p").exists());
+
+    fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn node_starter_writes_expected_tree() {
+    let base = scratch("node-tree");
+    let project = base.join("web");
+    let mut r = req("web", project.clone());
+    r.client = Client::Node;
+
+    let written = scaffold::generate(&r, true).expect("generate");
+    assert_eq!(written.len(), 5, "default node starter writes 5 files");
+    for f in [
+        "package.json",
+        "tsconfig.json",
+        ".gitignore",
+        "app.ts",
+        "README.md",
+    ] {
+        assert!(project.join(f).exists(), "missing {f}");
+    }
+    let pkg = fs::read_to_string(project.join("package.json")).unwrap();
+    assert!(pkg.contains("@twilldb/node"), "depends on the node client");
+    assert!(
+        pkg.contains("\"start\": \"node app.ts\""),
+        "node start script"
+    );
+    let app = fs::read_to_string(project.join("app.ts")).unwrap();
+    assert!(app.contains("@twilldb/node"), "app imports the node client");
+
+    fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn php_starter_writes_expected_tree() {
+    let base = scratch("php-tree");
+    let project = base.join("api");
+    let mut r = req("api", project.clone());
+    r.client = Client::Php;
+
+    let written = scaffold::generate(&r, true).expect("generate");
+    assert_eq!(written.len(), 4, "default php starter writes 4 files");
+    for f in ["composer.json", ".gitignore", "index.php", "README.md"] {
+        assert!(project.join(f).exists(), "missing {f}");
+    }
+    // No TS files for the PHP starter.
+    assert!(!project.join("app.ts").exists());
+    let composer = fs::read_to_string(project.join("composer.json")).unwrap();
+    assert!(
+        composer.contains("twilldb/twilldb"),
+        "requires the php package"
+    );
+    assert!(composer.contains("ext-ffi"), "declares the FFI requirement");
+    let index = fs::read_to_string(project.join("index.php")).unwrap();
+    assert!(
+        index.contains("Twill\\Database"),
+        "index uses the php client"
+    );
+
+    fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn node_and_php_vector_starters_use_native_extensions() {
+    let base = scratch("vec-clients");
+
+    let mut node = req("nv", base.join("nv"));
+    node.client = Client::Node;
+    node.vector = true;
+    let n = scaffold::generate(&node, true).unwrap();
+    assert_eq!(n.len(), 6, "node vector starter adds vectors.ts");
+    assert!(base.join("nv/vectors.ts").exists());
+
+    let mut php = req("pv", base.join("pv"));
+    php.client = Client::Php;
+    php.vector = true;
+    let p = scaffold::generate(&php, true).unwrap();
+    assert_eq!(p.len(), 5, "php vector starter adds vectors.php");
+    assert!(base.join("pv/vectors.php").exists());
 
     fs::remove_dir_all(&base).ok();
 }
@@ -175,21 +255,22 @@ fn client_and_backend_parse_rejects_unknown() {
 
 #[test]
 fn files_render_is_pure_and_complete() {
-    // The pure `files()` view should never leak a placeholder, for every file.
-    let r = Request {
-        name: "demo".into(),
-        dir: PathBuf::from("demo"),
-        client: Client::Bun,
-        backend: Backend::File,
-        vector: true,
-    };
-    let rendered: HashMap<_, _> = scaffold::files(&r).into_iter().collect();
-    assert!(rendered.contains_key("vectors.ts"));
-    for (path, content) in &rendered {
-        assert!(
-            !content.contains("{{"),
-            "{path} has an unsubstituted placeholder"
-        );
+    // The pure `files()` view should never leak a placeholder, for any client.
+    for client in [Client::Bun, Client::Node, Client::Php] {
+        let r = Request {
+            name: "demo".into(),
+            dir: PathBuf::from("demo"),
+            client,
+            backend: Backend::File,
+            vector: true,
+        };
+        let rendered: HashMap<_, _> = scaffold::files(&r).into_iter().collect();
+        for (path, content) in &rendered {
+            assert!(
+                !content.contains("{{"),
+                "{client:?} {path} has an unsubstituted placeholder"
+            );
+        }
     }
 }
 

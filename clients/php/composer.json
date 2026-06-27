@@ -1,0 +1,21 @@
+{
+    "name": "twilldb/twilldb",
+    "description": "Embed the Twill DB engine in-process from PHP via the FFI extension (Laravel, Symfony, CodeIgniter, plain PHP).",
+    "type": "library",
+    "license": "BUSL-1.1",
+    "keywords": ["database", "oltp", "embedded", "ffi", "sqlite", "twilldb"],
+    "homepage": "https://github.com/bihaviour/twill-db",
+    "require": {
+        "php": ">=8.1",
+        "ext-ffi": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Twill\\": "src/"
+        }
+    },
+    "scripts": {
+        "test": "php -d ffi.enable=1 test/embedded_test.php",
+        "example": "php -d ffi.enable=1 examples/notes.php"
+    }
+}

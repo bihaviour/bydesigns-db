@@ -19,6 +19,7 @@ window.SECTION = {
     { label: "Interfaces", items: [
       { file: "07-server-mode.html",   title: "Server Mode & Wire Protocol" },
       { file: "08-bun-integration.html", title: "Bun Integration" },
+      { file: "20-client-runtimes.html", title: "Client Runtimes & Language SDKs" },
     ]},
     { label: "Validation", items: [
       { file: "09-benchmark-plan.html",      title: "Benchmark & Validation Plan" },

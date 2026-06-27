@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Client Runtimes &amp; Language SDKs · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">20</span>
+<span class="badge badge-status status-review">Implemented (Node + PHP)</span>
+<span class="spec-date">Updated 2026-06-27</span>
+</div>
+<h1>Client Runtimes &amp; Language SDKs</h1>
+<p class="lede">Bun is the reference host (<a href="08-bun-integration.html">08</a>), but it is not special: the engine exposes exactly two seams — the stable C ABI (<a href="02-engine-core.html">02</a>'s <code>engine.h</code>) for <em>embedded</em> binding, and the Postgres wire protocol (<a href="07-server-mode.html">07</a>) for <em>server</em> connection. Every additional runtime is a thin shim over one of those two seams, with the <em>same</em> ergonomic surface. This page generalizes the Bun integration into a multi-runtime client matrix — shipping <strong>Node</strong> (and Node-based frameworks: Next.js, Astro, Nuxt, Remix, SvelteKit, Vite&nbsp;SSR) and <strong>PHP</strong> (plain PHP + Laravel / Symfony / CodeIgniter), with Python / Ruby / Go / Rust on the same additive path.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; scope</h2>
+<p>This spec expands the “adding a client is additive” claim of <a href="18-cli-tooling.html">18 — Scaffolding CLI</a> into a buildable, normative design for clients beyond Bun. It defines, for each runtime, which seam it binds, the binding mechanism, the package it ships through, and how its public surface stays identical to <code>@twilldb/bun</code>. It owns <em>none</em> of the engine, the ABI, the wire protocol, or the storage seam — those are <a href="02-engine-core.html">02</a> / <a href="07-server-mode.html">07</a> / <a href="03-storage-interface.html">03</a>; this page binds to them and MUST NOT redefine them.</p>
+<div class="callout success">
+<p class="callout-title">One engine, N hosts, two seams</p>
+<p>The same <code>libengine</code> artifact serves every client. A runtime with native-code access (Bun, Node, PHP, Python, Ruby, Go, Rust) <strong>embeds</strong> it via FFI over <code>engine.h</code> — function-call latency, no socket. A runtime without one (or any tool that prefers Postgres) <strong>connects</strong> to <code>engine-server</code> over pgwire with its existing Postgres driver. No client ever touches disk, the SQL parser, MVCC, or the WAL.</p>
+</div>
+</section>
+
+<section>
+<h2>The client matrix</h2>
+<p>Two binding mechanisms, chosen per runtime by what that runtime can do — not by anything in the engine:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Runtime</th><th>Seam</th><th>Binding mechanism</th><th>Ships via</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Bun</strong></td><td>C ABI (embedded)</td><td><code>bun:ffi</code></td><td>npm <code>@twilldb/bun</code></td><td><span class="req-tag must">SHIPPED</span></td></tr>
+<tr><td><strong>Node</strong> + frameworks</td><td>C ABI (embedded)</td><td><a href="https://koffi.dev">koffi</a> (FFI) — reuse the Bun wrapper, swap the loader</td><td>npm <code>@twilldb/node</code></td><td><span class="req-tag must">SHIPPED</span></td></tr>
+<tr><td><strong>PHP</strong> + frameworks</td><td>C ABI (embedded)</td><td>built-in <code>FFI</code> extension (<code>FFI::cdef</code> over <code>engine.h</code>)</td><td>Composer <code>twilldb/twilldb</code></td><td><span class="req-tag must">SHIPPED</span></td></tr>
+<tr><td>any Postgres tool</td><td>pgwire (server)</td><td>the runtime's existing Postgres driver</td><td>n/a (no Twill package)</td><td><span class="req-tag must">SHIPPED</span> via <a href="07-server-mode.html">07</a></td></tr>
+<tr><td>Python</td><td>C ABI / pgwire</td><td><code>ctypes</code>·<code>cffi</code> / <code>psycopg</code></td><td>PyPI</td><td><span class="req-tag may">ROADMAP</span></td></tr>
+<tr><td>Ruby / Go</td><td>C ABI / pgwire</td><td><code>Fiddle</code>·<code>ffi</code> / <code>cgo</code> / <code>pgx</code></td><td>RubyGems / go modules</td><td><span class="req-tag may">ROADMAP</span></td></tr>
+<tr><td>Rust</td><td>native</td><td>the <code>twill-engine</code> crate directly</td><td>crates.io</td><td><span class="req-tag may">ROADMAP</span></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout note">
+<p class="callout-title">Note — “SHIPPED via 07” needs no client package</p>
+<p>Because the engine already speaks the Postgres wire protocol, <em>every</em> language with a Postgres driver can reach Twill DB <strong>today</strong>, with zero Twill-specific code — that is the server path. The per-language packages above exist only to add the <em>embedded</em> (in-process, no-socket) path to that language. Server mode is the universal floor; embedding is the per-runtime upgrade.</p>
+</div>
+</section>
+
+<section>
+<h2>Responsibilities &amp; non-goals</h2>
+<h3>Responsibilities</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> bind one of the two existing seams unchanged: the C ABI via the runtime's FFI for embedded, or pgwire via the runtime's Postgres driver for server.</li>
+<li><span class="req-tag must">MUST</span> preserve the ABI ownership contract at every binding: marshal NUL-terminated <code>const char*</code> arguments, copy out <em>borrowed</em> returns before the owning object advances or is freed, and free every engine-owned resource exactly once (<a href="08-bun-integration.html">08</a>'s ownership table is normative).</li>
+<li><span class="req-tag must">MUST</span> map engine status codes + <code>engine_last_error</code> into the runtime's idiomatic typed error, distinguishing retryable (<code>CONFLICT</code> / transient <code>STORAGE</code>) from terminal.</li>
+<li><span class="req-tag must">MUST</span> verify the embedded <code>ENGINE_ABI_VERSION</code> at load time and fail fast on mismatch rather than calling a stale symbol.</li>
+<li><span class="req-tag should">SHOULD</span> keep the public surface (<code>open</code> / <code>exec</code> / <code>query</code> / <code>prepare</code> / <code>transaction</code> / <code>branch</code> / <code>close</code>) one-to-one with <code>@twilldb/bun</code>, so application code is portable across runtimes.</li>
+</ul>
+<h3>Non-goals</h3>
+<ul class="reqs">
+<li><span class="req-tag must-not">MUST NOT</span> define or alter the C ABI (<a href="02-engine-core.html">02</a>), the wire protocol or pooler (<a href="07-server-mode.html">07</a>), or the storage seam (<a href="03-storage-interface.html">03</a>).</li>
+<li><span class="req-tag must-not">MUST NOT</span> implement SQL parsing, MVCC, WAL, caching, or storage in any binding — each is a thin, faithful shim.</li>
+<li><span class="req-tag must-not">MUST NOT</span> require an engine rebuild, an ABI bump, or a storage-seam change to add a runtime. Adding a client is purely additive.</li>
+</ul>
+</section>
+
+<section>
+<h2>Convergence: one surface, many loaders</h2>
+<p>The Bun wrapper (<a href="08-bun-integration.html">08</a>) already separates a <em>loader</em> (the FFI symbol table) from an <em>ergonomic surface</em> (the typed <code>Database</code> / <code>Statement</code> / <code>EngineError</code>). A new embedded client reuses the surface verbatim and supplies only a new loader:</p>
+<div class="diagram">
+<pre>
+  application code  (open / exec / query / prepare / transaction / branch)
+        │  identical across runtimes
+        ▼
+  ergonomic surface  ── Database · Statement · EngineError · param encoding
+        │
+        ▼
+  loader  ─────────── bun:ffi   (Bun)
+                      koffi      (Node + Next.js/Astro/Nuxt/…)
+                      FFI::cdef  (PHP + Laravel/CodeIgniter)
+                      ctypes…    (Python/Ruby/Go — roadmap)
+        │
+        ▼
+  libengine  (engine.h)  ──  storage seam  ──  file:// | s3:// | r2:// | gs://
+</pre>
+<p class="diagram-caption">The surface is the contract; the loader is the only per-runtime part. Swapping <code>bun:ffi</code> for koffi or PHP's <code>FFI</code> changes the loader, not the API.</p>
+</div>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> mirror the parameter encoding exactly — the one-character type tag (<code>i</code>/<code>f</code>/<code>s</code>/<code>b</code>/<code>n</code>/<code>v</code>) from <a href="02-engine-core.html">02</a> — so a query written for one runtime binds identically on another.</li>
+<li><span class="req-tag should">SHOULD</span> expose deterministic disposal in the runtime's idiom (JS <code>using</code>/<code>close()</code>; PHP explicit <code>close()</code>/<code>finalize()</code> on long-lived workers), and never report a commit before <code>engine_commit</code> returns durable.</li>
+</ul>
+</section>
+
+<section>
+<h2>Node — koffi over the C ABI</h2>
+<p>Node has no <code>bun:ffi</code>, but <a href="https://koffi.dev">koffi</a> is a prebuilt, ABI-stable FFI library that loads the same <code>libengine</code> with no compile step. <code>@twilldb/node</code> is the Bun wrapper with a koffi loader: the public surface is byte-for-byte the Bun surface, so an app moves between them by changing the import.</p>
+<pre data-lang="ts"><code>import { open } from "@twilldb/node";        // same API as @twilldb/bun
+
+const db = open("file://./local.db");          // backend chosen by URL scheme
+db.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+db.query("INSERT INTO notes (id, body) VALUES (?, ?)", [1, "hello"]);
+const rows = db.query("SELECT * FROM notes");
+db.close();</code></pre>
+<h3>Frameworks (Next.js, Astro, Nuxt, Remix, SvelteKit, Vite SSR)</h3>
+<p>A Node-based framework renders in a Node server process; the engine embeds in that <em>same</em> process. The integration rule is the same everywhere:</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> open <strong>one</strong> <code>Database</code> per server process and reuse it across requests (a module-level singleton). The engine is a single writer per database; opening per-request thrashes the WAL.</li>
+<li><span class="req-tag must">MUST</span> keep the database on the <strong>Node.js runtime</strong>, not the <strong>Edge runtime</strong> — FFI is unavailable on Edge. In Next.js, mark the route <code>export const runtime = "nodejs"</code>.</li>
+<li><span class="req-tag should">SHOULD</span> guard the singleton on <code>globalThis</code> so dev hot-reload does not double-open.</li>
+</ul>
+<p>See <code>clients/node/examples/</code>: <code>nextjs-route.ts</code> (App Router handler) and <code>astro-endpoint.ts</code> (the same shape for any Vite-SSR framework).</p>
+<div class="callout note">
+<p class="callout-title">Runtime requirements</p>
+<p>Node ≥ 22.18 runs the published <code>.ts</code> sources directly (type stripping); older Node builds with <code>tsc</code>/<code>tsx</code>. <code>using</code> (explicit resource management) needs a runtime that supports it; on Node today the client and examples use <code>try { … } finally { db.close() }</code> while still exposing <code>Symbol.dispose</code> for parity.</p>
+</div>
+</section>
+
+<section>
+<h2>PHP — the FFI extension over the C ABI</h2>
+<p>PHP 8 ships a built-in <code>FFI</code> extension, so PHP <em>embeds</em> the engine directly — no native extension to compile. <code>twilldb/twilldb</code> declares the <code>engine.h</code> subset with <code>FFI::cdef</code> and wraps it in the same ergonomic surface.</p>
+<pre data-lang="php"><code>use Twill\Database;
+
+$db = Twill\Database::open('file://./local.db');
+$db->exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
+$db->query('INSERT INTO notes (id, body) VALUES (?, ?)', [1, 'hello']);
+$rows = $db->query('SELECT * FROM notes');
+$db->close();</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> require PHP ≥ 8.1 with FFI enabled (<code>ffi.enable=1</code>). PHP's FFI decodes a <code>const char*</code> return into a copied PHP string (and a NULL pointer — a SQL NULL cell — into <code>null</code>), satisfying the “copy out before free” rule for read paths automatically.</li>
+<li><span class="req-tag must">MUST</span> throw <code>Twill\EngineError</code> (carrying the numeric <code>EngineStatus</code> and a <code>retryable</code> flag) on every non-OK status.</li>
+</ul>
+<h3>Frameworks (Laravel, Symfony, CodeIgniter) — two paths</h3>
+<dl class="fields">
+<dt>Embedded</dt>
+<dd>Open one <code>Twill\Database</code> in a service/singleton and reuse it on a long-lived worker (FrankenPHP, RoadRunner, Swoole). Under classic per-request <code>php-fpm</code>, the open + WAL-replay cost is paid per request, so the embedded path favours a persistent worker.</dd>
+<dt>Server (PDO)</dt>
+<dd>Run <code>engine-server</code> and point the framework's <code>pgsql</code> connection at it (<code>host=127.0.0.1 port=5433 sslmode=disable</code>). No FFI, no native library in the PHP process — Laravel's <code>config/database.php</code> <code>pgsql</code> connection, or CodeIgniter's Postgre driver, just works. See <code>clients/php/examples/server-pdo.php</code>.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Polyglot via server mode (today) &amp; embedded (roadmap)</h2>
+<p>For any other language, the server path already works: connect to <code>engine-server</code> with the native Postgres driver (<code>psycopg</code>, Ruby <code>pg</code>, Go <code>pgx</code>, JDBC, …). The embedded path for each is the same additive pattern — a loader over <code>engine.h</code> behind the shared surface — and is sequenced on the roadmap, not blocked by anything in the engine:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Language</th><th>Embedded loader</th><th>Server driver (works now)</th></tr></thead>
+<tbody>
+<tr><td>Python</td><td><code>ctypes</code> / <code>cffi</code></td><td><code>psycopg</code>, <code>asyncpg</code></td></tr>
+<tr><td>Ruby</td><td><code>Fiddle</code> / <code>ffi</code> gem</td><td><code>pg</code></td></tr>
+<tr><td>Go</td><td><code>cgo</code></td><td><code>pgx</code>, <code>lib/pq</code></td></tr>
+<tr><td>Rust</td><td>native <code>twill-engine</code> crate</td><td><code>tokio-postgres</code></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Packaging &amp; distribution</h2>
+<p>The piece that makes a polyglot matrix tractable is building <code>libengine</code> <strong>once</strong> per platform/arch and fanning the <em>same</em> artifacts out to every ecosystem (<a href="18-cli-tooling.html">18</a>). No client rebuilds the engine.</p>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> resolve the engine binary for the host <code>platform</code>+<code>arch</code>, and fail with an actionable error when none matches (naming the missing package and the <code>TWILLDB_ENGINE_PATH</code> override).</li>
+<li><span class="req-tag should">SHOULD</span> reuse the existing <code>@twilldb/engine-{os}-{arch}</code> per-platform npm packages for both Bun and Node (Node lists them as the same <code>optionalDependencies</code>, resolved by <code>os</code>/<code>cpu</code>).</li>
+<li><span class="req-tag should">SHOULD</span> distribute through each ecosystem's own registry — npm for Bun/Node, Composer/Packagist for PHP, PyPI/RubyGems/crates.io later — none of which has a maturity gate.</li>
+</ul>
+<div class="diagram">
+<pre>
+  libengine.{so,dylib,dll}   (built once per platform/arch)
+        │
+        ├─ npm:       @twilldb/engine-{os}-{arch}   ← @twilldb/bun, @twilldb/node
+        ├─ Composer:  twilldb/twilldb loads the matching binary via FFI
+        └─ PyPI/Gems/crates.io                      ← roadmap, same binaries
+</pre>
+<p class="diagram-caption">Build once, fan out. Every client is a thin package over a shared binary.</p>
+</div>
+</section>
+
+<section>
+<h2>Scaffolding integration (CLI)</h2>
+<p>The single extension point in <a href="18-cli-tooling.html">18</a>'s scaffolder is the template set behind <code>--client</code>. Node and PHP are now <em>generated</em> clients, not roadmap placeholders:</p>
+<pre data-lang="bash"><code>twilldb new web --client node        # Node embedded starter (@twilldb/node)
+twilldb new api --client php         # PHP embedded starter (twilldb/twilldb)
+twilldb new search --client node --vector   # + an HNSW vector starter</code></pre>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> emit a runnable embedded starter per client — <code>package.json</code>/<code>app.ts</code> for Node, <code>composer.json</code>/<code>index.php</code> for PHP — selecting the backend purely by the connection string it writes.</li>
+<li><span class="req-tag must">MUST</span> print the correct install + run commands for the chosen client (<code>npm install</code>/<code>npm start</code>; <code>composer install</code>/<code>composer start</code>).</li>
+<li><span class="req-tag should">SHOULD</span> keep a roadmap-aware message for clients not yet generated (currently <code>rust</code>).</li>
+</ul>
+</section>
+
+<section>
+<h2>Failure modes &amp; edge cases</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Failure</th><th>Mechanism</th><th>Handling</th></tr></thead>
+<tbody>
+<tr><td>ABI mismatch</td><td>Installed <code>libengine</code> predates/postdates the binding's expected symbol set.</td><td>Every loader verifies <code>engine_abi_version()</code> at load and fails fast (“engine ABI vX, binding expects vY”). Never call a stale symbol.</td></tr>
+<tr><td>Missing native library</td><td>No per-platform binary matched <code>os</code>/<code>cpu</code>, or FFI is disabled.</td><td>Surface an actionable error naming the expected package and the <code>TWILLDB_ENGINE_PATH</code> override (PHP: also “enable <code>ffi.enable=1</code>”).</td></tr>
+<tr><td>Edge runtime</td><td>A framework route runs on an Edge/WASM runtime without FFI.</td><td>Keep the DB on the Node.js runtime (<code>export const runtime = "nodejs"</code>), or use server mode. The WASM target is a separate port (<a href="11-deployment-targets.html">11</a>).</td></tr>
+<tr><td>Per-request open</td><td>A framework opens a handle per request instead of a process singleton.</td><td>Document the single-writer-per-DB rule; clients SHOULD show the singleton pattern. Under classic <code>php-fpm</code>, prefer server mode or a persistent worker.</td></tr>
+<tr><td>Borrowed value escapes</td><td>JS/PHP keeps a value pointer after the result/statement advanced.</td><td>Surfaces copy all borrowed cstrings into native strings before freeing; raw pointers are never exposed.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Acceptance criteria / definition of done</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> run the full embedded suite (exec / parameterized query / prepared statement / transaction commit+rollback / SQL-NULL / typed error / copy-on-write branch / <code>lastLsn</code>) on Node over koffi and on PHP over the FFI extension, against a <code>file://</code> database. <span class="req-tag must">DONE</span> — <code>clients/node/test/embedded.test.ts</code>, <code>clients/php/test/embedded_test.php</code>.</li>
+<li><span class="req-tag must">MUST</span> keep the public surface identical to <code>@twilldb/bun</code> so application code is portable. <span class="req-tag must">DONE</span> — Node mirrors the Bun <code>Database</code>/<code>Statement</code> API; PHP mirrors it idiomatically.</li>
+<li><span class="req-tag must">MUST</span> generate runnable Node and PHP starters from <code>twilldb new --client</code>, with correct per-client install/run steps. <span class="req-tag must">DONE</span> — <code>crates/cli</code> templates + tests.</li>
+<li><span class="req-tag should">SHOULD</span> open the same code against an <code>s3://</code> URL with no source change (storage chosen by scheme only). <span class="req-tag should">DONE by construction</span> — no loader branches on backend.</li>
+<li><span class="req-tag should">SHOULD</span> document framework integration for Next.js / Astro / Vite (Node) and Laravel / CodeIgniter (PHP), including the Node.js-runtime and singleton rules.</li>
+</ul>
+</section>
+
+<section>
+<h2>Open questions &amp; risks</h2>
+<ul>
+<li><strong>NAPI vs koffi for Node.</strong> koffi ships today with no compile step; a <code>napi-rs</code> addon could lower per-call overhead for very chatty loops. Quantify against the embedded micro-loop (<a href="09-benchmark-plan.html">09</a>) before committing.</li>
+<li><strong>PHP worker model.</strong> The embedded path shines on persistent workers (FrankenPHP/RoadRunner/Swoole) and is weakest under per-request <code>php-fpm</code>. Should the PHP package detect the SAPI and nudge toward server mode there?</li>
+<li><strong>Published <code>.ts</code> vs prebuilt JS.</strong> Shipping <code>.ts</code> (like <code>@twilldb/bun</code>) keeps one source but pins a minimum Node; a prebuilt <code>dist/</code> widens reach at the cost of a build step. Pick per ecosystem norms.</li>
+<li><strong>Surface drift.</strong> As the engine grows (streaming cursors, new capabilities), all loaders must move together. A shared conformance suite run across runtimes guards this.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">The reference client whose ergonomic surface every runtime reuses.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">Owns engine.h — the C ABI every embedded client binds.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode &amp; Wire Protocol</span><span class="xref-desc">The pgwire seam every Postgres driver connects to.</span></a>
+<a class="xref" href="18-cli-tooling.html"><span class="xref-title">Scaffolding CLI &amp; Distribution</span><span class="xref-desc">The --client template sets and build-once-fan-out packaging.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">Native (FFI) vs the separate WASM build for Edge/Workers.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam a new client never crosses; adding one is additive.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-27. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

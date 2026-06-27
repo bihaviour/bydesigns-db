@@ -263,31 +263,37 @@ fn usage_err(msg: &str) -> i32 {
 
 fn print_success(req: &Request, is_new: bool, count: usize) {
     let vec = if req.vector { ", vector starter" } else { "" };
-    if is_new {
-        println!(
-            "created {}/ ({} files — {} client, {} backend{})\n",
-            req.dir.display(),
-            count,
-            req.client.as_str(),
-            backend_label(req.backend),
-            vec
-        );
-        println!("next steps:");
-        println!("  cd {}", req.name);
-        println!("  bun install");
-        println!("  bun run start");
+    let verb = if is_new { "created" } else { "scaffolded into" };
+    let target = if is_new {
+        format!("{}/", req.dir.display())
     } else {
-        println!(
-            "scaffolded into {} ({} files — {} client, {} backend{})\n",
-            req.dir.display(),
-            count,
-            req.client.as_str(),
-            backend_label(req.backend),
-            vec
-        );
-        println!("next steps:");
-        println!("  bun install");
-        println!("  bun run start");
+        req.dir.display().to_string()
+    };
+    println!(
+        "{} {} ({} files — {} client, {} backend{})\n",
+        verb,
+        target,
+        count,
+        req.client.as_str(),
+        backend_label(req.backend),
+        vec
+    );
+    println!("next steps:");
+    if is_new {
+        println!("  cd {}", req.name);
+    }
+    for step in install_steps(req.client) {
+        println!("  {step}");
+    }
+}
+
+/// The install + run commands for a client's starter.
+fn install_steps(client: Client) -> &'static [&'static str] {
+    match client {
+        Client::Bun => &["bun install", "bun run start"],
+        Client::Node => &["npm install", "npm start"],
+        Client::Php => &["composer install", "composer start"],
+        Client::Rust => &[],
     }
 }
 
@@ -309,8 +315,8 @@ fn print_help() {
          \x20 twilldb help                   show this help\n\
          \n\
          options:\n\
-         \x20 -c, --client <bun>             client ecosystem (default: bun)\n\
-         \x20                                node, php, rust are on the roadmap\n\
+         \x20 -c, --client <bun|node|php>    client ecosystem (default: bun)\n\
+         \x20                                a native rust starter is on the roadmap\n\
          \x20 -b, --backend <file|s3>        storage backend / connection string (default: file)\n\
          \x20     --vector                   include a vector-search (HNSW) starter\n\
          \x20 -y, --yes                      accept defaults; never prompt\n\
@@ -320,6 +326,8 @@ fn print_help() {
          \n\
          examples:\n\
          \x20 twilldb new notes\n\
+         \x20 twilldb new web --client node\n\
+         \x20 twilldb new api --client php\n\
          \x20 twilldb new search --vector\n\
          \x20 twilldb new app --backend s3\n\
          \x20 twilldb init"

@@ -1,0 +1,44 @@
+// {{name}} — vector search starter for Node (Phase 5 capability).
+//
+// The vector index is in-core: a `vector(N)` column, an HNSW index, and the
+// distance operators <-> (L2), <=> (cosine), <#> (negative inner product). It
+// rides the same WAL as the rows, so it branches and scales-to-zero for free.
+//
+//   node vectors.ts
+
+import { open } from "@twilldb/node";
+
+const db = open("{{db_url}}");
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS items (
+    id        INTEGER PRIMARY KEY,
+    label     TEXT NOT NULL,
+    embedding vector(3)
+  )`);
+  db.exec("DELETE FROM items");
+
+  // CREATE INDEX … USING hnsw builds the access method over the vector column.
+  db.exec("CREATE INDEX IF NOT EXISTS items_hnsw ON items USING hnsw (embedding)");
+
+  const insert = db.prepare("INSERT INTO items (id, label, embedding) VALUES (?, ?, ?)");
+  try {
+    insert.run(1, "apple", "[1, 0, 0]");
+    insert.run(2, "banana", "[0, 1, 0]");
+    insert.run(3, "cherry", "[0.9, 0.1, 0]");
+  } finally {
+    insert.finalize();
+  }
+
+  // Top-k nearest neighbours: ORDER BY <col> <dist-op> <query> ASC LIMIT k uses
+  // the HNSW index when present, and falls back to a brute-force scan otherwise.
+  const query = "[1, 0, 0]";
+  console.log(`nearest to ${query}:`);
+  for (const row of db.query<{ label: string; d: string }>(
+    "SELECT label, embedding <-> ? AS d FROM items ORDER BY embedding <-> ? ASC LIMIT 2",
+    [query, query],
+  )) {
+    console.log(`  ${row.label.padEnd(8)} distance ${row.d}`);
+  }
+} finally {
+  db.close();
+}

@@ -65,7 +65,7 @@ bun run start</code></pre>
 twilldb — new project
 
 Project name: search
-Client [bun] (node/php/rust coming soon):
+Client [bun] (bun/node/php; rust coming soon):
 Backend [file] (file/s3): s3
 Include a vector-search (HNSW) starter? [y/N]: y
 
@@ -90,16 +90,19 @@ created search/ (6 files — bun client, s3 backend, vector starter)</code></pre
 <table>
 <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
 <tbody>
-<tr><td><code>-c, --client &lt;bun&gt;</code></td><td><code>bun</code></td><td>client ecosystem. Bun ships today; <code>node</code>, <code>php</code>, <code>rust</code> are on the roadmap.</td></tr>
+<tr><td><code>-c, --client &lt;bun|node|php&gt;</code></td><td><code>bun</code></td><td>client ecosystem. <code>bun</code>, <code>node</code>, and <code>php</code> generate runnable embedded starters; a native <code>rust</code> starter is on the roadmap. See <a href="connect-embedded-node.html">Node</a> / <a href="connect-embedded-php.html">PHP</a>.</td></tr>
 <tr><td><code>-b, --backend &lt;file|s3&gt;</code></td><td><code>file</code></td><td>writes the connection string: <code>file://./&lt;name&gt;.db</code> or an <code>s3://your-bucket/&lt;name&gt;</code> placeholder.</td></tr>
 <tr><td><code>--vector</code></td><td>off</td><td>adds a <code>vectors.ts</code> starter — a <code>vector(3)</code> column, an HNSW index, and a top-k nearest-neighbour query.</td></tr>
 <tr><td><code>-y, --yes</code></td><td>off</td><td>accept defaults and never prompt (forces non-interactive on a terminal).</td></tr>
 </tbody>
 </table>
 </div>
-<pre data-lang="bash"><code>twilldb new search --vector        # add a vector-search starter
+<pre data-lang="bash"><code>twilldb new web --client node      # Node embedded starter (@twilldb/node)
+twilldb new api --client php       # PHP embedded starter (twilldb/twilldb)
+twilldb new search --vector        # add a vector-search starter
 twilldb new app --backend s3       # write an s3:// connection string
 twilldb init                       # scaffold into the current directory</code></pre>
+<p>A <code>node</code> starter installs and runs with <code>npm install</code> / <code>npm start</code>; a <code>php</code> starter with <code>composer install</code> / <code>composer start</code>. Each embeds the engine in-process over the same C ABI — see the per-runtime guides for <a href="connect-embedded-node.html">Node</a> (Next.js, Astro, Vite) and <a href="connect-embedded-php.html">PHP</a> (Laravel, CodeIgniter).</p>
 <div class="callout tip">
 <p class="callout-title">The backend is just the connection string</p>
 <p><code>--backend</code> only changes the URL written into <code>app.ts</code>. The engine selects the storage backend purely by the URL scheme at <code>open()</code> time, so your code is identical for <code>file://</code> and <code>s3://</code>. See <a href="storage.html">Storage backends</a> for credentials.</p>

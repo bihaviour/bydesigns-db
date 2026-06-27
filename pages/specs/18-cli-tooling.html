@@ -86,8 +86,8 @@ twilldb init</code></pre>
 <thead><tr><th>Client</th><th>Binding mechanism</th><th>Ships via</th><th>Status</th></tr></thead>
 <tbody>
 <tr><td><strong>Bun</strong></td><td><code>bun:ffi</code> over <code>engine.h</code></td><td>npm <code>@twilldb/bun</code></td><td><span class="req-tag must">SHIPPED</span> (reference impl)</td></tr>
-<tr><td><strong>Node</strong></td><td><code>koffi</code> (FFI) — reuse the Bun ergonomic wrapper, swap the loader</td><td>npm <code>@twilldb/node</code></td><td><span class="req-tag may">ROADMAP</span></td></tr>
-<tr><td><strong>PHP</strong></td><td>built-in <code>FFI</code> extension (<code>FFI::cdef</code> over <code>engine.h</code>)</td><td>Composer / Packagist</td><td><span class="req-tag may">ROADMAP</span></td></tr>
+<tr><td><strong>Node</strong></td><td><code>koffi</code> (FFI) — reuse the Bun ergonomic wrapper, swap the loader</td><td>npm <code>@twilldb/node</code></td><td><span class="req-tag must">SHIPPED</span> (see <a href="20-client-runtimes.html">20</a>)</td></tr>
+<tr><td><strong>PHP</strong></td><td>built-in <code>FFI</code> extension (<code>FFI::cdef</code> over <code>engine.h</code>)</td><td>Composer / Packagist</td><td><span class="req-tag must">SHIPPED</span> (see <a href="20-client-runtimes.html">20</a>)</td></tr>
 <tr><td>Python / Ruby / Go</td><td>ctypes·cffi / Fiddle·ffi / cgo</td><td>PyPI / RubyGems / go modules</td><td><span class="req-tag may">ROADMAP</span></td></tr>
 <tr><td>Rust</td><td>native (the <code>engine</code> crate)</td><td>crates.io</td><td><span class="req-tag may">ROADMAP</span></td></tr>
 </tbody>
@@ -141,7 +141,8 @@ brew install bihaviour/twilldb/twilldb</code></pre></div>
 <tr><td>Safety (no clobber), exit-code contract</td><td><span class="req-tag must">SHIPPED</span></td><td>refuses non-empty dir / existing files; 0 / 1 / 2 contract pinned by <code>crates/cli/tests/scaffold.rs</code></td></tr>
 <tr><td>Interactive wizard (TTY-aware), <code>--yes</code></td><td><span class="req-tag must">SHIPPED</span></td><td>prompts only unspecified fields; non-TTY/<code>--yes</code> falls back to defaults; pure over streams, unit-tested in <code>crates/cli/tests/wizard.rs</code></td></tr>
 <tr><td>Homebrew tap formula + release workflow</td><td><span class="req-tag must">SHIPPED</span></td><td><code>packaging/homebrew/twilldb.rb</code> + <code>release-cli.yml</code> (builds from source; auto-bumps url+sha256 on tag)</td></tr>
-<tr><td>Node / PHP / other clients</td><td><span class="req-tag may">ROADMAP</span></td><td>recognised by <code>--client</code>; thin FFI shims over the same C ABI when built</td></tr>
+<tr><td>Node &amp; PHP starters</td><td><span class="req-tag must">SHIPPED</span></td><td>embedded starters via <code>--client node|php</code> (<code>@twilldb/node</code> / <code>twilldb/twilldb</code>); per-client install/run steps; see <a href="20-client-runtimes.html">20 — Client Runtimes</a></td></tr>
+<tr><td>Python / Ruby / Go / Rust clients</td><td><span class="req-tag may">ROADMAP</span></td><td>recognised by <code>--client</code>; thin FFI shims over the same C ABI when built</td></tr>
 <tr><td>cargo install / Scoop / <code>curl|sh</code> / bottles</td><td><span class="req-tag may">ROADMAP</span></td><td>same release artifacts; gate-free; deferred from the first pass</td></tr>
 <tr><td><code>--server</code> starter variant</td><td><span class="req-tag may">ROADMAP</span></td><td>a pgwire-connected starter (vs embedded); deferred</td></tr>
 </tbody>
@@ -154,6 +155,7 @@ brew install bihaviour/twilldb/twilldb</code></pre></div>
 <div class="xref-grid">
 <a class="xref" href="15-twill-bench.html"><span class="xref-title">Twill Bench CLI</span><span class="xref-desc">The other workspace binary; the same thin-shim-over-testable-core dispatch shape.</span></a>
 <a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">The reference client the scaffolder's Bun starter targets, and the per-platform binary packaging.</span></a>
+<a class="xref" href="20-client-runtimes.html"><span class="xref-title">Client Runtimes &amp; Language SDKs</span><span class="xref-desc">The Node/PHP/polyglot clients the --client templates scaffold, and the shared-surface design.</span></a>
 <a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">Where the engine runs; the distribution channels here put the tooling on the user's machine.</span></a>
 <a class="xref" href="19-cli-management.html"><span class="xref-title">Database Management CLI</span><span class="xref-desc">The proposed second half of the same binary: run SQL, migrate, gen types, branch.</span></a>
 <a class="xref" href="13-roadmap.html"><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">Where the multi-client expansion sits in the phased plan.</span></a>

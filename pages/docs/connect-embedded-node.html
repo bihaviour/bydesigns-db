@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedded: Node &amp; frameworks · Twill DB</title>
+<meta name="description" content="Embed the Twill DB engine in-process on Node and Node-based frameworks (Next.js, Astro, Nuxt, Remix, SvelteKit, Vite) with @twilldb/node — the same API as @twilldb/bun, over koffi FFI.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Embedded: Node &amp; frameworks</h1>
+<p class="lede"><code>@twilldb/node</code> embeds the engine in-process on Node — function-call latency, no server, no socket — with the <em>same</em> API as <a href="connect-embedded-bun.html"><code>@twilldb/bun</code></a>. It binds the native engine through <a href="https://koffi.dev">koffi</a> instead of <code>bun:ffi</code>, so it runs on Node and every Node-based framework: Next.js, Astro, Nuxt, Remix, SvelteKit, Vite SSR.</p>
+</header>
+
+<section>
+<h2>Install</h2>
+<pre data-lang="bash"><code>npm install @twilldb/node      # or pnpm / yarn / bun add</code></pre>
+<p>The native engine ships as a per-platform optional dependency
+(<code>@twilldb/engine-&lt;os&gt;-&lt;arch&gt;</code> — the same binaries <code>@twilldb/bun</code> uses), so there is no <code>cargo build</code>. To point at a libengine you built yourself, set <code>TWILLDB_ENGINE_PATH=/abs/path/libengine.so</code>.</p>
+<div class="callout note">
+<p class="callout-title">Runtime requirements</p>
+<p>Node ≥ 22.18 runs the published <code>.ts</code> sources directly (type stripping); on older Node, build with <code>tsc</code>/<code>tsx</code>. Keep the database on the <strong>Node.js runtime</strong>, not the <strong>Edge runtime</strong> — FFI is unavailable on Edge.</p>
+</div>
+</section>
+
+<section>
+<h2>Quickstart</h2>
+<pre data-lang="ts"><code>import { open } from "@twilldb/node";
+
+// file://  embedded · s3://|r2://|gs://  storage-disaggregated
+const db = open("file://./local.db");
+try {
+  db.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)");
+  db.query("INSERT INTO notes (id, body) VALUES (?, ?)", [1, "hello"]);
+  const rows = db.query("SELECT id, body FROM notes");
+  console.log(rows);
+} finally {
+  db.close();
+}</code></pre>
+<p><strong>Breakdown:</strong> the storage backend is chosen entirely by the URL scheme — your code is identical for <code>file://</code> and <code>s3://</code>. Parameters bind positionally (<code>?</code>); values are never string-interpolated. The same snippet runs on Bun by changing the import to <code>@twilldb/bun</code>.</p>
+</section>
+
+<section>
+<h2>API at a glance</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Call</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>open(url)</code></td><td>open a database (backend chosen by URL scheme)</td></tr>
+<tr><td><code>db.exec(sql)</code></td><td>run DDL/DML, returns rows affected</td></tr>
+<tr><td><code>db.query(sql, params?)</code></td><td>buffered rows; params bind positionally</td></tr>
+<tr><td><code>db.prepare(sql)</code></td><td>reusable statement (<code>.all</code> / <code>.get</code> / <code>.run</code>)</td></tr>
+<tr><td><code>db.transaction(fn)</code></td><td>BEGIN/COMMIT, rollback on throw; commit blocks until durable</td></tr>
+<tr><td><code>db.branch(name)</code></td><td>copy-on-write branch at the current LSN</td></tr>
+<tr><td><code>db.close()</code></td><td>release the handle (idempotent)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Errors throw <code>EngineError</code> carrying the numeric <code>status</code> and a <code>retryable</code> flag (set for conflict / transient-storage failures). It is the same surface as the <a href="connect-bun.html">Bun client</a> — see that page for the full reference.</p>
+</section>
+
+<section>
+<h2>Frameworks (Next.js, Astro, Vite, …)</h2>
+<p>A Node framework renders in a Node server process; the engine embeds in that same process. The one rule that matters: <strong>open one <code>Database</code> per process and reuse it</strong> across requests — the engine is a single writer per database, so a per-request open would thrash the WAL.</p>
+<pre data-lang="ts"><code>// lib/db.ts — a module-level singleton, reused across requests.
+import { open, type Database } from "@twilldb/node";
+
+const g = globalThis as unknown as { __twill?: Database };
+export function db(): Database {
+  if (!g.__twill) {
+    g.__twill = open(process.env.TWILLDB_URL ?? "file://./app.db");
+    g.__twill.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)");
+  }
+  return g.__twill;          // globalThis guard survives dev hot-reload
+}</code></pre>
+<h3>Next.js (App Router)</h3>
+<pre data-lang="ts"><code>// app/api/notes/route.ts
+import { db } from "@/lib/db";
+
+export const runtime = "nodejs";   // FFI needs the Node runtime, not Edge
+
+export async function GET() {
+  return Response.json(db().query("SELECT id, body FROM notes ORDER BY id DESC LIMIT 100"));
+}
+
+export async function POST(req: Request) {
+  const { body } = await req.json();
+  db().transaction((tx) => tx.query("INSERT INTO notes (body) VALUES (?)", [body]));
+  return Response.json({ ok: true }, { status: 201 });
+}</code></pre>
+<p><strong>Breakdown:</strong> <code>export const runtime = "nodejs"</code> is required — on the Edge runtime FFI is unavailable. The route reuses the shared handle; the transaction's <code>COMMIT</code> blocks until the WAL is durable.</p>
+<h3>Astro / SvelteKit / Nuxt / Remix / Vite SSR</h3>
+<p>The pattern is identical — only the route-handler signature changes. An Astro API route:</p>
+<pre data-lang="ts"><code>// src/pages/api/notes.ts
+import { db } from "../../lib/db";
+
+export const GET = () =&gt;
+  new Response(JSON.stringify(db().query("SELECT id, body FROM notes")), {
+    headers: { "content-type": "application/json" },
+  });</code></pre>
+<div class="callout tip">
+<p class="callout-title">Edge? Use server mode</p>
+<p>If a route must run on an Edge runtime, it can't embed via FFI. Run <a href="connect-server.html">engine-server</a> and connect over Postgres with <code>node-postgres</code> / <code>Bun.sql</code> instead — see <a href="connect-server-node.html">Server: Node / Bun</a>.</p>
+</div>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-embedded-php.html"><span class="xref-title">Embedded: PHP</span><span class="xref-desc">The same engine, embedded from PHP via the FFI extension.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-title">Bun client reference</span><span class="xref-desc">The full API surface @twilldb/node mirrors.</span></a>
+<a class="xref" href="scaffolding.html"><span class="xref-title">Scaffold a Node project</span><span class="xref-desc">twilldb new web --client node</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under BUSL-1.1. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

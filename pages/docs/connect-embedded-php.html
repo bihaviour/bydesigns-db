@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedded: PHP &amp; frameworks · Twill DB</title>
+<meta name="description" content="Embed the Twill DB engine in-process from PHP via the built-in FFI extension with twilldb/twilldb, or connect over Postgres (PDO) from Laravel / CodeIgniter.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">Twill DB v0.4</span>
+</div>
+<h1>Embedded: PHP &amp; frameworks</h1>
+<p class="lede">PHP 8 ships a built-in <code>FFI</code> extension, so PHP <em>embeds</em> the engine directly over the same C ABI — no native extension to compile. The <code>twilldb/twilldb</code> package wraps it in the same ergonomic surface as the <a href="connect-embedded-bun.html">Bun</a> / <a href="connect-embedded-node.html">Node</a> clients. Frameworks that prefer Postgres connect over the wire with PDO instead.</p>
+</header>
+
+<section>
+<h2>Install</h2>
+<pre data-lang="bash"><code>composer require twilldb/twilldb</code></pre>
+<p>Requires PHP ≥ 8.1 with the <strong>FFI</strong> extension enabled — set <code>ffi.enable=1</code> in <code>php.ini</code>, or pass <code>-d ffi.enable=1</code>. The embedded path also needs the native <code>libengine</code>: build it with <code>cargo build -p twill-engine --release</code>, or set <code>TWILLDB_ENGINE_PATH</code> to a built <code>libengine.{so,dylib,dll}</code>.</p>
+</section>
+
+<section>
+<h2>Quickstart (embedded)</h2>
+<pre data-lang="php"><code>&lt;?php
+require __DIR__ . '/vendor/autoload.php';
+
+use Twill\Database;
+
+// file://  embedded · s3://|r2://|gs://  storage-disaggregated
+$db = Database::open('file://./local.db');
+try {
+    $db-&gt;exec('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)');
+    $db-&gt;query('INSERT INTO notes (id, body) VALUES (?, ?)', [1, 'hello']);
+    $rows = $db-&gt;query('SELECT id, body FROM notes');
+    \print_r($rows);
+} finally {
+    $db-&gt;close();
+}</code></pre>
+<p><strong>Breakdown:</strong> the storage backend is chosen entirely by the URL scheme. Parameters bind positionally (<code>?</code>); values are never string-interpolated. Failures throw <code>Twill\EngineError</code> with a numeric <code>-&gt;status</code> and a <code>-&gt;retryable</code> flag.</p>
+</section>
+
+<section>
+<h2>API at a glance</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Call</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>Database::open($url)</code></td><td>open a database (backend chosen by URL scheme)</td></tr>
+<tr><td><code>$db-&gt;exec($sql)</code></td><td>run DDL/DML, returns rows affected</td></tr>
+<tr><td><code>$db-&gt;query($sql, $params = [])</code></td><td>buffered rows; params bind positionally</td></tr>
+<tr><td><code>$db-&gt;prepare($sql)</code></td><td>reusable <code>Statement</code> (<code>-&gt;all()</code> / <code>-&gt;get()</code> / <code>-&gt;run()</code>)</td></tr>
+<tr><td><code>$db-&gt;transaction($fn)</code></td><td>BEGIN/COMMIT, rollback on throw; commit blocks until durable</td></tr>
+<tr><td><code>$db-&gt;branch($name)</code></td><td>copy-on-write branch at the current LSN</td></tr>
+<tr><td><code>$db-&gt;close()</code></td><td>release the handle (idempotent)</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Frameworks: Laravel, Symfony, CodeIgniter</h2>
+<p>There are two ways in, and the right choice depends on your runtime model.</p>
+<h3>1 — Embedded (persistent worker)</h3>
+<p>Open one <code>Twill\Database</code> in a singleton / service provider and reuse it across requests — the engine is a single writer per database. This shines on a <strong>long-lived worker</strong> (FrankenPHP, RoadRunner, Swoole), where the open + WAL-replay cost is paid once.</p>
+<pre data-lang="php"><code>// A Laravel service provider (register the engine as a singleton).
+$this-&gt;app-&gt;singleton(Twill\Database::class, fn () =&gt;
+    Twill\Database::open(env('TWILLDB_URL', 'file://./app.db'))
+);</code></pre>
+<div class="callout note">
+<p class="callout-title">Classic php-fpm pays the cost per request</p>
+<p>Under classic per-request <code>php-fpm</code>, each request opens and replays the WAL afresh. For that model, prefer server mode below (or move to a persistent worker).</p>
+</div>
+<h3>2 — Server mode (PDO — no FFI)</h3>
+<p>Run <a href="connect-server.html">engine-server</a> (the same engine behind a Postgres-wire listener) and point your framework's Postgres connection at it. No FFI, no native library in the PHP process — frameworks already speak Postgres.</p>
+<pre data-lang="php"><code>// Plain PDO against engine-server (cleartext — sslmode=disable).
+$pdo = new PDO('pgsql:host=127.0.0.1;port=5433;dbname=main;sslmode=disable', 'postgres', '');
+$pdo-&gt;exec('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)');
+$stmt = $pdo-&gt;prepare('INSERT INTO notes (id, body) VALUES (?, ?)');
+$stmt-&gt;execute([1, 'hello']);</code></pre>
+<ul>
+<li><strong>Laravel</strong>: add a <code>pgsql</code> connection in <code>config/database.php</code> with <code>host=127.0.0.1</code>, <code>port=5433</code>, <code>sslmode=disable</code>.</li>
+<li><strong>CodeIgniter</strong>: use the <code>Postgre</code> database driver with the same DSN.</li>
+<li><strong>Symfony</strong>: set <code>DATABASE_URL="postgresql://postgres@127.0.0.1:5433/main?sslmode=disable"</code>.</li>
+</ul>
+</section>
+
+<section>
+<h2>Next</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-embedded-node.html"><span class="xref-title">Embedded: Node</span><span class="xref-desc">The same engine, embedded from Node-based frameworks.</span></a>
+<a class="xref" href="connect-server.html"><span class="xref-title">Server mode</span><span class="xref-desc">Run engine-server and connect any Postgres client.</span></a>
+<a class="xref" href="scaffolding.html"><span class="xref-title">Scaffold a PHP project</span><span class="xref-desc">twilldb new api --client php</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under BUSL-1.1. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

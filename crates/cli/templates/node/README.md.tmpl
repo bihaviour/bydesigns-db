@@ -1,0 +1,39 @@
+# {{name}}
+
+A [Twill DB](https://github.com/bihaviour/twill-db) starter for **Node** — a
+serverless OLTP database embedded in-process via `@twilldb/node` (koffi FFI). No
+server to run, no infrastructure to provision.
+
+## Run it
+
+```bash
+npm install
+npm start
+```
+
+Requires **Node ≥ 22.18** (to run `.ts` directly via type stripping). The native
+engine ships with `@twilldb/node` as a per-platform optional dependency, so there
+is no `cargo build` step. To point at a libengine you built yourself, set
+`TWILLDB_ENGINE_PATH=/abs/path/libengine.{so,dylib,dll}`.
+
+## Frameworks
+
+The same `app.ts` logic drops into any Node-based framework — Next.js, Astro,
+Nuxt, Remix, SvelteKit, Vite SSR. Open **one** `Database` per server process and
+reuse it across requests (the engine is a single writer per database). On the
+Edge runtime, FFI is unavailable — keep the database on the Node.js runtime (in
+Next.js, add `export const runtime = "nodejs"` to the route).
+
+This same code also runs on **Bun**: change the import to `@twilldb/bun`.
+
+## Storage backend
+
+The backend is chosen entirely by the connection string in `app.ts`:
+
+| Scheme | Backend |
+| --- | --- |
+| `file://…` | embedded, persists to a local file (this starter's default) |
+| `s3://` · `r2://` · `gs://` | storage-disaggregated; credentials come from the environment |
+
+This project is configured for `{{db_url}}`.
+{{vector_readme}}
