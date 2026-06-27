@@ -279,6 +279,48 @@ fn schema_cache_reflection_serves_postgrest() {
 }
 
 #[test]
+fn twill_catalog_reflection_serves_the_management_cli() {
+    // The `twill.catalog` / `twill.relationships` reflection surface (spec 19
+    // Milestone 3) must reflect the live catalog as plain text rows so the CLI's
+    // tables/describe/gen-types/schema-dump commands work over postgres://.
+    let addr = start_server();
+    let mut c = Client::connect(&addr);
+    c.simple("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    c.simple(
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER REFERENCES authors(id))",
+    );
+
+    // Columns view: one row per column, (tbl, col, typ, notnull, pk).
+    let cols = c.simple("SHOW twill.catalog");
+    assert!(!has_error(&cols), "twill.catalog errored: {cols:?}");
+    let rows = data_rows(&cols);
+    // authors(id,name) + books(id,author_id) = 4 columns.
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    let authors_id = rows
+        .iter()
+        .find(|r| r[0].as_deref() == Some("authors") && r[1].as_deref() == Some("id"))
+        .expect("authors.id row");
+    assert_eq!(authors_id[2].as_deref(), Some("integer"));
+    assert_eq!(authors_id[4].as_deref(), Some("1"), "id is the PK");
+    let authors_name = rows
+        .iter()
+        .find(|r| r[0].as_deref() == Some("authors") && r[1].as_deref() == Some("name"))
+        .expect("authors.name row");
+    assert_eq!(authors_name[3].as_deref(), Some("1"), "name is NOT NULL");
+
+    // Relationships view: one row per foreign key.
+    let rels = c.simple("SHOW twill.relationships");
+    assert!(!has_error(&rels), "twill.relationships errored: {rels:?}");
+    let rels = data_rows(&rels);
+    assert_eq!(rels.len(), 1, "one FK: books.author_id -> authors.id");
+    let fk = &rels[0];
+    assert_eq!(fk[0].as_deref(), Some("books"));
+    assert_eq!(fk[2].as_deref(), Some("author_id"));
+    assert_eq!(fk[3].as_deref(), Some("authors"));
+    assert_eq!(fk[4].as_deref(), Some("id"));
+}
+
+#[test]
 fn unsupported_catalog_query_is_a_clear_error_simple() {
     // A system-catalog query outside the subset must return a clear
     // feature_not_supported (0A000), NOT a generic engine syntax error (42601),

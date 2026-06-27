@@ -10,10 +10,9 @@
 //! a file containing DDL runs statement-by-statement in autocommit. (The
 //! preview-and-swap mitigation — `migrate up --branch` — is Milestone 2.)
 
-use engine::Connection;
 use std::path::Path;
 
-use super::{stamp_compact, stamp_iso};
+use super::{stamp_compact, stamp_iso, Conn};
 
 const TRACKING_TABLE: &str = "_twilldb_migrations";
 
@@ -53,7 +52,7 @@ pub fn new(dir: &str, name: &str, now: i64) -> Result<String, String> {
 
 /// `migrate up <url>` — apply every pending migration in order, recording each in
 /// the tracking table, and warn on checksum drift for already-applied files.
-pub fn up(conn: &mut Connection, dir: &str, now: i64) -> Result<String, String> {
+pub fn up(conn: &mut Conn, dir: &str, now: i64) -> Result<String, String> {
     ensure_tracking_table(conn)?;
     let files = load_migrations(dir)?;
     let applied = applied_versions(conn)?;
@@ -82,7 +81,7 @@ pub fn up(conn: &mut Connection, dir: &str, now: i64) -> Result<String, String> 
 }
 
 /// `migrate status <url>` — list applied vs pending, flag checksum drift.
-pub fn status(conn: &mut Connection, dir: &str) -> Result<String, String> {
+pub fn status(conn: &mut Conn, dir: &str) -> Result<String, String> {
     ensure_tracking_table(conn)?;
     let files = load_migrations(dir)?;
     let applied = applied_versions(conn)?;
@@ -118,7 +117,7 @@ pub fn status(conn: &mut Connection, dir: &str) -> Result<String, String> {
 
 /// Apply one migration file: run its statements (DML-only → one transaction;
 /// any DDL → autocommit per statement), then record it in the tracking table.
-fn apply_one(conn: &mut Connection, f: &MigrationFile, now: i64) -> Result<(), String> {
+fn apply_one(conn: &mut Conn, f: &MigrationFile, now: i64) -> Result<(), String> {
     let statements = split_statements(&f.body);
     let has_ddl = statements.iter().any(|s| is_ddl(s));
 
@@ -146,7 +145,7 @@ fn apply_one(conn: &mut Connection, f: &MigrationFile, now: i64) -> Result<(), S
 
 /// Insert the tracking row for a freshly applied migration.
 fn record_applied(
-    conn: &mut Connection,
+    conn: &mut Conn,
     version: &str,
     name: &str,
     checksum: &str,
@@ -166,7 +165,7 @@ fn record_applied(
 
 // ---- tracking table -----------------------------------------------------
 
-fn ensure_tracking_table(conn: &mut Connection) -> Result<(), String> {
+fn ensure_tracking_table(conn: &mut Conn) -> Result<(), String> {
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {TRACKING_TABLE} (\
          version TEXT PRIMARY KEY, \
@@ -179,7 +178,7 @@ fn ensure_tracking_table(conn: &mut Connection) -> Result<(), String> {
 }
 
 /// The `(version, checksum)` of every recorded migration.
-fn applied_versions(conn: &mut Connection) -> Result<Vec<(String, String)>, String> {
+fn applied_versions(conn: &mut Conn) -> Result<Vec<(String, String)>, String> {
     let rs = conn
         .query(&format!(
             "SELECT version, checksum FROM {TRACKING_TABLE} ORDER BY version"

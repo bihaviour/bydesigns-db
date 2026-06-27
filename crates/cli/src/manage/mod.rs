@@ -8,15 +8,17 @@
 //!
 //! `file://` / `s3://` / `r2://` / `gs://` open the engine **embedded** (in this
 //! process, function-call latency). `postgres://` is the **pgwire** transport for
-//! a live deployment — reserved for Milestone 3 and rejected with guidance for
-//! now. Unknown schemes are rejected, never defaulted.
+//! a live deployment — it drives a running `engine-server` over the wire (see
+//! [`wire`]). The scheme picks the transport, modeled as a [`Conn`] the commands
+//! are written against. Unknown schemes are rejected, never defaulted.
 //!
 //! ## The single-writer caveat
 //!
 //! Twill is single-writer-per-database (a durable, epoch-fenced lease). When the
 //! CLI opens `file://` embedded it *is* the writer, so it must not be pointed at a
 //! database an app or server currently holds — manage a live deployment over
-//! `postgres://` instead (Milestone 3). The command help repeats this.
+//! `postgres://` instead, where the server stays the sole writer and the CLI is
+//! just a client. The command help repeats this.
 //!
 //! The command bodies return `Result<String, String>` (rendered output, or an
 //! error message) so the integration tests can drive them against a temp
@@ -27,9 +29,65 @@ mod gentypes;
 mod migrate;
 mod render;
 mod schema;
+mod wire;
 
 use crate::exit;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A management connection over the transport chosen by the connection-string
+/// scheme: [`Embedded`](Conn::Embedded) links the engine in-process (`file://` and
+/// the object stores), [`Wire`](Conn::Wire) drives a running `engine-server` over
+/// pgwire (`postgres://`, Milestone 3). The commands are written against this
+/// enum, so the same surface manages a local database and a live deployment; the
+/// renderers never learn which transport produced a result.
+pub enum Conn {
+    Embedded(engine::Connection),
+    Wire(wire::WireConn),
+}
+
+impl Conn {
+    /// Run a query, returning the engine result set (rebuilt from text cells on
+    /// the wire path).
+    pub fn query(&mut self, sql: &str) -> Result<engine::ResultSet, String> {
+        match self {
+            Conn::Embedded(c) => c.query(sql).map_err(|e| e.to_string()),
+            Conn::Wire(c) => c.query(sql),
+        }
+    }
+
+    /// Run a statement for its effect, updating [`last_changes`](Conn::last_changes).
+    pub fn exec(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Conn::Embedded(c) => c.exec(sql).map_err(|e| e.to_string()),
+            Conn::Wire(c) => c.exec(sql),
+        }
+    }
+
+    /// Affected-row count of the last `exec`/`query`.
+    pub fn last_changes(&self) -> i64 {
+        match self {
+            Conn::Embedded(c) => c.last_changes,
+            Conn::Wire(c) => c.last_changes,
+        }
+    }
+
+    /// The live catalog — read directly when embedded, reflected over the
+    /// `twill.catalog` surface when on the wire.
+    pub fn catalog(&mut self) -> Result<Vec<engine::CatalogTable>, String> {
+        match self {
+            Conn::Embedded(c) => Ok(c.catalog()),
+            Conn::Wire(c) => c.catalog(),
+        }
+    }
+
+    /// The engine + storage observability snapshot.
+    pub fn stats(&mut self) -> Result<engine::EngineStats, String> {
+        match self {
+            Conn::Embedded(c) => Ok(c.stats()),
+            Conn::Wire(c) => c.stats(),
+        }
+    }
+}
 
 /// Dispatch a management subcommand. `cmd` is the top-level verb (`sql`,
 /// `migrate`, …) and `rest` the arguments after it. Prints output to stdout and
@@ -139,14 +197,32 @@ fn finish(result: CmdResult) -> i32 {
 
 // ---- transport ----------------------------------------------------------
 
-/// Open a database by connection-string scheme (spec 19 transport model). Only
-/// the embedded schemes are wired up in Milestone 1; `postgres://` is the
-/// Milestone-3 pgwire transport and is rejected with guidance.
+/// Open a database by connection-string scheme (spec 19 transport model):
+/// `file://` and the object stores open the engine **embedded** (this process is
+/// the writer); `postgres://` drives a running `engine-server` over **pgwire**
+/// (Milestone 3), where the server stays the sole writer. Unknown schemes are
+/// rejected, never defaulted.
 ///
 /// A `<base-url>#branch=<id>` suffix (Milestone 2) opens a copy-on-write branch
 /// instead of the base line — the address `branch create` / `branch list` hand
-/// back, so every command can target a branch.
-fn open(url: &str) -> Result<engine::Connection, CmdError> {
+/// back, so every command can target a branch. Branches are an embedded /
+/// storage-seam concept with no wire form, so a branch address requires an
+/// embedded base.
+fn open(url: &str) -> Result<Conn, CmdError> {
+    if url.starts_with("postgres://") {
+        return wire::WireConn::connect(url)
+            .map(Conn::Wire)
+            .map_err(Runtime);
+    }
+    open_embedded(url).map(Conn::Embedded)
+}
+
+/// Open the engine **embedded** at `url`, the in-process transport that links the
+/// engine and makes this process the writer. Used directly by the commands that
+/// are inherently embedded — branching (a storage-seam operation) and the
+/// preview-and-swap fork — which have no `postgres://` form; a wire URL is
+/// rejected here with guidance to manage those against the embedded database.
+fn open_embedded(url: &str) -> Result<engine::Connection, CmdError> {
     if let Some((base, id)) = url.split_once("#branch=") {
         let id: u64 = id
             .parse()
@@ -161,17 +237,16 @@ fn open(url: &str) -> Result<engine::Connection, CmdError> {
     {
         engine::Connection::open(url).map_err(|e| Runtime(format!("opening {url}: {e}")))
     } else if url.starts_with("postgres://") {
-        Err(Runtime(
-            "the postgres:// transport is not implemented yet (spec 19 Milestone 3).\n\
-             Manage a live deployment over the wire is coming; for now manage a \
-             local or stopped database embedded via file://."
-                .to_string(),
-        ))
+        Err(Usage(format!(
+            "'{url}' is a live (postgres://) deployment; branching and the \
+             preview-and-swap fork are storage-level operations with no wire form. \
+             Manage branches against the embedded database (file://)."
+        )))
     } else {
         Err(Usage(format!(
             "unrecognized connection-string scheme in '{url}'. \
              Use file:// (embedded) — s3://, r2://, gs:// are also embedded; \
-             postgres:// (live, Milestone 3) is not wired up yet."
+             postgres:// drives a running engine-server over pgwire."
         )))
     }
 }
@@ -206,15 +281,15 @@ fn cmd_sql(args: &[String]) -> CmdResult {
     let query = positional(args, 1, "a SQL statement")?;
     let json = has_flag(args, "--json");
     let mut conn = open(url)?;
-    let rs = conn.query(query).map_err(|e| Runtime(e.to_string()))?;
-    Ok(render::result(&rs, conn.last_changes, json))
+    let rs = conn.query(query).map_err(Runtime)?;
+    Ok(render::result(&rs, conn.last_changes(), json))
 }
 
 /// `twilldb tables <url>` — list tables from the catalog.
 fn cmd_tables(args: &[String]) -> CmdResult {
     let url = positional(args, 0, "<url>")?;
-    let conn = open(url)?;
-    let tables = conn.catalog();
+    let mut conn = open(url)?;
+    let tables = conn.catalog().map_err(Runtime)?;
     if tables.is_empty() {
         return Ok("(no tables)".to_string());
     }
@@ -229,9 +304,10 @@ fn cmd_tables(args: &[String]) -> CmdResult {
 fn cmd_describe(args: &[String]) -> CmdResult {
     let url = positional(args, 0, "<url>")?;
     let table = positional(args, 1, "<table>")?;
-    let conn = open(url)?;
+    let mut conn = open(url)?;
     let t = conn
         .catalog()
+        .map_err(Runtime)?
         .into_iter()
         .find(|t| t.name.eq_ignore_ascii_case(table))
         .ok_or_else(|| Runtime(format!("no such table: {table}")))?;
@@ -241,8 +317,8 @@ fn cmd_describe(args: &[String]) -> CmdResult {
 /// `twilldb stats <url>` — engine + storage observability snapshot.
 fn cmd_stats(args: &[String]) -> CmdResult {
     let url = positional(args, 0, "<url>")?;
-    let conn = open(url)?;
-    Ok(render::stats(&conn.stats()))
+    let mut conn = open(url)?;
+    Ok(render::stats(&conn.stats().map_err(Runtime)?))
 }
 
 /// `twilldb seed <url> <file.sql>` — run a seed script.
@@ -255,7 +331,7 @@ fn cmd_seed(args: &[String]) -> CmdResult {
 
 /// Run a `.sql` script statement-by-statement against `conn`. Shared by `seed`
 /// and `db reset --seed`.
-fn apply_seed_file(conn: &mut engine::Connection, file: &str) -> CmdResult {
+fn apply_seed_file(conn: &mut Conn, file: &str) -> CmdResult {
     let sql = std::fs::read_to_string(file).map_err(|e| Runtime(format!("reading {file}: {e}")))?;
     let mut n = 0usize;
     for stmt in migrate::split_statements(&sql) {
@@ -282,7 +358,12 @@ fn cmd_db(args: &[String]) -> CmdResult {
     let dir = flag_value(args, "--dir").unwrap_or("migrations");
     let mut conn = open(url)?;
 
-    let tables: Vec<String> = conn.catalog().into_iter().map(|t| t.name).collect();
+    let tables: Vec<String> = conn
+        .catalog()
+        .map_err(Runtime)?
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
     if !tables.is_empty() && !has_flag(args, "--force") {
         return Err(Usage(format!(
             "refusing to reset a non-empty database ({} table(s)) without --force",
@@ -354,8 +435,8 @@ fn cmd_gen(args: &[String]) -> CmdResult {
     match positional(args, 0, "a `gen` target (only `types` is supported)")? {
         "types" => {
             let url = positional(args, 1, "<url>")?;
-            let conn = open(url)?;
-            let ts = gentypes::generate(&conn.catalog());
+            let mut conn = open(url)?;
+            let ts = gentypes::generate(&conn.catalog().map_err(Runtime)?);
             if let Some(out) = flag_value(args, "--out") {
                 std::fs::write(out, &ts).map_err(|e| Runtime(format!("writing {out}: {e}")))?;
                 Ok(format!("wrote {out}"))
@@ -420,7 +501,7 @@ fn migrate_up_branch(url: &str, dir: &str, args: &[String]) -> CmdResult {
         Some(v) if !v.starts_with("--") => v,
         _ => "migrate-preview",
     };
-    let base = open(url)?;
+    let base = open_embedded(url)?;
     let id = base
         .create_branch(label)
         .map_err(|e| Runtime(e.to_string()))?;
@@ -527,7 +608,8 @@ pub fn print_manage_help() {
          \n\
          <url> is a connection string: file:// (and s3://, r2://, gs://) open the\n\
          engine embedded — the CLI is itself the single writer, so point it only at\n\
-         a local or stopped database. A branch is addressed as <url>#branch=<id>. A\n\
-         live deployment is managed over postgres:// (Milestone 3, not wired up yet)."
+         a local or stopped database. A branch is addressed as <url>#branch=<id>\n\
+         (embedded only). A live deployment is managed over postgres:// (read /\n\
+         inspect / migrate over the wire; the server stays the sole writer)."
     );
 }

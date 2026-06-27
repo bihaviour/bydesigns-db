@@ -9,7 +9,7 @@
 //! `DEFAULT` / `CHECK` / standalone `UNIQUE` are not part of the reflected
 //! catalog and so are not emitted (noted in the docs).
 
-use super::{open, positional, CmdError::Usage, CmdResult};
+use super::{open, positional, CmdError::Runtime, CmdError::Usage, CmdResult};
 use engine::{CatalogTable, ColumnType};
 
 /// `twilldb schema dump <url>`.
@@ -17,8 +17,8 @@ pub fn cmd_schema(args: &[String]) -> CmdResult {
     match positional(args, 0, "a `schema` subcommand (only `dump` is supported)")? {
         "dump" => {
             let url = positional(args, 1, "<url>")?;
-            let conn = open(url)?;
-            let tables = conn.catalog();
+            let mut conn = open(url)?;
+            let tables = conn.catalog().map_err(Runtime)?;
             if tables.is_empty() {
                 return Ok("-- (no tables)".to_string());
             }

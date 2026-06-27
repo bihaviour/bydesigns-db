@@ -3,7 +3,8 @@
 //! REPL loop. All hand-rolled — no `serde`, no table crate — to keep the
 //! management build as dependency-light as the scaffolder.
 
-use engine::{CatalogTable, ColumnType, Connection, EngineStats, ResultSet, Value};
+use super::Conn;
+use engine::{CatalogTable, ColumnType, EngineStats, ResultSet, Value};
 use std::io::{BufRead, Write};
 
 /// Render a statement result. A query with columns prints a table (or JSON with
@@ -237,7 +238,7 @@ pub fn stats(s: &EngineStats) -> String {
 /// then runs it. Returns on EOF, `.quit`, or `.exit`. Parameterized over the I/O
 /// so the integration tests drive it with in-memory buffers.
 pub fn shell<R: BufRead, W: Write>(
-    conn: &mut Connection,
+    conn: &mut Conn,
     input: &mut R,
     out: &mut W,
     interactive: bool,
@@ -287,7 +288,7 @@ pub fn shell<R: BufRead, W: Write>(
         }
         match conn.query(&stmt) {
             Ok(rs) => {
-                writeln!(out, "{}", result(&rs, conn.last_changes, false)).map_err(map)?;
+                writeln!(out, "{}", result(&rs, conn.last_changes(), false)).map_err(map)?;
             }
             Err(e) => writeln!(out, "error: {e}").map_err(map)?,
         }
@@ -301,11 +302,7 @@ enum DotOutcome {
 }
 
 /// Handle a `.dot` REPL command.
-fn dot_command<W: Write>(
-    conn: &mut Connection,
-    cmd: &str,
-    out: &mut W,
-) -> Result<DotOutcome, String> {
+fn dot_command<W: Write>(conn: &mut Conn, cmd: &str, out: &mut W) -> Result<DotOutcome, String> {
     let map = |e: std::io::Error| e.to_string();
     let mut parts = cmd.split_whitespace();
     match parts.next() {
@@ -321,13 +318,13 @@ fn dot_command<W: Write>(
             .map_err(map)?;
         }
         Some(".tables") => {
-            for t in conn.catalog() {
+            for t in conn.catalog()? {
                 writeln!(out, "{}", t.name).map_err(map)?;
             }
         }
         Some(".schema") => {
             let want = parts.next();
-            let catalog = conn.catalog();
+            let catalog = conn.catalog()?;
             let mut any = false;
             for t in &catalog {
                 if want

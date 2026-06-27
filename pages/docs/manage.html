@@ -41,13 +41,13 @@ cargo install --path crates/cli --features manage</code></pre>
 <thead><tr><th>Scheme</th><th>Transport</th><th>Use it for</th></tr></thead>
 <tbody>
 <tr><td><code>file://</code> (and <code>s3://</code>, <code>r2://</code>, <code>gs://</code>)</td><td><strong>Embedded</strong> — opens the engine in this process</td><td>local dev, CI, one-off scripts, an offline/stopped database</td></tr>
-<tr><td><code>postgres://</code></td><td><strong>pgwire</strong> — connects to a running <code>engine-server</code></td><td>a live or shared deployment <span class="req-tag may">coming soon</span></td></tr>
+<tr><td><code>postgres://</code></td><td><strong>pgwire</strong> — connects to a running <code>engine-server</code></td><td>a live or shared deployment</td></tr>
 </tbody>
 </table>
 </div>
 <div class="callout warning">
 <p class="callout-title">The CLI is a writer when it opens a database embedded</p>
-<p>Twill is single-writer-per-database, enforced by a durable lease. When the CLI opens <code>file://</code> it <em>is</em> that writer — so point it at a <strong>local or stopped</strong> database, not one an app or server currently holds, or the two will contend for the lease. To manage a <strong>live</strong> deployment, use the <code>postgres://</code> transport so the server stays the sole writer and the CLI is just a client. (The <code>postgres://</code> transport is on the roadmap; embedded is available today.)</p>
+<p>Twill is single-writer-per-database, enforced by a durable lease. When the CLI opens <code>file://</code> it <em>is</em> that writer — so point it at a <strong>local or stopped</strong> database, not one an app or server currently holds, or the two will contend for the lease. To manage a <strong>live</strong> deployment, use the <code>postgres://</code> transport so the server stays the sole writer and the CLI is just a client (see <a href="#live">Manage a live deployment</a> below).</p>
 </div>
 </section>
 
@@ -87,7 +87,7 @@ twilldb migrate status file://./app.db</code></pre>
 <p>Each file is split into statements and applied in order; <code>migrate up</code> records the file's version, name, checksum, and apply time, so a second run is a no-op. If an already-applied file's checksum no longer matches, <code>status</code> and <code>up</code> flag <strong>drift</strong> — a previously-applied migration was edited. Use <code>--dir &lt;path&gt;</code> to point at a migrations directory other than <code>./migrations</code>.</p>
 <div class="callout note">
 <p class="callout-title">A migration is the unit of ordering, not always of atomicity</p>
-<p>Twill runs <code>CREATE</code>/<code>ALTER</code>/<code>DROP</code> in autocommit — DDL cannot run inside an explicit transaction. So a DML-only file is applied inside one transaction, but a file containing DDL runs statement-by-statement in autocommit, and a mid-file failure leaves earlier statements applied. Keep one concern per migration (schema changes separate from large data backfills) so a partial failure is easy to reason about. A copy-on-write preview-and-swap (<code>migrate up --branch</code>) is on the roadmap.</p>
+<p>Twill runs <code>CREATE</code>/<code>ALTER</code>/<code>DROP</code> in autocommit — DDL cannot run inside an explicit transaction. So a DML-only file is applied inside one transaction, but a file containing DDL runs statement-by-statement in autocommit, and a mid-file failure leaves earlier statements applied. Keep one concern per migration (schema changes separate from large data backfills) so a partial failure is easy to reason about. For a risky change, <code>migrate up --branch</code> applies it to a copy-on-write branch first so you can verify before promoting (see <em>Branches &amp; preview-and-swap migrations</em> below).</p>
 </div>
 </section>
 
@@ -146,6 +146,24 @@ twilldb serve file://./app.db --listen 127.0.0.1:5433</code></pre>
 <div class="callout note">
 <p class="callout-title">Branch addresses are for embedded commands only</p>
 <p>The <code>&lt;url&gt;#branch=&lt;id&gt;</code> address works with the embedded commands (<code>sql</code>, <code>tables</code>, <code>schema dump</code>, <code>migrate</code>, …). <code>serve</code> runs the <em>base</em> database (the server is the sole writer), so it rejects a <code>#branch=</code> address — branch first, then point a fresh server at the branch overlay if you need to serve one.</p>
+</div>
+</section>
+
+<section id="live">
+<h2>Manage a live deployment (<code>postgres://</code>)</h2>
+<p>When a database is already being served — an <code>engine-server</code> (or a <code>twilldb serve</code>) holding the writer lease — you must not also open it embedded, or the two contend for the lease. Instead point the same commands at the server over <code>postgres://</code>: the server stays the sole writer and the CLI is just a wire client.</p>
+<pre data-lang="bash"><code># the same commands, just a postgres:// URL — host[:port], default port 5432
+twilldb sql      'postgres://user@db.internal:5432/app' "SELECT count(*) FROM orders"
+twilldb tables   'postgres://user@db.internal:5432/app'
+twilldb describe 'postgres://user@db.internal:5432/app' orders
+twilldb schema dump 'postgres://user@db.internal:5432/app'
+twilldb gen types   'postgres://user@db.internal:5432/app' --out src/db.d.ts
+twilldb migrate up  'postgres://user@db.internal:5432/app' --dir migrations
+twilldb stats    'postgres://user@db.internal:5432/app'</code></pre>
+<p>The read, inspect, and migrate commands all work over the wire. SQL, seed, and migrations are plain statements the server runs; the inspect commands (<code>tables</code>, <code>describe</code>, <code>gen types</code>, <code>schema dump</code>) reflect the live catalog over a small read-only surface the server exposes, so the output matches the embedded form. The transport is chosen purely by the scheme — nothing else about a command changes.</p>
+<div class="callout note">
+<p class="callout-title">Branching &amp; serve are embedded-only</p>
+<p>Copy-on-write branches are a storage-level feature with no Postgres-wire form, so <code>branch create</code>/<code>list</code>/<code>delete</code>, <code>migrate up --branch</code>, and a <code>#branch=</code> address require an embedded (<code>file://</code>) base — a <code>postgres://</code> URL is refused with guidance. <code>serve</code> is itself the server, so it too is embedded-only. To preview a migration on a branch of a live database, branch the embedded file while the server is stopped, or fork from a snapshot.</p>
 </div>
 </section>
 

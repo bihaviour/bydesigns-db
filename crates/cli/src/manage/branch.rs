@@ -10,7 +10,7 @@
 //! [`super::open`]). Branch pointers are durable on the base, so a branch created
 //! by one invocation is visible to `list` / `delete` in the next.
 
-use super::{open, positional, CmdError::Usage, CmdResult};
+use super::{open_embedded, positional, CmdError::Usage, CmdResult};
 
 /// `twilldb branch <create|list|delete> …`.
 pub fn cmd_branch(args: &[String]) -> CmdResult {
@@ -36,7 +36,7 @@ fn create(args: &[String]) -> CmdResult {
         .nth(1)
         .map(String::as_str)
         .unwrap_or("branch");
-    let conn = open(url)?;
+    let conn = open_embedded(url)?;
     let id = conn.create_branch(name).map_err(|e| e.to_string())?;
     Ok(format!(
         "created branch {} (\"{name}\")\n\
@@ -48,7 +48,7 @@ fn create(args: &[String]) -> CmdResult {
 /// `branch list <url>` — every branch forked off the base, in id order.
 fn list(args: &[String]) -> CmdResult {
     let url = positional(args, 0, "<url>")?;
-    let conn = open(url)?;
+    let conn = open_embedded(url)?;
     let branches = conn.list_branches().map_err(|e| e.to_string())?;
     if branches.is_empty() {
         return Ok("(no branches)".to_string());
@@ -76,7 +76,7 @@ fn delete(args: &[String]) -> CmdResult {
     let id: u64 = id_str
         .parse()
         .map_err(|_| Usage(format!("branch id must be a number, got '{id_str}'")))?;
-    let conn = open(url)?;
+    let conn = open_embedded(url)?;
     conn.delete_branch(engine::BranchId(id))
         .map_err(|e| e.to_string())?;
     Ok(format!("deleted branch {id}"))

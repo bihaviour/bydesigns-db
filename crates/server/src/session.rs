@@ -245,6 +245,7 @@ impl Session {
         match introspect::intercept(sql, &self.user, &self.database) {
             Canned::Reflect(kind) => reflect::reflect(kind, &self.conn.catalog()),
             Canned::Stats => introspect::stats_rows(&self.conn.stats()),
+            Canned::Catalog(kind) => introspect::catalog_reflect(kind, &self.conn.catalog()),
             other => other,
         }
     }
@@ -268,6 +269,7 @@ impl Session {
             }
             Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Stats => unreachable!("inspect() resolves Stats"),
+            Canned::Catalog(_) => unreachable!("inspect() resolves Catalog"),
             Canned::Pass => {
                 // A system-catalog query outside the frozen subset: answer with a
                 // clear feature_not_supported error rather than letting it fall
@@ -490,6 +492,7 @@ impl Session {
                 Canned::Tag(_) => out.no_data(),
                 Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
                 Canned::Stats => unreachable!("inspect() resolves Stats"),
+                Canned::Catalog(_) => unreachable!("inspect() resolves Catalog"),
                 Canned::Pass if is_row_returning(&sql) => match self.dummy_columns(&sql, order_len)
                 {
                     Ok(Some((columns, oids))) => out.row_description(&fields(&columns, &oids, &[])),
@@ -674,6 +677,7 @@ impl Session {
             },
             Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Stats => unreachable!("inspect() resolves Stats"),
+            Canned::Catalog(_) => unreachable!("inspect() resolves Catalog"),
             Canned::Pass => self.run_engine(&sql, &params, &order)?,
         };
         self.portals.get_mut(portal).unwrap().materialized = Some(mat);

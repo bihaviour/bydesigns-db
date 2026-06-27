@@ -37,6 +37,29 @@ pub struct PgClient {
     stream: TcpStream,
 }
 
+/// The full result of a simple query: the column names, every row's text cells
+/// (`None` = SQL NULL), and the `CommandComplete` command tag (e.g. `INSERT 0 3`,
+/// `SELECT 2`). The management CLI rebuilds an engine result set from this.
+#[derive(Default, Debug)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub tag: String,
+}
+
+impl QueryResult {
+    /// The trailing integer of the `CommandComplete` tag — the affected-row count
+    /// for `INSERT`/`UPDATE`/`DELETE` (`INSERT 0 3` → 3, `UPDATE 5` → 5). `0` when
+    /// the tag has no count (e.g. `CREATE TABLE`, `BEGIN`).
+    pub fn affected(&self) -> i64 {
+        self.tag
+            .rsplit(' ')
+            .next()
+            .and_then(|n| n.parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+}
+
 impl PgClient {
     /// Connect to `addr` (`host:port`) and complete the protocol-3.0 startup
     /// handshake (cleartext, trust auth — the server's supported subset).
@@ -114,6 +137,26 @@ impl PgClient {
         }
     }
 
+    /// Run a statement and collect the *full* result: the column names (from
+    /// `RowDescription`), every row's text cells, and the `CommandComplete` tag.
+    /// This is the form the management CLI (spec 19 Milestone 3) drives over the
+    /// wire — it renders the column header, and reads the tag's trailing count for
+    /// the affected-row report on an INSERT/UPDATE/DELETE. The benchmark hot loop
+    /// uses the lighter scalar/exec paths instead.
+    pub fn query_full(&mut self, sql: &str) -> Result<QueryResult, ExecError> {
+        self.send_query(sql)
+            .map_err(|e| ExecError::Fatal(e.to_string()))?;
+        let mut result = QueryResult::default();
+        let err = self
+            .collect_full_to_ready(&mut result)
+            .map_err(|e| ExecError::Fatal(e.to_string()))?;
+        match err {
+            None => Ok(result),
+            Some((code, _)) if code == "40001" => Err(ExecError::Conflict),
+            Some((_, msg)) => Err(ExecError::Fatal(msg)),
+        }
+    }
+
     /// Run a query and collect every row as a vector of text cells (`None` =
     /// SQL NULL). Used to read multi-column results such as the `twill.stats`
     /// observability surface (#53); the benchmark's hot loop uses the scalar
@@ -183,6 +226,27 @@ impl PgClient {
         }
     }
 
+    /// Read until `ReadyForQuery`, filling `result` with the `RowDescription`
+    /// column names, every `DataRow`'s cells, and the `CommandComplete` tag, and
+    /// returning any `ErrorResponse`'s `(SQLSTATE, message)`.
+    fn collect_full_to_ready(
+        &mut self,
+        result: &mut QueryResult,
+    ) -> io::Result<Option<(String, String)>> {
+        let mut err = None;
+        loop {
+            let (tag, body) = self.read_msg()?;
+            match tag {
+                b'T' => result.columns = row_description_names(&body),
+                b'D' => result.rows.push(all_cells(&body)),
+                b'C' => result.tag = command_tag(&body),
+                b'E' => err = Some(parse_error(&body)),
+                b'Z' => return Ok(err),
+                _ => {} // ParameterStatus, NoData, etc.: ignore
+            }
+        }
+    }
+
     /// Read until `ReadyForQuery`, calling `on_row` with all cells of each
     /// `DataRow`, returning any `ErrorResponse`'s `(SQLSTATE, message)`.
     fn collect_rows_to_ready(
@@ -228,6 +292,40 @@ fn all_cells(body: &[u8]) -> Vec<Option<String>> {
         pos = end;
     }
     cells
+}
+
+/// Parse a `RowDescription` ('T') body into the field names. Layout: int16 field
+/// count, then per field a NUL-terminated name followed by 18 fixed bytes
+/// (tableOID, colno, typeOID, typlen, typmod, format) we don't need.
+fn row_description_names(body: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    if body.len() < 2 {
+        return names;
+    }
+    let nfields = i16::from_be_bytes([body[0], body[1]]).max(0) as usize;
+    let mut pos = 2;
+    for _ in 0..nfields {
+        let start = pos;
+        while pos < body.len() && body[pos] != 0 {
+            pos += 1;
+        }
+        if pos >= body.len() {
+            break;
+        }
+        names.push(String::from_utf8_lossy(&body[start..pos]).into_owned());
+        pos += 1; // skip NUL
+        pos += 18; // tableOID(4) + colno(2) + typeOID(4) + typlen(2) + typmod(4) + format(2)
+        if pos > body.len() {
+            break;
+        }
+    }
+    names
+}
+
+/// Decode a `CommandComplete` ('C') body — a single NUL-terminated command tag.
+fn command_tag(body: &[u8]) -> String {
+    let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+    String::from_utf8_lossy(&body[..end]).into_owned()
 }
 
 /// Extract the first column of a `DataRow` body as text (`None` = SQL NULL).

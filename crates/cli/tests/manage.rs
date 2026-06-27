@@ -517,13 +517,135 @@ fn serve_validates_transport_without_binding() {
 }
 
 #[test]
-fn transport_rejects_postgres_and_unknown_schemes() {
-    // postgres:// is a recognized-but-unimplemented transport (Milestone 3).
-    let pg = manage::run("tables", &args(&["postgres://localhost/db"])).unwrap_err();
-    assert!(pg.contains("postgres://"), "got: {pg}");
-    assert!(pg.contains("Milestone 3"), "got: {pg}");
-
-    // An unknown scheme is rejected outright.
+fn transport_rejects_unknown_schemes() {
+    // An unknown scheme is rejected outright (never silently defaulted).
     let bad = manage::run("tables", &args(&["mysql://x"])).unwrap_err();
     assert!(bad.contains("scheme"), "got: {bad}");
+
+    // Branching is an embedded/storage-seam operation with no wire form, so a
+    // live postgres:// deployment is refused with guidance (Milestone 3).
+    let pg = manage::run("branch", &args(&["create", "postgres://localhost/db"])).unwrap_err();
+    assert!(
+        pg.contains("postgres://") && pg.contains("embedded"),
+        "got: {pg}"
+    );
+}
+
+// ---- Milestone 3: the postgres:// (pgwire) transport ----------------------
+
+/// Spin up an in-process `engine-server` over the `file://` database at `url` and
+/// return the `postgres://` address the management commands connect to. The
+/// server is the sole writer; the CLI is just a wire client (the single-writer-
+/// safe path the spec mandates for a live deployment).
+fn start_pg_server(url: &str) -> String {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let backend = url.to_string();
+    std::thread::spawn(move || {
+        let _ = twill_server::serve_listener(listener, &backend);
+    });
+    format!("postgres://twilldb@127.0.0.1:{}/app", addr.port())
+}
+
+#[test]
+fn postgres_transport_runs_sql_and_reflects_catalog() {
+    let dir = scratch("pg-sql");
+    let pg = start_pg_server(&db_url(&dir));
+
+    // DDL + DML over the wire, against the server's database.
+    manage::run(
+        "sql",
+        &args(&[
+            &pg,
+            "CREATE TABLE authors (id integer PRIMARY KEY, name text NOT NULL)",
+        ]),
+    )
+    .unwrap();
+    manage::run(
+        "sql",
+        &args(&[
+            &pg,
+            "CREATE TABLE books (id integer PRIMARY KEY, author_id integer REFERENCES authors(id))",
+        ]),
+    )
+    .unwrap();
+    let ins = manage::run(
+        "sql",
+        &args(&[&pg, "INSERT INTO authors VALUES (1, 'Ada')"]),
+    )
+    .unwrap();
+    assert!(ins.contains("1 row(s) affected"), "got: {ins}");
+
+    let sel = manage::run("sql", &args(&[&pg, "SELECT name FROM authors"])).unwrap();
+    assert!(
+        sel.contains("Ada") && sel.contains("(1 row(s))"),
+        "got: {sel}"
+    );
+
+    // Inspect commands reflect the catalog over the `twill.catalog` surface.
+    let tables = manage::run("tables", &args(&[&pg])).unwrap();
+    assert!(
+        tables.contains("authors") && tables.contains("books"),
+        "got: {tables}"
+    );
+
+    let desc = manage::run("describe", &args(&[&pg, "books"])).unwrap();
+    assert!(desc.contains("author_id"), "columns missing: {desc}");
+    assert!(
+        desc.contains("authors") && desc.contains("Foreign keys"),
+        "FK missing: {desc}"
+    );
+
+    // `schema dump` reconstructs reparseable DDL purely from the wire reflection.
+    let dump = manage::run("schema", &args(&["dump", &pg])).unwrap();
+    assert!(dump.contains("CREATE TABLE authors"), "got: {dump}");
+    assert!(dump.contains("name text NOT NULL"), "got: {dump}");
+    assert!(
+        dump.contains("FOREIGN KEY (author_id) REFERENCES authors (id)"),
+        "got: {dump}"
+    );
+
+    // `gen types` reflects the same catalog into TypeScript.
+    let ts = manage::run("gen", &args(&["types", &pg])).unwrap();
+    assert!(ts.contains("export interface Authors"), "got: {ts}");
+    assert!(ts.contains("name: string;"), "got: {ts}");
+
+    // `stats` parses the `twill.stats` rows back into the same rendered block.
+    let stats = manage::run("stats", &args(&[&pg])).unwrap();
+    assert!(stats.contains("commits"), "got: {stats}");
+    assert!(stats.contains("storage.wal_appends"), "got: {stats}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn postgres_transport_applies_migrations() {
+    let dir = scratch("pg-migrate");
+    let mig_dir = dir.join("migrations");
+    fs::create_dir_all(&mig_dir).unwrap();
+    fs::write(
+        mig_dir.join("20260101000000_init.sql"),
+        "CREATE TABLE widgets (id integer PRIMARY KEY, label text);",
+    )
+    .unwrap();
+    let mig = mig_dir.to_str().unwrap();
+    let pg = start_pg_server(&db_url(&dir));
+
+    // Apply pending migrations over the wire, then confirm idempotency + status.
+    let up = migrate(&["up", &pg, "--dir", mig]).unwrap();
+    assert!(up.contains("applied 20260101000000_init"), "got: {up}");
+    let again = migrate(&["up", &pg, "--dir", mig]).unwrap();
+    assert!(again.contains("up to date"), "got: {again}");
+    let status = migrate(&["status", &pg, "--dir", mig]).unwrap();
+    assert!(
+        status.contains("[applied] 20260101000000_init"),
+        "got: {status}"
+    );
+
+    // The migrated table is visible over the same wire transport.
+    let tables = manage::run("tables", &args(&[&pg])).unwrap();
+    assert!(tables.contains("widgets"), "got: {tables}");
+
+    fs::remove_dir_all(&dir).ok();
 }
