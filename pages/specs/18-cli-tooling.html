@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scaffolding CLI &amp; Multi-Client Distribution · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">18</span>
+<span class="badge badge-status status-draft">Draft v0.4</span>
+<span class="spec-date">Updated 2026-06-27</span>
+</div>
+<h1>Scaffolding CLI &amp; Multi-Client Distribution</h1>
+<p class="lede">A second binary joins <a href="15-twill-bench.html"><code>twill-bench</code></a> and <a href="07-server-mode.html"><code>engine-server</code></a>: <code>twilldb</code>, a project scaffolder that generates a ready-to-run starter app for a chosen client. This page captures its design and, more importantly, the <strong>distribution strategy</strong> it anchors — how the CLI binary reaches users (a Homebrew tap, cargo, binary downloads) versus how the <em>language clients</em> reach theirs (each ecosystem's own registry), all riding the one frozen C ABI.</p>
+</header>
+
+<section>
+<h2>Why a scaffolding CLI</h2>
+<p>The embedded payoff — a persistent, in-process database with zero infrastructure — is only one <code>open()</code> call away, but a new user still has to assemble a project around it: a <code>package.json</code> that depends on the client, a connection string for the right backend, a first table, and a runnable script. <code>twilldb new</code> collapses that into one command, emitting a working starter that mirrors the verified examples under <code>clients/bun/examples/</code>.</p>
+<div class="callout note">
+<p class="callout-title">The name was deliberately chosen for distribution-cleanliness</p>
+<p>The bare name <code>twill</code> is already taken across the channels that matter: it is a <em>mature CLI on PyPI</em> (so the command name collides on any machine that pip-installed it), and a registered package on npm and crates.io. <code>twilldb</code> is free on npm, crates.io, and Homebrew, and matches the <code>@twilldb</code> npm scope the project already owns. The binary, the crate (<code>twilldb-cli</code>), and the tap are all named <code>twilldb</code>.</p>
+</div>
+</section>
+
+<section>
+<h2>Design principles</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> be a dependency-free Rust binary in its own crate (<code>crates/cli</code>), hand-rolling argument parsing and placeholder substitution like the rest of the workspace — no <code>clap</code>, no template engine. It only writes files; it never links the engine.</li>
+<li><span class="req-tag must">MUST</span> embed its templates at compile time (<code>include_str!</code>), so the binary is self-contained and works offline — no network fetch, no version skew between binary and templates.</li>
+<li><span class="req-tag must">MUST</span> be language-neutral: the scaffolder generates projects for <em>multiple</em> client ecosystems, so it is not itself published into any one of them as the primary channel.</li>
+<li><span class="req-tag must">MUST NOT</span> overwrite existing files; <code>new</code> refuses a non-empty target directory and both subcommands refuse to clobber an individual file.</li>
+<li><span class="req-tag should">SHOULD</span> mirror the dispatch shape of <code>twill-bench</code> — a thin <code>main.rs</code> over a testable <code>run_cli(&amp;[String]) -&gt; i32</code> core — so exit codes are asserted without spawning a process.</li>
+<li><span class="req-tag should">SHOULD</span> recognise not-yet-shipped clients and answer with a roadmap-aware message, not "unknown value".</li>
+</ul>
+</section>
+
+<section>
+<h2>Command structure</h2>
+<div class="code-block"><pre><code>twilldb new &lt;name&gt; [options]    # create a new project in ./&lt;name&gt;
+twilldb init [options]          # scaffold into the current directory
+twilldb version                 # print the version
+twilldb help                    # usage
+
+# options
+-c, --client &lt;bun&gt;              # client ecosystem (default: bun)
+-b, --backend &lt;file|s3&gt;         # storage backend / connection string (default: file)
+    --vector                    # include a vector-search (HNSW) starter
+
+# examples
+twilldb new notes
+twilldb new search --vector
+twilldb new app --backend s3
+twilldb init</code></pre></div>
+<p>The generated Bun starter is a working <code>@twilldb/bun</code> project: <code>package.json</code> (pinned to the workspace version), <code>tsconfig.json</code>, <code>.gitignore</code>, an <code>app.ts</code> derived from <code>examples/notes.ts</code>, and a <code>README.md</code>. <code>--backend</code> only changes the connection string written into <code>app.ts</code> (<code>file://./&lt;name&gt;.db</code> vs an <code>s3://your-bucket/&lt;name&gt;</code> placeholder) — the engine selects the backend purely by URL scheme, so nothing else differs. <code>--vector</code> adds a <code>vectors.ts</code> starter (a <code>vector(3)</code> column, an HNSW index, a top-k query) and wires a <code>vectors</code> script.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>success</td></tr>
+<tr><td>1</td><td>generation failure (I/O, or a refused overwrite)</td></tr>
+<tr><td>2</td><td>usage error (bad flags, unknown subcommand, unavailable client, unsafe name)</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>The C ABI is the universal client seam</h2>
+<p>Only the <strong>Bun</strong> starter ships today; <code>node</code>, <code>php</code>, and <code>rust</code> are recognised by <code>--client</code> but answer with a roadmap message rather than generating. That is not a placeholder accident — it reflects the architecture. Every language client is a <em>thin FFI shim</em> over the same frozen <a href="../docs/c-abi.html">C ABI</a> (<code>crates/engine/include/engine.h</code>) and the same prebuilt <code>libengine</code> binaries; none reimplements the engine. The Bun client (<code>bun:ffi</code> over the header, with per-platform <code>@twilldb/engine-*</code> binary packages as optional dependencies) is the reference shape each future client copies.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Client</th><th>Binding mechanism</th><th>Ships via</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><strong>Bun</strong></td><td><code>bun:ffi</code> over <code>engine.h</code></td><td>npm <code>@twilldb/bun</code></td><td><span class="req-tag must">SHIPPED</span> (reference impl)</td></tr>
+<tr><td><strong>Node</strong></td><td><code>koffi</code> (FFI) — reuse the Bun ergonomic wrapper, swap the loader</td><td>npm <code>@twilldb/node</code></td><td><span class="req-tag may">ROADMAP</span></td></tr>
+<tr><td><strong>PHP</strong></td><td>built-in <code>FFI</code> extension (<code>FFI::cdef</code> over <code>engine.h</code>)</td><td>Composer / Packagist</td><td><span class="req-tag may">ROADMAP</span></td></tr>
+<tr><td>Python / Ruby / Go</td><td>ctypes·cffi / Fiddle·ffi / cgo</td><td>PyPI / RubyGems / go modules</td><td><span class="req-tag may">ROADMAP</span></td></tr>
+<tr><td>Rust</td><td>native (the <code>engine</code> crate)</td><td>crates.io</td><td><span class="req-tag may">ROADMAP</span></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">Adding a client is additive — it never touches the engine or the seam</p>
+<p>A new language binding is a new <code>clients/&lt;lang&gt;/</code> shim plus a new <code>--client</code> template; it requires <em>no</em> engine change, no ABI bump, and no <a href="03-storage-interface.html">storage-seam</a> movement. The single extension point in the CLI is the template set behind <code>--client</code>.</p>
+</div>
+</section>
+
+<section>
+<h2>Distribution: two different problems</h2>
+<p>"How do we distribute this?" has two separate answers, and conflating them is the common mistake. The <strong>CLI / server binaries</strong> are standalone executables; the <strong>client libraries</strong> are language packages. They travel different roads.</p>
+
+<h3>The CLI binary → a Homebrew tap (and friends)</h3>
+<p>The CLI is distributed primarily through a <strong>Homebrew tap</strong> — a self-hosted formula repo (<code>bihaviour/homebrew-twilldb</code>). A tap has <em>no</em> notability/maturity gate and needs no registration, unlike <code>homebrew-core</code> (which also would not accept the project's <code>BUSL-1.1</code> license, a source-available license rather than an OSI-approved one). Users run:</p>
+<div class="code-block"><pre><code>brew tap bihaviour/twilldb      # → github.com/bihaviour/homebrew-twilldb
+brew install twilldb
+
+# or the fully-qualified one-liner (Homebrew needs three parts: user/repo/formula)
+brew install bihaviour/twilldb/twilldb</code></pre></div>
+<p>The formula <strong>builds from source via cargo</strong> (<code>depends_on "rust" =&gt; :build</code>), the simplest robust option for v1 — no per-platform binary matrix to maintain. <code>.github/workflows/release-cli.yml</code> keeps the tap current: on every <code>v*</code> tag it downloads the source tarball, computes its <code>sha256</code>, renders <code>Formula/twilldb.rb</code>, and pushes it to the tap repo (using a <code>HOMEBREW_TAP_TOKEN</code> PAT). The canonical formula and setup steps live in <code>packaging/homebrew/</code>.</p>
+<div class="callout note">
+<p class="callout-title">Same binary, more channels — all gate-free</p>
+<p>Because the CLI is a plain Rust binary, the same release also feeds <code>cargo install twilldb-cli</code>, a Scoop bucket (Windows), and a <code>curl | sh</code> install script over GitHub-Release binaries. The "own tap / own bucket / own flake / AUR" variants of every native package manager have no maturity gate — that gate exists only for the <em>central</em> repos (homebrew-core, winget, official distro archives). Those extra channels are intentionally out of scope for the first pass; if build-from-source time becomes a concern, the tap switches to prebuilt <strong>bottles</strong> (a binary matrix + <code>bottle do … end</code> blocks).</p>
+</div>
+
+<h3>The client libraries → each ecosystem's own registry</h3>
+<p>Homebrew is irrelevant for the language clients. A Bun/Node developer installs from npm; a PHP developer from Composer; a Python developer from PyPI. Each client ships through the registry its users already <code>install</code> from — and none of those have a maturity gate either.</p>
+</section>
+
+<section>
+<h2>The shared release pipeline (the scaling lever)</h2>
+<p>The piece that makes a polyglot client matrix tractable is building <code>libengine</code> <em>once</em> per platform and fanning the same artifacts out. The project already does the npm half (the <code>@twilldb/engine-{os}-{arch}</code> per-platform packages that <code>@twilldb/bun</code> depends on); every other ecosystem reuses those same binaries.</p>
+<div class="code-block"><pre><code>build libengine.{so,dylib,dll} × {linux,darwin,win} × {x64,arm64}
+   ├── npm:       @twilldb/engine-{os}-{arch}   (Bun + Node depend on these)
+   ├── Packagist: PHP wrapper loads the matching binary via FFI
+   ├── PyPI:      wheels bundling the binary
+   └── Homebrew tap / Scoop / cargo / curl|sh:  the CLI + server binaries</code></pre></div>
+</section>
+
+<section>
+<h2>Verification — what ships today</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Capability</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>twilldb new</code> / <code>init</code>, Bun starter</td><td><span class="req-tag must">SHIPPED</span></td><td>5-file Bun project (6 with <code>--vector</code>); name/version/backend substitution; mirrors <code>examples/notes.ts</code></td></tr>
+<tr><td><code>--backend file|s3</code>, <code>--vector</code></td><td><span class="req-tag must">SHIPPED</span></td><td>backend changes the connection string only; vector adds <code>vectors.ts</code> + script + README section</td></tr>
+<tr><td>Safety (no clobber), exit-code contract</td><td><span class="req-tag must">SHIPPED</span></td><td>refuses non-empty dir / existing files; 0 / 1 / 2 contract pinned by <code>crates/cli/tests/scaffold.rs</code></td></tr>
+<tr><td>Homebrew tap formula + release workflow</td><td><span class="req-tag must">SHIPPED</span></td><td><code>packaging/homebrew/twilldb.rb</code> + <code>release-cli.yml</code> (builds from source; auto-bumps url+sha256 on tag)</td></tr>
+<tr><td>Node / PHP / other clients</td><td><span class="req-tag may">ROADMAP</span></td><td>recognised by <code>--client</code>; thin FFI shims over the same C ABI when built</td></tr>
+<tr><td>cargo install / Scoop / <code>curl|sh</code> / bottles</td><td><span class="req-tag may">ROADMAP</span></td><td>same release artifacts; gate-free; deferred from the first pass</td></tr>
+<tr><td><code>--server</code> starter variant</td><td><span class="req-tag may">ROADMAP</span></td><td>a pgwire-connected starter (vs embedded); deferred</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="15-twill-bench.html"><span class="xref-title">Twill Bench CLI</span><span class="xref-desc">The other workspace binary; the same thin-shim-over-testable-core dispatch shape.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">The reference client the scaffolder's Bun starter targets, and the per-platform binary packaging.</span></a>
+<a class="xref" href="11-deployment-targets.html"><span class="xref-title">Deployment Targets</span><span class="xref-desc">Where the engine runs; the distribution channels here put the tooling on the user's machine.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">Where the multi-client expansion sits in the phased plan.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam a new client never crosses; adding a binding is purely additive.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Draft, 2026-06-27. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

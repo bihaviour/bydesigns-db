@@ -1,0 +1,28 @@
+# {{name}}
+
+A [Twill DB](https://github.com/bihaviour/twill-db) starter for **Bun** — a
+serverless OLTP database embedded in-process via `bun:ffi`. No server to run, no
+infrastructure to provision.
+
+## Run it
+
+```bash
+bun install
+bun run start
+```
+
+The native engine ships with `@twilldb/bun` as a per-platform optional
+dependency, so there is no `cargo build` step. To point at a libengine you built
+yourself, set `TWILLDB_ENGINE_PATH=/abs/path/libengine.{so,dylib,dll}`.
+
+## Storage backend
+
+The backend is chosen entirely by the connection string in `app.ts`:
+
+| Scheme | Backend |
+| --- | --- |
+| `file://…` | embedded, persists to a local file (this starter's default) |
+| `s3://` · `r2://` · `gs://` | storage-disaggregated; credentials come from the environment |
+
+This project is configured for `{{db_url}}`.
+{{vector_readme}}
