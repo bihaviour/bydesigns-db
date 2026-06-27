@@ -76,10 +76,21 @@ fn backend_choice_is_honored() {
 
 #[test]
 fn unavailable_client_is_reprompted_until_valid() {
-    // "node" (coming soon) is rejected, then "bun" accepted; then defaults.
-    let a = run("x\nnode\nbun\n\n\n\n", None, None, None, None, true).expect("not aborted");
+    // "rust" (coming soon) is rejected, then "bun" accepted; then defaults.
+    let a = run("x\nrust\nbun\n\n\n\n", None, None, None, None, true).expect("not aborted");
     assert_eq!(a.name, "x");
     assert_eq!(a.client, Client::Bun);
+}
+
+#[test]
+fn node_and_php_clients_are_accepted() {
+    // node is now a shipping client: choose it and take the other defaults
+    // (client, backend, vector, confirm).
+    let a = run("node\n\n\n\n", Some("web"), None, None, None, true).expect("not aborted");
+    assert_eq!(a.client, Client::Node);
+
+    let b = run("php\n\n\n\n", Some("api"), None, None, None, true).expect("not aborted");
+    assert_eq!(b.client, Client::Php);
 }
 
 #[test]

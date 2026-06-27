@@ -1,0 +1,13 @@
+{
+    "name": "{{name}}/app",
+    "description": "A Twill DB starter app (embedded via PHP FFI).",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "ext-ffi": "*",
+        "twilldb/twilldb": "^{{version}}"
+    },
+    "scripts": {
+        "start": "php -d ffi.enable=1 index.php"{{vector_script}}
+    }
+}

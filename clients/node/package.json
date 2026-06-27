@@ -1,0 +1,43 @@
+{
+  "name": "@twilldb/node",
+  "version": "0.4.0",
+  "description": "Embed the Twill DB engine in-process on Node (and Node-based frameworks) via koffi FFI.",
+  "type": "module",
+  "license": "BUSL-1.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bihaviour/twill-db"
+  },
+  "module": "src/index.ts",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "dependencies": {
+    "koffi": "^3.0.2"
+  },
+  "optionalDependencies": {
+    "@twilldb/engine-linux-x64": "0.4.0",
+    "@twilldb/engine-linux-arm64": "0.4.0",
+    "@twilldb/engine-darwin-x64": "0.4.0",
+    "@twilldb/engine-darwin-arm64": "0.4.0",
+    "@twilldb/engine-win32-x64": "0.4.0"
+  },
+  "scripts": {
+    "test": "node --test test/embedded.test.ts",
+    "typecheck": "tsc --noEmit",
+    "example": "node examples/notes.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^6.0.3"
+  }
+}

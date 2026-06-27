@@ -1,0 +1,39 @@
+# {{name}}
+
+A [Twill DB](https://github.com/bihaviour/twill-db) starter for **PHP** — a
+serverless OLTP database embedded in-process via the `twilldb/twilldb` package
+over PHP's FFI extension. No server to run, no infrastructure to provision.
+
+## Run it
+
+```bash
+composer install
+composer start
+```
+
+Requires **PHP ≥ 8.1** with the **FFI** extension enabled (`ffi.enable=1` in
+`php.ini`, or the `-d ffi.enable=1` flag used by the `start` script). The native
+`libengine` is located automatically; to point at one you built yourself, set
+`TWILLDB_ENGINE_PATH=/abs/path/libengine.{so,dylib,dll}`.
+
+## Frameworks
+
+In Laravel, Symfony, or CodeIgniter, open one `Twill\Database` in a
+singleton/service and reuse it across requests (the engine is a single writer per
+database) — ideally on a long-lived worker (FrankenPHP, RoadRunner, Swoole).
+
+Prefer talking Postgres instead? Run `engine-server` and point your framework's
+`pgsql` connection at it (`host=127.0.0.1 port=5433 sslmode=disable`) — no FFI
+needed. See the project docs for the server-mode path.
+
+## Storage backend
+
+The backend is chosen entirely by the connection string in `index.php`:
+
+| Scheme | Backend |
+| --- | --- |
+| `file://…` | embedded, persists to a local file (this starter's default) |
+| `s3://` · `r2://` · `gs://` | storage-disaggregated; credentials come from the environment |
+
+This project is configured for `{{db_url}}`.
+{{vector_readme}}

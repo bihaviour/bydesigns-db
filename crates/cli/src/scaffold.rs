@@ -11,29 +11,59 @@ use std::path::{Path, PathBuf};
 
 use crate::exit;
 
-// ---- Embedded templates (the Bun starter) ----------------------------------
+// ---- Embedded templates -----------------------------------------------------
+//
+// One template set per client ecosystem, under templates/<client>/. Each set is
+// an embedded starter over the same engine; only the host binding differs (Bun:
+// bun:ffi, Node: koffi FFI, PHP: the FFI extension). See spec 20 — Client
+// Runtimes.
 
-const T_PACKAGE: &str = include_str!("../templates/bun/package.json.tmpl");
-const T_TSCONFIG: &str = include_str!("../templates/bun/tsconfig.json.tmpl");
-const T_GITIGNORE: &str = include_str!("../templates/bun/gitignore.tmpl");
-const T_APP: &str = include_str!("../templates/bun/app.ts.tmpl");
-const T_README: &str = include_str!("../templates/bun/README.md.tmpl");
-const T_VECTORS: &str = include_str!("../templates/bun/vectors.ts.tmpl");
+// Bun (the reference client).
+const BUN_PACKAGE: &str = include_str!("../templates/bun/package.json.tmpl");
+const BUN_TSCONFIG: &str = include_str!("../templates/bun/tsconfig.json.tmpl");
+const BUN_GITIGNORE: &str = include_str!("../templates/bun/gitignore.tmpl");
+const BUN_APP: &str = include_str!("../templates/bun/app.ts.tmpl");
+const BUN_README: &str = include_str!("../templates/bun/README.md.tmpl");
+const BUN_VECTORS: &str = include_str!("../templates/bun/vectors.ts.tmpl");
 
-/// README section appended when `--vector` is set.
-const VECTOR_README: &str = "\n## Vector search\n\nThis project includes a \
+// Node (and Node-based frameworks: Next.js, Astro, Nuxt, …).
+const NODE_PACKAGE: &str = include_str!("../templates/node/package.json.tmpl");
+const NODE_TSCONFIG: &str = include_str!("../templates/node/tsconfig.json.tmpl");
+const NODE_GITIGNORE: &str = include_str!("../templates/node/gitignore.tmpl");
+const NODE_APP: &str = include_str!("../templates/node/app.ts.tmpl");
+const NODE_README: &str = include_str!("../templates/node/README.md.tmpl");
+const NODE_VECTORS: &str = include_str!("../templates/node/vectors.ts.tmpl");
+
+// PHP (plain PHP + frameworks: Laravel, Symfony, CodeIgniter).
+const PHP_COMPOSER: &str = include_str!("../templates/php/composer.json.tmpl");
+const PHP_GITIGNORE: &str = include_str!("../templates/php/gitignore.tmpl");
+const PHP_INDEX: &str = include_str!("../templates/php/index.php.tmpl");
+const PHP_README: &str = include_str!("../templates/php/README.md.tmpl");
+const PHP_VECTORS: &str = include_str!("../templates/php/vectors.php.tmpl");
+
+/// Per-client README section + manifest script entry appended when `--vector`
+/// is set. `(readme, script)`.
+const BUN_VECTOR_README: &str = "\n## Vector search\n\nThis project includes a \
 vector starter (`vectors.ts`):\n\n```bash\nbun run vectors\n```\n\nIt creates a \
 `vector(3)` column, an HNSW index, and runs a top-k nearest-neighbour query.\n";
+const BUN_VECTOR_SCRIPT: &str = ",\n    \"vectors\": \"bun run vectors.ts\"";
 
-/// `package.json` script entry added when `--vector` is set.
-const VECTOR_SCRIPT: &str = ",\n    \"vectors\": \"bun run vectors.ts\"";
+const NODE_VECTOR_README: &str = "\n## Vector search\n\nThis project includes a \
+vector starter (`vectors.ts`):\n\n```bash\nnpm run vectors\n```\n\nIt creates a \
+`vector(3)` column, an HNSW index, and runs a top-k nearest-neighbour query.\n";
+const NODE_VECTOR_SCRIPT: &str = ",\n    \"vectors\": \"node vectors.ts\"";
+
+const PHP_VECTOR_README: &str = "\n## Vector search\n\nThis project includes a \
+vector starter (`vectors.php`):\n\n```bash\ncomposer vectors\n```\n\nIt creates a \
+`vector(3)` column, an HNSW index, and runs a top-k nearest-neighbour query.\n";
+const PHP_VECTOR_SCRIPT: &str = ",\n        \"vectors\": \"php -d ffi.enable=1 vectors.php\"";
 
 // ---- Request model ----------------------------------------------------------
 
-/// The client ecosystem a starter targets. Only [`Client::Bun`] is generated
-/// today; the others are recognised so the CLI gives a roadmap-aware message
-/// rather than "unknown value" — the engine's C ABI makes each a thin future
-/// binding (see the CLI spec page).
+/// The client ecosystem a starter targets. Bun, Node, and PHP each generate a
+/// working embedded starter over the same engine C ABI (see spec 20 — Client
+/// Runtimes); `rust` is recognised so the CLI gives a roadmap-aware message
+/// rather than "unknown value".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Client {
     Bun,
@@ -57,7 +87,7 @@ impl Client {
 
     /// Whether a starter for this client can be generated yet.
     pub fn available(self) -> bool {
-        matches!(self, Client::Bun)
+        matches!(self, Client::Bun | Client::Node | Client::Php)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -141,11 +171,11 @@ impl GenError {
 // ---- Generation -------------------------------------------------------------
 
 /// Render the file list (relative path → contents) for a request. Pure: writes
-/// nothing, so tests can assert the tree directly.
+/// nothing, so tests can assert the tree directly. Each client has its own
+/// template set, but the substitution tokens are shared.
 pub fn files(req: &Request) -> Vec<(String, String)> {
     let db_url = req.backend.db_url(&req.name);
-    let vector_script = if req.vector { VECTOR_SCRIPT } else { "" };
-    let vector_readme = if req.vector { VECTOR_README } else { "" };
+    let (vector_script, vector_readme) = vector_tokens(req.client, req.vector);
     let render = |tmpl: &str| {
         tmpl.replace("{{name}}", &req.name)
             .replace("{{version}}", env!("CARGO_PKG_VERSION"))
@@ -154,17 +184,62 @@ pub fn files(req: &Request) -> Vec<(String, String)> {
             .replace("{{vector_readme}}", vector_readme)
     };
 
-    let mut out = vec![
-        ("package.json".to_string(), render(T_PACKAGE)),
-        ("tsconfig.json".to_string(), render(T_TSCONFIG)),
-        (".gitignore".to_string(), render(T_GITIGNORE)),
-        ("app.ts".to_string(), render(T_APP)),
-        ("README.md".to_string(), render(T_README)),
-    ];
-    if req.vector {
-        out.push(("vectors.ts".to_string(), render(T_VECTORS)));
+    match req.client {
+        Client::Bun => {
+            let mut out = vec![
+                ("package.json".to_string(), render(BUN_PACKAGE)),
+                ("tsconfig.json".to_string(), render(BUN_TSCONFIG)),
+                (".gitignore".to_string(), render(BUN_GITIGNORE)),
+                ("app.ts".to_string(), render(BUN_APP)),
+                ("README.md".to_string(), render(BUN_README)),
+            ];
+            if req.vector {
+                out.push(("vectors.ts".to_string(), render(BUN_VECTORS)));
+            }
+            out
+        }
+        Client::Node => {
+            let mut out = vec![
+                ("package.json".to_string(), render(NODE_PACKAGE)),
+                ("tsconfig.json".to_string(), render(NODE_TSCONFIG)),
+                (".gitignore".to_string(), render(NODE_GITIGNORE)),
+                ("app.ts".to_string(), render(NODE_APP)),
+                ("README.md".to_string(), render(NODE_README)),
+            ];
+            if req.vector {
+                out.push(("vectors.ts".to_string(), render(NODE_VECTORS)));
+            }
+            out
+        }
+        Client::Php => {
+            let mut out = vec![
+                ("composer.json".to_string(), render(PHP_COMPOSER)),
+                (".gitignore".to_string(), render(PHP_GITIGNORE)),
+                ("index.php".to_string(), render(PHP_INDEX)),
+                ("README.md".to_string(), render(PHP_README)),
+            ];
+            if req.vector {
+                out.push(("vectors.php".to_string(), render(PHP_VECTORS)));
+            }
+            out
+        }
+        // Unavailable: `generate()` guards before reaching here.
+        Client::Rust => Vec::new(),
     }
-    out
+}
+
+/// `(vector_script, vector_readme)` substitution values for a client, or empty
+/// strings when `--vector` is off.
+fn vector_tokens(client: Client, vector: bool) -> (&'static str, &'static str) {
+    if !vector {
+        return ("", "");
+    }
+    match client {
+        Client::Bun => (BUN_VECTOR_SCRIPT, BUN_VECTOR_README),
+        Client::Node => (NODE_VECTOR_SCRIPT, NODE_VECTOR_README),
+        Client::Php => (PHP_VECTOR_SCRIPT, PHP_VECTOR_README),
+        Client::Rust => ("", ""),
+    }
 }
 
 /// Generate the project. `is_new` is true for `twilldb new` (the target dir must
@@ -212,9 +287,9 @@ pub fn generate(req: &Request, is_new: bool) -> Result<Vec<PathBuf>, GenError> {
 /// The message shown when a not-yet-shipped client is requested.
 pub fn unavailable_msg(client: Client) -> String {
     format!(
-        "the '{}' client is not available yet — only 'bun' ships today.\n\
-         twilldb's C ABI makes each language a thin binding; node, php and rust \
-         are on the roadmap (see pages/specs).",
+        "the '{}' client is not available yet — bun, node and php ship today.\n\
+         twilldb's C ABI makes each language a thin binding; a native rust \
+         starter is on the roadmap (see pages/specs/20-client-runtimes.html).",
         client.as_str()
     )
 }

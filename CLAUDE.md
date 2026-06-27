@@ -52,6 +52,8 @@ crates/controller # lifecycle controller: scale-to-zero instances, lease heartbe
 crates/bench      # twill-bench: embedded + pgwire benchmark/correctness driver (spec 09/15)
 crates/cli        # twilldb: project scaffolder — `twilldb new`/`init` generates a starter app (embedded templates, dependency-free)
 clients/bun       # @twilldb/bun: bun:ffi bindings + ergonomic typed wrapper + example
+clients/node      # @twilldb/node: koffi FFI bindings (same surface as bun) for Node + frameworks (Next.js/Astro/Vite); spec 20
+clients/php       # twilldb/twilldb: PHP FFI-extension bindings (embedded) + PDO server-mode example (Laravel/CodeIgniter); spec 20
 pages/            # the website + documentation (static HTML, deployed to GitHub Pages):
                   #   index.html  — home (project overview)
                   #   docs/       — user documentation (connect, branch, pool, operate)
@@ -89,6 +91,12 @@ cd clients/bun
 bun test                                      # end-to-end embedded tests
 TWILLDB_ENGINE_PATH=/abs/path/libengine.so bun test   # explicit library override
 bun run examples/notes.ts                      # runnable sample app
+
+# Node client (@twilldb/node; koffi FFI; same surface as bun). Needs koffi: `bun add koffi` in clients/node.
+node --test clients/node/test/embedded.test.ts   # end-to-end embedded tests (Node >= 22.18 runs .ts directly)
+
+# PHP client (twilldb/twilldb; built-in FFI extension; embedded). No Composer needed for the test.
+php -d ffi.enable=1 clients/php/test/embedded_test.php   # end-to-end embedded tests
 
 # Website + docs (static HTML in pages/, no build step; deployed to GitHub Pages)
 bunx http-server pages -c-1                     # preview the site locally (uses bunx, not python3)

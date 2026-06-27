@@ -1,0 +1,62 @@
+<?php
+
+declare(strict_types=1);
+
+// {{name}} — a Twill DB starter for PHP (embedded path).
+//
+// The engine runs in-process via the twilldb/twilldb package over PHP's FFI
+// extension; there is no server to start. The storage backend is chosen entirely
+// by the connection-string scheme below.
+//
+//   composer install
+//   composer start          # php -d ffi.enable=1 index.php
+//
+// Requires PHP >= 8.1 with the FFI extension enabled (ffi.enable=1). The native
+// libengine is located automatically; override with TWILLDB_ENGINE_PATH.
+
+require __DIR__ . '/vendor/autoload.php';
+
+use Twill\Database;
+
+// file://    embedded, persists to a local file
+// s3://|r2://|gs://  storage-disaggregated (credentials come from the env)
+$url = '{{db_url}}';
+echo "opening {$url}\n";
+
+$db = Database::open($url);
+try {
+    $db->exec('CREATE TABLE IF NOT EXISTS notes (
+        id     INTEGER PRIMARY KEY,
+        body   TEXT NOT NULL,
+        weight REAL
+    )');
+
+    // Start fresh each run for a deterministic demo.
+    $db->exec('DELETE FROM notes');
+
+    // Parameterized inserts (values bind positionally; no string interpolation).
+    $insert = $db->prepare('INSERT INTO notes (id, body, weight) VALUES (?, ?, ?)');
+    try {
+        $insert->run(1, 'buy milk', 1.0);
+        $insert->run(2, 'write spec', 2.5);
+        $insert->run(3, 'ship it', 9.9);
+    } finally {
+        $insert->finalize();
+    }
+
+    // A transaction: commit on normal return; the commit blocks until durable.
+    $db->transaction(static function (Database $tx) {
+        $tx->exec('UPDATE notes SET weight = weight + 1 WHERE id = 1');
+        $tx->exec("INSERT INTO notes (id, body, weight) VALUES (4, 'tidy up', 0.5)");
+    });
+
+    echo "\nall notes (by weight desc):\n";
+    foreach ($db->query('SELECT id, body, weight FROM notes ORDER BY weight DESC') as $row) {
+        \printf("  #%s  %-16s %s\n", $row['id'], $row['body'], $row['weight']);
+    }
+
+    echo "\nlast commit LSN: {$db->lastLsn()}\n";
+    echo "persisted to {$url} — re-run to see it reload from the WAL.\n";
+} finally {
+    $db->close();
+}

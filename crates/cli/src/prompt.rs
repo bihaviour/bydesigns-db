@@ -107,7 +107,7 @@ fn prompt_name<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> io::Result<S
 
 fn prompt_client<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> io::Result<Client> {
     loop {
-        write!(out, "Client [bun] (node/php/rust coming soon): ")?;
+        write!(out, "Client [bun] (bun/node/php; rust coming soon): ")?;
         out.flush()?;
         match read_line(input)? {
             // Empty line or EOF accepts the default.
@@ -117,7 +117,7 @@ fn prompt_client<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> io::Result
                 Ok(c) if c.available() => return Ok(c),
                 Ok(c) => writeln!(
                     out,
-                    "  the '{}' client is coming soon — choose 'bun' for now.",
+                    "  the '{}' client is coming soon — choose bun, node or php for now.",
                     c.as_str()
                 )?,
                 Err(e) => writeln!(out, "  {e}")?,
