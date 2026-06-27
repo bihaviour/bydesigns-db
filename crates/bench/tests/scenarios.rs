@@ -220,9 +220,11 @@ fn scale_to_zero_rejects_the_pgwire_form() {
 #[test]
 fn long_run_flat_control_passes() {
     // A short soak with no seeded growth: the interval sampler captures a series,
-    // the trend checker fits a slope over memory/fds/p99, and a steady run trends
-    // up on nothing past its floor → clean exit. Short duration + fast sampling
-    // keeps it quick while still producing enough samples to fit a line.
+    // the trend checker fits a slope over the gated leak gauges (memory/fds), and
+    // a steady run trends up on nothing past its floor → clean exit. Short
+    // duration + fast sampling keeps it quick while still producing enough
+    // samples to fit a line. (p99 is sampled too but informational, so its noisy
+    // per-window tail can't flake this control run.)
     let url = unique_url();
     let code = run_cli(&argv(&[
         "long-run",

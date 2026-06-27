@@ -14,9 +14,11 @@
 //!     thread counts from Linux `/proc/self`, degrading to zeros (never a crash)
 //!     where `/proc` is unavailable — no extra dependency (guardrail 1, #78).
 //!   * **L3 — trend / leak analysis** ([`analyze`]): a least-squares slope per
-//!     metric (memory, fds, p99) over the post-warm-up window, flagging a
-//!     leak/drift when the projected growth crosses both a relative threshold
-//!     (`--drift-threshold`) and an absolute noise floor.
+//!     metric over the post-warm-up window, flagging a leak/drift when a *gated*
+//!     metric's projected growth crosses both a relative threshold
+//!     (`--drift-threshold`) and an absolute noise floor. Memory and fds are
+//!     gated (cumulative, monotone leak gauges); p99 is sampled and reported but
+//!     informational — a noisy per-window tail statistic, not a leak gauge.
 //!
 //! The metric source is the same pull-based snapshot the rest of the bench uses
 //! ([`Connection::stats`] / `StorageStats` — #53 Decision 2), so the engine core
@@ -37,9 +39,10 @@ use std::time::{Duration, Instant};
 
 /// The soak scenario's own table: a pre-seeded fixed working set the writers read
 /// from. The load is deliberately **steady-state** (point reads over a bounded
-/// set), not unbounded ingestion — a soak is a *stability* baseline, so memory,
-/// fds, and p99 must be genuinely flat under a healthy engine for a real leak or
-/// drift to stand out. An insert-only load would grow the WAL and the in-memory
+/// set), not unbounded ingestion — a soak is a *stability* baseline, so the
+/// gated gauges (memory, fds) must be genuinely flat under a healthy engine for
+/// a real leak or drift to stand out. An insert-only load would grow the WAL and
+/// the in-memory
 /// MVCC store without bound (no vacuum this phase), drifting on its own and
 /// drowning the signal the soak exists to find.
 const TABLE: &str = "bench_soak";
@@ -182,8 +185,10 @@ struct Gate {
     floor: f64,
 }
 
-/// The gated metrics and their noise floors (L3 flags memory, fds, p99).
-const GATES: [Gate; 3] = [
+/// The gated metrics and their noise floors (L3 gates memory and fds — the two
+/// cumulative, monotone leak gauges). p99 latency is sampled and reported but
+/// deliberately **not** gated: see the `metrics` table in [`analyze`].
+const GATES: [Gate; 2] = [
     // 8 MiB of resident growth — well above allocator slack on a short run.
     Gate {
         name: "memory",
@@ -193,11 +198,6 @@ const GATES: [Gate; 3] = [
     Gate {
         name: "fds",
         floor: 4.0,
-    },
-    // 200 µs of p99 drift — above the run-to-run jitter of a warm window.
-    Gate {
-        name: "p99",
-        floor: 200.0,
     },
 ];
 
@@ -278,8 +278,9 @@ fn trend(
 }
 
 /// The trend / leak analysis (L3). Drop samples inside the warm-up window, fit a
-/// slope per gated metric (memory, fds, p99) plus the informational `threads`
-/// gauge, and decide the verdict: PASS unless a gated metric's projected growth
+/// slope per gated metric (memory, fds) plus the informational `p99`, `threads`,
+/// and `commits` gauges, and decide the verdict: PASS unless a gated metric's
+/// projected growth
 /// crosses both the relative `threshold` and its absolute floor. Fewer than two
 /// post-warm-up samples can't support a trend, so the run passes (no evidence of
 /// a leak), with `analyzed` recording how many samples were actually fit.
@@ -294,7 +295,17 @@ pub(crate) fn analyze(samples: &[Sample], warmup: Duration, threshold: f64) -> S
     let metrics: [(&'static str, bool, f64, Extract); 5] = [
         (GATES[0].name, true, GATES[0].floor, |s| s.rss_bytes as f64),
         (GATES[1].name, true, GATES[1].floor, |s| s.fds as f64),
-        (GATES[2].name, true, GATES[2].floor, |s| s.p99_us as f64),
+        // p99 is sampled and reported but NOT gated. Unlike RSS and fds — which
+        // are cumulative, monotone gauges where any sustained positive slope is
+        // a real leak — p99 is a noisy per-window tail statistic: over a short
+        // soak each `--sample-interval-ms` window holds only a handful of
+        // commits, so a single slow one (an fsync stall / scheduler preemption
+        // on a shared host) sets that window's 99th percentile and, landing late
+        // in the run, fits a large positive slope that clears any jitter-scale
+        // floor. The bulk distribution (p50–p95) stays flat through it, so a
+        // slope over window-p99 cannot distinguish drift from one tail outlier.
+        // It is informational, like threads/commits.
+        ("p99", false, 0.0, |s| s.p99_us as f64),
         // Threads and the cumulative commits counter are sampled and reported,
         // but a change in either is not a gated leak verdict on its own — they
         // are informational (a stalled `commits` slope is a liveness signal, not
@@ -761,7 +772,7 @@ nonsense line without colon
         assert!(a.analyzed < 2);
     }
 
-    /// L4: the seeded-leak hook makes every gated metric rise so the verdict
+    /// L4: the seeded-leak hook makes the gated metrics rise so the verdict
     /// fails even when the real gauges start flat (e.g. `/proc` absent).
     #[test]
     fn seeded_leak_fails_the_verdict() {
@@ -769,12 +780,19 @@ nonsense line without colon
         seed_leak(&mut s);
         let a = analyze(&s, Duration::from_secs(2), 0.10);
         assert!(!a.passed, "the seeded leak must trip the verdict");
-        // All three gated metrics climb under the seed.
-        for name in ["memory", "fds", "p99"] {
+        // The gated leak gauges (memory, fds) climb under the seed.
+        for name in ["memory", "fds"] {
             assert!(
                 a.trends.iter().find(|t| t.name == name).unwrap().leaking,
                 "{name} should be flagged under the seeded leak"
             );
         }
+        // p99 also rises under the seed but is informational — reported, never
+        // gated, so it can never flip the verdict on its own.
+        let p99 = a.trends.iter().find(|t| t.name == "p99").unwrap();
+        assert!(
+            !p99.gated && !p99.leaking,
+            "p99 must be informational, not a gated leak signal"
+        );
     }
 }
