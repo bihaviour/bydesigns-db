@@ -228,11 +228,50 @@ twilldb new search --client node --vector   # + an HNSW vector starter</code></p
 <section>
 <h2>Open questions &amp; risks</h2>
 <ul>
-<li><strong>NAPI vs koffi for Node.</strong> koffi ships today with no compile step; a <code>napi-rs</code> addon could lower per-call overhead for very chatty loops. Quantify against the embedded micro-loop (<a href="09-benchmark-plan.html">09</a>) before committing.</li>
+<li><strong>NAPI vs koffi for Node — decided (EX-2 / #101): stay FFI-only.</strong> koffi already gives cross-runtime Node support over the same C ABI with no compile step; a <code>napi-rs</code> addon is added only on demand if a measured per-call overhead on the embedded micro-loop (<a href="09-benchmark-plan.html">09</a>) justifies it. See the decision section above.</li>
 <li><strong>PHP worker model.</strong> The embedded path shines on persistent workers (FrankenPHP/RoadRunner/Swoole) and is weakest under per-request <code>php-fpm</code>. Should the PHP package detect the SAPI and nudge toward server mode there?</li>
 <li><strong>Published <code>.ts</code> vs prebuilt JS.</strong> Shipping <code>.ts</code> (like <code>@twilldb/bun</code>) keeps one source but pins a minimum Node; a prebuilt <code>dist/</code> widens reach at the cost of a build step. Pick per ecosystem norms.</li>
 <li><strong>Surface drift.</strong> As the engine grows (streaming cursors, new capabilities), all loaders must move together. A shared conformance suite run across runtimes guards this.</li>
 </ul>
+</section>
+
+<section>
+<h2>Decision — NAPI vs FFI for a single Bun + Node package (EX-2 / #101)</h2>
+<p><strong>Decision: stay FFI-only. Ship Bun via <code>bun:ffi</code> and Node via
+koffi over the same frozen C ABI; add a NAPI addon only on demand.</strong> This
+is a MAY decision/spike, not committed build work, and it does <strong>not touch
+the C ABI</strong> (<code>engine.h</code>) — both bindings consume the same FFI
+boundary, so there is no engine-core or storage change either way.</p>
+<h3>Why FFI-only wins now</h3>
+<p>The premise that made NAPI attractive — "cross-runtime needs a compiled addon"
+— no longer holds: <strong>cross-runtime is already achieved without NAPI.</strong>
+<code>@twilldb/node</code> binds the <em>same</em> <code>libengine</code> through
+koffi, mirroring <code>@twilldb/bun</code>'s <code>bun:ffi</code> surface
+one-for-one, so <code>open</code> / <code>query</code> / <code>transaction</code>
+have identical semantics in both runtimes against one prebuilt platform binary —
+the exact "if cross-runtime is chosen, prove one triple identical in Bun and Node"
+exit criterion, met with zero addon code.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Axis</th><th>FFI-only (bun:ffi + koffi) — chosen</th><th>NAPI addon (napi-rs)</th></tr></thead>
+<tbody>
+<tr><td>Runtime reach</td><td>Bun + Node (+ PHP FFI) over one C ABI</td><td>Bun + Node; needs a Node-API shim host</td></tr>
+<tr><td>Build / distribution</td><td>one <code>libengine</code> per platform; no postinstall compile</td><td>per-platform <code>.node</code> prebuilds shipped via <code>optionalDependencies</code></td></tr>
+<tr><td>Maintenance</td><td>one binding surface, mirrored per loader</td><td>extra addon crate + Node-API version matrix to track</td></tr>
+<tr><td>Per-call overhead</td><td>FFI marshalling (ample for OLTP statement latency)</td><td>marginally lower for very chatty micro-loops</td></tr>
+<tr><td>Time to ship</td><td>shipping today</td><td>new crate, CI, and release pipeline first</td></tr>
+</tbody>
+</table>
+</div>
+<h3>The on-demand trigger</h3>
+<p>Revisit NAPI only if a concrete need appears: (a) a measured per-call overhead
+on the embedded micro-loop (<a href="09-benchmark-plan.html">09</a>) that FFI
+marshalling cannot meet for a real workload, or (b) a target runtime that cannot
+load a raw <code>cdylib</code> through an FFI library but does host Node-API. Until
+one of those is real, a NAPI addon is per-platform compile + distribute +
+maintenance cost buying reach we already have. The shared cross-runtime
+conformance suite (run against Bun, Node, and PHP) is what guards surface drift —
+not a second binding mechanism.</p>
 </section>
 
 <section>

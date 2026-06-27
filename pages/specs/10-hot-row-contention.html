@@ -371,6 +371,63 @@ SELECT coalesce(sum(delta), 0) AS total
 </section>
 
 <section>
+<h2>Addendum — observable contention + the routing runbook (EX-4 / #103)</h2>
+<p>EX-4 makes the Option-2 boundary <strong>measurable in production</strong> (the
+MUST above) so the "rare outlier" assumption stays falsifiable. It is
+<strong>metrics only</strong>: single-writer-per-DB and MVCC serialization are
+unchanged — the counters surface behaviour that already happens, they never
+alter it.</p>
+<h3>The signal</h3>
+<p>Every write to a database serializes through one <em>write lane</em>
+(single-writer-per-DB). The lane now carries three read-only counters, folded
+into <code>Database::stats()</code> (<a href="../specs/15-twill-bench.html">#53</a>
+<code>EngineStats</code>) and exported in-band over pgwire as <code>twill.stats</code>:</p>
+<table>
+<thead><tr><th>Metric</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>twill_write_lane_acquire_total</code></td><td>write-lane acquisitions (≈ write transactions) — the denominator</td></tr>
+<tr><td><code>twill_write_handoff_total</code></td><td>acquisitions that had to wait behind another writer — the <strong>serialized-handoff</strong> count</td></tr>
+<tr><td><code>twill_write_wait_us_total</code></td><td>cumulative microseconds writers spent blocked on the lane</td></tr>
+</tbody>
+</table>
+<p>Because every write funnels through the one lane, the <strong>handoff rate</strong>
+(<code>handoff_total / acquire_total</code>) and the <strong>mean wait</strong>
+(<code>wait_us_total / handoff_total</code>) are the hot-row contention signal at
+the granularity the engine actually serializes at: per-DB, which — under the
+many-small-DBs posture where each tool gets its own database — <em>is</em> the
+per-tool signal. An uncontended workload records acquisitions with a flat handoff
+count (nothing to wait behind); a hot row drives the handoff share and wait time
+up. The counters are cumulative, so a sampler takes the delta between two pulls.</p>
+<h3>Routing runbook (Option 2, per tool)</h3>
+<p>Correctness is global; <strong>placement is per-tool</strong> and reversible.
+The decision is deterministic and test-driven:</p>
+<ol>
+<li><strong>Observe.</strong> Sample <code>twill.stats</code> (or
+<code>EngineStats</code> embedded) per database over a window. Compute the handoff
+rate and mean wait from the deltas.</li>
+<li><strong>Flag.</strong> A tool is a hot-row outlier when its handoff rate and
+mean wait stay above threshold across several windows under real load — a single
+spike is not a flag. Default threshold: sustained handoff rate &gt; ~50% with mean
+wait above the backend's durable-handoff latency (≈ the CAS/fsync round-trip);
+tune per workload. The threshold is a platform default, overridable per tool.</li>
+<li><strong>First, try to fix in place.</strong> Apply the Option-1 helpers
+(sharded counter / event-log) — these convert most red-quadrant workloads back to
+green without moving anything. Re-sample to confirm the handoff rate dropped.</li>
+<li><strong>If still contended, route.</strong> Move <em>only the flagged tool's</em>
+write path to coupled Postgres; every other tool stays on the engine untouched.
+Nothing about the engine or other tools changes — the boundary is per-DB.</li>
+<li><strong>Verify reversibility.</strong> The decision is falsifiable: if the
+flagged tool's contention later falls (workload shift, sharding adopted), the same
+metrics show it, and the tool routes back. Placement is never one-way.</li>
+</ol>
+<p>The handoff counters and their uncontended-vs-contended behaviour are pinned by
+<code>crates/engine/tests/group_commit.rs</code>
+(<code>write_lane_handoffs_are_observable_under_contention</code>) and surfaced
+over the wire via the <code>twill.stats</code> family in
+<code>crates/server/src/introspect.rs</code>.</p>
+</section>
+
+<section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
 <a class="xref" href="09-benchmark-plan.html"><span class="xref-title">Benchmark &amp; Validation Plan</span><span class="xref-desc">Experiment 3 is the red-quadrant detector that flags hot-row outliers; Exp 2 proves the W1 group-commit plateau.</span></a>
