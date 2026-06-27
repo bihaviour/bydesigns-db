@@ -110,7 +110,7 @@
           <li><span class="req-tag stage">Report ✓</span><span>Reporting — <code>--json</code>-only mode, the full 0–4 exit-code table, p90/p95 percentiles, and <code>compare --baseline --candidate</code> for release-over-release diffs. <em>Shipped.</em></span></li>
           <li><span class="req-tag stage">Lifecycle ✓</span><span>Lifecycle scenarios &amp; serverless-efficiency metrics — <code>scale-to-zero</code> (Exp 5 cold read), <code>burst</code> (closed-loop rate driver), <code>long-run</code> (interval sampler + leak/drift detection), and a feature-gated <code>custom --profile workload.yaml</code> loader; compute active/idle, scale-to-zero count, compute-seconds/query. <em>Shipped (issues #78–#81).</em></span></li>
         </ul>
-        <p>Detail in <a href="../specs/15-twill-bench.html">Twill Bench CLI</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/49" target="_blank" rel="noopener">issue #49</a>. Remaining work is the ongoing spec-09 five-experiment validation, not the CLI surface.</p>
+        <p>Detail in <a href="../specs/15-twill-bench.html">Twill Bench CLI</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/49" target="_blank" rel="noopener">issue #49</a>. Remaining work is the ongoing spec-09 five-experiment validation (<a href="https://github.com/bihaviour/twill-db/issues/91" target="_blank" rel="noopener">epic #91</a>), not the CLI surface.</p>
       </div>
 
       <div class="tl-item next">
@@ -121,7 +121,7 @@
           <li><span class="req-tag may">MAY</span> support <strong>incremental index maintenance</strong> under heavy delete churn (deletes are tombstoned today; full-vs-incremental rebuild is an open question).</li>
           <li><span class="req-tag should">SHOULD</span> expose richer <strong>recall tuning</strong> — HNSW is approximate by design, governed by <code>ef_search</code>; surface and document the recall/latency trade-off.</li>
         </ul>
-        <p>Detail in <a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a> and the <a href="../specs/phase-5-capabilities.html">vector-search implementation map</a>.</p>
+        <p>Detail in <a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a> and the <a href="../specs/phase-5-capabilities.html">vector-search implementation map</a>; scoped in <a href="https://github.com/bihaviour/twill-db/issues/89" target="_blank" rel="noopener">epic #89</a>.</p>
       </div>
 
       <div class="tl-item next">
@@ -132,6 +132,7 @@
           <li><span class="req-tag should">SHOULD</span> make the exact <strong>pgwire subset boundary</strong> explicit — the minimum for <code>Bun.sql</code> / PostgREST / <code>pgbench</code> may be smaller than full Postgres compatibility.</li>
           <li><span class="req-tag must">MUST</span> keep the per-tool go/no-go decision attached to rollout, routing write-heavy hot-row outliers to coupled Postgres rather than blocking a gate. See <a href="../specs/10-hot-row-contention.html">Hot-Row Contention</a>.</li>
         </ul>
+        <p>Scoped in <a href="https://github.com/bihaviour/twill-db/issues/90" target="_blank" rel="noopener">epic #90</a>.</p>
       </div>
 
     </div>
@@ -184,7 +185,7 @@
           <tr><td>14</td><td><a href="../specs/14-tradeoffs-risks.html">Tradeoffs &amp; Risk Register</a></td><td>Write latency, single-writer ceiling, cold start</td><td><span class="chip shipped">● Live</span></td></tr>
           <tr><td>15</td><td><a href="../specs/15-twill-bench.html">Twill Bench CLI</a></td><td>Benchmark + correctness + serverless-efficiency CLI (all scenarios shipped)</td><td><span class="chip shipped">● Live</span></td></tr>
           <tr><td>16</td><td><a href="../specs/16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a></td><td>PostgreSQL/SQLite → Twill surface (Phase 6: 6A–6E live)</td><td><span class="chip shipped">● Live</span></td></tr>
-          <tr><td>17</td><td><a href="../specs/17-row-level-security.html">Row-Level Security</a></td><td>Proposal (Phase 7) — not yet implemented</td><td><span class="chip planned">○ Backlog</span></td></tr>
+          <tr><td>17</td><td><a href="../specs/17-row-level-security.html">Row-Level Security</a></td><td>Proposal (Phase 7) — not yet implemented (<a href="https://github.com/bihaviour/twill-db/issues/88" target="_blank" rel="noopener">epic #88</a>)</td><td><span class="chip planned">○ Backlog</span></td></tr>
         </tbody>
       </table>
     </div>
