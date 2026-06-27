@@ -531,5 +531,10 @@ fn report(
         soak: None,
         burst: None,
         mix_realized: None,
+        archival: crate::Archival::from_opts(opts),
+        stall: None,
+        sweep: None,
+        shard: None,
+        herd: None,
     }
 }

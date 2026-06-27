@@ -44,6 +44,46 @@ $BIN exp2 --transport pgwire --url file:///tmp/bench.db --writers 8 --duration-m
 $BIN exp2 --server 127.0.0.1:5433 --url file:///srv.db --writers 8 --duration-ms 5000
 ```
 
+### Validation campaign (spec 09 sweeps & gates — issue #91)
+
+The campaign turns the single-lever experiments into the falsifiable boundary
+the platform routes by. Each sweep drives the public commit path, builds the
+spec-09 curve, and hands it to a pure analysis layer (`src/analysis.rs`) for the
+verdict — the gates are off by default (report-only) and map to a non-zero exit
+under `--gate` for CI.
+
+```bash
+# V-1 — Exp-1 variants + stall acceptance gate (p999/p50). --max-stall-ratio
+# trips (exit 1) on a commit-path stall; --cold-connection pays a fresh connect
+# per sample (the cold-connection distribution); --region tags the archive.
+$BIN exp1 --url s3://bucket/db --duration-ms 5000 --region us-east-1 \
+  --max-stall-ratio 50                     # steady state, same-region
+$BIN exp1 --url s3://bucket/db --duration-ms 5000 --cold-connection
+
+# V-2 — group-commit-window sweep + plateau-knee detection. Sweeps 1..N writers
+# (the coalescing window), finds the knee, gates plateau vs the Exp-1 ceiling.
+$BIN exp2-sweep --url s3://bucket/db --sweep-max 64 --duration-ms 5000 --gate
+
+# V-3 — N-database sharding sweep: 1..N independent DBs under one pacer; reports
+# aggregate scaling and the cross-DB CAS finding (efficiency < 0.80 → sub-linear).
+$BIN exp3-shard --url s3://bucket/db --databases 16 --writers 8 --duration-ms 5000
+
+# V-4 — thundering-herd: 1..N simultaneous cold starts; reports the spin-up
+# saturation knee + controller-pulled admission-wait / peak-workers.
+$BIN herd --url file:///tmp/bench.db --concurrency 64 --rows 100 --idle-ms 600000
+
+# V-5 — boundary tables from a directory of archived records (W1/W2 decision rule).
+$BIN boundary --dir bench-archive --out boundary.md --gate
+```
+
+The archived JSON record now also pins run provenance (`region`,
+`instance_type`, `backend_sha` from `TWILL_BENCH_BACKEND_SHA`, `captured_at`) so a
+baseline is reproducible. The scheduled CI job
+(`.github/workflows/bench-validation.yml`) runs Exp 1–3 against real S3 when the
+`BENCH_S3_*` secrets are present (else a `file://` smoke), archives the records,
+gates regressions via `compare`, folds in the Experiment-4 crash-safety verdict,
+and emits the boundary tables.
+
 ### Request-mix scenarios (named workload shapes)
 
 A ratio-controlled mix of `SELECT`/`INSERT`/`UPDATE`/`DELETE` over a pre-seeded

@@ -252,6 +252,11 @@ pub(crate) fn run_mix_core(run: &MixRun, opts: &Opts) -> Result<(Report, [u64; 4
         soak: None,
         burst: None,
         mix_realized: None,
+        archival: crate::Archival::from_opts(opts),
+        stall: None,
+        sweep: None,
+        shard: None,
+        herd: None,
     };
     Ok((report, realized))
 }

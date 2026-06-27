@@ -1,0 +1,130 @@
+name: Bench validation (spec-09 campaign)
+
+# The spec-09 validation campaign as a scheduled regression gate (issue #91 V-5).
+# It runs the experiment sweep, archives each run as a JSON record pinned with
+# the git SHA + region + instance type + storage-backend SHA + date, gates the
+# numbers against a committed baseline via `twill-bench compare`, folds in the
+# Experiment-4 crash-safety verdict, and emits the W1/W2 boundary tables.
+#
+# Real-S3 runs (the spec-09 MUST for Exp 1, since W1 is the round-trip) fire only
+# when the S3 secrets are present; without them the job runs the offline `file://`
+# smoke so the pipeline still exercises the archival + gating + boundary machinery
+# on every change. The boundary tables are uploaded as an artifact and the
+# baseline gate fails the job (non-zero exit) on a regression.
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC — the boundary is measured periodically, not per push.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      backend_url:
+        description: "Override backend URL (e.g. s3://bucket/bench). Blank = file:// smoke."
+        required: false
+        default: ""
+      region:
+        description: "Object-store region tag for the archive."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validation:
+    name: Run, archive, gate & boundary
+    runs-on: ubuntu-latest
+    env:
+      # Pin provenance into every archived record. The backend SHA is the
+      # storage-crate revision under test (here, the same checkout).
+      TWILL_BENCH_GIT_SHA: ${{ github.sha }}
+      TWILL_BENCH_BACKEND_SHA: ${{ github.sha }}
+      # S3 credentials, if configured as repo secrets, select the real-network run.
+      AWS_ACCESS_KEY_ID: ${{ secrets.BENCH_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.BENCH_S3_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.BENCH_S3_REGION }}
+      BENCH_S3_URL: ${{ secrets.BENCH_S3_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build twill-bench (release)
+        run: cargo build -p twill-bench --release
+
+      # The Experiment-4 crash-safety durability proof is already a CI gate; run
+      # it here too so its verdict can travel with the campaign's numbers.
+      - name: Durability gate — Experiment 4 crash safety
+        run: cargo test -p twill-storage --test crash_safety --release
+
+      - name: Resolve backend URL + region
+        id: backend
+        run: |
+          URL="${{ github.event.inputs.backend_url }}"
+          REGION="${{ github.event.inputs.region }}"
+          if [ -z "$URL" ] && [ -n "$BENCH_S3_URL" ]; then URL="$BENCH_S3_URL"; fi
+          if [ -z "$REGION" ] && [ -n "$AWS_REGION" ]; then REGION="$AWS_REGION"; fi
+          if [ -z "$URL" ]; then
+            URL="file://$RUNNER_TEMP/bench-validation.db"
+            echo "::notice::No S3 backend configured — running file:// smoke. Exp-1 real-S3 (spec-09 MUST) is skipped."
+          fi
+          echo "url=$URL"        >> "$GITHUB_OUTPUT"
+          echo "region=$REGION"  >> "$GITHUB_OUTPUT"
+
+      - name: Run experiments & archive records
+        run: |
+          set -euo pipefail
+          BIN=target/release/twill-bench
+          URL='${{ steps.backend.outputs.url }}'
+          REGION='${{ steps.backend.outputs.region }}'
+          INSTANCE="$(uname -m)-github-runner"
+          OUT=bench-archive
+          mkdir -p "$OUT"
+          common=(--url "$URL" --region "$REGION" --instance-type "$INSTANCE" --json)
+
+          # Exp 1 — latency floor + stall gate (V-1). Same-region steady state.
+          "$BIN" exp1 "${common[@]}" --duration-ms 5000 --warmup-ms 1000 \
+            --max-stall-ratio 50 --label same-region > "$OUT/exp1.json"
+          # Exp 1 cold-connection variant (V-1).
+          "$BIN" exp1 "${common[@]}" --duration-ms 5000 --warmup-ms 1000 \
+            --cold-connection --label cold-connection > "$OUT/exp1-cold.json"
+          # Exp 2 — group-commit-window sweep + plateau gate (V-2).
+          "$BIN" exp2-sweep "${common[@]}" --sweep-max 64 --duration-ms 5000 \
+            --warmup-ms 1000 > "$OUT/exp2-sweep.json"
+          # Exp 3 — N-database sharding sweep (V-3).
+          "$BIN" exp3-shard "${common[@]}" --databases 16 --writers 8 \
+            --duration-ms 5000 --warmup-ms 1000 > "$OUT/exp3-shard.json"
+          # Stamp the Exp-4 crash-safety verdict (the gate above passed to get here).
+          echo '{"experiment":"exp4-crash-safety","crash_safety":true}' > "$OUT/exp4.json"
+          ls -l "$OUT"
+
+      - name: Gate against baseline (regression)
+        run: |
+          set -euo pipefail
+          BIN=target/release/twill-bench
+          # Gate Exp-1 against the committed baseline, if one is present. A
+          # regression (throughput drop / tail rise beyond threshold) exits non-zero.
+          if [ -f bench-baselines/exp1.json ]; then
+            "$BIN" compare --baseline bench-baselines/exp1.json \
+              --candidate bench-archive/exp1.json --threshold 0.15
+          else
+            echo "::notice::No committed baseline (bench-baselines/exp1.json) — skipping regression gate. Commit the current archive to establish one."
+          fi
+
+      - name: Build W1/W2 boundary tables
+        run: |
+          set -euo pipefail
+          BIN=target/release/twill-bench
+          "$BIN" boundary --dir bench-archive --out bench-archive/boundary.md
+          echo "## Spec-09 boundary tables" >> "$GITHUB_STEP_SUMMARY"
+          cat bench-archive/boundary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload archive + boundary tables
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-validation-${{ github.sha }}
+          path: bench-archive/
