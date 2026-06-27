@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scaffold a project (twilldb CLI) · Twill DB docs</title>
+<meta name="description" content="Generate a ready-to-run Twill DB starter app with the twilldb scaffolding CLI, and install it from a Homebrew tap.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">~2 minutes</span>
+</div>
+<h1>Scaffold a project</h1>
+<p class="lede">The <code>twilldb</code> CLI generates a ready-to-run starter app around the engine — a <code>package.json</code>, a connection string for the backend you choose, a first table, and a runnable script — so you go from nothing to a working embedded database in one command.</p>
+</header>
+
+<section>
+<h2>Install the CLI</h2>
+<p>The CLI ships through a <strong>Homebrew tap</strong> (a self-hosted formula repo). Tap it once, then install:</p>
+<pre data-lang="bash"><code>brew tap bihaviour/twilldb
+brew install twilldb</code></pre>
+<p>Or as a single fully-qualified command (Homebrew resolves a tapped formula as <code>user/repo/formula</code>, so the name repeats):</p>
+<pre data-lang="bash"><code>brew install bihaviour/twilldb/twilldb</code></pre>
+<div class="callout note">
+<p class="callout-title">Building from a checkout instead</p>
+<p>If you have the repo cloned, you can build and run the CLI directly: <code>cargo run -p twilldb-cli -- new myapp</code>, or <code>cargo install --path crates/cli</code> to put <code>twilldb</code> on your <code>PATH</code>.</p>
+</div>
+</section>
+
+<section>
+<h2>Create a project</h2>
+<pre data-lang="bash"><code>twilldb new notes
+cd notes
+bun install
+bun run start</code></pre>
+<p>That generates a Bun project and runs a first script against a local <code>file://</code> database — no server, no infrastructure. The native engine ships with <code>@twilldb/bun</code> as a per-platform optional dependency, so there is no <code>cargo build</code> step.</p>
+<p>What you get:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>File</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>package.json</code></td><td>depends on <code>@twilldb/bun</code>; a <code>start</code> script</td></tr>
+<tr><td><code>app.ts</code></td><td>opens the database, creates a table, inserts in a transaction, queries</td></tr>
+<tr><td><code>tsconfig.json</code>, <code>.gitignore</code></td><td>Bun/TypeScript config; ignores the generated <code>*.db</code> files</td></tr>
+<tr><td><code>README.md</code></td><td>how to run it and how the backend is selected</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Interactive mode</h2>
+<p>On a terminal, anything you don't pass as a flag is asked interactively. Run a bare command and the wizard walks you through it:</p>
+<pre data-lang="bash"><code>$ twilldb new
+twilldb — new project
+
+Project name: search
+Client [bun] (node/php/rust coming soon):
+Backend [file] (file/s3): s3
+Include a vector-search (HNSW) starter? [y/N]: y
+
+about to create:
+  name     search
+  client   bun
+  backend  s3
+  vector   yes
+
+proceed? [Y/n]:
+created search/ (6 files — bun client, s3 backend, vector starter)</code></pre>
+<p>Only the unspecified fields are asked — <code>twilldb new app --backend s3</code> still prompts for the rest but skips the backend. Press <kbd>Enter</kbd> to accept the bracketed default.</p>
+<div class="callout note">
+<p class="callout-title">Scripts and CI never block</p>
+<p>The wizard runs only when stdin is a real terminal. In a pipe or a CI job, <code>twilldb</code> takes the defaults for any omitted option (and still errors if <code>new</code> has no name). Pass <code>-y, --yes</code> to force that non-interactive behavior on a terminal too.</p>
+</div>
+</section>
+
+<section>
+<h2>Options</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>-c, --client &lt;bun&gt;</code></td><td><code>bun</code></td><td>client ecosystem. Bun ships today; <code>node</code>, <code>php</code>, <code>rust</code> are on the roadmap.</td></tr>
+<tr><td><code>-b, --backend &lt;file|s3&gt;</code></td><td><code>file</code></td><td>writes the connection string: <code>file://./&lt;name&gt;.db</code> or an <code>s3://your-bucket/&lt;name&gt;</code> placeholder.</td></tr>
+<tr><td><code>--vector</code></td><td>off</td><td>adds a <code>vectors.ts</code> starter — a <code>vector(3)</code> column, an HNSW index, and a top-k nearest-neighbour query.</td></tr>
+<tr><td><code>-y, --yes</code></td><td>off</td><td>accept defaults and never prompt (forces non-interactive on a terminal).</td></tr>
+</tbody>
+</table>
+</div>
+<pre data-lang="bash"><code>twilldb new search --vector        # add a vector-search starter
+twilldb new app --backend s3       # write an s3:// connection string
+twilldb init                       # scaffold into the current directory</code></pre>
+<div class="callout tip">
+<p class="callout-title">The backend is just the connection string</p>
+<p><code>--backend</code> only changes the URL written into <code>app.ts</code>. The engine selects the storage backend purely by the URL scheme at <code>open()</code> time, so your code is identical for <code>file://</code> and <code>s3://</code>. See <a href="storage.html">Storage backends</a> for credentials.</p>
+</div>
+</section>
+
+<section>
+<h2>Next steps</h2>
+<div class="xref-grid">
+<a class="xref" href="getting-started.html"><span class="xref-title">Quickstart</span><span class="xref-desc">Build the engine, run SQL, and start a Postgres-wire server.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-title">Embedded (bun:ffi)</span><span class="xref-desc">The client API the generated app uses — open, query, transactions.</span></a>
+<a class="xref" href="storage.html"><span class="xref-title">Storage backends</span><span class="xref-desc">Choose file:// or an object store, and how credentials are supplied.</span></a>
+<a class="xref" href="olap.html"><span class="xref-title">Vector &amp; analytics</span><span class="xref-desc">More on the in-core vector capability the --vector starter shows.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB — user documentation. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

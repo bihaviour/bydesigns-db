@@ -1,0 +1,91 @@
+name: Release CLI (Homebrew tap)
+
+# Keeps the Homebrew tap (bihaviour/homebrew-twilldb) in sync with each release.
+# On a `v*` tag it computes the source-tarball digest and pushes a refreshed
+# `Formula/twilldb.rb` to the tap repo. The formula builds from source via
+# cargo, so no per-platform binaries are needed for v1.
+#
+# Requires a repo/org secret HOMEBREW_TAP_TOKEN: a fine-grained PAT with
+# contents:write on bihaviour/homebrew-twilldb (see packaging/homebrew/README.md).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.4.0)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cli-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  update-tap:
+    name: Update Homebrew tap formula
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute source-tarball sha256
+        id: src
+        run: |
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${{ steps.ver.outputs.tag }}.tar.gz"
+          curl -fsSL "$URL" -o src.tar.gz
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum src.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v7
+        with:
+          repository: bihaviour/homebrew-twilldb
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render formula
+        run: |
+          mkdir -p tap/Formula
+          cat > tap/Formula/twilldb.rb <<'FORMULA'
+          class Twilldb < Formula
+            desc "Project scaffolding CLI for the Twill DB engine"
+            homepage "https://github.com/bihaviour/twill-db"
+            url "${{ steps.src.outputs.url }}"
+            sha256 "${{ steps.src.outputs.sha256 }}"
+            license "BUSL-1.1"
+            head "https://github.com/bihaviour/twill-db.git", branch: "main"
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args(path: "crates/cli")
+            end
+
+            test do
+              assert_match "twilldb #{version}", shell_output("#{bin}/twilldb version")
+              system bin/"twilldb", "new", "smoke"
+              assert_predicate testpath/"smoke/package.json", :exist?
+            end
+          end
+          FORMULA
+
+      - name: Commit & push to tap
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/twilldb.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date for ${{ steps.ver.outputs.version }}."
+          else
+            git commit -m "twilldb ${{ steps.ver.outputs.version }}"
+            git push
+          fi

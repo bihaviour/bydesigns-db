@@ -1,0 +1,21 @@
+[package]
+name = "twilldb-cli"
+description = "twilldb: project scaffolding for the Twill DB engine — generates a ready-to-run starter app for a chosen client (Phase 6 tooling)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The scaffolder is deliberately dependency-free: it only writes files, so it
+# hand-rolls arg parsing and placeholder substitution like the rest of the
+# workspace (no clap, no template engine). Templates are embedded at compile
+# time via `include_str!`, so the binary is self-contained and works offline.
+
+[[bin]]
+name = "twilldb"
+path = "src/main.rs"
+
+[lib]
+name = "twilldb_cli"
+path = "src/lib.rs"

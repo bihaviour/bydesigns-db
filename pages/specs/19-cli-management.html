@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Database Management CLI · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">19</span>
+<span class="badge badge-status status-draft">Proposal v0.4</span>
+<span class="spec-date">Updated 2026-06-27</span>
+</div>
+<h1>Database Management CLI</h1>
+<p class="lede">A proposal to grow <code>twilldb</code> from a project <em>scaffolder</em> (spec 18) into a database <em>management</em> CLI — run SQL and inspect data, author and apply migrations, generate client types, and manage copy-on-write branches — in the spirit of the Supabase CLI, but shaped by Twill's embeddable, single-writer, branchable architecture. This page is the design intent; the implementation is tracked separately and is <strong>not built yet</strong>.</p>
+</header>
+
+<section>
+<h2>Purpose &amp; relationship to scaffolding (spec 18)</h2>
+<p>Spec 18's <code>twilldb new</code>/<code>init</code> only <em>writes files</em> — it never opens a database. Management is the opposite: every command here <em>talks to a real database</em>. That single difference drives the whole design (a transport, the single-writer lease, the engine linked into the binary). The two halves share one binary and one help surface; the scaffolder stays dependency-free, and the management half is additive behind a cargo feature.</p>
+<div class="callout note">
+<p class="callout-title">What this is modeled on, and where it deliberately diverges</p>
+<p>The Supabase CLI is the reference for the <em>command vocabulary</em> (sql, migration new/up/list, db reset, gen types, branches, seed). Twill diverges on three axes that make some commands easier and some harder: it is <strong>embeddable</strong> (no server required — a transport choice, not a given), <strong>single-writer</strong> (a separate CLI process is itself a writer), and <strong>branchable</strong> (copy-on-write branches are a first-class engine capability, not a cloud feature). The design leans into the third and respects the first two.</p>
+</div>
+</section>
+
+<section>
+<h2>Design principles</h2>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> reach durable state only through the engine's public API (the <code>twill-engine</code> crate's <code>Connection</code>: <code>exec</code>/<code>query</code>/<code>prepare</code>/<code>catalog</code>/<code>branch</code>/<code>stats</code>) or over the <a href="07-server-mode.html">pgwire</a> wire — never by opening a file, socket, or cloud SDK directly. No new engine or <a href="03-storage-interface.html">storage-seam</a> surface is required; management is a <em>consumer</em> of what Phases 1–6 already expose.</li>
+<li><span class="req-tag must">MUST</span> choose its transport by the connection-string scheme, exactly like the engine chooses its backend: <code>file://</code>/<code>s3://</code> → embedded (link the engine); <code>postgres://</code> → a pgwire client. Unknown schemes are rejected, never defaulted.</li>
+<li><span class="req-tag must">MUST</span> respect the single-writer lease (see below) — the CLI is a writer when it opens a database embedded, so it must not be used to mutate a database a server/app currently holds; manage a live deployment over <code>postgres://</code> instead.</li>
+<li><span class="req-tag must">MUST</span> be additive and feature-gated: the management commands link <code>twill-engine</code> behind a <code>manage</code> cargo feature, so a default build remains the lean, dependency-free scaffolder (the same wall <code>twill-bench</code>'s <code>custom-profile</code> feature uses).</li>
+<li><span class="req-tag should">SHOULD</span> be safe-by-default: read-only commands (<code>sql</code> SELECT, <code>tables</code>, <code>describe</code>, <code>stats</code>, <code>gen types</code>) run anywhere; destructive commands (<code>db reset</code>, <code>migrate up</code> on a non-empty db) confirm or require an explicit flag.</li>
+<li><span class="req-tag must-not">MUST NOT</span> add a GUI, a cloud/login surface, or a hosted control plane — there is no Twill cloud; <code>link</code>/<code>login</code>/<code>studio</code> are explicitly out of scope.</li>
+</ul>
+</section>
+
+<section>
+<h2>Transport model &amp; the single-writer caveat</h2>
+<p>Two transports, chosen by URL scheme:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Scheme</th><th>Transport</th><th>Mechanism</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td><code>file://</code>, <code>s3://</code>/<code>r2://</code>/<code>gs://</code></td><td><strong>Embedded</strong></td><td>links <code>twill-engine</code>; opens a <code>Connection</code> in-process (function-call latency, no server)</td><td>local dev, CI, one-off scripts, an offline/stopped database</td></tr>
+<tr><td><code>postgres://</code></td><td><strong>pgwire</strong></td><td>connects to a running <code>engine-server</code> as a plain Postgres client (cleartext subset)</td><td>a live or shared deployment</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warning">
+<p class="callout-title">The CLI is a writer when it opens a database embedded</p>
+<p>Twill is single-writer-per-database, enforced by a durable, epoch-fenced lease (Phase 4). If the CLI opens <code>file://</code> in its own process while an app or server already holds that database, the two contend for the writer lease and one is fenced. Unlike a Postgres-centric tool (where every client funnels through one server process), an embedded Twill CLI <em>is</em> a participant. The rule, surfaced in docs and command help:</p>
+<ul class="reqs">
+<li><span class="req-tag must">Local / stopped database</span> → manage embedded (<code>file://</code> directly).</li>
+<li><span class="req-tag must">Live deployment</span> → manage over <code>postgres://</code>, so the server remains the sole writer and the CLI is just a client.</li>
+</ul>
+</div>
+</section>
+
+<section>
+<h2>Command surface</h2>
+<p>The full proposed surface, with the engine capability each rides and a feasibility note. Milestone assignment is in <a href="#delivery">Phased delivery</a>.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Command</th><th>Does</th><th>Rides</th><th>Feasibility</th></tr></thead>
+<tbody>
+<tr><td><code>twilldb sql &lt;url&gt; "&lt;query&gt;"</code></td><td>run one statement/query, print rows (table or <code>--json</code>)</td><td><code>query</code>/<code>exec</code></td><td><span class="req-tag must">STRAIGHTFORWARD</span></td></tr>
+<tr><td><code>twilldb shell &lt;url&gt;</code></td><td>interactive REPL (history, multi-line, <code>.tables</code>/<code>.schema</code> dot-commands)</td><td><code>query</code>/<code>exec</code></td><td><span class="req-tag must">STRAIGHTFORWARD</span></td></tr>
+<tr><td><code>twilldb tables &lt;url&gt;</code> · <code>describe &lt;url&gt; &lt;table&gt;</code></td><td>list tables / show columns, PK, FKs, unique sets</td><td><code>catalog()</code></td><td><span class="req-tag must">STRAIGHTFORWARD</span></td></tr>
+<tr><td><code>twilldb migrate new &lt;name&gt;</code></td><td>create a timestamped <code>migrations/&lt;ts&gt;_&lt;name&gt;.sql</code></td><td>file gen</td><td><span class="req-tag must">STRAIGHTFORWARD</span></td></tr>
+<tr><td><code>twilldb migrate up &lt;url&gt;</code></td><td>apply pending migrations in order, record each</td><td><code>exec</code> + tracking table</td><td><span class="req-tag should">DOABLE</span> (atomicity caveat)</td></tr>
+<tr><td><code>twilldb migrate status &lt;url&gt;</code></td><td>show applied vs pending, flag checksum drift</td><td>tracking table</td><td><span class="req-tag must">STRAIGHTFORWARD</span></td></tr>
+<tr><td><code>twilldb gen types &lt;url&gt;</code></td><td>emit TypeScript types for <code>@twilldb/bun</code> from the live schema</td><td><code>catalog()</code></td><td><span class="req-tag should">DOABLE</span></td></tr>
+<tr><td><code>twilldb seed &lt;url&gt; &lt;file.sql&gt;</code></td><td>run a seed script</td><td><code>exec</code></td><td><span class="req-tag must">STRAIGHTFORWARD</span></td></tr>
+<tr><td><code>twilldb db reset &lt;url&gt;</code></td><td>fresh database → replay all migrations → seed</td><td><code>exec</code> + branching/fresh open</td><td><span class="req-tag should">DOABLE</span></td></tr>
+<tr><td><code>twilldb schema dump &lt;url&gt;</code></td><td>print reconstructed DDL (and optionally data) </td><td><code>catalog()</code> + <code>query</code></td><td><span class="req-tag should">DOABLE</span></td></tr>
+<tr><td><code>twilldb branch create|list|delete &lt;url&gt;</code></td><td>manage copy-on-write branches</td><td><code>branch()</code> / <code>open_branch</code></td><td><span class="req-tag should">DOABLE</span> — differentiator</td></tr>
+<tr><td><code>twilldb serve &lt;url&gt;</code></td><td>run the engine behind pgwire (wrap <code>engine-server</code>)</td><td><code>twill-server</code></td><td><span class="req-tag should">DOABLE</span></td></tr>
+<tr><td><code>twilldb stats &lt;url&gt;</code></td><td>print EngineStats/StorageStats (or <code>SHOW twill.stats</code> over pgwire)</td><td><code>stats()</code></td><td><span class="req-tag must">STRAIGHTFORWARD</span></td></tr>
+<tr><td><code>twilldb schema diff</code></td><td>diff live catalog vs a target SQL schema</td><td>a schema differ</td><td><span class="req-tag may">DEFERRED</span> — needs a differ; out of v1</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="migrations">
+<h2>Migrations design</h2>
+<p>A directory of ordered, immutable SQL files plus a tracking table in the database. The model is intentionally close to Supabase / dbmate / golang-migrate so it's familiar.</p>
+
+<h3>Layout</h3>
+<div class="code-block"><pre><code>migrations/
+  20260627120000_init.sql
+  20260627123000_add_notes_index.sql
+  ...</code></pre></div>
+
+<h3>Tracking table</h3>
+<p>Created on first <code>migrate up</code> if absent. Names are underscored to stay out of the user's namespace:</p>
+<div class="code-block"><pre><code>CREATE TABLE _twilldb_migrations (
+  version    TEXT PRIMARY KEY,   -- the file's timestamp prefix
+  name       TEXT NOT NULL,
+  checksum   TEXT NOT NULL,      -- hash of the file at apply time (drift detection)
+  applied_at TEXT NOT NULL       -- ISO-8601
+)</code></pre></div>
+
+<h3>Apply semantics</h3>
+<ul class="reqs">
+<li><span class="req-tag must">MUST</span> apply pending versions (those not in the tracking table) in ascending order, one file at a time, recording each in <code>_twilldb_migrations</code> on success.</li>
+<li><span class="req-tag must">MUST</span> split a file into statements and run them in order. DML-only files run inside one transaction; a file containing DDL runs its DDL in autocommit (see the constraint below) — so a file is the unit of <em>ordering</em>, not always of <em>atomicity</em>.</li>
+<li><span class="req-tag must">MUST</span> stop on the first failing statement and report which migration/statement failed; already-applied earlier migrations remain applied.</li>
+<li><span class="req-tag should">SHOULD</span> detect <strong>drift</strong>: if an already-applied file's checksum no longer matches, <code>migrate up</code>/<code>status</code> warns (a previously-applied migration was edited — a footgun in every migration tool).</li>
+</ul>
+
+<div class="callout warning">
+<p class="callout-title">Constraint: DDL is autocommit-only — migrations are not always one transaction</p>
+<p>Twill runs <code>CREATE</code>/<code>ALTER</code>/<code>DROP</code> in autocommit; DDL inside an explicit transaction returns <code>ENGINE_ERR_TXN</code> (a deliberate Phase-1 boundary, still in force). So a migration that mixes schema and data <em>cannot</em> be a single atomic transaction the way Postgres allows. The design accepts this rather than fighting the engine:</p>
+<ul class="reqs">
+<li><span class="req-tag should">Guidance</span>: keep one concern per migration (schema changes separate from large data backfills) so a partial failure is easy to reason about.</li>
+<li><span class="req-tag should">Mitigation — Twill's advantage</span>: <code>migrate up --branch</code> applies to a <em>copy-on-write branch</em> first (zero data copy), lets you verify, then you promote — a preview-and-swap that is safer than Postgres's in-place transactional DDL for risky changes. This turns the single-writer/branchable architecture into a migration <em>feature</em>, not just a constraint.</li>
+</ul>
+</div>
+</section>
+
+<section>
+<h2>Type generation</h2>
+<p><code>gen types</code> reflects the live schema through <code>catalog()</code> (the same <code>TableSchema</code> — columns, types, PK, FK, unique sets — the server already uses for PostgREST reflection) and emits TypeScript for the Bun client: a row interface per table, with the engine's value types mapped to TS (INTEGER/REAL/TEXT/BLOB → number/number/string/Uint8Array, <code>vector(N)</code> → number[], nullable columns → <code>| null</code>). The output is a single <code>.ts</code> file the app imports, keeping <code>db.query&lt;Row&gt;()</code> calls statically typed against the real schema. This is the most <code>@twilldb/bun</code>-aligned command and a strong reason to do it early.</p>
+</section>
+
+<section>
+<h2>Binary shape &amp; dependencies</h2>
+<p>One binary, two halves. The scaffolder (spec 18) stays dependency-free. Management is gated behind a <code>manage</code> cargo feature that pulls in <code>twill-engine</code> (and, when <code>postgres://</code> support lands, a minimal pgwire client — reuse the bench driver's <code>pgclient</code> rather than a new dependency). A default <code>cargo install twilldb-cli</code> compiles no management code; <code>--features manage</code> (or the release build) includes it. The engine itself carries no heavy third-party dependencies (it hand-rolls its SQL parser, WAL codec, and base64), so even the management build stays auditable. The Homebrew/release builds ship the full-featured binary; the lean build remains available for embedders who only want the scaffolder.</p>
+</section>
+
+<section id="delivery">
+<h2>Phased delivery</h2>
+<ol class="reqs">
+<li><span class="req-tag must">Milestone 1 — inspect &amp; migrate (embedded)</span>: <code>sql</code>, <code>shell</code>, <code>tables</code>/<code>describe</code>, <code>migrate new</code>/<code>up</code>/<code>status</code>, <code>gen types</code>, <code>seed</code> — all over the embedded (<code>file://</code>/<code>s3://</code>) transport, behind the <code>manage</code> feature. Covers "create schema, check data, run migrations." Each command ships with a test (and migration apply/idempotency/drift is covered end-to-end on <code>file://</code>).</li>
+<li><span class="req-tag should">Milestone 2 — branches &amp; serve</span>: <code>branch create/list/delete</code>, <code>migrate up --branch</code> (preview-and-swap), <code>db reset</code>, <code>serve</code>, <code>stats</code>, <code>schema dump</code>.</li>
+<li><span class="req-tag should">Milestone 3 — live deployments</span>: the <code>postgres://</code> pgwire transport across the read/inspect/migrate commands, so the same surface manages a running <code>engine-server</code> (single-writer-safe).</li>
+<li><span class="req-tag may">Deferred</span>: <code>schema diff</code> (needs a differ), data <code>dump</code>/restore round-trips, a TUI. No GUI/cloud, ever.</li>
+</ol>
+</section>
+
+<section>
+<h2>Deliberate scope boundaries</h2>
+<ul class="reqs">
+<li><span class="req-tag must-not">OUT</span> — GUI/studio, cloud login/link, hosted control plane (no Twill cloud).</li>
+<li><span class="req-tag must-not">OUT</span> — any new engine or storage-seam surface; management consumes the existing <code>Connection</code> API only.</li>
+<li><span class="req-tag may">DEFERRED</span> — transactional, all-or-nothing migrations (blocked by autocommit-only DDL; branch-and-swap is the v1 answer).</li>
+<li><span class="req-tag may">DEFERRED</span> — schema diff / declarative schema; v1 migrations are imperative ordered SQL.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related specifications</h2>
+<div class="xref-grid">
+<a class="xref" href="18-cli-tooling.html"><span class="xref-title">Scaffolding CLI &amp; Distribution</span><span class="xref-desc">The other half of the same binary; this management surface is additive behind a feature.</span></a>
+<a class="xref" href="07-server-mode.html"><span class="xref-title">Server Mode</span><span class="xref-desc">The pgwire transport the Milestone-3 live-deployment commands drive against.</span></a>
+<a class="xref" href="phase-4-branching-lifecycle.html"><span class="xref-title">Phase 4 — Branching &amp; Lifecycle</span><span class="xref-desc">The copy-on-write branching the branch commands and preview-and-swap migrations ride.</span></a>
+<a class="xref" href="16-sql-compatibility.html"><span class="xref-title">SQL Compatibility</span><span class="xref-desc">The SQL surface sql/shell/migrations run; the DDL-autocommit boundary that shapes migration atomicity.</span></a>
+<a class="xref" href="08-bun-integration.html"><span class="xref-title">Bun Integration</span><span class="xref-desc">The client gen types targets, and the catalog reflection it reuses.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Serverless OLTP Engine — internal development specification. Proposal, 2026-06-27. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

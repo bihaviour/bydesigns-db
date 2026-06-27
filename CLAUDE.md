@@ -49,11 +49,13 @@ crates/storage    # the pluggable `Storage` trait (the seam) + LocalFileStorage 
 crates/engine     # libengine: SQL → MVCC → WAL, plus the stable C ABI (include/engine.h)
 crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset); links the engine unchanged
 crates/controller # lifecycle controller: scale-to-zero instances, lease heartbeat, keep-warm + thundering-herd admission (Phase 4)
+crates/bench      # twill-bench: embedded + pgwire benchmark/correctness driver (spec 09/15)
+crates/cli        # twilldb: project scaffolder — `twilldb new`/`init` generates a starter app (embedded templates, dependency-free)
 clients/bun       # @twilldb/bun: bun:ffi bindings + ergonomic typed wrapper + example
 pages/            # the website + documentation (static HTML, deployed to GitHub Pages):
                   #   index.html  — home (project overview)
                   #   docs/       — user documentation (connect, branch, pool, operate)
-                  #   specs/      — development guidelines: the 14 design specs (the source of
+                  #   specs/      — development guidelines: the design specs (the source of
                   #                 truth for design intent) + per-phase implementation maps
                   #   release/    — releases & upcoming roadmap
                   #   assets/     — one shared design system (app.css + app.js + section manifests)
@@ -75,6 +77,12 @@ cargo build -p twill-engine --release     # build target/release/libengine.{a,so
 # Server mode (Phase 3): the engine behind a Postgres-wire listener
 cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
 # any Postgres client connects (cleartext): psql/Bun.sql/pgbench with sslmode=disable
+
+# Scaffolding CLI: generate a ready-to-run starter app (templates embedded in the binary)
+cargo run -p twilldb-cli -- new myapp                 # ./myapp Bun starter (file:// backend)
+cargo run -p twilldb-cli -- new search --vector       # + an HNSW vector starter
+cargo run -p twilldb-cli -- new app --backend s3      # write an s3:// connection string
+# distribution: Homebrew tap (packaging/homebrew/) + release-cli.yml; see pages/specs/18-cli-tooling.html
 
 # Bun client (needs the built libengine; auto-discovered from target/{release,debug})
 cd clients/bun
