@@ -97,6 +97,14 @@ jobs:
       # explicit, named step so a regression is unmissable in the CI log.
       - name: Durability gate — Experiment 4 crash safety
         run: cargo test -p twill-storage --test crash_safety
+      # Phase 7 RLS security gate (spec 17 / #88): bypass-resistance across a
+      # second handle and a debug branch, denied-write durability, branch policy
+      # divergence, PITR across the policy-creation LSN, default-deny, and RLS over
+      # pgwire — kept as an explicit, named step so a regression is unmissable.
+      - name: Security gate — Phase 7 row-level security
+        run: |
+          cargo test -p twill-engine --test rls_core --test rls_write --test rls_branching
+          cargo test -p twill-server --test wire rls_enforced_over_pgwire
       - name: cargo test (workspace)
         run: cargo test --workspace --all-targets
       # Feature-gate wall for the twill-bench `custom` profile loader (#81 C2):

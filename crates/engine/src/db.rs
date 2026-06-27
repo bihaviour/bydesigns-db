@@ -344,6 +344,13 @@ fn apply_replay(store: &mut Store, op: WalOp, commit_lsn: u64) {
             }
         }
         WalOp::DropView { name } => store.replay_drop_view(&name),
+        // Row-level-security catalog facts (Phase 7): additive, replayed like
+        // views/constraints so policies branch / scale-to-zero / PITR-restore.
+        WalOp::CreatePolicy { table, policy } => store.add_policy(&table, policy),
+        WalOp::DropPolicy { table, name } => {
+            store.drop_policy(&table, &name);
+        }
+        WalOp::SetRls { table, enabled } => store.set_rls(&table, enabled),
         WalOp::Commit => {}
     }
 }
@@ -364,6 +371,7 @@ pub(crate) fn apply_alter(store: &mut Store, op: &WalOp) {
         WalOp::AlterDropColumn { table, column } => store.drop_column(table, column),
         WalOp::AlterRenameColumn { table, from, to } => store.rename_column(table, from, to),
         WalOp::AlterRenameTable { table, to } => store.rename_table(table, to),
+        WalOp::SetRls { table, enabled } => store.set_rls(table, *enabled),
         _ => {}
     }
 }

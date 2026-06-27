@@ -34,6 +34,68 @@ pub struct ForeignKey {
     pub foreign_columns: Vec<String>,
 }
 
+/// The command(s) a row-level-security policy governs (Phase 7). `All` applies to
+/// every command; the others scope a policy to one (`SELECT` reads, `INSERT` /
+/// `UPDATE` / `DELETE` writes), matching Postgres `CREATE POLICY … FOR …`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyCommand {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCommand {
+    /// The `pg_policies.cmd` spelling clients (and PostgREST) expect.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyCommand::All => "ALL",
+            PolicyCommand::Select => "SELECT",
+            PolicyCommand::Insert => "INSERT",
+            PolicyCommand::Update => "UPDATE",
+            PolicyCommand::Delete => "DELETE",
+        }
+    }
+    pub fn tag(&self) -> u8 {
+        match self {
+            PolicyCommand::All => 0,
+            PolicyCommand::Select => 1,
+            PolicyCommand::Insert => 2,
+            PolicyCommand::Update => 3,
+            PolicyCommand::Delete => 4,
+        }
+    }
+    pub fn from_tag(tag: u8) -> PolicyCommand {
+        match tag {
+            1 => PolicyCommand::Select,
+            2 => PolicyCommand::Insert,
+            3 => PolicyCommand::Update,
+            4 => PolicyCommand::Delete,
+            _ => PolicyCommand::All,
+        }
+    }
+}
+
+/// A row-level-security policy on a table (Phase 7). The `using` / `check`
+/// predicates are kept as SQL text — a durable catalog fact carried in the WAL,
+/// re-parsed at enforcement time against the session principal (spec 17). The
+/// engine never verifies identity; the predicate reads the already-trusted
+/// `auth.*` accessors.
+#[derive(Clone, Debug)]
+pub struct Policy {
+    pub name: String,
+    pub command: PolicyCommand,
+    /// Roles this policy applies to; empty means `PUBLIC` (every role).
+    pub roles: Vec<String>,
+    /// `USING (expr)` read/visibility predicate text; `None` means unrestricted
+    /// (the policy grants visibility of every row to its roles).
+    pub using: Option<String>,
+    /// `WITH CHECK (expr)` write-admissibility predicate text; `None` falls back
+    /// to `using` for writes, matching Postgres.
+    pub check: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TableSchema {
     pub name: String,
@@ -45,6 +107,13 @@ pub struct TableSchema {
     /// Table-level / composite `UNIQUE (cols)` constraints (stage 6D). Single
     /// inline `UNIQUE` lives on the column instead (`Column::unique`).
     pub uniques: Vec<Vec<String>>,
+    /// Whether `ALTER TABLE … ENABLE ROW LEVEL SECURITY` is in force (Phase 7).
+    /// When enabled with no matching policy, reads/writes default-deny.
+    pub rls_enabled: bool,
+    /// Row-level-security policies on this table (Phase 7). Additive catalog
+    /// facts replayed from the WAL, so they branch / scale-to-zero / PITR-restore
+    /// with the database.
+    pub policies: Vec<Policy>,
 }
 
 impl TableSchema {

@@ -7,7 +7,7 @@
 //! the group, stamping every produced row version with the marker's commit LSN.
 //! Records after the last marker (an incomplete transaction) are discarded.
 
-use crate::catalog::{Column, ForeignKey, TableSchema};
+use crate::catalog::{Column, ForeignKey, Policy, PolicyCommand, TableSchema};
 use crate::error::{EngineError, Result};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexDef, IndexParams, Metric};
@@ -68,6 +68,22 @@ pub enum WalOp {
     DropView {
         name: String,
     },
+    /// `CREATE POLICY … ON <table> …` (Phase 7 RLS): an additive durable catalog
+    /// fact (predicate text + command + roles), replayed like a view/constraint.
+    CreatePolicy {
+        table: String,
+        policy: Policy,
+    },
+    /// `DROP POLICY <name> ON <table>` (Phase 7 RLS).
+    DropPolicy {
+        table: String,
+        name: String,
+    },
+    /// `ALTER TABLE <table> {ENABLE|DISABLE} ROW LEVEL SECURITY` (Phase 7 RLS).
+    SetRls {
+        table: String,
+        enabled: bool,
+    },
     Commit,
 }
 
@@ -84,6 +100,9 @@ const OP_ALTER_RENAME_COL: u8 = 10;
 const OP_ALTER_RENAME_TABLE: u8 = 11;
 const OP_CREATE_VIEW: u8 = 12;
 const OP_DROP_VIEW: u8 = 13;
+const OP_CREATE_POLICY: u8 = 14;
+const OP_DROP_POLICY: u8 = 15;
+const OP_SET_RLS: u8 = 16;
 
 impl WalOp {
     pub fn encode(&self) -> WalRecord {
@@ -243,6 +262,28 @@ impl WalOp {
                 b.push(OP_DROP_VIEW);
                 put_str(&mut b, name);
             }
+            WalOp::CreatePolicy { table, policy } => {
+                b.push(OP_CREATE_POLICY);
+                put_str(&mut b, table);
+                put_str(&mut b, &policy.name);
+                b.push(policy.command.tag());
+                put_u32(&mut b, policy.roles.len() as u32);
+                for r in &policy.roles {
+                    put_str(&mut b, r);
+                }
+                put_opt_str(&mut b, policy.using.as_deref());
+                put_opt_str(&mut b, policy.check.as_deref());
+            }
+            WalOp::DropPolicy { table, name } => {
+                b.push(OP_DROP_POLICY);
+                put_str(&mut b, table);
+                put_str(&mut b, name);
+            }
+            WalOp::SetRls { table, enabled } => {
+                b.push(OP_SET_RLS);
+                put_str(&mut b, table);
+                b.push(*enabled as u8);
+            }
             WalOp::Commit => b.push(OP_COMMIT),
         }
         WalRecord::new(b)
@@ -254,24 +295,6 @@ impl WalOp {
         let op = match tag {
             OP_CREATE => decode_create(&mut c)?,
             OP_ALTER_ADD => decode_alter_add(&mut c)?,
-            OP_ALTER_DROP => WalOp::AlterDropColumn {
-                table: c.str()?,
-                column: c.str()?,
-            },
-            OP_ALTER_RENAME_COL => WalOp::AlterRenameColumn {
-                table: c.str()?,
-                from: c.str()?,
-                to: c.str()?,
-            },
-            OP_ALTER_RENAME_TABLE => WalOp::AlterRenameTable {
-                table: c.str()?,
-                to: c.str()?,
-            },
-            OP_CREATE_VIEW => WalOp::CreateView {
-                name: c.str()?,
-                sql: c.str()?,
-            },
-            OP_DROP_VIEW => WalOp::DropView { name: c.str()? },
             OP_DROP => WalOp::DropTable { name: c.str()? },
             OP_CREATE_INDEX => decode_create_index(&mut c)?,
             OP_DROP_INDEX => WalOp::DropIndex { name: c.str()? },
@@ -281,10 +304,48 @@ impl WalOp {
                 vid: c.u64()?,
             },
             OP_COMMIT => WalOp::Commit,
-            other => return Err(EngineError::internal(format!("bad WAL op tag {other}"))),
+            // Schema-evolution, view, and RLS catalog facts — split into a helper
+            // so this dispatcher stays within the project's complexity gate.
+            other => decode_catalog_op(other, &mut c)?,
         };
         Ok(op)
     }
+}
+
+/// Decode the schema-evolution / view / row-level-security catalog ops (the
+/// less-common tags), kept out of [`WalOp::decode`] so that dispatcher stays
+/// within the cyclomatic-complexity gate. Errors on an unknown tag.
+fn decode_catalog_op(tag: u8, c: &mut Cursor) -> Result<WalOp> {
+    Ok(match tag {
+        OP_ALTER_DROP => WalOp::AlterDropColumn {
+            table: c.str()?,
+            column: c.str()?,
+        },
+        OP_ALTER_RENAME_COL => WalOp::AlterRenameColumn {
+            table: c.str()?,
+            from: c.str()?,
+            to: c.str()?,
+        },
+        OP_ALTER_RENAME_TABLE => WalOp::AlterRenameTable {
+            table: c.str()?,
+            to: c.str()?,
+        },
+        OP_CREATE_VIEW => WalOp::CreateView {
+            name: c.str()?,
+            sql: c.str()?,
+        },
+        OP_DROP_VIEW => WalOp::DropView { name: c.str()? },
+        OP_CREATE_POLICY => decode_create_policy(c)?,
+        OP_DROP_POLICY => WalOp::DropPolicy {
+            table: c.str()?,
+            name: c.str()?,
+        },
+        OP_SET_RLS => WalOp::SetRls {
+            table: c.str()?,
+            enabled: c.u8()? != 0,
+        },
+        other => return Err(EngineError::internal(format!("bad WAL op tag {other}"))),
+    })
 }
 
 /// Decode a `CreateTable` op body (name + columns + FKs + checks/uniques).
@@ -300,6 +361,12 @@ fn decode_create(c: &mut Cursor) -> Result<WalOp> {
             foreign_keys,
             checks,
             uniques,
+            // RLS state is never carried in a `CreateTable` record — a fresh
+            // table starts with RLS off and no policies. They arrive as their own
+            // additive `SetRls`/`CreatePolicy` ops, so an older WAL (and the
+            // CreateTable framing) stays unchanged (Phase 7).
+            rls_enabled: false,
+            policies: Vec::new(),
         },
     })
 }
@@ -314,6 +381,26 @@ fn decode_alter_add(c: &mut Cursor) -> Result<WalOp> {
         column: cols
             .pop()
             .ok_or_else(|| EngineError::internal("ALTER ADD COLUMN record has no column"))?,
+    })
+}
+
+/// Decode a `CreatePolicy` op body (table + name + command + roles + predicates).
+fn decode_create_policy(c: &mut Cursor) -> Result<WalOp> {
+    let table = c.str()?;
+    let name = c.str()?;
+    let command = PolicyCommand::from_tag(c.u8()?);
+    let roles = decode_str_list(c)?;
+    let using = c.opt_str()?;
+    let check = c.opt_str()?;
+    Ok(WalOp::CreatePolicy {
+        table,
+        policy: Policy {
+            name,
+            command,
+            roles,
+            using,
+            check,
+        },
     })
 }
 
@@ -446,6 +533,16 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
     put_u32(b, s.len() as u32);
     b.extend_from_slice(s.as_bytes());
 }
+/// An optional string: a presence byte then the string when present.
+fn put_opt_str(b: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => {
+            b.push(1);
+            put_str(b, s);
+        }
+        None => b.push(0),
+    }
+}
 /// Column type codec: the affinity tag, plus the dimension for `vector(n)`.
 fn put_coltype(b: &mut Vec<u8>, ty: ColumnType) {
     b.push(ty.tag());
@@ -514,6 +611,14 @@ impl<'a> Cursor<'a> {
         let n = self.u32()? as usize;
         let s = self.take(n)?;
         String::from_utf8(s.to_vec()).map_err(|_| EngineError::internal("bad utf8 in WAL"))
+    }
+    /// An optional string written by [`put_opt_str`].
+    fn opt_str(&mut self) -> Result<Option<String>> {
+        if self.u8()? == 1 {
+            Ok(Some(self.str()?))
+        } else {
+            Ok(None)
+        }
     }
     fn value(&mut self) -> Result<Value> {
         let tag = self.u8()?;

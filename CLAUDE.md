@@ -10,7 +10,7 @@ the *same* engine runs either purely embedded (`file://`) or storage-disaggregat
 on object storage (`s3://`/`r2://`/`gs://`). The full design lives as an HTML spec
 site under `pages/specs/` (start at `pages/specs/13-roadmap.html` for the phased plan).
 
-**Phases 1, 2, 3, 4, 5, and 6 are implemented.** Phase 1 is the embedded library
+**Phases 1, 2, 3, 4, 5, 6, and 7 are implemented.** Phase 1 is the embedded library
 (`file://`); Phase 2 adds the disaggregated `ObjectStorage` backend
 (`s3://`/`r2://`/`gs://`) — an LSM page store + CAS commit log over a pluggable
 object-client seam — selected purely by connection string, with the engine and C
@@ -36,11 +36,28 @@ evolution (`DEFAULT`/`CHECK`/`UNIQUE`/composite-PK/`AUTOINCREMENT`, `ALTER TABLE
 `SAVEPOINT`); 6E dialect shims (`$1`/`:name` placeholders, backtick quoting,
 `LIKE`/`ILIKE` split, `SET`/`SHOW`/`PRAGMA`/`EXPLAIN`). The seam never moved
 (`STORAGE_TRAIT_VERSION` stays 2, `ENGINE_ABI_VERSION` stays 3); the only WAL
-growth is backward-compatible additive catalog facts. Everything stays *additive*
+growth is backward-compatible additive catalog facts. Phase 7 is **row-level
+security** (spec 17) — Supabase-style RLS split along the build-in-vs-compose seam:
+the per-row enforcement predicate is built **into** the engine (`exec.rs`, over the
+same MVCC snapshot every query already passes through), while JWT verification and
+identity stay composed **around** it. It is additive `sql.rs`→`exec.rs`/`conn.rs`
+growth — a per-connection `SessionContext` (`session.rs`) carrying role + claims
+(set via `SET ROLE` / `SET twill.jwt.claims`, reusing 6E's `SET` path) read by the
+`auth.uid()`/`auth.role()`/`auth.claim()` accessors; `CREATE/DROP POLICY` +
+`ALTER TABLE … ENABLE ROW LEVEL SECURITY` persisted as additive `CreatePolicy`/
+`DropPolicy`/`SetRls` WAL catalog facts (`pg_policies` reflection via
+`Connection::policies`); `USING` read enforcement on the single-table **and**
+relational paths with **default-deny**, and `WITH CHECK`/`USING` write enforcement
+with RLS-filtered `RETURNING` and an explicit off-by-default bypass
+(`SET twill.rls.bypass = on`, never inferred from a role name). The server forwards
+the RLS-principal `SET`s to the engine (`crates/server/src/introspect.rs`) so
+PostgREST-style identity composes around in-core enforcement.
+`STORAGE_TRAIT_VERSION` and `ENGINE_ABI_VERSION` are **unchanged** — policies
+branch / scale-to-zero / PITR-restore for free. Everything stays *additive*
 because the storage seam never moves. See the per-phase implementation maps under
-`pages/specs/phase-1-embedded.html`–`pages/specs/phase-5-capabilities.html` and the
-SQL gap map in `pages/specs/16-sql-compatibility.html` for the deliberate scope
-decisions.
+`pages/specs/phase-1-embedded.html`–`pages/specs/phase-5-capabilities.html`, the
+SQL gap map in `pages/specs/16-sql-compatibility.html`, and the RLS design in
+`pages/specs/17-row-level-security.html` for the deliberate scope decisions.
 
 ## Layout
 
