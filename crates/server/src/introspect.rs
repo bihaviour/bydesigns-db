@@ -96,6 +96,43 @@ fn empty_rows(columns: &[&str]) -> Canned {
     }
 }
 
+/// Whether `s` (lowercased/trimmed) is a session statement that sets the RLS
+/// principal — `SET [LOCAL|SESSION] ROLE …`, `SET … twill.jwt.claims` /
+/// `request.jwt.claims` (PostgREST's GUC), `SET … twill.rls.bypass`, or the
+/// matching `RESET`. These must reach the engine (identity composed at the
+/// boundary, enforced in-core), unlike the other fire-and-forget `SET`s. Matched
+/// precisely so an unrelated `SET` (which the engine's lexer may reject) is still
+/// a no-op.
+pub fn is_rls_session_stmt(s: &str) -> bool {
+    let body = match s.strip_prefix("set ").or_else(|| s.strip_prefix("reset ")) {
+        Some(b) => b.trim_start(),
+        None => return false,
+    };
+    let body = body
+        .strip_prefix("local ")
+        .or_else(|| body.strip_prefix("session "))
+        .map(str::trim_start)
+        .unwrap_or(body);
+    // The GUC name may be double-quoted (`"request.jwt.claims"`).
+    let body = body.trim_start_matches('"');
+    for name in [
+        "role",
+        "twill.jwt.claims",
+        "request.jwt.claims",
+        "twill.rls.bypass",
+    ] {
+        if let Some(after) = body.strip_prefix(name) {
+            if after.is_empty()
+                || after.starts_with(['"', ' ', '\t', '='])
+                || after.starts_with(';')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The CommandComplete tag for a fire-and-forget session-setup command
 /// (`SET` / `DISCARD` / `LISTEN` / `UNLISTEN`), or `None` if `s` is not one.
 /// Drivers issue these on connect and ignore the reply; the engine has no GUCs
@@ -172,6 +209,14 @@ pub fn stats_rows(stats: &engine::EngineStats) -> Canned {
 /// Inspect a statement; return a canned answer or [`Canned::Pass`].
 pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     let s = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
+
+    // RLS principal statements (`SET ROLE` / `SET … {twill,request}.jwt.claims` /
+    // `SET … twill.rls.bypass` and their `RESET`) must reach the engine so the
+    // executor can enforce policies against the session principal (Phase 7).
+    // Checked before the fire-and-forget `SET` no-op below.
+    if is_rls_session_stmt(&s) {
+        return Canned::Pass;
+    }
 
     // Session-setup commands drivers fire and forget (SET / DISCARD / LISTEN /
     // UNLISTEN) — grouped into a helper to keep this classifier within the

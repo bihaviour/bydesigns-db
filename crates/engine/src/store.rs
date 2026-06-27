@@ -412,6 +412,39 @@ impl Store {
     pub fn replay_drop_view(&mut self, name: &str) {
         self.drop_view(name);
     }
+
+    // ---- row-level security (Phase 7) -----------------------------------
+
+    /// Toggle `rls_enabled` on a table's schema (live DDL + replay).
+    pub fn set_rls(&mut self, table: &str, enabled: bool) {
+        if let Some(t) = self.table_mut(table) {
+            t.schema.rls_enabled = enabled;
+        }
+    }
+
+    /// Add (or replace by name) a policy on a table (live DDL + replay). The live
+    /// path rejects a duplicate name before calling this; replay simply applies
+    /// the recorded fact, so a same-name redefinition supersedes the old one.
+    pub fn add_policy(&mut self, table: &str, policy: crate::catalog::Policy) {
+        if let Some(t) = self.table_mut(table) {
+            t.schema
+                .policies
+                .retain(|p| !p.name.eq_ignore_ascii_case(&policy.name));
+            t.schema.policies.push(policy);
+        }
+    }
+
+    /// Drop a policy by name from a table; returns whether one was removed.
+    pub fn drop_policy(&mut self, table: &str, name: &str) -> bool {
+        if let Some(t) = self.table_mut(table) {
+            let before = t.schema.policies.len();
+            t.schema
+                .policies
+                .retain(|p| !p.name.eq_ignore_ascii_case(name));
+            return t.schema.policies.len() != before;
+        }
+        false
+    }
     pub fn replay_insert(&mut self, table: &str, vid: u64, values: Vec<Value>, commit_lsn: u64) {
         if let Some(t) = self.table_mut(table) {
             t.rows.push(RowVersion {

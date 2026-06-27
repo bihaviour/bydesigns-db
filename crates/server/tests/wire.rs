@@ -232,3 +232,45 @@ fn extended_query_with_parameter() {
     assert_eq!(rows, vec![vec![Some("bel".into())]], "{msgs:?}");
     assert_eq!(command_tags(&msgs), vec!["SELECT 1"]);
 }
+
+/// Phase 7 (P7-5 composition): row-level security is enforced over the wire. The
+/// principal is set by the client via `SET ROLE` / `SET twill.jwt.claims` (identity
+/// composed at the boundary) and the engine — the chokepoint — filters rows. A
+/// fresh connection that never set the principal is default-denied.
+#[test]
+fn rls_enforced_over_pgwire() {
+    let addr = start_server();
+    let mut c = Client::connect(&addr);
+
+    c.simple("CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT)");
+    c.simple("INSERT INTO notes VALUES (1,'42'),(2,'99'),(3,'42')");
+    c.simple("ALTER TABLE notes ENABLE ROW LEVEL SECURITY");
+    let r =
+        c.simple("CREATE POLICY p ON notes FOR ALL TO authenticated USING (owner = auth.uid())");
+    assert!(!has_error(&r), "CREATE POLICY failed: {r:?}");
+
+    // Still anon on this connection → default-deny.
+    let r = c.simple("SELECT id FROM notes ORDER BY id");
+    assert_eq!(data_rows(&r), Vec::<Vec<Option<String>>>::new());
+
+    // Set the principal over the wire; the SET must reach the engine.
+    let r = c.simple("SET ROLE authenticated");
+    assert_eq!(command_tags(&r), vec!["SET"], "{r:?}");
+    assert!(!has_error(&r));
+    let r = c.simple(r#"SET twill.jwt.claims = '{"sub":"42"}'"#);
+    assert!(!has_error(&r), "{r:?}");
+
+    // Now only the principal's own rows are visible.
+    let r = c.simple("SELECT id FROM notes ORDER BY id");
+    assert_eq!(
+        data_rows(&r),
+        vec![vec![Some("1".into())], vec![Some("3".into())]],
+        "{r:?}"
+    );
+
+    // A second connection that never set the principal is still default-denied —
+    // enforcement is in the engine, not a layer the first client configured.
+    let mut c2 = Client::connect(&addr);
+    let r = c2.simple("SELECT id FROM notes");
+    assert_eq!(data_rows(&r), Vec::<Vec<Option<String>>>::new(), "{r:?}");
+}

@@ -6,7 +6,8 @@
 use crate::db::{commit_error, Database};
 use crate::error::{EngineError, Result};
 use crate::exec::{run_delete, run_insert, run_select_tuned, run_update, ResultSet, WriteCtx};
-use crate::sql::{self, Stmt};
+use crate::session::SessionContext;
+use crate::sql::{self, SessionSet, Stmt};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexDef, IndexParams};
 use crate::wal::WalOp;
@@ -53,6 +54,23 @@ pub struct Connection {
     /// binding — no durable or shared state, so it never affects branching or
     /// scale-to-zero.
     vector_ef_search: Option<usize>,
+    /// The authorization principal for this connection (Phase 7 RLS): the role
+    /// and trusted claims policies are evaluated against. Per-connection, so two
+    /// handles on the same `Database` never see each other's principal.
+    session: SessionContext,
+}
+
+/// A reflected row-level-security policy, for wire-protocol introspection
+/// (`pg_policies`) — the read side of [`Connection::policies`].
+pub struct CatalogPolicy {
+    pub table: String,
+    pub name: String,
+    /// `ALL`/`SELECT`/`INSERT`/`UPDATE`/`DELETE`.
+    pub command: &'static str,
+    /// Roles the policy applies to; empty means `PUBLIC`.
+    pub roles: Vec<String>,
+    pub using: Option<String>,
+    pub check: Option<String>,
 }
 
 /// A reflected table, for wire-protocol catalog introspection ([`Connection::catalog`]).
@@ -165,6 +183,7 @@ impl Connection {
             last_changes: 0,
             last_lsn: 0,
             vector_ef_search: None,
+            session: SessionContext::default(),
         })
     }
 
@@ -177,6 +196,17 @@ impl Connection {
     /// rows). Equivalent result either way; this confirms the page path engaged.
     pub fn vector_pages_loaded(&self) -> u64 {
         self.db.index_pages_loaded()
+    }
+
+    /// Apply a parsed session-context mutation to this connection's principal
+    /// (Phase 7 RLS). Identity is supplied by the boundary; the engine only
+    /// records it (the claims blob is never verified here).
+    fn apply_session_set(&mut self, set: &SessionSet) {
+        match set {
+            SessionSet::Role(r) => self.session.set_role(r.clone()),
+            SessionSet::Claims(c) => self.session.set_claims(c.clone()),
+            SessionSet::Bypass(on) => self.session.set_bypass(*on),
+        }
     }
 
     /// A read-only [`EngineStats`](crate::EngineStats) snapshot of the shared
@@ -222,6 +252,38 @@ impl Connection {
             .collect()
     }
 
+    /// Reflect row-level-security policies (Phase 7) for wire-protocol
+    /// introspection (`pg_policies`), sorted by table then policy name. Mirrors
+    /// [`Connection::catalog`]; the pgwire server answers PostgREST's policy
+    /// reflection from this.
+    pub fn policies(&self) -> Vec<CatalogPolicy> {
+        let mut out: Vec<CatalogPolicy> = Vec::new();
+        for s in self.db.catalog() {
+            for p in &s.policies {
+                out.push(CatalogPolicy {
+                    table: s.name.clone(),
+                    name: p.name.clone(),
+                    command: p.command.as_str(),
+                    roles: p.roles.clone(),
+                    using: p.using.clone(),
+                    check: p.check.clone(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.table.cmp(&b.table).then(a.name.cmp(&b.name)));
+        out
+    }
+
+    /// Whether row-level security is enabled on `table` (Phase 7 reflection).
+    pub fn rls_enabled(&self, table: &str) -> bool {
+        self.db
+            .catalog()
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(table))
+            .map(|s| s.rls_enabled)
+            .unwrap_or(false)
+    }
+
     /// Create a copy-on-write branch off this connection's database at its
     /// current committed LSN, returning a new connection bound to the branch.
     /// The branch forks from committed state (not this connection's uncommitted
@@ -248,6 +310,10 @@ impl Connection {
             last_changes: 0,
             last_lsn: 0,
             vector_ef_search: None,
+            // A fresh branch handle starts with an empty principal — a debug
+            // branch does not inherit the parent connection's session, so RLS
+            // still enforces against the branch's own (default) role.
+            session: SessionContext::default(),
         })
     }
 
@@ -287,7 +353,17 @@ impl Connection {
 
     /// Execute a (possibly parameterized) statement, returning rows for SELECT.
     pub fn run(&mut self, stmt: &Stmt, params: &[Value]) -> Result<ResultSet> {
+        // Install this connection's principal into the executor for the duration
+        // of the statement (Phase 7 RLS). Per-connection isolation: one handle's
+        // SETs never reach another's statements (the executor reads only what is
+        // installed here, synchronously, before it runs).
+        crate::exec::install_session(&self.session);
         match stmt {
+            // Session-context mutations apply to *subsequent* statements.
+            Stmt::SetSession(set) => {
+                self.apply_session_set(set);
+                Ok(ResultSet::default())
+            }
             Stmt::Begin => {
                 self.begin()?;
                 Ok(ResultSet::default())
@@ -326,7 +402,9 @@ impl Connection {
             | Stmt::DropIndex { .. }
             | Stmt::AlterTable { .. }
             | Stmt::CreateView { .. }
-            | Stmt::DropView { .. } => {
+            | Stmt::DropView { .. }
+            | Stmt::CreatePolicy(_)
+            | Stmt::DropPolicy { .. } => {
                 self.exec_ddl(stmt)?;
                 Ok(ResultSet::default())
             }
@@ -710,6 +788,8 @@ impl Connection {
                     foreign_keys: fks,
                     checks: checks.clone(),
                     uniques: uniques.clone(),
+                    rls_enabled: false,
+                    policies: Vec::new(),
                 };
                 let records = vec![
                     WalOp::CreateTable {
@@ -760,8 +840,99 @@ impl Connection {
                 if_not_exists,
             } => self.do_create_view(name, query, sql, *or_replace, *if_not_exists),
             Stmt::DropView { name, if_exists } => self.do_drop_view(name, *if_exists),
+            Stmt::CreatePolicy(def) => self.do_create_policy(def),
+            Stmt::DropPolicy {
+                name,
+                table,
+                if_exists,
+            } => self.do_drop_policy(name, table, *if_exists),
             _ => unreachable!(),
         }
+    }
+
+    /// `CREATE POLICY` (Phase 7 RLS): validate the target table and that the
+    /// predicate texts parse, durably log a `CreatePolicy` catalog fact, then
+    /// register it. Autocommit, like `CREATE TABLE`.
+    fn do_create_policy(&self, def: &crate::sql::PolicyDef) -> Result<Option<u64>> {
+        {
+            let store = self.db.store.read().unwrap();
+            let t = store
+                .table(&def.table)
+                .ok_or_else(|| EngineError::sql(format!("no such table: {}", def.table)))?;
+            if t.schema
+                .policies
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(&def.name))
+            {
+                return Err(EngineError::sql(format!(
+                    "policy {} already exists on {}",
+                    def.name, def.table
+                )));
+            }
+        }
+        // Fail fast on a malformed predicate so a bad policy never becomes a
+        // durable fact that would later break every query on the table.
+        if let Some(u) = &def.using {
+            sql::parse_expr(u)?;
+        }
+        if let Some(c) = &def.check {
+            sql::parse_expr(c)?;
+        }
+        let policy = crate::catalog::Policy {
+            name: def.name.clone(),
+            command: def.command,
+            roles: def.roles.clone(),
+            using: def.using.clone(),
+            check: def.check.clone(),
+        };
+        let records = vec![
+            WalOp::CreatePolicy {
+                table: def.table.clone(),
+                policy: policy.clone(),
+            }
+            .encode(),
+            WalOp::Commit.encode(),
+        ];
+        let commit_lsn =
+            block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
+        let mut store = self.db.store.write().unwrap();
+        store.add_policy(&def.table, policy);
+        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        Ok(Some(commit_lsn.0))
+    }
+
+    fn do_drop_policy(&self, name: &str, table: &str, if_exists: bool) -> Result<Option<u64>> {
+        {
+            let store = self.db.store.read().unwrap();
+            let has = store.table(table).is_some_and(|t| {
+                t.schema
+                    .policies
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(name))
+            });
+            if !has {
+                if if_exists {
+                    return Ok(None);
+                }
+                return Err(EngineError::sql(format!(
+                    "no such policy: {name} on {table}"
+                )));
+            }
+        }
+        let records = vec![
+            WalOp::DropPolicy {
+                table: table.to_string(),
+                name: name.to_string(),
+            }
+            .encode(),
+            WalOp::Commit.encode(),
+        ];
+        let commit_lsn =
+            block_on(self.db.storage.append_wal(&self.db.token, &records)).map_err(commit_error)?;
+        let mut store = self.db.store.write().unwrap();
+        store.drop_policy(table, name);
+        store.committed_lsn = store.committed_lsn.max(commit_lsn.0);
+        Ok(Some(commit_lsn.0))
     }
 
     /// `CREATE [OR REPLACE] VIEW … AS <select>` (deferred 6B item): reject a name
@@ -974,6 +1145,10 @@ impl Connection {
             AlterAction::RenameTable { to } => WalOp::AlterRenameTable {
                 table: table.to_string(),
                 to: to.clone(),
+            },
+            AlterAction::SetRls(enabled) => WalOp::SetRls {
+                table: table.to_string(),
+                enabled: *enabled,
             },
         };
         let records = vec![op.encode(), WalOp::Commit.encode()];

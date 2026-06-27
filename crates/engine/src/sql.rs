@@ -4,6 +4,7 @@
 //! DML + queries + transaction control); anything outside it is rejected with
 //! `ENGINE_ERR_SQL` rather than silently mis-parsed.
 
+use crate::catalog::PolicyCommand;
 use crate::error::{EngineError, Result};
 use crate::lex::{lex, Tok};
 use crate::value::{ColumnType, Value};
@@ -112,6 +113,42 @@ pub enum Stmt {
         name: String,
         if_exists: bool,
     },
+    /// A session-context mutation (`SET ROLE` / `SET twill.jwt.claims` /
+    /// `SET twill.rls.bypass`) that the connection applies to its principal
+    /// (Phase 7 RLS). Other `SET`/`PRAGMA`/… variants stay [`Stmt::Noop`].
+    SetSession(SessionSet),
+    /// `CREATE POLICY … ON <table> …` (Phase 7 RLS). DDL, autocommit-only.
+    CreatePolicy(PolicyDef),
+    /// `DROP POLICY [IF EXISTS] <name> ON <table>` (Phase 7 RLS).
+    DropPolicy {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
+}
+
+/// A parsed session-context mutation (Phase 7 RLS); applied by the connection.
+#[derive(Debug)]
+pub enum SessionSet {
+    /// `SET ROLE <name>` / `RESET ROLE` (`None` returns to the default role).
+    Role(Option<String>),
+    /// `SET twill.jwt.claims = '<json>'` / reset (`None`).
+    Claims(Option<String>),
+    /// `SET twill.rls.bypass = on|off` — the explicit RLS bypass.
+    Bypass(bool),
+}
+
+/// A parsed `CREATE POLICY` (Phase 7 RLS). The `using`/`check` predicates are the
+/// raw source text of each parenthesized clause, stored verbatim as a durable
+/// catalog fact and re-parsed at enforcement time.
+#[derive(Debug)]
+pub struct PolicyDef {
+    pub name: String,
+    pub table: String,
+    pub command: PolicyCommand,
+    pub roles: Vec<String>,
+    pub using: Option<String>,
+    pub check: Option<String>,
 }
 
 /// Where an `INSERT` gets its rows: literal `VALUES` tuples or the result of a
@@ -162,9 +199,19 @@ pub struct ColumnSpec {
 #[derive(Debug)]
 pub enum AlterAction {
     AddColumn(ColumnSpec),
-    DropColumn { name: String, if_exists: bool },
-    RenameColumn { from: String, to: String },
-    RenameTable { to: String },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    RenameTable {
+        to: String,
+    },
+    /// `{ENABLE|DISABLE} ROW LEVEL SECURITY` (Phase 7 RLS).
+    SetRls(bool),
 }
 
 /// A foreign key as parsed from `CREATE TABLE` (inline or table-level). The
@@ -784,6 +831,8 @@ impl Parser {
         if self.is_kw("create") {
             if self.next_is_kw("index") {
                 self.create_index()
+            } else if self.next_is_kw("policy") {
+                self.create_policy()
             } else if self.create_is_view() {
                 self.create_view()
             } else {
@@ -794,6 +843,8 @@ impl Parser {
                 self.drop_index()
             } else if self.next_is_kw("view") {
                 self.drop_view()
+            } else if self.next_is_kw("policy") {
+                self.drop_policy()
             } else {
                 self.drop_table()
             }
@@ -838,36 +889,13 @@ impl Parser {
             // dotted GUC name (`twill.vector_ef_search`) reads as one segment.
             let mut parts = Vec::new();
             while self.peek_word().is_some() {
-                parts.push(self.read_dotted_name());
+                parts.push(self.dotted_name());
             }
             Ok(Some(Ok(Stmt::Show(parts.join(" ")))))
         } else if self.is_kw("set") {
-            self.bump();
-            // `SET [SESSION|LOCAL] name [=|TO] value`. Recognize the vector recall
-            // knob (VH-3); every other GUC stays accepted-and-ignored.
-            let _ = self.eat_kw("session") || self.eat_kw("local");
-            let name = self.read_dotted_name();
-            if name.eq_ignore_ascii_case(VECTOR_EF_SEARCH_GUC) {
-                let _ = self.skip(Tok::Eq) || self.eat_kw("to");
-                let value = if self.eat_kw("default") {
-                    None
-                } else {
-                    Some(self.int_value()?.max(1) as usize)
-                };
-                self.skip_to_end();
-                return Ok(Some(Ok(Stmt::SetVectorEf(value))));
-            }
-            self.skip_to_end();
-            Ok(Some(Ok(Stmt::Noop)))
+            Ok(Some(self.set_stmt()))
         } else if self.is_kw("reset") {
-            self.bump();
-            let name = self.read_dotted_name();
-            self.skip_to_end();
-            if name.eq_ignore_ascii_case(VECTOR_EF_SEARCH_GUC) {
-                Ok(Some(Ok(Stmt::SetVectorEf(None))))
-            } else {
-                Ok(Some(Ok(Stmt::Noop)))
-            }
+            Ok(Some(self.reset_stmt()))
         } else if self.is_kw("pragma")
             || self.is_kw("vacuum")
             || self.is_kw("analyze")
@@ -880,29 +908,114 @@ impl Parser {
         }
     }
 
-    /// Read a (possibly schema-qualified) GUC / setting name: `word(.word)*`,
-    /// joined with `.` — e.g. `twill.vector_ef_search`. Returns an empty string
-    /// when the next token is not a word.
-    fn read_dotted_name(&mut self) -> String {
-        let mut s = String::new();
-        match self.peek_word() {
-            Some(w) => {
-                s.push_str(w);
-                self.bump();
+    /// `SET [SESSION|LOCAL] …` (stage 6E dialect shim, extended for Phase 7 RLS
+    /// and VH-3 vector tuning). `SET ROLE`, `SET twill.jwt.claims`, and
+    /// `SET twill.rls.bypass` mutate the session principal; `SET
+    /// twill.vector_ef_search` sets the per-session HNSW recall knob; every other
+    /// `SET` is accepted-and-ignored ([`Stmt::Noop`]).
+    fn set_stmt(&mut self) -> Result<Stmt> {
+        self.expect_kw("set")?;
+        let _ = self.eat_kw("session") || self.eat_kw("local");
+        if self.eat_kw("role") {
+            let role = if self.eat_kw("none") || self.eat_kw("default") {
+                None
+            } else {
+                Some(self.ident()?)
+            };
+            self.skip_to_end();
+            return Ok(Stmt::SetSession(SessionSet::Role(role)));
+        }
+        let name = self.dotted_name().to_ascii_lowercase();
+        let stmt = match name.as_str() {
+            // The trusted claims blob (`request.jwt.claims` is PostgREST's GUC).
+            "twill.jwt.claims" | "request.jwt.claims" => {
+                let claims = match self.read_set_value() {
+                    SetVal::Str(s) => Some(s),
+                    SetVal::Word(w) => Some(w),
+                    _ => None,
+                };
+                Stmt::SetSession(SessionSet::Claims(claims))
             }
-            None => return s,
+            "twill.rls.bypass" => {
+                Stmt::SetSession(SessionSet::Bypass(self.read_set_value().truthy()))
+            }
+            // VH-3: the per-session HNSW recall knob (`Default`/non-numeric → reset).
+            VECTOR_EF_SEARCH_GUC => {
+                let value = match self.read_set_value() {
+                    SetVal::Word(w) => w.parse::<usize>().ok().map(|n| n.max(1)),
+                    _ => None,
+                };
+                Stmt::SetVectorEf(value)
+            }
+            // Unrecognized GUC: accept and ignore.
+            _ => Stmt::Noop,
+        };
+        self.skip_to_end();
+        Ok(stmt)
+    }
+
+    /// `RESET <name>` — `RESET ROLE` / `RESET twill.jwt.claims` /
+    /// `RESET twill.vector_ef_search` clear the matching session state; every
+    /// other `RESET` is accepted-and-ignored.
+    fn reset_stmt(&mut self) -> Result<Stmt> {
+        self.expect_kw("reset")?;
+        if self.eat_kw("role") {
+            self.skip_to_end();
+            return Ok(Stmt::SetSession(SessionSet::Role(None)));
+        }
+        let name = self.dotted_name().to_ascii_lowercase();
+        let stmt = match name.as_str() {
+            "twill.jwt.claims" | "request.jwt.claims" => Stmt::SetSession(SessionSet::Claims(None)),
+            "twill.rls.bypass" => Stmt::SetSession(SessionSet::Bypass(false)),
+            VECTOR_EF_SEARCH_GUC => Stmt::SetVectorEf(None),
+            _ => Stmt::Noop,
+        };
+        self.skip_to_end();
+        Ok(stmt)
+    }
+
+    /// Read a dotted GUC name (`twill.jwt.claims`) from consecutive word/dot tokens.
+    fn dotted_name(&mut self) -> String {
+        let mut parts = Vec::new();
+        if let Some(w) = self.peek_word() {
+            parts.push(w.to_string());
+            self.bump();
         }
         while self.peek() == &Tok::Dot {
             self.bump();
-            if let Some(w) = self.peek_word() {
-                s.push('.');
-                s.push_str(w);
-                self.bump();
-            } else {
-                break;
+            match self.peek_word() {
+                Some(w) => {
+                    parts.push(w.to_string());
+                    self.bump();
+                }
+                None => break,
             }
         }
-        s
+        parts.join(".")
+    }
+
+    /// Read a `SET name [=|TO] value` right-hand side as a single value token.
+    fn read_set_value(&mut self) -> SetVal {
+        let _ = self.skip(Tok::Eq) || self.eat_kw("to");
+        match self.peek().clone() {
+            Tok::Str(s) => {
+                self.bump();
+                SetVal::Str(s)
+            }
+            Tok::Int(n) => {
+                self.bump();
+                SetVal::Word(n.to_string())
+            }
+            Tok::Word(w) => {
+                self.bump();
+                if w.eq_ignore_ascii_case("default") {
+                    SetVal::Default
+                } else {
+                    SetVal::Word(w)
+                }
+            }
+            _ => SetVal::None,
+        }
     }
 
     /// Transaction-control statements (`BEGIN`/`START`, `COMMIT`/`END`,
@@ -1063,9 +1176,19 @@ impl Parser {
                     to: self.ident()?,
                 }
             }
+        } else if self.is_kw("enable") || self.is_kw("disable") {
+            // `{ENABLE|DISABLE} ROW LEVEL SECURITY` (Phase 7 RLS).
+            let enable = self.eat_kw("enable");
+            if !enable {
+                self.expect_kw("disable")?;
+            }
+            self.expect_kw("row")?;
+            self.expect_kw("level")?;
+            self.expect_kw("security")?;
+            AlterAction::SetRls(enable)
         } else {
             return Err(EngineError::sql(
-                "unsupported ALTER TABLE action (expected ADD/DROP/RENAME)",
+                "unsupported ALTER TABLE action (expected ADD/DROP/RENAME/ENABLE/DISABLE)",
             ));
         };
         Ok(Stmt::AlterTable { table, action })
@@ -1445,6 +1568,95 @@ impl Parser {
         };
         let name = self.ident()?;
         Ok(Stmt::DropView { name, if_exists })
+    }
+
+    /// `CREATE POLICY <name> ON <table> [FOR <cmd>] [TO <role>[, …]]
+    ///  [USING (<expr>)] [WITH CHECK (<expr>)]` (Phase 7 RLS).
+    fn create_policy(&mut self) -> Result<Stmt> {
+        self.expect_kw("create")?;
+        self.expect_kw("policy")?;
+        let name = self.ident()?;
+        self.expect_kw("on")?;
+        let table = self.ident()?;
+        // `FOR {ALL|SELECT|INSERT|UPDATE|DELETE}` (defaults to ALL).
+        let command = if self.eat_kw("for") {
+            self.policy_command()?
+        } else {
+            PolicyCommand::All
+        };
+        // `TO role[, role…]` (defaults to PUBLIC = every role). `PUBLIC` is the
+        // explicit all-roles spelling, recorded as an empty role list.
+        let mut roles = Vec::new();
+        if self.eat_kw("to") {
+            loop {
+                let r = self.ident()?;
+                if !r.eq_ignore_ascii_case("public") {
+                    roles.push(r);
+                }
+                if self.skip(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        let using = if self.eat_kw("using") {
+            Some(self.capture_paren_expr_sql()?)
+        } else {
+            None
+        };
+        let check = if self.eat_kw("with") {
+            self.expect_kw("check")?;
+            Some(self.capture_paren_expr_sql()?)
+        } else {
+            None
+        };
+        Ok(Stmt::CreatePolicy(PolicyDef {
+            name,
+            table,
+            command,
+            roles,
+            using,
+            check,
+        }))
+    }
+
+    /// One `FOR <command>` keyword in a `CREATE POLICY`.
+    fn policy_command(&mut self) -> Result<PolicyCommand> {
+        if self.eat_kw("all") {
+            Ok(PolicyCommand::All)
+        } else if self.eat_kw("select") {
+            Ok(PolicyCommand::Select)
+        } else if self.eat_kw("insert") {
+            Ok(PolicyCommand::Insert)
+        } else if self.eat_kw("update") {
+            Ok(PolicyCommand::Update)
+        } else if self.eat_kw("delete") {
+            Ok(PolicyCommand::Delete)
+        } else {
+            Err(EngineError::sql(
+                "policy command must be ALL/SELECT/INSERT/UPDATE/DELETE",
+            ))
+        }
+    }
+
+    /// `DROP POLICY [IF EXISTS] <name> ON <table>` (Phase 7 RLS).
+    fn drop_policy(&mut self) -> Result<Stmt> {
+        self.expect_kw("drop")?;
+        self.expect_kw("policy")?;
+        let if_exists = if self.eat_kw("if") {
+            self.expect_kw("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        self.expect_kw("on")?;
+        let table = self.ident()?;
+        Ok(Stmt::DropPolicy {
+            name,
+            table,
+            if_exists,
+        })
     }
 
     fn insert(&mut self) -> Result<Stmt> {
@@ -2507,7 +2719,12 @@ impl Parser {
                         // becomes a qualified reference the relational binder
                         // resolves (the single-table path ignores the qualifier).
                         let col = self.ident()?;
-                        if w.eq_ignore_ascii_case("excluded") {
+                        // A dotted name immediately followed by `(` is a
+                        // schema-qualified function call (e.g. `auth.uid()`,
+                        // Phase 7 RLS), not a column reference.
+                        if self.peek() == &Tok::LParen {
+                            self.func_call(format!("{w}.{col}"))
+                        } else if w.eq_ignore_ascii_case("excluded") {
                             Ok(Expr::Excluded(col))
                         } else {
                             Ok(Expr::Qualified(w, col))
@@ -2611,18 +2828,46 @@ fn is_serial_type(name: &str) -> bool {
 
 /// Re-stringify a token slice into a re-parseable SQL fragment (whitespace
 /// normalized). Used to capture `DEFAULT`/`CHECK` expression source.
+/// The right-hand side of a `SET name = value` (Phase 7 RLS session GUCs).
+enum SetVal {
+    Str(String),
+    Word(String),
+    Default,
+    None,
+}
+
+impl SetVal {
+    /// Interpret the value as a boolean (`on`/`true`/`1`/`yes` → true).
+    fn truthy(&self) -> bool {
+        let s = match self {
+            SetVal::Str(s) | SetVal::Word(s) => s.as_str(),
+            _ => return false,
+        };
+        matches!(s.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")
+    }
+}
+
 fn render_tokens(toks: &[Tok]) -> String {
     let mut out = String::new();
     for (i, t) in toks.iter().enumerate() {
-        if i > 0
-            && !matches!(t, Tok::Comma | Tok::RParen | Tok::DColon)
-            && !matches!(toks[i - 1], Tok::LParen | Tok::DColon)
-        {
+        if i > 0 && needs_space(&toks[i - 1], t) {
             out.push(' ');
         }
         out.push_str(&render_token(t));
     }
     out
+}
+
+/// Whether a space is needed between consecutive tokens when re-stringifying an
+/// expression (`DEFAULT`/`CHECK`/policy predicate capture). No space hugs `.`
+/// (qualified names / `auth.uid()`), the `,`/`)`/`::` punctuators, or a `(` that
+/// opens a call/grouping right after a word or `)` (`uid()`, `lower(x)`).
+fn needs_space(prev: &Tok, cur: &Tok) -> bool {
+    if matches!(cur, Tok::LParen) && matches!(prev, Tok::Word(_) | Tok::RParen) {
+        return false;
+    }
+    !matches!(cur, Tok::Comma | Tok::RParen | Tok::DColon | Tok::Dot)
+        && !matches!(prev, Tok::LParen | Tok::DColon | Tok::Dot)
 }
 
 fn render_token(t: &Tok) -> String {

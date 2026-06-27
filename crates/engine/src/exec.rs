@@ -6,9 +6,10 @@
 //! `PENDING` and emit [`WalOp`]s; durability and publish-at-commit-LSN are the
 //! transaction manager's job (see [`crate::conn`]).
 
-use crate::catalog::TableSchema;
+use crate::catalog::{Policy, PolicyCommand, TableSchema};
 use crate::datetime;
 use crate::error::{EngineError, Result};
+use crate::session::SessionContext;
 use crate::sql::{
     AggArg, AggFunc, BinOp, CastTarget, Expr, FromClause, InsertSource, JoinKind, OnConflict,
     OrderKey, SelItem, SelectStmt, SetOp, UnOp,
@@ -17,8 +18,202 @@ use crate::store::{RowVersion, Store, PENDING};
 use crate::value::{parse_vector, ColumnType, Value};
 use crate::vector::{distance, Metric};
 use crate::wal::WalOp;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+
+// ---- session principal (Phase 7 RLS) --------------------------------------
+
+thread_local! {
+    /// The principal the executor evaluates policies against. A connection
+    /// installs its own [`SessionContext`] here ([`install_session`]) before each
+    /// statement runs, synchronously, so even when two connections share a thread
+    /// the executor always reads the one currently executing — never a peer's.
+    static SESSION: RefCell<SessionContext> = RefCell::new(SessionContext::default());
+}
+
+/// Install the active connection's principal for the duration of one statement
+/// (Phase 7 RLS). Called by [`crate::conn::Connection::run`] before execution.
+pub fn install_session(s: &SessionContext) {
+    SESSION.with(|c| *c.borrow_mut() = s.clone());
+}
+
+/// Read the installed principal.
+fn with_session<R>(f: impl FnOnce(&SessionContext) -> R) -> R {
+    SESSION.with(|c| f(&c.borrow()))
+}
+
+/// Evaluate an `auth.*` accessor (`auth.uid()`/`auth.role()`/`auth.claim(k)`),
+/// reading the installed principal. The engine never verifies the claims — it
+/// only reports what the boundary vouched for (spec 17).
+fn eval_auth(fname: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
+    match fname {
+        "uid" => Ok(with_session(|s| s.uid())
+            .map(Value::Text)
+            .unwrap_or(Value::Null)),
+        "role" => Ok(Value::Text(with_session(|s| s.role().to_string()))),
+        "claim" => {
+            let key = match args.first() {
+                Some(e) => eval(e, ctx)?,
+                None => return Err(EngineError::sql("auth.claim(key) requires a key argument")),
+            };
+            if key.is_null() {
+                return Ok(Value::Null);
+            }
+            let key = text_of(&key);
+            Ok(with_session(|s| s.claim(&key))
+                .map(Value::Text)
+                .unwrap_or(Value::Null))
+        }
+        other => Err(EngineError::sql(format!("unknown function: auth.{other}"))),
+    }
+}
+
+// ---- row-level-security policy evaluation (Phase 7) -----------------------
+
+/// If `name` is an `auth.<fn>` accessor, return the `<fn>` part, lowercased.
+fn strip_auth_prefix(name: &str) -> Option<String> {
+    name.to_ascii_lowercase()
+        .strip_prefix("auth.")
+        .map(|s| s.to_string())
+}
+
+/// Whether a policy governs `cmd` for `role`: its command matches (or is `ALL`)
+/// and its role list includes `role` (or is `PUBLIC` / empty).
+fn policy_applies(p: &Policy, cmd: PolicyCommand, role: &str) -> bool {
+    let cmd_ok = p.command == PolicyCommand::All || p.command == cmd;
+    let role_ok = p.roles.is_empty() || p.roles.iter().any(|r| r.eq_ignore_ascii_case(role));
+    cmd_ok && role_ok
+}
+
+/// The RLS decision for a *read* of a table (`USING` predicates), computed once
+/// per statement (parse-once, spec 17). `Unrestricted` when RLS is off, the
+/// session bypasses, or an applicable policy grants every row; `Deny` (default-
+/// deny) when RLS is on and no policy applies; otherwise the OR of the applicable
+/// policies' `USING` predicates.
+enum RlsRead {
+    Unrestricted,
+    Filter(Vec<Expr>),
+    Deny,
+}
+
+impl RlsRead {
+    /// Whether `ctx`'s row passes the read filter (permissive OR; a NULL/false
+    /// `USING` hides the row).
+    fn passes(&self, ctx: &EvalCtx) -> Result<bool> {
+        match self {
+            RlsRead::Unrestricted => Ok(true),
+            RlsRead::Deny => Ok(false),
+            RlsRead::Filter(preds) => {
+                for p in preds {
+                    if eval(p, ctx)?.as_bool() == Some(true) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// Compute the read decision for `schema` under the installed principal and the
+/// command whose visibility is being enforced (`SELECT` for reads; `UPDATE` /
+/// `DELETE` for the target set those commands filter).
+fn rls_read(schema: &TableSchema, cmd: PolicyCommand) -> Result<RlsRead> {
+    if !schema.rls_enabled || with_session(|s| s.bypass()) {
+        return Ok(RlsRead::Unrestricted);
+    }
+    let role = with_session(|s| s.role().to_string());
+    let mut preds = Vec::new();
+    let mut applicable = false;
+    for p in &schema.policies {
+        if !policy_applies(p, cmd, &role) {
+            continue;
+        }
+        applicable = true;
+        match &p.using {
+            None => return Ok(RlsRead::Unrestricted), // USING (true)
+            Some(sql) => preds.push(crate::sql::parse_expr(sql)?),
+        }
+    }
+    if !applicable {
+        return Ok(RlsRead::Deny);
+    }
+    if preds.is_empty() {
+        return Ok(RlsRead::Unrestricted);
+    }
+    Ok(RlsRead::Filter(preds))
+}
+
+/// The RLS decision for a *write* of a table (`WITH CHECK` predicates; a policy
+/// with no `WITH CHECK` falls back to its `USING`, per Postgres). `Unrestricted`
+/// when RLS is off, the session bypasses, or a policy admits any row; `Deny` when
+/// RLS is on and no policy applies; otherwise the OR of admissibility predicates.
+enum RlsWrite {
+    Unrestricted,
+    Check(Vec<Expr>),
+    Deny,
+}
+
+/// Compute the write decision for `schema` under the installed principal.
+fn rls_write(schema: &TableSchema, cmd: PolicyCommand) -> Result<RlsWrite> {
+    if !schema.rls_enabled || with_session(|s| s.bypass()) {
+        return Ok(RlsWrite::Unrestricted);
+    }
+    let role = with_session(|s| s.role().to_string());
+    let mut preds = Vec::new();
+    let mut applicable = false;
+    for p in &schema.policies {
+        if !policy_applies(p, cmd, &role) {
+            continue;
+        }
+        applicable = true;
+        match p.check.as_ref().or(p.using.as_ref()) {
+            None => return Ok(RlsWrite::Unrestricted), // WITH CHECK (true)
+            Some(sql) => preds.push(crate::sql::parse_expr(sql)?),
+        }
+    }
+    if !applicable {
+        return Ok(RlsWrite::Deny);
+    }
+    if preds.is_empty() {
+        return Ok(RlsWrite::Unrestricted);
+    }
+    Ok(RlsWrite::Check(preds))
+}
+
+/// Enforce a write decision against a proposed/updated row (`schema` + `vals`).
+/// A row that satisfies no admissibility predicate (or any row under `Deny`) is
+/// rejected *before* any WAL op is emitted — a denied write never becomes durable.
+fn enforce_rls_write(
+    decision: &RlsWrite,
+    schema: &TableSchema,
+    table: &str,
+    vals: &[Value],
+) -> Result<()> {
+    let ok = match decision {
+        RlsWrite::Unrestricted => true,
+        RlsWrite::Deny => false,
+        RlsWrite::Check(preds) => {
+            let ctx = EvalCtx::row(vals, schema, &[]);
+            let mut pass = false;
+            for p in preds {
+                if eval(p, &ctx)?.as_bool() == Some(true) {
+                    pass = true;
+                    break;
+                }
+            }
+            pass
+        }
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(EngineError::constraint(format!(
+            "new row violates row-level security policy for table {table}"
+        )))
+    }
+}
 
 /// How many candidates the HNSW scan over-fetches per requested result, to
 /// absorb hits that are MVCC-invisible or filtered out by a `WHERE` clause.
@@ -189,6 +384,12 @@ fn eval(e: &Expr, ctx: &EvalCtx) -> Result<Value> {
             cast_value(v, *target)
         }
         Expr::Func { name, args } => {
+            // `auth.*` accessors read the session principal (Phase 7 RLS) and so
+            // are evaluated here, where the eval context is in scope, rather than
+            // in the principal-free [`call_func`].
+            if let Some(rest) = strip_auth_prefix(name) {
+                return eval_auth(&rest, args, ctx);
+            }
             let vals: Vec<Value> = args.iter().map(|a| eval(a, ctx)).collect::<Result<_>>()?;
             call_func(name, vals)
         }
@@ -738,20 +939,30 @@ fn single_table_select(
         .ok_or_else(|| EngineError::sql(format!("no such table: {table_name}")))?;
     let schema = &table.schema;
 
+    // Row-level-security read filter (Phase 7), parsed once per statement and
+    // AND-ed into the scan below over the same MVCC snapshot.
+    let rls = rls_read(schema, PolicyCommand::Select)?;
+
     // Index-accelerated top-k nearest-neighbour, when the query shape allows it
     // (an HNSW index exists for the ordered-by distance) — answered by the access
-    // method, not a full scan plus sort (spec 12).
-    if let Some(rs) = knn_select(store, sel, table_name, snapshot, writer, params, ef_search)? {
-        return Ok(rs);
+    // method, not a full scan plus sort (spec 12). Skipped when RLS restricts the
+    // table, so the per-row predicate is always applied on the scan path.
+    if matches!(rls, RlsRead::Unrestricted) {
+        if let Some(rs) = knn_select(store, sel, table_name, snapshot, writer, params, ef_search)? {
+            return Ok(rs);
+        }
     }
 
-    // Visible rows passing WHERE.
+    // Visible rows passing RLS and WHERE.
     let mut matched: Vec<&Vec<Value>> = Vec::new();
     for v in &table.rows {
         if !row_visible(v, snapshot, writer) {
             continue;
         }
         let ctx = EvalCtx::row(&v.values, schema, params);
+        if !rls.passes(&ctx)? {
+            continue;
+        }
         if predicate(&sel.filter, &ctx)? {
             matched.push(&v.values);
         }
@@ -2252,6 +2463,25 @@ pub struct Mutation {
     pub result: Option<ResultSet>,
 }
 
+/// Drop rows a write's `RETURNING` must not surface (Phase 7 RLS): the projected
+/// rows are filtered by the table's `SELECT` policy, so `… RETURNING *` cannot
+/// leak a row the session could not have read. The affected-row *count* is
+/// unchanged — only what is returned is filtered.
+fn rls_filter_returning(schema: &TableSchema, rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
+    let read = rls_read(schema, PolicyCommand::Select)?;
+    if matches!(read, RlsRead::Unrestricted) {
+        return Ok(rows);
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let ctx = EvalCtx::row(&r, schema, &[]);
+        if read.passes(&ctx)? {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
 /// Project affected rows (full table-row value vectors) through a `RETURNING`
 /// list — `*` expands the table's columns, expressions evaluate per row.
 fn project_returning(
@@ -2416,6 +2646,14 @@ pub fn run_insert(
 
     let slots = build_insert_slots(store, &schema, columns, source, wc)?;
     let staged = finalize_insert_rows(store, &schema, table, slots)?;
+
+    // Row-level-security `WITH CHECK` (Phase 7): every proposed row must satisfy
+    // the INSERT policy before any mutation, so a denied write never reaches the
+    // WAL. Validated here, in the validation phase, like NOT NULL / CHECK above.
+    let with_check = rls_write(&schema, PolicyCommand::Insert)?;
+    for row in &staged {
+        enforce_rls_write(&with_check, &schema, table, row)?;
+    }
 
     // Secondary UNIQUE is enforced for plain inserts (upserts resolve on the PK).
     if matches!(on_conflict, OnConflict::Error) {
@@ -2628,7 +2866,10 @@ fn apply_insert(
     }
     let changes = affected.len() as i64;
     let result = match returning {
-        Some(items) => Some(project_returning(items, schema, &affected, wc.params)?),
+        Some(items) => {
+            let visible = rls_filter_returning(schema, affected)?;
+            Some(project_returning(items, schema, &visible, wc.params)?)
+        }
         None => None,
     };
     Ok(Mutation {
@@ -2783,7 +3024,10 @@ pub fn run_delete(
     }
     let changes = victims.len() as i64;
     let result = match returning {
-        Some(items) => Some(project_returning(items, &schema, &affected, wc.params)?),
+        Some(items) => {
+            let visible = rls_filter_returning(&schema, affected)?;
+            Some(project_returning(items, &schema, &visible, wc.params)?)
+        }
         None => None,
     };
     Ok(Mutation {
@@ -2803,6 +3047,9 @@ fn collect_delete_victims(
     want_returning: bool,
     wc: &WriteCtx,
 ) -> Result<(Vec<u64>, Vec<Vec<Value>>)> {
+    // RLS (Phase 7): `USING` filters which rows the DELETE may remove (default-
+    // deny when enabled with no matching policy).
+    let using = rls_read(schema, PolicyCommand::Delete)?;
     let t = store.table(table).unwrap();
     let mut victims = Vec::new();
     let mut affected: Vec<Vec<Value>> = Vec::new();
@@ -2811,6 +3058,9 @@ fn collect_delete_victims(
             continue;
         }
         let ctx = EvalCtx::row(&v.values, schema, wc.params);
+        if !using.passes(&ctx)? {
+            continue;
+        }
         if predicate(filter, &ctx)? {
             check_no_conflict(v, wc.snapshot, wc.owner)?;
             victims.push(v.vid);
@@ -2839,11 +3089,17 @@ fn collect_delete_victims_join(
     let mut cols = target_rel_cols(schema, table);
     cols.extend(from_cols);
 
+    // RLS (Phase 7): `USING` over the target row filters which rows may be removed.
+    let using = rls_read(schema, PolicyCommand::Delete)?;
     let t = store.table(table).unwrap();
     let mut victims = Vec::new();
     let mut affected: Vec<Vec<Value>> = Vec::new();
     for v in &t.rows {
         if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        let target_ctx = EvalCtx::row(&v.values, schema, wc.params);
+        if !using.passes(&target_ctx)? {
             continue;
         }
         for frow in &from_rows {
@@ -2931,10 +3187,20 @@ fn compute_updates_join(
     let mut cols = target_rel_cols(schema, table);
     cols.extend(from_cols);
 
+    // RLS (Phase 7): `USING` over the target row filters which rows may update;
+    // `WITH CHECK` admits the new row.
+    let using = rls_read(schema, PolicyCommand::Update)?;
+    let with_check = rls_write(schema, PolicyCommand::Update)?;
+
     let t = store.table(table).unwrap();
     let mut updates: Vec<(u64, Vec<Value>)> = Vec::new();
     for v in &t.rows {
         if !v.visible_to_writer(wc.snapshot, wc.owner) {
+            continue;
+        }
+        // The `USING` predicate reads only the target row's columns.
+        let target_ctx = EvalCtx::row(&v.values, schema, wc.params);
+        if !using.passes(&target_ctx)? {
             continue;
         }
         for frow in &from_rows {
@@ -2952,6 +3218,7 @@ fn compute_updates_join(
             check_not_null(schema, &nv, table)?;
             check_vector_dims(schema, &nv, table)?;
             check_row_constraints(&check_exprs, schema, &nv)?;
+            enforce_rls_write(&with_check, schema, table, &nv)?;
             updates.push((v.vid, nv));
             break; // one update per target row (first match wins)
         }
@@ -2983,6 +3250,11 @@ fn compute_updates(
         .map(|s| crate::sql::parse_expr(s))
         .collect::<Result<_>>()?;
 
+    // RLS (Phase 7): `USING` filters which existing rows the UPDATE may touch
+    // (default-deny when enabled with no policy); `WITH CHECK` admits the new row.
+    let using = rls_read(schema, PolicyCommand::Update)?;
+    let with_check = rls_write(schema, PolicyCommand::Update)?;
+
     let t = store.table(table).unwrap();
     let mut updates: Vec<(u64, Vec<Value>)> = Vec::new();
     for v in &t.rows {
@@ -2990,6 +3262,9 @@ fn compute_updates(
             continue;
         }
         let ctx = EvalCtx::row(&v.values, schema, wc.params);
+        if !using.passes(&ctx)? {
+            continue;
+        }
         if !predicate(filter, &ctx)? {
             continue;
         }
@@ -3001,6 +3276,7 @@ fn compute_updates(
         check_not_null(schema, &nv, table)?;
         check_vector_dims(schema, &nv, table)?;
         check_row_constraints(&check_exprs, schema, &nv)?;
+        enforce_rls_write(&with_check, schema, table, &nv)?;
         updates.push((v.vid, nv));
     }
     Ok(updates)
@@ -3068,7 +3344,10 @@ fn apply_updates(
         store.index_row_inserted(table, *vid, vals);
     }
     let result = match returning {
-        Some(items) => Some(project_returning(items, schema, &affected, wc.params)?),
+        Some(items) => {
+            let visible = rls_filter_returning(schema, affected)?;
+            Some(project_returning(items, schema, &visible, wc.params)?)
+        }
         None => None,
     };
     Ok(Mutation {
@@ -3484,12 +3763,21 @@ mod relational {
                         ty: c.ty,
                     })
                     .collect();
-                let rows = table
-                    .rows
-                    .iter()
-                    .filter(|v| row_visible(v, snapshot, writer))
-                    .map(|v| v.values.clone())
-                    .collect();
+                // Each base table in a join / subquery applies its own RLS read
+                // filter (Phase 7), so no query shape leaks an unfiltered row;
+                // derived tables inherit it by recursing through this path.
+                let rls = rls_read(&table.schema, PolicyCommand::Select)?;
+                let mut rows = Vec::new();
+                for v in &table.rows {
+                    if !row_visible(v, snapshot, writer) {
+                        continue;
+                    }
+                    let ctx = EvalCtx::row(&v.values, &table.schema, params);
+                    if !rls.passes(&ctx)? {
+                        continue;
+                    }
+                    rows.push(v.values.clone());
+                }
                 Ok(Relation { cols, rows })
             }
             Some(FromClause::Derived { query, alias }) => {

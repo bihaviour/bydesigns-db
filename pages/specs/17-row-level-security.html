@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Row-Level Security (Proposal) · Serverless OLTP Engine Spec</title>
+<title>Row-Level Security · Serverless OLTP Engine Spec</title>
 <link rel="stylesheet" href="../assets/app.css">
 </head>
 <body>
@@ -16,18 +16,18 @@
 <header class="page-header">
 <div class="spec-meta">
 <span class="badge badge-id">17</span>
-<span class="badge badge-status status-draft">Proposal v0.1</span>
-<span class="spec-date">Updated 2026-06-23</span>
+<span class="badge badge-status status-review">Phase 7 · Implemented</span>
+<span class="spec-date">Updated 2026-06-27</span>
 </div>
-<h1>Row-Level Security (Proposal)</h1>
+<h1>Row-Level Security</h1>
 <p class="lede">A proposal to resolve the open authorization question from <a href="12-capabilities.html">Capabilities</a>: bring Supabase-style row-level security to Twill by splitting it along the build-in-vs-compose seam — the <em>per-row enforcement predicate</em> is an execution capability built <strong>into</strong> the engine, while <em>identity, JWT verification, and policy authoring</em> stay composed <strong>around</strong> it. The storage seam never moves; RLS rides the same WAL/replay path the rows do, so policies branch and scale-to-zero with the database.</p>
 </header>
 
 <section>
 <h2>Status &amp; purpose</h2>
-<div class="callout warning">
-<p class="callout-title">This is a proposal, not a ratified spec</p>
-<p>Phases 1–6 are implemented; row-level security is <strong>not</strong> built and not yet committed to the roadmap. This page exists to answer the dangling open question in <a href="12-capabilities.html">Capabilities §Open questions</a> — "<em>where do row-level security / policy enforcement live — in the engine, in PostgREST, or in the app?</em>" — with a concrete, seam-respecting design and a proposed roadmap slot. It is <span class="badge badge-status status-draft">Proposal v0.1</span> until engineering sign-off promotes it to <span class="badge badge-status status-review">In review</span>.</p>
+<div class="callout note">
+<p class="callout-title">Implemented in Phase 7 (#88)</p>
+<p>This design is now built. Row-level security ships as the additive <code>sql.rs</code>→<code>exec.rs</code> growth described below: a per-connection session principal (<code>SET ROLE</code> / <code>SET twill.jwt.claims</code>) read by the <code>auth.*</code> accessors, <code>CREATE/DROP POLICY</code> + <code>ALTER TABLE … ENABLE ROW LEVEL SECURITY</code> persisted as additive <code>CreatePolicy</code>/<code>DropPolicy</code>/<code>SetRls</code> WAL catalog facts, and <code>USING</code>/<code>WITH CHECK</code> enforcement AND-ed into both the single-table and relational read paths and the write paths, with default-deny. The storage seam never moved (<code>STORAGE_TRAIT_VERSION</code> unchanged) and no C symbol or ABI changed (<code>ENGINE_ABI_VERSION</code> unchanged) — RLS rides the same SET path and WAL the rest of the engine does, so policies branch, scale-to-zero, and PITR-restore for free. It originally answered the dangling open question in <a href="12-capabilities.html">Capabilities §Open questions</a> — "<em>where do row-level security / policy enforcement live — in the engine, in PostgREST, or in the app?</em>" — and the answer it landed: enforcement in the executor, identity at the boundary.</p>
 </div>
 <p>The motivation is the Supabase experience: the database itself enforces <em>who can see and change which rows</em>, driven by a request's authenticated identity (a JWT's claims and role), so a single auto-generated API surface (PostgREST) can be exposed to untrusted clients safely. The application writes <code>CREATE POLICY</code> once; every query — no matter which client issues it — is filtered by the engine. This page specifies how that experience maps onto Twill without violating the <a href="12-capabilities.html">deciding rule</a> or the <a href="03-storage-interface.html">storage seam</a>.</p>
 <div class="callout note">
