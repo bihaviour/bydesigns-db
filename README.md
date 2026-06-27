@@ -22,6 +22,13 @@ entry points below.
 > [!WARNING]
 > **Pre-1.0 — active development.** Twill DB is under active development (currently `0.x`). Interfaces, the SQL surface, on-disk and storage formats, and behaviour may change between releases — **backward compatibility is not guaranteed until the `1.0.0` release**. Pin an exact version and review the release notes before upgrading.
 
+> [!NOTE]
+> **Experimental, maintainer-led project.**
+> - 🌐 **Source is public** — read, evaluate, and **self-host** freely (production self-hosting is permitted; see [License](#license)).
+> - 💬 **Feedback is welcome** — issues, bug reports, and feature suggestions are encouraged.
+> - 🚫 **Pull requests are not accepted** right now and may be closed without review — see [`CONTRIBUTING.md`](.github/CONTRIBUTING.md) and [`GOVERNANCE.md`](GOVERNANCE.md).
+> - 🏗️ **API and architecture are subject to change.**
+
 ## What this is
 
 **Twill DB** is an OLTP database engine that is, at the same time:
@@ -179,6 +186,21 @@ See [Releases & roadmap](pages/release/index.html) and the [full build sequence]
 
 ## License
 
-Licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [`LICENSE`](LICENSE).
+Licensed under the **Business Source License 1.1** (BUSL-1.1). See [`LICENSE`](LICENSE).
 
-If you run a modified version of this software as a network service, the AGPL requires you to make your modified source available to its users.
+The BUSL is a **source-available** (not open source) license. In short:
+
+- ✅ You may read, evaluate, modify, and **self-host** Twill DB — including in
+  production as the database behind your own applications or internal systems.
+- 🚫 You may **not** offer Twill DB to third parties as a hosted or managed
+  database service.
+- ⏳ Each released version automatically converts to the **Apache License 2.0**
+  on its Change Date (four years after release).
+
+For uses the license does not appear to cover, please open an issue to discuss.
+
+## Contributing & governance
+
+Twill DB is an experimental, **maintainer-led** project. Issues and feedback are
+welcome, but external pull requests are not currently accepted. See
+[`CONTRIBUTING.md`](.github/CONTRIBUTING.md) and [`GOVERNANCE.md`](GOVERNANCE.md).
