@@ -59,6 +59,32 @@ bun run start</code></pre>
 </section>
 
 <section>
+<h2>Interactive mode</h2>
+<p>On a terminal, anything you don't pass as a flag is asked interactively. Run a bare command and the wizard walks you through it:</p>
+<pre data-lang="bash"><code>$ twilldb new
+twilldb — new project
+
+Project name: search
+Client [bun] (node/php/rust coming soon):
+Backend [file] (file/s3): s3
+Include a vector-search (HNSW) starter? [y/N]: y
+
+about to create:
+  name     search
+  client   bun
+  backend  s3
+  vector   yes
+
+proceed? [Y/n]:
+created search/ (6 files — bun client, s3 backend, vector starter)</code></pre>
+<p>Only the unspecified fields are asked — <code>twilldb new app --backend s3</code> still prompts for the rest but skips the backend. Press <kbd>Enter</kbd> to accept the bracketed default.</p>
+<div class="callout note">
+<p class="callout-title">Scripts and CI never block</p>
+<p>The wizard runs only when stdin is a real terminal. In a pipe or a CI job, <code>twilldb</code> takes the defaults for any omitted option (and still errors if <code>new</code> has no name). Pass <code>-y, --yes</code> to force that non-interactive behavior on a terminal too.</p>
+</div>
+</section>
+
+<section>
 <h2>Options</h2>
 <div class="table-wrap">
 <table>
@@ -67,6 +93,7 @@ bun run start</code></pre>
 <tr><td><code>-c, --client &lt;bun&gt;</code></td><td><code>bun</code></td><td>client ecosystem. Bun ships today; <code>node</code>, <code>php</code>, <code>rust</code> are on the roadmap.</td></tr>
 <tr><td><code>-b, --backend &lt;file|s3&gt;</code></td><td><code>file</code></td><td>writes the connection string: <code>file://./&lt;name&gt;.db</code> or an <code>s3://your-bucket/&lt;name&gt;</code> placeholder.</td></tr>
 <tr><td><code>--vector</code></td><td>off</td><td>adds a <code>vectors.ts</code> starter — a <code>vector(3)</code> column, an HNSW index, and a top-k nearest-neighbour query.</td></tr>
+<tr><td><code>-y, --yes</code></td><td>off</td><td>accept defaults and never prompt (forces non-interactive on a terminal).</td></tr>
 </tbody>
 </table>
 </div>

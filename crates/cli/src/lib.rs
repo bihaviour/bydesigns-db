@@ -7,8 +7,10 @@
 //! assert exit codes without spawning a process — the same shape as
 //! `twill-bench`.
 
+pub mod prompt;
 pub mod scaffold;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use scaffold::{Backend, Client, Request};
@@ -54,27 +56,33 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
 }
 
-/// Parsed `--flags`, shared by `new` and `init`.
+/// Parsed `--flags`, shared by `new` and `init`. `None` means "not specified on
+/// the command line": on a terminal the wizard prompts for those; otherwise the
+/// non-interactive path fills them with defaults.
 struct Flags {
-    client: Client,
-    backend: Backend,
-    vector: bool,
+    client: Option<Client>,
+    backend: Option<Backend>,
+    vector: Option<bool>,
+    /// `--yes`/`-y`: accept defaults, never prompt.
+    yes: bool,
 }
 
 /// Split `args` into positionals and flags. Returns a usage error string on a
 /// bad flag or a flag missing its value.
 fn parse_flags(args: &[String]) -> Result<(Vec<String>, Flags), String> {
     let mut positionals = Vec::new();
-    let mut client = Client::Bun;
-    let mut backend = Backend::File;
-    let mut vector = false;
+    let mut client = None;
+    let mut backend = None;
+    let mut vector = None;
+    let mut yes = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--client" | "-c" => client = Client::parse(value(&mut it, "--client")?)?,
-            "--backend" | "-b" => backend = Backend::parse(value(&mut it, "--backend")?)?,
-            "--vector" => vector = true,
+            "--client" | "-c" => client = Some(Client::parse(value(&mut it, "--client")?)?),
+            "--backend" | "-b" => backend = Some(Backend::parse(value(&mut it, "--backend")?)?),
+            "--vector" => vector = Some(true),
+            "--yes" | "-y" => yes = true,
             s if s.starts_with('-') => return Err(format!("unknown flag '{s}'")),
             other => positionals.push(other.to_string()),
         }
@@ -85,6 +93,7 @@ fn parse_flags(args: &[String]) -> Result<(Vec<String>, Flags), String> {
             client,
             backend,
             vector,
+            yes,
         },
     ))
 }
@@ -101,20 +110,48 @@ fn run_new(args: &[String]) -> i32 {
         Ok(v) => v,
         Err(e) => return usage_err(&e),
     };
-    let name = match positionals.as_slice() {
-        [name] => name.clone(),
-        [] => return usage_err("new requires a project name: twilldb new <name>"),
+    let name_arg = match positionals.as_slice() {
+        [] => None,
+        [name] => Some(name.clone()),
         _ => return usage_err("new takes a single project name"),
     };
-    if let Err(e) = check_name(&name) {
-        return usage_err(&e);
+    if let Some(n) = &name_arg {
+        if let Err(e) = scaffold::validate_name(n) {
+            return usage_err(&e);
+        }
     }
+
+    let (name, client, backend, vector) = if interactive(&flags) {
+        match run_wizard(name_arg, &flags, true) {
+            Ok(Some(a)) => (a.name, a.client, a.backend, a.vector),
+            Ok(None) => {
+                println!("aborted.");
+                return exit::OK;
+            }
+            Err(e) => {
+                eprintln!("error: reading input: {e}");
+                return exit::ERROR;
+            }
+        }
+    } else {
+        let name = match name_arg {
+            Some(n) => n,
+            None => return usage_err("new requires a project name: twilldb new <name>"),
+        };
+        (
+            name,
+            flags.client.unwrap_or(Client::Bun),
+            flags.backend.unwrap_or(Backend::File),
+            flags.vector.unwrap_or(false),
+        )
+    };
+
     let req = Request {
         dir: PathBuf::from(&name),
         name,
-        client: flags.client,
-        backend: flags.backend,
-        vector: flags.vector,
+        client,
+        backend,
+        vector,
     };
     generate(&req, true)
 }
@@ -141,18 +178,39 @@ fn run_init(args: &[String]) -> i32 {
         .and_then(|s| s.to_str())
         .unwrap_or("app")
         .to_string();
-    if let Err(e) = check_name(&name) {
+    if let Err(e) = scaffold::validate_name(&name) {
         return usage_err(&format!(
             "current directory name '{name}' is not a usable project name ({e}); \
              use `twilldb new <name>` instead"
         ));
     }
+
+    let (client, backend, vector) = if interactive(&flags) {
+        match run_wizard(Some(name.clone()), &flags, false) {
+            Ok(Some(a)) => (a.client, a.backend, a.vector),
+            Ok(None) => {
+                println!("aborted.");
+                return exit::OK;
+            }
+            Err(e) => {
+                eprintln!("error: reading input: {e}");
+                return exit::ERROR;
+            }
+        }
+    } else {
+        (
+            flags.client.unwrap_or(Client::Bun),
+            flags.backend.unwrap_or(Backend::File),
+            flags.vector.unwrap_or(false),
+        )
+    };
+
     let req = Request {
         name,
         dir,
-        client: flags.client,
-        backend: flags.backend,
-        vector: flags.vector,
+        client,
+        backend,
+        vector,
     };
     generate(&req, false)
 }
@@ -171,25 +229,30 @@ fn generate(req: &Request, is_new: bool) -> i32 {
     }
 }
 
-/// Reject names that would escape the target directory or break the package
-/// manifest. Permissive otherwise.
-fn check_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("name is empty".into());
-    }
-    if name.starts_with('-') {
-        return Err("name may not start with '-'".into());
-    }
-    if name == "." || name == ".." {
-        return Err("name may not be '.' or '..'".into());
-    }
-    if name.contains(['/', '\\']) || name.contains("..") {
-        return Err("name may not contain path separators or '..'".into());
-    }
-    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("name may not contain whitespace or control characters".into());
-    }
-    Ok(())
+/// Whether to run the interactive wizard: not suppressed by `--yes`, and stdin
+/// is a real terminal (so CI / pipes never block waiting on a prompt).
+fn interactive(flags: &Flags) -> bool {
+    !flags.yes && std::io::stdin().is_terminal()
+}
+
+/// Drive the wizard against stdin/stdout.
+fn run_wizard(
+    name: Option<String>,
+    flags: &Flags,
+    need_name: bool,
+) -> std::io::Result<Option<prompt::Answers>> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout();
+    prompt::wizard(
+        &mut input,
+        &mut out,
+        name,
+        flags.client,
+        flags.backend,
+        flags.vector,
+        need_name,
+    )
 }
 
 fn usage_err(msg: &str) -> i32 {
@@ -250,6 +313,10 @@ fn print_help() {
          \x20                                node, php, rust are on the roadmap\n\
          \x20 -b, --backend <file|s3>        storage backend / connection string (default: file)\n\
          \x20     --vector                   include a vector-search (HNSW) starter\n\
+         \x20 -y, --yes                      accept defaults; never prompt\n\
+         \n\
+         On a terminal, any option you omit is asked interactively; pass --yes (or\n\
+         run non-interactively, e.g. in CI) to take the defaults instead.\n\
          \n\
          examples:\n\
          \x20 twilldb new notes\n\

@@ -41,6 +41,7 @@
 <li><span class="req-tag must">MUST NOT</span> overwrite existing files; <code>new</code> refuses a non-empty target directory and both subcommands refuse to clobber an individual file.</li>
 <li><span class="req-tag should">SHOULD</span> mirror the dispatch shape of <code>twill-bench</code> — a thin <code>main.rs</code> over a testable <code>run_cli(&amp;[String]) -&gt; i32</code> core — so exit codes are asserted without spawning a process.</li>
 <li><span class="req-tag should">SHOULD</span> recognise not-yet-shipped clients and answer with a roadmap-aware message, not "unknown value".</li>
+<li><span class="req-tag should">SHOULD</span> be interactive on a terminal but never block automation: prompt only for fields omitted on the command line, and skip prompting entirely when stdin is not a TTY (falling back to defaults). The wizard is pure over its read/write streams so it is testable without a pseudo-terminal.</li>
 </ul>
 </section>
 
@@ -55,12 +56,15 @@ twilldb help                    # usage
 -c, --client &lt;bun&gt;              # client ecosystem (default: bun)
 -b, --backend &lt;file|s3&gt;         # storage backend / connection string (default: file)
     --vector                    # include a vector-search (HNSW) starter
+-y, --yes                       # accept defaults; never prompt
 
 # examples
+twilldb new                     # full interactive wizard (on a terminal)
 twilldb new notes
 twilldb new search --vector
 twilldb new app --backend s3
-twilldb init</code></pre></div>
+twilldb init</code></pre>
+<p>On a terminal, any option not given as a flag is filled by an <strong>interactive wizard</strong> — it prompts only for the unspecified fields (name, client, backend, vector), shows a summary, and confirms before writing. The trigger is TTY-aware: a non-terminal stdin (a pipe, or CI) never enters the wizard, so automation can't hang — it takes the defaults for omitted options (and still errors if <code>new</code> has no name). <code>--yes</code> forces that non-interactive behaviour on a terminal too. The wizard logic is pure over its read/write streams, so it is unit-tested with canned input rather than a pseudo-terminal.</p></div>
 <p>The generated Bun starter is a working <code>@twilldb/bun</code> project: <code>package.json</code> (pinned to the workspace version), <code>tsconfig.json</code>, <code>.gitignore</code>, an <code>app.ts</code> derived from <code>examples/notes.ts</code>, and a <code>README.md</code>. <code>--backend</code> only changes the connection string written into <code>app.ts</code> (<code>file://./&lt;name&gt;.db</code> vs an <code>s3://your-bucket/&lt;name&gt;</code> placeholder) — the engine selects the backend purely by URL scheme, so nothing else differs. <code>--vector</code> adds a <code>vectors.ts</code> starter (a <code>vector(3)</code> column, an HNSW index, a top-k query) and wires a <code>vectors</code> script.</p>
 <div class="table-wrap">
 <table>
@@ -135,6 +139,7 @@ brew install bihaviour/twilldb/twilldb</code></pre></div>
 <tr><td><code>twilldb new</code> / <code>init</code>, Bun starter</td><td><span class="req-tag must">SHIPPED</span></td><td>5-file Bun project (6 with <code>--vector</code>); name/version/backend substitution; mirrors <code>examples/notes.ts</code></td></tr>
 <tr><td><code>--backend file|s3</code>, <code>--vector</code></td><td><span class="req-tag must">SHIPPED</span></td><td>backend changes the connection string only; vector adds <code>vectors.ts</code> + script + README section</td></tr>
 <tr><td>Safety (no clobber), exit-code contract</td><td><span class="req-tag must">SHIPPED</span></td><td>refuses non-empty dir / existing files; 0 / 1 / 2 contract pinned by <code>crates/cli/tests/scaffold.rs</code></td></tr>
+<tr><td>Interactive wizard (TTY-aware), <code>--yes</code></td><td><span class="req-tag must">SHIPPED</span></td><td>prompts only unspecified fields; non-TTY/<code>--yes</code> falls back to defaults; pure over streams, unit-tested in <code>crates/cli/tests/wizard.rs</code></td></tr>
 <tr><td>Homebrew tap formula + release workflow</td><td><span class="req-tag must">SHIPPED</span></td><td><code>packaging/homebrew/twilldb.rb</code> + <code>release-cli.yml</code> (builds from source; auto-bumps url+sha256 on tag)</td></tr>
 <tr><td>Node / PHP / other clients</td><td><span class="req-tag may">ROADMAP</span></td><td>recognised by <code>--client</code>; thin FFI shims over the same C ABI when built</td></tr>
 <tr><td>cargo install / Scoop / <code>curl|sh</code> / bottles</td><td><span class="req-tag may">ROADMAP</span></td><td>same release artifacts; gate-free; deferred from the first pass</td></tr>

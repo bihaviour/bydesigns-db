@@ -219,6 +219,27 @@ pub fn unavailable_msg(client: Client) -> String {
     )
 }
 
+/// Reject names that would escape the target directory or break the package
+/// manifest. Permissive otherwise. Shared by the flag path and the wizard.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name is empty".into());
+    }
+    if name.starts_with('-') {
+        return Err("name may not start with '-'".into());
+    }
+    if name == "." || name == ".." {
+        return Err("name may not be '.' or '..'".into());
+    }
+    if name.contains(['/', '\\']) || name.contains("..") {
+        return Err("name may not contain path separators or '..'".into());
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("name may not contain whitespace or control characters".into());
+    }
+    Ok(())
+}
+
 fn dir_non_empty(dir: &Path) -> Result<bool, GenError> {
     let mut entries =
         fs::read_dir(dir).map_err(|e| GenError::Io(format!("{}: {e}", dir.display())))?;
