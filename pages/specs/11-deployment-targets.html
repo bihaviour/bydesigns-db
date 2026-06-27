@@ -363,6 +363,59 @@ op_cost_per_period
 </section>
 
 <section>
+<h2>Addendum — WASM build track: the port spike (EX-1 / #100)</h2>
+<p>EX-1 is a <strong>MAY spike</strong> that pins the shape of the
+WASM/Cloudflare-Workers port and de-risks its one structural unknown — without
+moving the storage seam or the engine core. <em>A port, not a recompile:</em> the
+<a href="03-storage-interface.html"><code>Storage</code> trait</a> and the engine
+semantics stay byte-for-byte unchanged (<code>STORAGE_TRAIT_VERSION</code> and
+<code>ENGINE_ABI_VERSION</code> do not move); only two things fork, both
+additive and feature-gated.</p>
+<h3>Fork 1 — the storage-backend binding</h3>
+<p>In a Worker isolate there are no S3 credentials and (often) no raw outbound
+TCP; the durable store is reached through the Worker's <strong>R2 binding</strong>,
+a host object the runtime injects. The fork is therefore <em>not</em> a new
+<code>Storage</code> impl — it is a new <a href="04-object-storage-backend.html">object
+client</a> (<code>BindingObjectStore</code>) behind the existing thin
+object-client seam, composed under the <em>same</em> <code>ObjectStorage</code>
+(LSM page store + CAS commit log). R2 exposes the two conditional writes the
+commit log + single-writer fence require (<code>If-None-Match: *</code> /
+<code>If-Match: &lt;etag&gt;</code>), so the CAS-append-and-fence design carries
+over verbatim; the durability rule (a <code>put</code> returns <code>Ok</code>
+only once durable) is unchanged. The store is generic over a
+<code>BindingHost</code> call seam, so the whole backend is unit-tested off-target
+with an in-memory host: <code>cargo test -p twill-storage binding</code> drives
+<code>engine → ObjectStorage → binding</code> through a durable WAL append +
+replay — the seam reduction of the "SELECT 1 against R2 from a Worker" exit
+criterion. The one piece that cannot run off a Worker is the concrete host that
+forwards calls across the JS↔WASM boundary to the real R2 binding; it lives in
+the Worker entrypoint crate behind <code>#[cfg(target_arch = "wasm32")]</code>.</p>
+<h3>Fork 2 — the single-threaded executor</h3>
+<p>A Worker isolate has no threads to park or wake, so the native parking
+<code>block_on</code> cannot bridge the async seam there. The <code>wasm</code>
+Cargo feature (on <code>twill-storage</code>, propagated by
+<code>twill-engine/wasm</code>) selects a single-threaded variant that polls with
+a no-op waker, yielding with <code>spin_loop</code> between polls. It is correct
+for every backend the port uses — <code>LocalFileStorage</code> resolves in one
+poll, and the R2 binding resolves synchronously because the Worker glue bridges
+the R2 promises to host calls before re-entering Rust. The whole storage suite,
+including the C1–C8 conformance battery and the Experiment-4 crash gate, passes
+under <code>--features wasm</code>, so the executor fork preserves durability and
+MVCC semantics. The local-file cache (<code>lfc.enabled</code>) is off on this
+target, as the matrix requires.</p>
+<h3>The open question this spike scopes (not yet answered)</h3>
+<p>The realistic <strong>cold-start + module-size</strong> penalty of the
+<code>.wasm</code> build versus the native Bun-FFI path — parse/instantiate time
+plus the bytes shipped to each cold isolate — and whether it stays inside
+edge-latency budgets, is an Experiment-1/5 measurement on a real Worker, which is
+out of scope for an off-target spike. What this spike <em>does</em> settle: the
+backend binding and executor forks are additive over an unmoved seam, and they
+build and pass the durability gates. The Worker's front door is HTTP/WS, not
+pgwire (Workers have no raw TCP) — so the listener shape depends on EX-3's
+explicit subset boundary, and pgwire is simply absent on this target.</p>
+</section>
+
+<section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
 <a class="xref" href="05-local-cache.html"><span class="xref-title">Local Cache</span><span class="xref-desc">the miss rate that couples to egress; LFC must be off on the WASM/Workers target.</span></a>

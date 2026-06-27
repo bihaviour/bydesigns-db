@@ -10,6 +10,14 @@ rust-version.workspace = true
 [lib]
 name = "twill_storage"
 
+[features]
+# WASM / Cloudflare-Workers port (EX-1 / #100, spec 11): selects the
+# single-threaded `block_on` executor variant (a Worker isolate has no threads
+# to park). Additive and off by default — the native path is unchanged. The
+# R2-binding backend (`BindingObjectStore`) is always compiled (pure Rust over
+# the object-client seam); only the executor threading forks behind this flag.
+wasm = []
+
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true

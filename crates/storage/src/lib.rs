@@ -37,8 +37,9 @@ pub use types::{
 };
 
 pub use object::{
-    Config as ObjectConfig, FaultKind, FaultMode, FaultObjectStore, FaultPlan, FsObjectStore,
-    MemObjectStore, ObjectError, ObjectStorage, ObjectStore,
+    BindingError, BindingHost, BindingObjectStore, Config as ObjectConfig, FaultKind, FaultMode,
+    FaultObjectStore, FaultPlan, FsObjectStore, MemBindingHost, MemObjectStore, ObjectError,
+    ObjectStorage, ObjectStore,
 };
 
 use async_trait::async_trait;
@@ -236,6 +237,7 @@ fn branch_overlay_url(url: &str, branch: BranchId) -> String {
 /// dependency-free executor bridges the two: it works for any future and never
 /// busy-spins (it parks the thread until the waker fires). `LocalFileStorage`
 /// futures resolve in a single poll.
+#[cfg(not(feature = "wasm"))]
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
@@ -257,6 +259,40 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// Single-threaded executor variant for the WASM / Cloudflare-Workers port
+/// (EX-1 / #100, spec 11), selected by the `wasm` feature. A Worker isolate has
+/// no threads to park or wake, so the native parking executor cannot bridge the
+/// async seam there. This variant polls with a no-op waker, yielding the CPU
+/// with `spin_loop` between polls instead of parking.
+///
+/// It is correct for futures that make progress on each poll without an external
+/// cross-thread wake — which is every backend the port uses: `LocalFileStorage`
+/// resolves in one poll, and the R2-binding backend
+/// ([`BindingObjectStore`]) resolves synchronously because the Worker entrypoint
+/// bridges the R2 promises to host calls *before* re-entering Rust (see
+/// [`BindingHost`]). A future that parks waiting on a foreign waker would spin
+/// here; the port deliberately keeps the host calls synchronous so none does.
+#[cfg(feature = "wasm")]
+pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct NoopWaker;
+    impl Wake for NoopWaker {
+        fn wake(self: std::sync::Arc<Self>) {}
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {}
+    }
+
+    let waker = Waker::from(std::sync::Arc::new(NoopWaker));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => std::hint::spin_loop(),
         }
     }
 }

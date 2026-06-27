@@ -13,6 +13,12 @@ name = "engine"
 # rlib so engine-server (Phase 3) can depend on the engine as a normal crate.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# WASM / Cloudflare-Workers port (EX-1 / #100, spec 11): a port, not a recompile
+# — forks only the executor threading (via `twill-storage/wasm`), never the
+# engine core, the storage seam, or the C ABI. Off by default.
+wasm = ["twill-storage/wasm"]
+
 [dependencies]
 twill-storage = { path = "../storage" }
 async-trait.workspace = true

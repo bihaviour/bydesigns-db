@@ -19,6 +19,7 @@
 //! `CancelRequest` are deliberate non-goals for this phase
 //! (see `pages/specs/phase-3-server.html`).
 
+pub mod capability;
 mod datapath;
 mod introspect;
 mod protocol;

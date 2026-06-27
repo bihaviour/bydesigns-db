@@ -500,6 +500,57 @@ fn engine_cancel(h: EngineHandle, secret: u32) -&gt; Result&lt;(), EngineError&g
 </section>
 
 <section>
+<h2>Addendum — the frozen pgwire-subset boundary (EX-3 / #102)</h2>
+<p>The boundary used to live implicitly in the protocol enum and the connect-time
+introspection classifier. EX-3 makes it <strong>explicit, reviewable, and
+conformance-tested</strong>: a capability matrix enumerated <em>empirically</em>
+— from SQL captured by running the real clients against the listener
+(<code>TWILL_LOG_SQL</code>), not from reading this spec — and frozen as data in
+<code>crates/server/src/capability.rs</code> with a conformance suite in
+<code>crates/server/tests/pgwire_subset.rs</code>. It is wire-surface only: no
+engine-core or storage change.</p>
+<p>Each entry is one of four dispositions: <strong>Answered</strong> (handled
+end-to-end), <strong>Reflected</strong> (the live engine catalog reflected into
+the client's expected shape — PostgREST's schema cache), <strong>Stubbed</strong>
+(accepted with a canned/empty but correctly-shaped reply for a concept the engine
+lacks — GUCs, tz list, role settings), or <strong>Errored</strong> (a deliberate
+non-goal, rejected with a typed error).</p>
+<h3>Protocol messages</h3>
+<table>
+<thead><tr><th>Message</th><th>Disposition</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Startup / SSL &amp; GSS decline / Cancel</td><td>Answered / Stubbed</td><td>protocol 3.0, trust auth, cleartext; probes declined with <code>N</code></td></tr>
+<tr><td>Query (simple)</td><td>Answered</td><td>multi-statement; intercepts + engine</td></tr>
+<tr><td>Parse / Bind / Describe / Execute / Close / Sync / Flush</td><td>Answered</td><td>full extended query path; text + binary formats</td></tr>
+<tr><td>Terminate</td><td>Answered</td><td>closes the connection</td></tr>
+<tr><td>PasswordMessage (SCRAM/MD5), FunctionCall, CopyData</td><td>Errored</td><td>deliberate non-goals this phase</td></tr>
+</tbody>
+</table>
+<h3>Connect-time catalog / introspection queries</h3>
+<table>
+<thead><tr><th>Query (marker)</th><th>Disposition</th><th>Purpose · client</th></tr></thead>
+<tbody>
+<tr><td><code>server_version_num</code> · <code>version()</code> · <code>current_setting</code> · <code>SHOW</code></td><td>Answered</td><td>the make-or-break version probe + GUC accessors · PostgREST, Bun.sql, psql</td></tr>
+<tr><td><code>current_schema/database/user</code> · <code>pg_backend_pid()</code></td><td>Answered</td><td>identity probes · Bun.sql, ORMs</td></tr>
+<tr><td><code>twill.stats</code></td><td>Answered</td><td>in-band observability surface (#53 / EX-4)</td></tr>
+<tr><td><code>pg_relation_is_updatable</code> (tables/PKs) · <code>pks_uniques_cols</code> (FKs)</td><td>Reflected</td><td>PostgREST schema cache, from the live catalog</td></tr>
+<tr><td><code>SET</code> · <code>set_config()</code> · <code>DISCARD</code> · <code>LISTEN</code></td><td>Stubbed</td><td>session setup drivers fire-and-forget</td></tr>
+<tr><td><code>pg_timezone_names</code> · <code>pg_cast</code> · <code>computed_rels</code> · <code>rettype_is_setof</code> · <code>pks_fks</code> · <code>pg_db_role_setting</code> · <code>pg_auth_members</code></td><td>Stubbed</td><td>PostgREST schema-cache queries for concepts the engine lacks → empty, correctly-shaped</td></tr>
+<tr><td>any other <code>pg_catalog.</code> / <code>information_schema.</code> / <code>::regclass</code> query</td><td>Errored</td><td>clear <code>0A000 feature_not_supported</code>, never a baffling parser error</td></tr>
+</tbody>
+</table>
+<p>The make-or-break value is <code>server_version</code> (<code>15.0</code> /
+<code>server_version_num = 150000</code>): the first thing PostgREST probes, and
+failing it aborts startup. The <strong>Errored</strong> fallback is the spec MUST
+that an unsupported catalog query "returns a clear error" — the classifier keys on
+table-reference / cast forms (<code> from pg_</code>, <code>pg_catalog.</code>,
+<code>::regclass</code>), never a bare identifier, so a user column named
+<code>version</code> passes straight through. When captured client SQL starts
+issuing a new catalog query for real, it graduates from Errored into the matrix
+with a decided disposition.</p>
+</section>
+
+<section>
 <h2>Related specifications</h2>
 <div class="xref-grid">
 <a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">The library the listener wraps; same C ABI the embedded path binds.</span></a>

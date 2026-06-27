@@ -143,6 +143,11 @@ pub fn stats_rows(stats: &engine::EngineStats) -> Canned {
         ("twill_commit_total", stats.commits),
         ("twill_durable_append_total", stats.durable_appends),
         ("twill_committed_lsn", stats.committed_lsn),
+        // write-contention family (EX-4 / spec 10 hot-row): per-DB serialized
+        // handoffs + wait time, the signal the per-tool routing decision keys on.
+        ("twill_write_lane_acquire_total", stats.write_acquires),
+        ("twill_write_handoff_total", stats.write_handoffs),
+        ("twill_write_wait_us_total", stats.write_wait_us_total),
         // storage family (pulled through the seam)
         ("twill_storage_wal_appends_total", st.wal_appends),
         ("twill_storage_wal_bytes_total", st.wal_bytes),
@@ -430,6 +435,9 @@ mod tests {
             commits: 7,
             durable_appends: 3,
             committed_lsn: 42,
+            write_acquires: 9,
+            write_handoffs: 2,
+            write_wait_us_total: 1234,
             storage: engine::StorageStats {
                 wal_appends: 3,
                 fsyncs: 4,
@@ -451,6 +459,10 @@ mod tests {
                 assert_eq!(kv["twill_committed_lsn"], 42);
                 assert_eq!(kv["twill_storage_wal_appends_total"], 3);
                 assert_eq!(kv["twill_storage_fsync_total"], 4);
+                // write-contention family (EX-4 / spec 10 hot-row).
+                assert_eq!(kv["twill_write_lane_acquire_total"], 9);
+                assert_eq!(kv["twill_write_handoff_total"], 2);
+                assert_eq!(kv["twill_write_wait_us_total"], 1234);
             }
             _ => panic!("expected rows from stats_rows"),
         }

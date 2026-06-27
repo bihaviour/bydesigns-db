@@ -23,9 +23,25 @@ use twill_storage::{
 /// A simple counting write lane: at most one writer holds it at a time. Held
 /// across the statements of a write transaction; released on commit/rollback.
 /// Not tied to a guard lifetime, so a connection can hold it across FFI calls.
+///
+/// The lane is the one point every write to a database serializes through
+/// (single-writer-per-DB). It carries read-only contention counters so the
+/// spec-10 hot-row routing decision is *observable* (EX-4 / #103): how many
+/// writers had to wait behind another, and for how long. The counters never
+/// change the lane's behaviour — they only surface what already happens.
 pub struct WriteLane {
     locked: Mutex<bool>,
     cv: Condvar,
+    /// Write-lane acquisitions (≈ write transactions) — the denominator of the
+    /// serialized-handoff rate.
+    acquires: AtomicU64,
+    /// Acquisitions that had to wait because another writer already held the
+    /// lane: the per-DB **serialized-handoff** count (spec 10). Because every
+    /// write funnels through this one lane, a rising handoff share is the
+    /// hot-row contention signal the per-tool placement decision keys on.
+    handoffs: AtomicU64,
+    /// Cumulative microseconds writers spent blocked waiting for the lane.
+    wait_us_total: AtomicU64,
 }
 
 impl WriteLane {
@@ -33,12 +49,24 @@ impl WriteLane {
         WriteLane {
             locked: Mutex::new(false),
             cv: Condvar::new(),
+            acquires: AtomicU64::new(0),
+            handoffs: AtomicU64::new(0),
+            wait_us_total: AtomicU64::new(0),
         }
     }
     pub fn acquire(&self) {
+        self.acquires.fetch_add(1, Ordering::Relaxed);
         let mut g = self.locked.lock().unwrap();
-        while *g {
-            g = self.cv.wait(g).unwrap();
+        if *g {
+            // Contended: another writer holds the lane. This wait *is* a
+            // serialized handoff — count it and time how long we block.
+            self.handoffs.fetch_add(1, Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            while *g {
+                g = self.cv.wait(g).unwrap();
+            }
+            let us = start.elapsed().as_micros() as u64;
+            self.wait_us_total.fetch_add(us, Ordering::Relaxed);
         }
         *g = true;
     }
@@ -46,6 +74,17 @@ impl WriteLane {
         let mut g = self.locked.lock().unwrap();
         *g = false;
         self.cv.notify_one();
+    }
+
+    /// `(acquires, handoffs, wait_us_total)`: total lane acquisitions, the
+    /// contended subset (serialized handoffs), and cumulative wait microseconds.
+    /// Read-only observation for the spec-10 hot-row decision (EX-4).
+    pub(crate) fn stats(&self) -> (u64, u64, u64) {
+        (
+            self.acquires.load(Ordering::Relaxed),
+            self.handoffs.load(Ordering::Relaxed),
+            self.wait_us_total.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -61,6 +100,17 @@ pub struct EngineStats {
     pub durable_appends: u64,
     /// Highest committed (visible) LSN — a gauge, not a counter.
     pub committed_lsn: u64,
+    /// Write-lane acquisitions (≈ write transactions) — the denominator of the
+    /// serialized-handoff rate (EX-4 / spec 10 hot-row contention).
+    pub write_acquires: u64,
+    /// Acquisitions that had to wait for another writer: the per-DB
+    /// **serialized-handoff** count. Single-writer-per-DB funnels every write
+    /// through one lane, so `write_handoffs / write_acquires` is the hot-row
+    /// contention rate the per-tool routing decision keys on (spec 10).
+    pub write_handoffs: u64,
+    /// Cumulative microseconds writers spent blocked on the write lane — the
+    /// wait-time signal paired with the handoff count.
+    pub write_wait_us_total: u64,
     /// The backend's counters, pulled through the seam (`Storage::stats`).
     pub storage: twill_storage::StorageStats,
 }
@@ -226,17 +276,24 @@ impl Database {
     }
 
     /// A read-only [`EngineStats`] snapshot — the engine-tier observability
-    /// surface (#53 / spec 15). Folds the group-commit counters and the
-    /// committed-LSN gauge together with the backend's [`StorageStats`], pulled
-    /// through the seam ([`twill_storage::Storage::stats`]), so a single pull on
-    /// an engine handle yields both engine and storage counters. Pure
-    /// observation; the commit/durability contract does not depend on it.
+    /// surface (#53 / spec 15). Folds the group-commit counters, the
+    /// committed-LSN gauge, and the write-lane contention counters (the
+    /// serialized-handoff count + wait time that make the spec-10 hot-row
+    /// decision observable — EX-4 / #103) together with the backend's
+    /// [`StorageStats`], pulled through the seam
+    /// ([`twill_storage::Storage::stats`]), so a single pull on an engine handle
+    /// yields all of them. Pure observation; the commit/durability contract and
+    /// single-writer serialization do not depend on it.
     pub fn stats(&self) -> EngineStats {
         let (durable_appends, commits) = self.group_commit.metrics();
+        let (write_acquires, write_handoffs, write_wait_us_total) = self.lane.stats();
         EngineStats {
             commits,
             durable_appends,
             committed_lsn: self.committed_lsn(),
+            write_acquires,
+            write_handoffs,
+            write_wait_us_total,
             storage: self.storage.stats(),
         }
     }

@@ -4,6 +4,7 @@
 //! engine handle = one thread; parallelism comes from multiple handles sharing
 //! the process-global `Database`, exactly as in the embedded path.
 
+use crate::capability;
 use crate::datapath;
 use crate::introspect::{self, Canned, SERVER_VERSION};
 use crate::protocol::{read_message, read_startup, Frontend, Out, Startup};
@@ -267,27 +268,39 @@ impl Session {
             }
             Canned::Reflect(_) => unreachable!("inspect() resolves Reflect"),
             Canned::Stats => unreachable!("inspect() resolves Stats"),
-            Canned::Pass => match self.conn.query(sql) {
-                Ok(rs) => {
-                    if !rs.columns.is_empty() {
-                        let oids = engine_oids(&rs);
-                        self.send_rows(out, &rs.columns, &oids, &rs.rows, &[]);
-                        out.command_complete(&format!("SELECT {}", rs.rows.len()));
-                    } else {
-                        let tag = command_tag(&classify(sql), 0, self.conn.last_changes);
-                        out.command_complete(&tag);
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    let (code, msg) = describe_error(&e.to_string());
-                    out.error("ERROR", code, &msg);
+            Canned::Pass => {
+                // A system-catalog query outside the frozen subset: answer with a
+                // clear feature_not_supported error rather than letting it fall
+                // through to a baffling engine syntax error (EX-3 / spec 07 MUST).
+                if let Some(reason) = capability::unsupported_catalog_reason(sql) {
+                    out.error("ERROR", "0A000", &reason);
                     if self.conn.in_transaction() {
                         self.failed_txn = true;
                     }
-                    Err(())
+                    return Err(());
                 }
-            },
+                match self.conn.query(sql) {
+                    Ok(rs) => {
+                        if !rs.columns.is_empty() {
+                            let oids = engine_oids(&rs);
+                            self.send_rows(out, &rs.columns, &oids, &rs.rows, &[]);
+                            out.command_complete(&format!("SELECT {}", rs.rows.len()));
+                        } else {
+                            let tag = command_tag(&classify(sql), 0, self.conn.last_changes);
+                            out.command_complete(&tag);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let (code, msg) = describe_error(&e.to_string());
+                        out.error("ERROR", code, &msg);
+                        if self.conn.in_transaction() {
+                            self.failed_txn = true;
+                        }
+                        Err(())
+                    }
+                }
+            }
         }
     }
 
@@ -350,6 +363,15 @@ impl Session {
                 introspect::intercept(&sql, &self.user, &self.database),
                 Canned::Pass
             );
+        // A system-catalog query outside the frozen subset reaches the engine
+        // parser only to fail confusingly; reject it up front with a clear
+        // feature_not_supported error (EX-3 / spec 07 MUST). PostgREST templates
+        // (PgrstRead) target user tables, so they never trip this.
+        if matches!(postprocess, Postprocess::None) {
+            if let Some(reason) = capability::unsupported_catalog_reason(&sql) {
+                return self.fail(out, "0A000", &reason);
+            }
+        }
         let prepared = if to_engine {
             let (rewritten, order) = rewrite_placeholders(&engine_sql);
             if let Err(e) = self.conn.prepare(&rewritten) {

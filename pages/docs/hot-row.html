@@ -107,6 +107,37 @@ SELECT SUM(delta) AS total FROM counter_events WHERE counter_id = 'video:42';</c
 </section>
 
 <section>
+<h2>Measure it: the contention metrics</h2>
+<p>You don't have to guess which tool is a hot-row outlier — the engine surfaces
+the signal. Every write serializes through one <em>write lane</em> per database,
+and the lane counts how often a writer had to wait behind another (a
+<strong>serialized handoff</strong>) and for how long. Pull the counters in-band
+over pgwire:</p>
+<pre><code>SHOW twill.stats;   -- or: SELECT * FROM twill_stats;</code></pre>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Metric</th><th>What it tells you</th></tr></thead>
+<tbody>
+<tr><td><code>twill_write_lane_acquire_total</code></td><td>write transactions — the denominator</td></tr>
+<tr><td><code>twill_write_handoff_total</code></td><td>writes that waited behind another writer (serialized handoffs)</td></tr>
+<tr><td><code>twill_write_wait_us_total</code></td><td>total microseconds spent waiting on the lane</td></tr>
+</tbody>
+</table>
+</div>
+<p>The counters are cumulative — sample them twice and take the difference. Two
+derived numbers drive the decision: the <strong>handoff rate</strong>
+(<code>handoff / acquire</code>) and the <strong>mean wait</strong>
+(<code>wait_us / handoff</code>). A healthy tool shows acquisitions climbing while
+handoffs stay flat. A hot row pushes both the handoff rate and the mean wait up.</p>
+<p><strong>Runbook.</strong> When a tool's handoff rate and mean wait stay high
+across several windows under real load (a single spike is not a flag): first apply
+Lever 2 (shard / event-log) and re-measure — most red workloads go green there.
+If it stays contended, apply Lever 3 and route <em>only that tool</em> to Postgres;
+every other tool is untouched. The decision is per-tool and reversible — if the
+contention later falls, the same metrics show it and the tool routes back.</p>
+</section>
+
+<section>
 <h2>Diagnose by dependency, not by rate</h2>
 <p>A million inserts a second into a million distinct rows is <em>not</em> a hot-row problem — that is throughput, solved by more lanes (separate databases) and batching. A thousand updates a second to <em>one</em> row is a hot-row problem at any volume. Diagnose by whether writes depend on each other's value, never by request rate. Spreading independent write streams across separate databases gives each its own writer lane and keeps unrelated writes from ever queuing behind each other.</p>
 </section>

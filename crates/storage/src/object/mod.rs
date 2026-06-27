@@ -40,12 +40,14 @@
 //!   immutably named); a single mutable `manifest` pointer is an optimization
 //!   for cutting LIST cost at scale, not a correctness requirement here.
 
+mod binding;
 mod codec;
 mod fault;
 mod fs;
 mod mem;
 mod store;
 
+pub use binding::{BindingError, BindingHost, BindingObjectStore, MemBindingHost};
 pub use fault::{FaultKind, FaultMode, FaultObjectStore, FaultPlan};
 pub use fs::FsObjectStore;
 pub use mem::MemObjectStore;

@@ -184,6 +184,87 @@ fn database_stats_fold_engine_and_storage_counters() {
 }
 
 #[test]
+fn write_lane_handoffs_are_observable_under_contention() {
+    // EX-4 / spec 10: the per-DB serialized-handoff count + wait time must be
+    // observable through `Database::stats()` so the hot-row routing decision is
+    // falsifiable. A single uncontended writer records acquisitions but zero
+    // handoffs (nothing to wait behind); many writers hammering ONE hot row
+    // force serialized handoffs through the single write lane.
+    let p = db_path("handoff");
+    let url = url_for(&p);
+
+    let db = Database::open(&url).unwrap();
+    {
+        let mut setup = Connection::open(&url).unwrap();
+        setup
+            .exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        setup.exec("INSERT INTO t (id, n) VALUES (1, 0)").unwrap();
+    }
+
+    // Uncontended baseline: a single writer never waits behind another, so the
+    // handoff counter stays put even as acquisitions climb.
+    let base = db.stats();
+    {
+        let mut solo = Connection::open(&url).unwrap();
+        for _ in 0..20 {
+            exec_retrying(&mut solo, "UPDATE t SET n = n + 1 WHERE id = 1");
+        }
+    }
+    let solo = db.stats();
+    assert!(
+        solo.write_acquires > base.write_acquires,
+        "a lone writer still acquires the lane per write"
+    );
+    assert_eq!(
+        solo.write_handoffs, base.write_handoffs,
+        "a lone writer never hands off (no contention): {} -> {}",
+        base.write_handoffs, solo.write_handoffs
+    );
+
+    // Contended: many writers on the same hot row serialize through the lane.
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 40;
+    let barrier = Barrier::new(WRITERS);
+    thread::scope(|s| {
+        for _ in 0..WRITERS {
+            let url = &url;
+            let barrier = &barrier;
+            s.spawn(move || {
+                let mut c = Connection::open(url).unwrap();
+                barrier.wait(); // maximize overlap so writers collide on the lane
+                for _ in 0..PER_WRITER {
+                    exec_retrying(&mut c, "UPDATE t SET n = n + 1 WHERE id = 1");
+                }
+            });
+        }
+    });
+
+    let after = db.stats();
+    assert!(
+        after.write_handoffs > solo.write_handoffs,
+        "contended writers must record serialized handoffs: {} -> {}",
+        solo.write_handoffs,
+        after.write_handoffs
+    );
+    assert!(
+        after.write_wait_us_total >= solo.write_wait_us_total,
+        "handoff wait time is cumulative and non-decreasing"
+    );
+    // The hot row was incremented exactly once per successful UPDATE.
+    let mut check = Connection::open(&url).unwrap();
+    assert_eq!(
+        scalar_i64(&mut check, "SELECT n FROM t WHERE id = 1"),
+        (20 + WRITERS * PER_WRITER) as i64,
+        "single-writer serialization loses no update even while we measure it"
+    );
+
+    drop(check);
+    drop(db);
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
 fn commit_lsns_are_unique_across_concurrent_writers() {
     // Each autocommit insert publishes at its own commit LSN; across concurrent
     // writers those LSNs must be distinct and positive (the batched append
