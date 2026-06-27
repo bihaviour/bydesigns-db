@@ -19,3 +19,38 @@ path = "src/main.rs"
 [lib]
 name = "twilldb_cli"
 path = "src/lib.rs"
+
+[features]
+# `manage` half (spec 19): the database *management* commands (sql / shell /
+# tables / describe / migrate / gen types / seed / stats). Gated so a default
+# `twilldb` build stays the lean, dependency-free scaffolder (spec 18) — the
+# same wall `twill-bench`'s `custom-profile` feature uses. The feature links
+# `twill-engine` and opens a real database over the embedded (`file://`/`s3://`)
+# transport; the engine itself carries no heavy third-party deps, so even the
+# management build stays auditable. CI builds both with and without the feature.
+# `serve` (Milestone 2) wraps `engine-server`, so the feature additionally links
+# `twill-server` — itself dependency-light (only the engine + a hand-rolled
+# pgwire listener), so the wall it guards stays auditable.
+# Milestone 3 adds the `postgres://` transport, which reuses `twill-bench`'s
+# hand-rolled, dependency-free pgwire client (`pgclient`) rather than adding a new
+# third-party dependency — so the `manage` build stays as auditable as before.
+manage = ["dep:engine", "dep:twill-server", "dep:twill-bench"]
+
+[dependencies]
+# Only pulled in by the `manage` feature; the default scaffolder links nothing.
+engine = { package = "twill-engine", path = "../engine", optional = true }
+twill-server = { path = "../server", optional = true }
+# Reused for its `pgclient` (the pgwire transport) only; no new third-party dep.
+twill-bench = { path = "../bench", optional = true }
+
+[dev-dependencies]
+# The Milestone-3 `postgres://` transport tests spin up an in-process
+# `engine-server` listener and drive the management commands against it over the
+# wire. Only used by the `manage`-gated integration test (which itself only
+# builds under that feature); it does not affect the lean binary build.
+twill-server = { path = "../server" }
+
+[[test]]
+name = "manage"
+path = "tests/manage.rs"
+required-features = ["manage"]

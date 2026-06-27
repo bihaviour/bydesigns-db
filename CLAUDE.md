@@ -67,7 +67,7 @@ crates/engine     # libengine: SQL → MVCC → WAL, plus the stable C ABI (incl
 crates/server     # engine-server: the engine behind a Postgres-wire listener (pgwire subset); links the engine unchanged
 crates/controller # lifecycle controller: scale-to-zero instances, lease heartbeat, keep-warm + thundering-herd admission (Phase 4)
 crates/bench      # twill-bench: embedded + pgwire benchmark/correctness driver (spec 09/15)
-crates/cli        # twilldb: project scaffolder — `twilldb new`/`init` generates a starter app (embedded templates, dependency-free)
+crates/cli        # twilldb: project scaffolder (`new`/`init`, dependency-free) + database management (`sql`/`shell`/`tables`/`migrate`/`gen types`/`seed`/`stats`/`branch`/`db reset`/`schema dump`/`serve`, behind the `manage` feature — spec 19; embedded file:// and over-the-wire postgres:// transports)
 clients/bun       # @twilldb/bun: bun:ffi bindings + ergonomic typed wrapper + example
 clients/node      # @twilldb/node: koffi FFI bindings (same surface as bun) for Node + frameworks (Next.js/Astro/Vite); spec 20
 clients/php       # twilldb/twilldb: PHP FFI-extension bindings (embedded) + PDO server-mode example (Laravel/CodeIgniter); spec 20
@@ -102,6 +102,32 @@ cargo run -p twilldb-cli -- new myapp                 # ./myapp Bun starter (fil
 cargo run -p twilldb-cli -- new search --vector       # + an HNSW vector starter
 cargo run -p twilldb-cli -- new app --backend s3      # write an s3:// connection string
 # distribution: Homebrew tap (packaging/homebrew/) + release-cli.yml; see pages/specs/18-cli-tooling.html
+
+# Management CLI (spec 19, behind the `manage` feature — links twill-engine +
+# twill-server, and twill-bench for its dependency-free pgclient; the default
+# build above stays the lean, dependency-free scaffolder). Transport is chosen by
+# the connection-string scheme: file:// (and s3://) open the engine embedded — the
+# CLI is itself the single writer, so point those at a local/stopped database, not
+# one a server holds; postgres:// drives a running engine-server over pgwire (the
+# server stays the sole writer). Milestones 1 (inspect + migrate), 2 (branches, db
+# reset, schema dump, serve) and 3 (the postgres:// transport across read/inspect/
+# migrate) are all implemented. The inspect commands reflect the catalog over the
+# wire via a server-side `SHOW twill.catalog`/`twill.relationships` surface (the
+# same #53 mechanism as `SHOW twill.stats`); no engine/storage-seam change.
+# Branching and serve are embedded-only (no wire form).
+cargo run -p twilldb-cli --features manage -- sql file://./app.db "SELECT 1"   # run a query (--json for JSON)
+cargo run -p twilldb-cli --features manage -- tables file://./app.db           # list tables (describe <t> for one)
+cargo run -p twilldb-cli --features manage -- migrate new add_users            # write migrations/<ts>_add_users.sql
+cargo run -p twilldb-cli --features manage -- migrate up file://./app.db       # apply pending (status for applied/pending+drift)
+cargo run -p twilldb-cli --features manage -- migrate up file://./app.db --branch try   # preview on a copy-on-write branch
+cargo run -p twilldb-cli --features manage -- gen types file://./app.db        # TypeScript types for @twilldb/bun
+cargo run -p twilldb-cli --features manage -- shell file://./app.db            # interactive REPL (.tables/.schema)
+cargo run -p twilldb-cli --features manage -- branch create file://./app.db x  # fork a CoW branch (list/delete; address <url>#branch=<id>)
+cargo run -p twilldb-cli --features manage -- schema dump file://./app.db      # reconstructed CREATE TABLE DDL from catalog()
+cargo run -p twilldb-cli --features manage -- db reset file://./app.db --force # drop -> re-migrate -> seed (safe-by-default)
+cargo run -p twilldb-cli --features manage -- serve file://./app.db            # run the engine behind pgwire (wraps engine-server)
+cargo run -p twilldb-cli --features manage -- sql postgres://u@host:5432/app "SELECT 1"  # same commands over the wire (Milestone 3)
+cargo test -p twilldb-cli --features manage   # management tests (cargo build -p twilldb-cli stays lean — the gate)
 
 # Bun client (needs the built libengine; auto-discovered from target/{release,debug})
 cd clients/bun

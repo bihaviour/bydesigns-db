@@ -6,7 +6,7 @@
 //! These are *not* engine features; they are protocol-handshake glue. Anything
 //! not matched here falls through to the engine ([`Canned::Pass`]).
 
-use engine::Value;
+use engine::{CatalogTable, ColumnType, Value};
 
 /// The server version string advertised in `ParameterStatus` and `version()`.
 /// Clients parse the leading `MAJOR.MINOR`; we report a modern Postgres major.
@@ -38,8 +38,27 @@ pub enum Canned {
     /// answer it by pulling the live [`engine::EngineStats`] snapshot (the pure
     /// classifier here has no engine access, exactly like `Reflect`).
     Stats,
+    /// The `twill.catalog` / `twill.relationships` reflection surface (spec 19
+    /// Milestone 3): a plain-text view of the live catalog the management CLI
+    /// consumes over the wire to drive its `tables`/`describe`/`gen types`/
+    /// `schema dump` commands. Resolved by the session against the live
+    /// [`engine::Connection::catalog`], exactly like `Stats`/`Reflect` (which the
+    /// pure classifier cannot reach). Distinct from `Reflect`, whose binary,
+    /// PostgREST-query-shaped output is for PostgREST's schema cache, not a
+    /// generic client.
+    Catalog(CatalogKind),
     /// Not intercepted — hand the statement to the engine.
     Pass,
+}
+
+/// Which view of the live catalog the `twill.catalog` family reflects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CatalogKind {
+    /// `twill.catalog` — one row per column: `(tbl, col, typ, notnull, pk)`.
+    Columns,
+    /// `twill.relationships` — one row per foreign key:
+    /// `(tbl, name, cols, ftable, fcols)` (column lists comma-joined).
+    Relationships,
 }
 
 /// Which PostgREST schema-cache query to reflect from the catalog.
@@ -167,6 +186,30 @@ fn is_twill_stats_query(s: &str) -> bool {
     )
 }
 
+/// Whether `s` (already lowercased/trimmed) is one of the accepted spellings of
+/// the `twill.catalog` / `twill.relationships` reflection surface (spec 19
+/// Milestone 3), and if so which view. Accepts `SHOW`, a `SELECT *`, or a bare
+/// `TABLE`, with either the dotted or underscored name — the same vocabulary as
+/// `twill.stats`. Kept separate from `intercept` so that classifier's cyclomatic
+/// complexity stays within the project's lizard gate.
+fn twill_catalog_query(s: &str) -> Option<CatalogKind> {
+    let one = |name: &str| {
+        matches!(s.strip_prefix("show ").map(str::trim), Some(n) if n == name)
+            || matches!(s.strip_prefix("table ").map(str::trim), Some(n) if n == name)
+            || matches!(
+                s.strip_prefix("select * from ").map(str::trim),
+                Some(n) if n == name
+            )
+    };
+    if one("twill.catalog") || one("twill_catalog") {
+        Some(CatalogKind::Columns)
+    } else if one("twill.relationships") || one("twill_relationships") {
+        Some(CatalogKind::Relationships)
+    } else {
+        None
+    }
+}
+
 /// Format a live [`engine::EngineStats`] snapshot into the `twill.stats` result
 /// set: `(metric TEXT, value BIGINT)`, one row per signal under the settled #53
 /// vocabulary (spec 15). Pure formatting from a passed-in value — this module
@@ -211,6 +254,83 @@ pub fn stats_rows(stats: &engine::EngineStats) -> Canned {
     }
 }
 
+/// The lowercase SQL type keyword for an engine storage class — the spelling the
+/// management CLI re-parses when it rebuilds the catalog from the wire (the
+/// inverse of the parser's type mapping). Mirrors `render`/`schema` in the CLI so
+/// a wire `schema dump` matches an embedded one.
+fn sql_type_name(ty: ColumnType) -> String {
+    match ty {
+        ColumnType::Integer => "integer".to_string(),
+        ColumnType::Real => "real".to_string(),
+        ColumnType::Text => "text".to_string(),
+        ColumnType::Blob => "blob".to_string(),
+        ColumnType::Vector(n) => format!("vector({n})"),
+    }
+}
+
+/// Resolve a `twill.catalog` / `twill.relationships` query against the live
+/// catalog (the session calls this, exactly like [`stats_rows`]).
+pub fn catalog_reflect(kind: CatalogKind, catalog: &[CatalogTable]) -> Canned {
+    match kind {
+        CatalogKind::Columns => catalog_columns_rows(catalog),
+        CatalogKind::Relationships => catalog_relationships_rows(catalog),
+    }
+}
+
+/// `twill.catalog`: one row per column, `(tbl, col, typ, notnull, pk)`, in table
+/// then ordinal order. `notnull` / `pk` are `0`/`1` integers.
+fn catalog_columns_rows(catalog: &[CatalogTable]) -> Canned {
+    let mut rows = Vec::new();
+    for t in catalog {
+        for c in &t.columns {
+            rows.push(vec![
+                Value::Text(t.name.clone()),
+                Value::Text(c.name.clone()),
+                Value::Text(sql_type_name(c.ty)),
+                Value::Int(c.not_null as i64),
+                Value::Int(c.primary_key as i64),
+            ]);
+        }
+    }
+    let n = rows.len();
+    Canned::Rows {
+        columns: ["tbl", "col", "typ", "notnull", "pk"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        oids: vec![],
+        rows,
+        tag: format!("SELECT {n}"),
+    }
+}
+
+/// `twill.relationships`: one row per foreign key, `(tbl, name, cols, ftable,
+/// fcols)`, with the local/foreign column lists comma-joined.
+fn catalog_relationships_rows(catalog: &[CatalogTable]) -> Canned {
+    let mut rows = Vec::new();
+    for t in catalog {
+        for fk in &t.foreign_keys {
+            rows.push(vec![
+                Value::Text(t.name.clone()),
+                Value::Text(fk.name.clone()),
+                Value::Text(fk.columns.join(",")),
+                Value::Text(fk.foreign_table.clone()),
+                Value::Text(fk.foreign_columns.join(",")),
+            ]);
+        }
+    }
+    let n = rows.len();
+    Canned::Rows {
+        columns: ["tbl", "name", "cols", "ftable", "fcols"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        oids: vec![],
+        rows,
+        tag: format!("SELECT {n}"),
+    }
+}
+
 /// Inspect a statement; return a canned answer or [`Canned::Pass`].
 pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     let s = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
@@ -236,6 +356,13 @@ pub fn intercept(sql: &str, user: &str, database: &str) -> Canned {
     // mistaken for a GUC. The session resolves it against the live engine.
     if is_twill_stats_query(&s) {
         return Canned::Stats;
+    }
+
+    // `twill.catalog` / `twill.relationships` — the catalog reflection surface
+    // the management CLI consumes over the wire (spec 19 Milestone 3). Matched
+    // before the generic `SHOW <name>` so the dotted name is not taken for a GUC.
+    if let Some(kind) = twill_catalog_query(&s) {
+        return Canned::Catalog(kind);
     }
 
     // SHOW <name> — one row named after the setting.

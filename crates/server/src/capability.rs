@@ -295,6 +295,18 @@ pub const CATALOG_QUERIES: &[CatalogCap] = &[
         support: Support::Answered,
         clients: "operators",
     },
+    CatalogCap {
+        marker: "twill.catalog",
+        purpose: "catalog reflection (columns) for the management CLI (spec 19 M3)",
+        support: Support::Reflected,
+        clients: "twilldb",
+    },
+    CatalogCap {
+        marker: "twill.relationships",
+        purpose: "catalog reflection (foreign keys) for the management CLI (spec 19 M3)",
+        support: Support::Reflected,
+        clients: "twilldb",
+    },
 ];
 
 /// Markers that signal a system-catalog / introspection query the subset does
