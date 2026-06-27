@@ -300,6 +300,222 @@ fn shell_runs_statements_and_dot_commands() {
     fs::remove_dir_all(&dir).ok();
 }
 
+// ---- Milestone 2: branches, db reset, schema dump, serve ----------------
+
+#[test]
+fn branch_create_list_delete() {
+    let dir = scratch("branch");
+    let url = db_url(&dir);
+    manage::run("sql", &args(&[&url, "CREATE TABLE t (a integer)"])).unwrap();
+    manage::run("sql", &args(&[&url, "INSERT INTO t VALUES (1)"])).unwrap();
+
+    // No branches on a fresh database.
+    let empty = manage::run("branch", &args(&["list", &url])).unwrap();
+    assert!(empty.contains("no branches"), "got: {empty}");
+
+    // Create one — reported with its id and a #branch= address.
+    let created = manage::run("branch", &args(&["create", &url, "feature"])).unwrap();
+    assert!(created.contains("created branch 1"), "got: {created}");
+    assert!(created.contains("#branch=1"), "got: {created}");
+
+    // List shows it.
+    let list = manage::run("branch", &args(&["list", &url])).unwrap();
+    assert!(list.contains("#branch=1"), "got: {list}");
+
+    // Delete it; the namespace is empty again.
+    let del = manage::run("branch", &args(&["delete", &url, "1"])).unwrap();
+    assert!(del.contains("deleted branch 1"), "got: {del}");
+    let after = manage::run("branch", &args(&["list", &url])).unwrap();
+    assert!(after.contains("no branches"), "got: {after}");
+
+    // A non-numeric branch id is a usage error, not a panic.
+    let bad = manage::run("branch", &args(&["delete", &url, "nope"])).unwrap_err();
+    assert!(bad.contains("must be a number"), "got: {bad}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn branch_writes_are_isolated_from_base() {
+    let dir = scratch("branchiso");
+    let url = db_url(&dir);
+    manage::run("sql", &args(&[&url, "CREATE TABLE t (a integer)"])).unwrap();
+    manage::run("sql", &args(&[&url, "INSERT INTO t VALUES (1)"])).unwrap();
+    manage::run("branch", &args(&["create", &url, "b"])).unwrap();
+
+    // Write through the branch address; the base must not see it.
+    let branch_url = format!("{url}#branch=1");
+    manage::run("sql", &args(&[&branch_url, "INSERT INTO t VALUES (2)"])).unwrap();
+
+    let on_branch = manage::run(
+        "sql",
+        &args(&[&branch_url, "SELECT count(*) AS c FROM t", "--json"]),
+    )
+    .unwrap();
+    assert_eq!(on_branch, "[{\"c\":2}]");
+    let on_base = manage::run(
+        "sql",
+        &args(&[&url, "SELECT count(*) AS c FROM t", "--json"]),
+    )
+    .unwrap();
+    assert_eq!(on_base, "[{\"c\":1}]", "base must be untouched");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn migrate_up_branch_previews_without_touching_base() {
+    let dir = scratch("migbranch");
+    let url = db_url(&dir);
+    let mdir = dir.join("migrations");
+    fs::create_dir_all(&mdir).unwrap();
+    fs::write(
+        mdir.join("0001_init.sql"),
+        "CREATE TABLE t (id integer primary key);",
+    )
+    .unwrap();
+    let mdir_s = mdir.to_str().unwrap();
+
+    let out = manage::run(
+        "migrate",
+        &args(&["up", &url, "--dir", mdir_s, "--branch", "preview"]),
+    )
+    .unwrap();
+    assert!(out.contains("applied 0001_init"), "got: {out}");
+    assert!(out.contains("previewed on branch 1"), "got: {out}");
+
+    // The base is untouched — the migration applied only to the branch.
+    let base_tables = manage::run("tables", &args(&[&url])).unwrap();
+    assert!(
+        base_tables.contains("no tables"),
+        "base must be untouched: {base_tables}"
+    );
+    let branch_tables = manage::run("tables", &args(&[&format!("{url}#branch=1")])).unwrap();
+    assert!(
+        branch_tables.contains("t ("),
+        "branch has it: {branch_tables}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn db_reset_is_safe_by_default_and_rebuilds() {
+    let dir = scratch("dbreset");
+    let url = db_url(&dir);
+    let mdir = dir.join("migrations");
+    fs::create_dir_all(&mdir).unwrap();
+    fs::write(
+        mdir.join("0001_init.sql"),
+        "CREATE TABLE t (id integer primary key, n integer);",
+    )
+    .unwrap();
+    let mdir_s = mdir.to_str().unwrap();
+
+    manage::run("migrate", &args(&["up", &url, "--dir", mdir_s])).unwrap();
+    manage::run("sql", &args(&[&url, "CREATE TABLE stray (x integer)"])).unwrap();
+
+    // A non-empty database refuses to reset without --force.
+    let refused = manage::run("db", &args(&["reset", &url, "--dir", mdir_s])).unwrap_err();
+    assert!(refused.contains("--force"), "got: {refused}");
+
+    // With --force + --seed: drop everything, re-migrate, re-seed.
+    let seed = dir.join("seed.sql");
+    fs::write(&seed, "INSERT INTO t VALUES (1, 10);").unwrap();
+    let out = manage::run(
+        "db",
+        &args(&[
+            "reset",
+            &url,
+            "--dir",
+            mdir_s,
+            "--seed",
+            seed.to_str().unwrap(),
+            "--force",
+        ]),
+    )
+    .unwrap();
+    assert!(out.contains("dropped"), "got: {out}");
+    assert!(out.contains("1 migration(s) applied"), "got: {out}");
+    assert!(out.contains("seeded"), "got: {out}");
+
+    // The stray table is gone; t exists with exactly the seeded row.
+    let tables = manage::run("tables", &args(&[&url])).unwrap();
+    assert!(!tables.contains("stray"), "stray dropped: {tables}");
+    let json = manage::run("sql", &args(&[&url, "SELECT n FROM t", "--json"])).unwrap();
+    assert_eq!(json, "[{\"n\":10}]");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn schema_dump_reconstructs_reparseable_ddl() {
+    let dir = scratch("schemadump");
+    let url = db_url(&dir);
+    manage::run(
+        "sql",
+        &args(&[
+            &url,
+            "CREATE TABLE authors (id integer primary key, name text NOT NULL)",
+        ]),
+    )
+    .unwrap();
+    manage::run(
+        "sql",
+        &args(&[
+            &url,
+            "CREATE TABLE books (id integer primary key, title text NOT NULL, \
+             author_id integer REFERENCES authors(id), embedding vector(3))",
+        ]),
+    )
+    .unwrap();
+
+    let dump = manage::run("schema", &args(&["dump", &url])).unwrap();
+    assert!(dump.contains("CREATE TABLE authors ("), "got: {dump}");
+    assert!(dump.contains("id integer PRIMARY KEY"), "pk inline: {dump}");
+    assert!(dump.contains("name text NOT NULL"), "not null: {dump}");
+    assert!(dump.contains("embedding vector(3)"), "vector type: {dump}");
+    assert!(
+        dump.contains("FOREIGN KEY (author_id) REFERENCES authors (id)"),
+        "fk: {dump}"
+    );
+
+    // The dump re-parses: replaying it into a fresh database reproduces the shape.
+    let dir2 = scratch("schemadump2");
+    let url2 = db_url(&dir2);
+    for stmt in dump.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            manage::run("sql", &args(&[&url2, s])).unwrap();
+        }
+    }
+    let tables = manage::run("tables", &args(&[&url2])).unwrap();
+    assert!(tables.contains("authors"), "got: {tables}");
+    assert!(tables.contains("books"), "got: {tables}");
+
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
+fn serve_validates_transport_without_binding() {
+    // An embedded url + an explicit listen resolve cleanly.
+    let (listen, url) =
+        manage::serve_check(&args(&["file://./x.db", "--listen", "127.0.0.1:6000"])).unwrap();
+    assert_eq!(listen, "127.0.0.1:6000");
+    assert_eq!(url, "file://./x.db");
+
+    // The listen address defaults when omitted.
+    let (listen, _) = manage::serve_check(&args(&["file://./x.db"])).unwrap();
+    assert_eq!(listen, "127.0.0.1:5433");
+
+    // postgres:// and #branch= addresses are rejected before any bind.
+    let pg = manage::serve_check(&args(&["postgres://h/db"])).unwrap_err();
+    assert!(pg.contains("embedded"), "got: {pg}");
+    let br = manage::serve_check(&args(&["file://./x.db#branch=1"])).unwrap_err();
+    assert!(br.contains("#branch="), "got: {br}");
+}
+
 #[test]
 fn transport_rejects_postgres_and_unknown_schemes() {
     // postgres:// is a recognized-but-unimplemented transport (Milestone 3).

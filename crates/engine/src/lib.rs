@@ -52,6 +52,12 @@ pub use vector::{IndexParams, Metric};
 /// [`EngineStats::storage`] need not depend on `twill-storage` directly (#53).
 pub use twill_storage::StorageStats;
 
+/// Re-export the copy-on-write branch identifiers so a consumer (the management
+/// CLI's `branch` commands) can name and reflect branches without depending on
+/// `twill-storage` directly. `BranchId` addresses a branch; `BranchRef` is a
+/// reflected `{id, parent, base_lsn, head_lsn}` from [`Connection::list_branches`].
+pub use twill_storage::{BranchId, BranchRef};
+
 /// ABI version embedded in `engine.h`; bindings verify it at load time.
 ///
 /// v3 (Phase 5): adds the in-core vector capability — the `vector(N)` type, the

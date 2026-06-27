@@ -52,9 +52,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         "init" => run_init(rest),
         // Management half (spec 19), behind the `manage` feature. The verbs are
         // recognized either way so a lean build can explain how to get them.
-        "sql" | "shell" | "tables" | "describe" | "migrate" | "gen" | "seed" | "stats" => {
-            run_manage(cmd, rest)
-        }
+        "sql" | "shell" | "tables" | "describe" | "migrate" | "gen" | "seed" | "stats"
+        | "branch" | "db" | "serve" | "schema" => run_manage(cmd, rest),
         other => {
             eprintln!("error: unknown subcommand '{other}'\n");
             print_help();
@@ -365,6 +364,10 @@ fn print_help() {
          \x20 twilldb migrate new|up|status  author and apply migrations\n\
          \x20 twilldb gen types <url>        TypeScript types for @twilldb/bun\n\
          \x20 twilldb seed|stats <url>       run a seed script / show stats\n\
+         \x20 twilldb branch create|list|delete   manage copy-on-write branches\n\
+         \x20 twilldb db reset <url>         drop, re-migrate, and re-seed a database\n\
+         \x20 twilldb schema dump <url>      print reconstructed CREATE TABLE DDL\n\
+         \x20 twilldb serve <url>            run the engine behind a Postgres-wire listener\n\
          <url> is file:// (embedded — the CLI is the single writer, so use it on a\n\
          local or stopped database). These need the management build (--features manage)."
     );

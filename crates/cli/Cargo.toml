@@ -28,11 +28,15 @@ path = "src/lib.rs"
 # `twill-engine` and opens a real database over the embedded (`file://`/`s3://`)
 # transport; the engine itself carries no heavy third-party deps, so even the
 # management build stays auditable. CI builds both with and without the feature.
-manage = ["dep:engine"]
+# `serve` (Milestone 2) wraps `engine-server`, so the feature additionally links
+# `twill-server` — itself dependency-light (only the engine + a hand-rolled
+# pgwire listener), so the wall it guards stays auditable.
+manage = ["dep:engine", "dep:twill-server"]
 
 [dependencies]
 # Only pulled in by the `manage` feature; the default scaffolder links nothing.
 engine = { package = "twill-engine", path = "../engine", optional = true }
+twill-server = { path = "../server", optional = true }
 
 [[test]]
 name = "manage"

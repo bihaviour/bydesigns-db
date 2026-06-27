@@ -21,7 +21,7 @@
 <span class="spec-date">~4 minutes</span>
 </div>
 <h1>Manage a database</h1>
-<p class="lede">The same <code>twilldb</code> binary that <a href="scaffolding.html">scaffolds a project</a> can also <em>talk to a real database</em>: run SQL, inspect the schema, author and apply migrations, generate TypeScript types, and load seed data. Where the scaffolder only writes files, the management commands open a <code>Connection</code> in-process — so they need the engine linked in, behind a cargo feature.</p>
+<p class="lede">The same <code>twilldb</code> binary that <a href="scaffolding.html">scaffolds a project</a> can also <em>talk to a real database</em>: run SQL, inspect the schema, author and apply migrations, generate TypeScript types, load seed data, manage copy-on-write branches, reset and dump a database, and even serve it behind Postgres-wire. Where the scaffolder only writes files, the management commands open a <code>Connection</code> in-process — so they need the engine linked in, behind a cargo feature.</p>
 </header>
 
 <section>
@@ -92,6 +92,30 @@ twilldb migrate status file://./app.db</code></pre>
 </section>
 
 <section>
+<h2>Branches &amp; preview-and-swap migrations</h2>
+<p>Branching is Twill's differentiator, and the CLI leans into it. A <a href="branching.html">branch</a> is a zero-copy fork of the database at its committed point — creating one copies no data. Branches are durable on the base, so one invocation creates them and the next sees them:</p>
+<pre data-lang="bash"><code># fork a copy-on-write branch (an optional label is just for humans)
+twilldb branch create file://./app.db feature-x
+# → created branch 1 ("feature-x")
+#   address it with: file://./app.db#branch=1
+
+twilldb branch list   file://./app.db        # id, parent, fork/head LSN, address
+twilldb branch delete file://./app.db 1      # drop the pointer + its private overlay</code></pre>
+<p>A branch is <strong>addressed by appending <code>#branch=&lt;id&gt;</code></strong> to the base URL, and every other command accepts that address — so you can run SQL, inspect, or migrate against a branch in complete isolation from the base:</p>
+<pre data-lang="bash"><code>twilldb sql    'file://./app.db#branch=1' "INSERT INTO notes (title) VALUES ('draft')"
+twilldb schema dump 'file://./app.db#branch=1'
+# the base is untouched — writes land only in the branch's private overlay</code></pre>
+<div class="callout tip">
+<p class="callout-title">Preview-and-swap migrations</p>
+<p><code>migrate up --branch [name]</code> turns branching into a migration safety feature. It forks a branch, applies the pending migrations <em>there</em>, and leaves the base untouched — so you can verify a risky change on a zero-copy preview before committing to it. Once satisfied, <strong>promote</strong> by running the ordinary <code>migrate up</code> on the base (the same migrations apply identically); <strong>discard</strong> with <code>branch delete</code>. This is safer than an in-place transactional DDL migration, which a single-writer, autocommit-DDL engine cannot offer.</p>
+<pre data-lang="bash"><code>twilldb migrate up file://./app.db --branch try-it   # preview on a fresh branch
+twilldb schema dump 'file://./app.db#branch=2'        # inspect the result
+twilldb migrate up file://./app.db                    # promote: apply to the base
+twilldb branch delete file://./app.db 2               # (or discard the preview)</code></pre>
+</div>
+</section>
+
+<section>
 <h2>Generate TypeScript types</h2>
 <p><code>gen types</code> reflects the live schema and emits a TypeScript interface per table for the <a href="connect-bun.html"><code>@twilldb/bun</code></a> client, so your <code>db.query&lt;Row&gt;()</code> calls stay statically typed against the real schema:</p>
 <pre data-lang="bash"><code>twilldb gen types file://./app.db --out src/db-types.ts</code></pre>
@@ -106,6 +130,23 @@ twilldb seed file://./app.db seed.sql
 # print the engine + storage observability counters
 twilldb stats file://./app.db</code></pre>
 <p><code>stats</code> reports the same engine and storage counters the server surfaces over <code>SHOW twill.stats</code> — commits, durable WAL appends, the committed LSN, write-lane contention, and the storage backend's read/cache/fsync counters.</p>
+</section>
+
+<section>
+<h2>Reset, dump &amp; serve</h2>
+<pre data-lang="bash"><code># reconstruct CREATE TABLE DDL from the live schema (columns, types, PK, FKs)
+twilldb schema dump file://./app.db
+
+# rebuild a database from scratch: drop every table → re-apply migrations → seed
+twilldb db reset file://./app.db --seed seed.sql --force
+
+# run the engine behind a Postgres-wire listener (wraps engine-server)
+twilldb serve file://./app.db --listen 127.0.0.1:5433</code></pre>
+<p><code>schema dump</code> prints the DDL a fresh database would need to match this one's shape — it reflects the catalog, so column types, nullability, primary keys, and foreign keys round-trip (defaults, checks, and standalone unique constraints are not part of the reflected catalog and are not emitted). <code>db reset</code> is destructive, so on a non-empty database it requires <code>--force</code>; it drops every table (including the migration tracking table), re-applies all migrations, and runs the optional <code>--seed</code> script. <code>serve</code> composes the Phase&nbsp;3 <a href="connect-postgres.html">engine-server</a> in-process and blocks, so any Postgres client can connect — the same single-writer rule applies, so the server should be the sole writer of that database.</p>
+<div class="callout note">
+<p class="callout-title">Branch addresses are for embedded commands only</p>
+<p>The <code>&lt;url&gt;#branch=&lt;id&gt;</code> address works with the embedded commands (<code>sql</code>, <code>tables</code>, <code>schema dump</code>, <code>migrate</code>, …). <code>serve</code> runs the <em>base</em> database (the server is the sole writer), so it rejects a <code>#branch=</code> address — branch first, then point a fresh server at the branch overlay if you need to serve one.</p>
+</div>
 </section>
 
 <section>

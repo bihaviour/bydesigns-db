@@ -22,9 +22,11 @@
 //! error message) so the integration tests can drive them against a temp
 //! `file://` database without spawning a process or capturing stdout.
 
+mod branch;
 mod gentypes;
 mod migrate;
 mod render;
+mod schema;
 
 use crate::exit;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,9 +35,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `migrate`, …) and `rest` the arguments after it. Prints output to stdout and
 /// errors to stderr, returning the process exit code.
 pub fn dispatch(cmd: &str, rest: &[String]) -> i32 {
-    // `shell` streams to stdout/stdin rather than buffering one output string.
+    // `shell` and `serve` run long / stream to stdio rather than buffering one
+    // output string, so they bypass the buffered-output path.
     if cmd == "shell" {
         return cmd_shell(rest);
+    }
+    if cmd == "serve" {
+        return cmd_serve(rest);
     }
     finish(run_core(cmd, rest))
 }
@@ -51,8 +57,14 @@ fn run_core(cmd: &str, rest: &[String]) -> CmdResult {
         "gen" => cmd_gen(rest),
         "seed" => cmd_seed(rest),
         "stats" => cmd_stats(rest),
+        "branch" => branch::cmd_branch(rest),
+        "schema" => schema::cmd_schema(rest),
+        "db" => cmd_db(rest),
         "shell" => Err(Usage(
             "`shell` is interactive; run it from a terminal".into(),
+        )),
+        "serve" => Err(Usage(
+            "`serve` runs a server; run it from a terminal".into(),
         )),
         other => Err(Usage(format!("unknown management subcommand '{other}'"))),
     }
@@ -63,6 +75,14 @@ fn run_core(cmd: &str, rest: &[String]) -> CmdResult {
 /// it without spawning a process or capturing stdout.
 pub fn run(cmd: &str, rest: &[String]) -> Result<String, String> {
     run_core(cmd, rest).map_err(|e| match e {
+        Usage(m) | Runtime(m) => m,
+    })
+}
+
+/// Test-facing wrapper: validate `serve` arguments without binding a listener,
+/// returning the resolved `(listen, url)` or a flattened error message.
+pub fn serve_check(rest: &[String]) -> Result<(String, String), String> {
+    serve_args(rest).map_err(|e| match e {
         Usage(m) | Runtime(m) => m,
     })
 }
@@ -122,7 +142,18 @@ fn finish(result: CmdResult) -> i32 {
 /// Open a database by connection-string scheme (spec 19 transport model). Only
 /// the embedded schemes are wired up in Milestone 1; `postgres://` is the
 /// Milestone-3 pgwire transport and is rejected with guidance.
+///
+/// A `<base-url>#branch=<id>` suffix (Milestone 2) opens a copy-on-write branch
+/// instead of the base line — the address `branch create` / `branch list` hand
+/// back, so every command can target a branch.
 fn open(url: &str) -> Result<engine::Connection, CmdError> {
+    if let Some((base, id)) = url.split_once("#branch=") {
+        let id: u64 = id
+            .parse()
+            .map_err(|_| Usage(format!("branch id in '{url}' must be a number")))?;
+        return engine::Connection::open_branch(base, engine::BranchId(id))
+            .map_err(|e| Runtime(format!("opening branch {id} of {base}: {e}")));
+    }
     if url.starts_with("file://")
         || url.starts_with("s3://")
         || url.starts_with("r2://")
@@ -218,8 +249,14 @@ fn cmd_stats(args: &[String]) -> CmdResult {
 fn cmd_seed(args: &[String]) -> CmdResult {
     let url = positional(args, 0, "<url>")?;
     let file = positional(args, 1, "<file.sql>")?;
-    let sql = std::fs::read_to_string(file).map_err(|e| Runtime(format!("reading {file}: {e}")))?;
     let mut conn = open(url)?;
+    apply_seed_file(&mut conn, file)
+}
+
+/// Run a `.sql` script statement-by-statement against `conn`. Shared by `seed`
+/// and `db reset --seed`.
+fn apply_seed_file(conn: &mut engine::Connection, file: &str) -> CmdResult {
+    let sql = std::fs::read_to_string(file).map_err(|e| Runtime(format!("reading {file}: {e}")))?;
     let mut n = 0usize;
     for stmt in migrate::split_statements(&sql) {
         conn.exec(&stmt)
@@ -227,6 +264,89 @@ fn cmd_seed(args: &[String]) -> CmdResult {
         n += 1;
     }
     Ok(format!("seeded {file} ({n} statement(s))"))
+}
+
+/// `twilldb db reset <url> [--dir d] [--seed f] [--force]` — drop every table,
+/// re-apply all migrations, and optionally re-seed: a clean rebuild of the
+/// database's shape and fixtures. Destructive, so a non-empty database requires
+/// `--force` (spec 19 safe-by-default).
+fn cmd_db(args: &[String]) -> CmdResult {
+    let sub = positional(args, 0, "a `db` subcommand (only `reset` is supported)")?;
+    if sub != "reset" {
+        return Err(Usage(format!(
+            "unknown `db` subcommand '{sub}' (only `reset` is supported)"
+        )));
+    }
+    // positional 0 is `reset`; the url is positional 1.
+    let url = positional(args, 1, "<url>")?;
+    let dir = flag_value(args, "--dir").unwrap_or("migrations");
+    let mut conn = open(url)?;
+
+    let tables: Vec<String> = conn.catalog().into_iter().map(|t| t.name).collect();
+    if !tables.is_empty() && !has_flag(args, "--force") {
+        return Err(Usage(format!(
+            "refusing to reset a non-empty database ({} table(s)) without --force",
+            tables.len()
+        )));
+    }
+    // Drop every table (DDL is autocommit; the engine enforces no FK, so order
+    // is irrelevant). The migration tracking table drops too, so `migrate up`
+    // re-applies from a clean slate.
+    for t in &tables {
+        conn.exec(&format!("DROP TABLE IF EXISTS {t}"))
+            .map_err(|e| Runtime(format!("dropping {t}: {e}")))?;
+    }
+    let mut out = format!("dropped {} table(s)\n", tables.len());
+    out.push_str(&migrate::up(&mut conn, dir, now_unix())?);
+    if let Some(seed) = flag_value(args, "--seed") {
+        out.push('\n');
+        out.push_str(&apply_seed_file(&mut conn, seed)?);
+    }
+    Ok(out)
+}
+
+/// `twilldb serve <url> [--listen HOST:PORT]` — run the engine behind a
+/// Postgres-wire listener (Phase 3's `engine-server`, composed in-process).
+/// Blocks until the server exits. Returns the process exit code directly.
+fn cmd_serve(args: &[String]) -> i32 {
+    let (listen, url) = match serve_args(args) {
+        Ok(v) => v,
+        Err(e) => return finish(Err(e)),
+    };
+    eprintln!("twilldb serve: listening on {listen}, serving {url}");
+    match twill_server::run(&listen, &url) {
+        Ok(()) => exit::OK,
+        Err(e) => {
+            eprintln!("error: serve: {e}");
+            exit::ERROR
+        }
+    }
+}
+
+/// Parse and validate `serve` arguments *without* binding, so the logic is unit
+/// testable (the bind/block is the only untested part). Returns `(listen, url)`.
+/// The transport must be embedded — the server itself opens the base as the sole
+/// writer — so `postgres://` / an unknown scheme / a `#branch=` address is
+/// rejected.
+fn serve_args(args: &[String]) -> Result<(String, String), CmdError> {
+    let url = positional(args, 0, "<url>")?;
+    if url.contains("#branch=") {
+        return Err(Usage(
+            "serve runs the base database; pass the base url, not a #branch= address".into(),
+        ));
+    }
+    let embedded = ["file://", "s3://", "r2://", "gs://"]
+        .iter()
+        .any(|s| url.starts_with(s));
+    if !embedded {
+        return Err(Usage(format!(
+            "serve needs an embedded url (file://, s3://, r2://, gs://); got '{url}'"
+        )));
+    }
+    let listen = flag_value(args, "--listen")
+        .unwrap_or("127.0.0.1:5433")
+        .to_string();
+    Ok((listen, url.to_string()))
 }
 
 /// `twilldb gen types <url> [--out <file>]` — TypeScript for `@twilldb/bun`.
@@ -263,6 +383,9 @@ fn cmd_migrate(args: &[String]) -> CmdResult {
         "up" => {
             let url = positional(&rest, 0, "<url>")?;
             let dir = flag_value(&rest, "--dir").unwrap_or("migrations");
+            if has_flag(&rest, "--branch") {
+                return migrate_up_branch(url, dir, &rest);
+            }
             let mut conn = open(url)?;
             migrate::up(&mut conn, dir, now_unix()).map_err(Into::into)
         }
@@ -276,6 +399,42 @@ fn cmd_migrate(args: &[String]) -> CmdResult {
             "unknown migrate subcommand '{other}' (new|up|status)"
         ))),
     }
+}
+
+/// `migrate up <url> --branch [name]` (spec 19 preview-and-swap): fork a
+/// copy-on-write branch off the base, apply the pending migrations there, and
+/// report how to inspect / promote / discard it. Turns Twill's branching into a
+/// migration safety feature — verify a risky change on a zero-copy fork before
+/// touching the base, which a single-writer, autocommit-DDL engine cannot do
+/// transactionally in place.
+fn migrate_up_branch(url: &str, dir: &str, args: &[String]) -> CmdResult {
+    if url.contains("#branch=") {
+        return Err(Usage(
+            "migrate up --branch forks from the base; pass the base url, not a #branch= address"
+                .into(),
+        ));
+    }
+    // An optional label after `--branch`; anything starting with `--` is the next
+    // flag, not the name.
+    let label = match flag_value(args, "--branch") {
+        Some(v) if !v.starts_with("--") => v,
+        _ => "migrate-preview",
+    };
+    let base = open(url)?;
+    let id = base
+        .create_branch(label)
+        .map_err(|e| Runtime(e.to_string()))?;
+    let branch_url = format!("{url}#branch={}", id.0);
+    let mut branch_conn = open(&branch_url)?;
+    let applied = migrate::up(&mut branch_conn, dir, now_unix())?;
+    Ok(format!(
+        "{applied}\n\n\
+         previewed on branch {id} (\"{label}\").\n\
+         \x20 inspect:  twilldb schema dump {branch_url}\n\
+         \x20 promote:  twilldb migrate up {url}   (applies the same migrations to the base)\n\
+         \x20 discard:  twilldb branch delete {url} {id}",
+        id = id.0
+    ))
 }
 
 /// `twilldb shell <url>` — interactive REPL over stdin/stdout. Returns the exit
@@ -354,14 +513,21 @@ pub fn print_manage_help() {
          \x20 twilldb describe <url> <table>          show columns, PK, FKs\n\
          \x20 twilldb migrate new <name> [--dir d]    create a timestamped migration\n\
          \x20 twilldb migrate up <url> [--dir d]      apply pending migrations\n\
+         \x20 twilldb migrate up <url> --branch [n]   preview on a copy-on-write branch\n\
          \x20 twilldb migrate status <url> [--dir d]  applied vs pending + drift\n\
          \x20 twilldb gen types <url> [--out f]       TypeScript types for @twilldb/bun\n\
          \x20 twilldb seed <url> <file.sql>           run a seed script\n\
          \x20 twilldb stats <url>                     engine + storage stats\n\
+         \x20 twilldb branch create <url> [name]      fork a copy-on-write branch\n\
+         \x20 twilldb branch list <url>               list branches\n\
+         \x20 twilldb branch delete <url> <id>        delete a branch\n\
+         \x20 twilldb db reset <url> [--seed f] [--force]   drop, re-migrate, re-seed\n\
+         \x20 twilldb schema dump <url>               print reconstructed CREATE TABLE DDL\n\
+         \x20 twilldb serve <url> [--listen H:P]      run the engine behind pgwire\n\
          \n\
          <url> is a connection string: file:// (and s3://, r2://, gs://) open the\n\
          engine embedded — the CLI is itself the single writer, so point it only at\n\
-         a local or stopped database. A live deployment is managed over postgres://\n\
-         (Milestone 3, not wired up yet)."
+         a local or stopped database. A branch is addressed as <url>#branch=<id>. A\n\
+         live deployment is managed over postgres:// (Milestone 3, not wired up yet)."
     );
 }

@@ -14,7 +14,7 @@ use crate::wal::WalOp;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Arc;
-use twill_storage::{block_on, Lsn, WalRecord};
+use twill_storage::{block_on, BranchId, BranchRef, Lsn, WalRecord};
 
 struct Txn {
     /// MVCC snapshot LSN captured at transaction start.
@@ -321,6 +321,59 @@ impl Connection {
             // still enforces against the branch's own (default) role.
             session: SessionContext::default(),
         })
+    }
+
+    /// Open an existing copy-on-write branch of the database at `url` as a new
+    /// connection (cf. [`Connection::branch`], which *creates* a branch off this
+    /// handle). The branch must already exist (created via [`Connection::branch`]
+    /// or [`Connection::create_branch`]); an unknown branch is an error. Used by
+    /// the management CLI to address a branch (`<url>#branch=<id>`).
+    pub fn open_branch(url: &str, branch: BranchId) -> Result<Connection> {
+        Ok(Connection {
+            db: Database::open_branch(url, branch)?,
+            txn: None,
+            last_error: CString::default(),
+            last_changes: 0,
+            last_lsn: 0,
+            vector_ef_search: None,
+            session: SessionContext::default(),
+        })
+    }
+
+    /// Create a copy-on-write branch off this connection's database at its
+    /// committed LSN, returning the new branch's id *without* opening a handle on
+    /// it — the read side of [`Connection::branch`], for callers (the management
+    /// CLI's `branch create`) that only need the identifier. Same rules as
+    /// [`Connection::branch`]: not inside a transaction, not a branch-of-branch.
+    pub fn create_branch(&self, name: &str) -> Result<BranchId> {
+        if self.txn.is_some() {
+            return Err(EngineError::txn(
+                "cannot branch inside an active transaction",
+            ));
+        }
+        if self.db.is_branch() {
+            return Err(EngineError::misuse(
+                "branch-of-branch is not supported yet; branch from the base database",
+            ));
+        }
+        let base = self.db.committed_lsn();
+        block_on(self.db.storage.create_branch(name, Lsn(base))).map_err(commit_error)
+    }
+
+    /// List every copy-on-write branch forked off this database (id / parent /
+    /// fork point / head), in ascending id order. A read-through to the storage
+    /// seam's branch namespace ([`twill_storage::Storage::list_branches`]) — the
+    /// management CLI's `branch list`.
+    pub fn list_branches(&self) -> Result<Vec<BranchRef>> {
+        block_on(self.db.storage.list_branches()).map_err(commit_error)
+    }
+
+    /// Delete a branch pointer and reclaim only its diverged (branch-private)
+    /// data; the shared base is never touched. Refuses a branch with live
+    /// children. A read-through to [`twill_storage::Storage::delete_branch`] —
+    /// the management CLI's `branch delete`.
+    pub fn delete_branch(&self, branch: BranchId) -> Result<()> {
+        block_on(self.db.storage.delete_branch(branch)).map_err(commit_error)
     }
 
     /// Record the last error for retrieval via `engine_last_error`.
