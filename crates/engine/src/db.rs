@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use twill_storage::{
-    block_on, open_branch as storage_open_branch, open_storage, BranchId, FenceToken, Lsn, Storage,
-    WriterId,
+    block_on, open_branch as storage_open_branch, open_storage, BranchId, FenceToken, Lsn, PageId,
+    Storage, WriterId, PAGE_SIZE,
 };
 
 /// A simple counting write lane: at most one writer holds it at a time. Held
@@ -81,6 +81,10 @@ pub struct Database {
     /// Set once a lease renewal observes that a newer writer fenced us; commits
     /// then fail fast (the storage append would reject them anyway).
     fenced: AtomicBool,
+    /// VH-1 observability: vector indexes warmed from a page checkpoint (rather
+    /// than rebuilt from the rows) on this database's cold open. Purely a counter
+    /// for tests / stats; the warm result is identical either way.
+    index_pages_loaded: AtomicU64,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Weak<Database>>> {
@@ -145,6 +149,7 @@ impl Database {
         replay(storage.as_ref(), &mut store)?;
         let committed = block_on(storage.get_commit_lsn())?;
         store.committed_lsn = store.committed_lsn.max(committed.0);
+        let loaded = warm_vector_indexes(storage.as_ref(), &mut store);
 
         let db = Arc::new(Database {
             storage,
@@ -156,6 +161,7 @@ impl Database {
             url: url.to_string(),
             branch: None,
             fenced: AtomicBool::new(false),
+            index_pages_loaded: AtomicU64::new(loaded),
         });
 
         let mut reg = registry().lock().unwrap();
@@ -187,6 +193,7 @@ impl Database {
         replay(storage.as_ref(), &mut store)?;
         let committed = block_on(storage.get_commit_lsn())?;
         store.committed_lsn = store.committed_lsn.max(committed.0);
+        let loaded = warm_vector_indexes(storage.as_ref(), &mut store);
 
         let db = Arc::new(Database {
             storage,
@@ -198,6 +205,7 @@ impl Database {
             url: url.to_string(),
             branch: Some(branch),
             fenced: AtomicBool::new(false),
+            index_pages_loaded: AtomicU64::new(loaded),
         });
 
         let mut reg = registry().lock().unwrap();
@@ -210,6 +218,43 @@ impl Database {
 
     pub fn committed_lsn(&self) -> u64 {
         self.store.read().unwrap().committed_lsn
+    }
+
+    /// VH-1: checkpoint index `name`'s freshly built graph as page images through
+    /// `put_page`, stamped with the committed LSN they reflect, so a later cold
+    /// open can load the graph in bounded page reads instead of rebuilding it.
+    /// Best-effort: any failure (an unpageable graph, a storage error) leaves the
+    /// WAL-derived rebuild path as the source of truth.
+    pub(crate) fn checkpoint_vector_index(&self, name: &str, reflected_lsn: u64) {
+        let frames = self
+            .store
+            .read()
+            .unwrap()
+            .index_page_frames(name, reflected_lsn);
+        let Some(frames) = frames else {
+            return;
+        };
+        let region = index_page_region(name);
+        for (i, frame) in frames.iter().enumerate() {
+            if frame.len() > PAGE_SIZE {
+                return;
+            }
+            if block_on(
+                self.storage
+                    .put_page(&self.token, PageId(region + i as u64), frame),
+            )
+            .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// VH-1 observability: vector indexes warmed from a page checkpoint on this
+    /// database's cold open (vs. rebuilt from rows). The two warms are equivalent;
+    /// this only lets callers/tests confirm the page path engaged.
+    pub fn index_pages_loaded(&self) -> u64 {
+        self.index_pages_loaded.load(Ordering::Relaxed)
     }
 
     /// Snapshot of every table's schema, for catalog reflection (spec 07).
@@ -307,13 +352,74 @@ fn replay(storage: &dyn Storage, store: &mut Store) -> Result<()> {
             other => group.push(other),
         }
     }
-    // `group` non-empty here would be an incomplete trailing txn: discard.
-    // Build every vector index from the recovered rows — this is the index's
-    // cold-start "warm" (spec 12): no graph is stored, it is replayed. The
-    // autoincrement counters are likewise rebuilt from the recovered rows.
-    store.rebuild_indexes();
+    // `group` non-empty here would be an incomplete trailing txn: discard. The
+    // autoincrement counters are rebuilt from the recovered rows; the vector
+    // indexes are warmed separately (after `committed_lsn` is finalized) so a page
+    // checkpoint can be matched against the exact replayed head — see
+    // [`warm_vector_indexes`].
     store.rebuild_autoinc();
     Ok(())
+}
+
+/// VH-1 page-id region for an index's checkpoint pages: an FNV-1a hash of the
+/// (lowercased) index name placed in a high reserved band so it never overlaps a
+/// row page, with the low 23 bits left for the per-index page offset. A hash
+/// collision is harmless — the loader re-checks the index name in the page header
+/// and falls back to a rebuild on any mismatch.
+fn index_page_region(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.to_ascii_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (1u64 << 63) | ((h & 0xFF_FFFF_FFFF) << 23)
+}
+
+/// Warm every vector index after replay (spec 12 / VH-1): adopt a page-laid-out
+/// checkpoint when one exists *and* exactly reflects the replayed head
+/// (`reflected_lsn == committed_lsn`), otherwise rebuild the graph from the
+/// recovered rows. Returns how many indexes were loaded from pages. The graph is
+/// derived-from-WAL either way, so a stale, missing, or branch-private checkpoint
+/// simply takes the rebuild path — correctness never depends on the pages.
+fn warm_vector_indexes(storage: &dyn Storage, store: &mut Store) -> u64 {
+    let committed = store.committed_lsn;
+    let mut loaded = 0;
+    for name in store.index_names() {
+        let Some(def) = store.index_def(&name) else {
+            continue;
+        };
+        match load_index_pages(storage, &def, committed) {
+            Some(ix) => {
+                store.adopt_index(ix);
+                loaded += 1;
+            }
+            None => store.rebuild_one_index(&name),
+        }
+    }
+    loaded
+}
+
+/// Try to reconstruct an index graph from its page checkpoint. `None` (→ rebuild)
+/// on a missing/old/foreign/corrupt checkpoint.
+fn load_index_pages(
+    storage: &dyn Storage,
+    def: &crate::vector::IndexDef,
+    committed: u64,
+) -> Option<crate::vector::VectorIndex> {
+    let region = index_page_region(&def.name);
+    let header = block_on(storage.get_page(PageId(region), Lsn(u64::MAX))).ok()?;
+    let hdr = crate::vector::parse_page_header(&header.bytes[..])?;
+    // Guard against a page-id-region collision and a stale checkpoint.
+    if !hdr.name.eq_ignore_ascii_case(&def.name) || hdr.reflected_lsn != committed {
+        return None;
+    }
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(hdr.num_body_pages + 1);
+    frames.push(header.bytes[..].to_vec());
+    for i in 0..hdr.num_body_pages as u64 {
+        let p = block_on(storage.get_page(PageId(region + 1 + i), Lsn(u64::MAX))).ok()?;
+        frames.push(p.bytes[..].to_vec());
+    }
+    crate::vector::VectorIndex::from_page_frames(def.clone(), &frames)
 }
 
 fn apply_replay(store: &mut Store, op: WalOp, commit_lsn: u64) {

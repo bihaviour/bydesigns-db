@@ -9,6 +9,9 @@ use crate::lex::{lex, Tok};
 use crate::value::{ColumnType, Value};
 use crate::vector::{IndexParams, Metric};
 
+/// The session GUC that overrides HNSW `ef_search` per connection (VH-3).
+pub const VECTOR_EF_SEARCH_GUC: &str = "twill.vector_ef_search";
+
 // ---- AST ------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -84,6 +87,11 @@ pub enum Stmt {
     /// An accepted-and-ignored session statement — `SET`/`PRAGMA`/`VACUUM`/
     /// `ANALYZE`/`RESET`/`DISCARD` (stage 6E dialect shim).
     Noop,
+    /// `SET twill.vector_ef_search = N` / `RESET twill.vector_ef_search` (VH-3):
+    /// the per-session HNSW recall knob. `Some(n)` sets the search width for
+    /// subsequent KNN queries on this connection; `None` resets it to each index's
+    /// configured default.
+    SetVectorEf(Option<usize>),
     /// `SHOW name` — returns a one-row result for the setting (stage 6E).
     Show(String),
     /// `EXPLAIN [ANALYZE] <statement>` — returns a one-line plan (stage 6E).
@@ -826,18 +834,43 @@ impl Parser {
             Ok(Some(self.statement().map(|s| Stmt::Explain(Box::new(s)))))
         } else if self.is_kw("show") {
             self.bump();
-            // `SHOW name` / `SHOW TRANSACTION ISOLATION LEVEL` / `SHOW ALL`.
+            // `SHOW name` / `SHOW TRANSACTION ISOLATION LEVEL` / `SHOW ALL`. A
+            // dotted GUC name (`twill.vector_ef_search`) reads as one segment.
             let mut parts = Vec::new();
-            while let Some(w) = self.peek_word() {
-                parts.push(w.to_string());
-                self.bump();
+            while self.peek_word().is_some() {
+                parts.push(self.read_dotted_name());
             }
             Ok(Some(Ok(Stmt::Show(parts.join(" ")))))
-        } else if self.is_kw("set")
-            || self.is_kw("pragma")
+        } else if self.is_kw("set") {
+            self.bump();
+            // `SET [SESSION|LOCAL] name [=|TO] value`. Recognize the vector recall
+            // knob (VH-3); every other GUC stays accepted-and-ignored.
+            let _ = self.eat_kw("session") || self.eat_kw("local");
+            let name = self.read_dotted_name();
+            if name.eq_ignore_ascii_case(VECTOR_EF_SEARCH_GUC) {
+                let _ = self.skip(Tok::Eq) || self.eat_kw("to");
+                let value = if self.eat_kw("default") {
+                    None
+                } else {
+                    Some(self.int_value()?.max(1) as usize)
+                };
+                self.skip_to_end();
+                return Ok(Some(Ok(Stmt::SetVectorEf(value))));
+            }
+            self.skip_to_end();
+            Ok(Some(Ok(Stmt::Noop)))
+        } else if self.is_kw("reset") {
+            self.bump();
+            let name = self.read_dotted_name();
+            self.skip_to_end();
+            if name.eq_ignore_ascii_case(VECTOR_EF_SEARCH_GUC) {
+                Ok(Some(Ok(Stmt::SetVectorEf(None))))
+            } else {
+                Ok(Some(Ok(Stmt::Noop)))
+            }
+        } else if self.is_kw("pragma")
             || self.is_kw("vacuum")
             || self.is_kw("analyze")
-            || self.is_kw("reset")
             || self.is_kw("discard")
         {
             self.skip_to_end();
@@ -845,6 +878,31 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    /// Read a (possibly schema-qualified) GUC / setting name: `word(.word)*`,
+    /// joined with `.` — e.g. `twill.vector_ef_search`. Returns an empty string
+    /// when the next token is not a word.
+    fn read_dotted_name(&mut self) -> String {
+        let mut s = String::new();
+        match self.peek_word() {
+            Some(w) => {
+                s.push_str(w);
+                self.bump();
+            }
+            None => return s,
+        }
+        while self.peek() == &Tok::Dot {
+            self.bump();
+            if let Some(w) = self.peek_word() {
+                s.push('.');
+                s.push_str(w);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        s
     }
 
     /// Transaction-control statements (`BEGIN`/`START`, `COMMIT`/`END`,

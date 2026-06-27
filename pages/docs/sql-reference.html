@@ -338,6 +338,13 @@ DROP INDEX IF EXISTS mem_e;</code></pre>
 <p class="callout-title">Index or brute force — same answers</p>
 <p>An <code>ORDER BY &lt;col&gt; &lt;dist-op&gt; &lt;query&gt; ASC LIMIT k</code> query is answered by the HNSW index when one exists, and falls back to a brute-force scan-and-sort when it does not — the results match. HNSW is approximate by design (recall governed by <code>ef_search</code>); results are MVCC-filtered against your snapshot and any <code>WHERE</code> clause.</p>
 </div>
+
+<h3>Tuning recall per session</h3>
+<p><code>ef_search</code> (the HNSW search width) is fixed when the index is created but can be overridden per connection at runtime. Raise it for more recall, lower it for less latency:</p>
+<pre data-lang="sql"><code>SET twill.vector_ef_search = 128;   -- widen ANN search for this connection
+SHOW twill.vector_ef_search;        -- inspect the current value
+RESET twill.vector_ef_search;       -- restore each index's configured default</code></pre>
+<p>The override is per-session state only — it changes recall/latency for your queries, never the stored index — so it is safe to set differently on different connections. See the measured recall/latency curve in the <a href="../specs/12-capabilities.html">capabilities spec</a>. Heavily-churned indexes (many deletes) are compacted automatically; queries stay correct throughout with no <code>VACUUM</code> step.</p>
 </section>
 
 <section>

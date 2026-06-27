@@ -667,6 +667,19 @@ pub fn run_select(
     writer: Option<u64>,
     params: &[Value],
 ) -> Result<ResultSet> {
+    run_select_tuned(store, sel, snapshot, writer, params, None)
+}
+
+/// As [`run_select`], but with a per-query `ef_search` override (VH-3): the
+/// session's `twill.vector_ef_search` value, threaded into the KNN access method.
+pub fn run_select_tuned(
+    store: &Store,
+    sel: &SelectStmt,
+    snapshot: u64,
+    writer: Option<u64>,
+    params: &[Value],
+    ef_search: Option<usize>,
+) -> Result<ResultSet> {
     // The single-source fast path (and its KNN optimization) handles the common
     // shape directly; multi-source / set-op / DISTINCT / CTE / subquery queries
     // route to the relational executor.
@@ -676,7 +689,7 @@ pub fn run_select(
         Some(FromClause::Table { name, .. })
             if !needs_relational(sel) && store.table(name).is_some() =>
         {
-            single_table_select(store, sel, name, snapshot, writer, params)
+            single_table_select(store, sel, name, snapshot, writer, params, ef_search)
         }
         None if !needs_relational(sel) => constant_select(sel, params),
         _ => relational::run_query(store, sel, snapshot, writer, params),
@@ -718,6 +731,7 @@ fn single_table_select(
     snapshot: u64,
     writer: Option<u64>,
     params: &[Value],
+    ef_search: Option<usize>,
 ) -> Result<ResultSet> {
     let table = store
         .table(table_name)
@@ -727,7 +741,7 @@ fn single_table_select(
     // Index-accelerated top-k nearest-neighbour, when the query shape allows it
     // (an HNSW index exists for the ordered-by distance) — answered by the access
     // method, not a full scan plus sort (spec 12).
-    if let Some(rs) = knn_select(store, sel, table_name, snapshot, writer, params)? {
+    if let Some(rs) = knn_select(store, sel, table_name, snapshot, writer, params, ef_search)? {
         return Ok(rs);
     }
 
@@ -1095,6 +1109,7 @@ fn knn_select(
     snapshot: u64,
     writer: Option<u64>,
     params: &[Value],
+    ef_search: Option<usize>,
 ) -> Result<Option<ResultSet>> {
     let limit = eval_count(&sel.limit, params)?;
     let Some(plan) = knn_plan(sel, limit) else {
@@ -1109,6 +1124,13 @@ fn knn_select(
     if index.metric() != plan.metric || index.is_empty() {
         return Ok(None);
     }
+    // VH-2: a compacting rebuild dropped head-deleted nodes at `rebuild_floor`, so
+    // the graph can no longer serve a snapshot below that floor (a row it dropped
+    // may still be visible there). Fall back to the brute-force scan + sort, which
+    // reads every retained row version and stays snapshot-correct.
+    if snapshot < index.rebuild_floor() {
+        return Ok(None);
+    }
     // Evaluate the (constant) query vector; bail to the scan path if it is not one.
     let cctx = EvalCtx::root(params);
     let Some(query) = to_vec_operand(&eval(plan.query, &cctx)?) else {
@@ -1119,16 +1141,20 @@ fn knn_select(
         return Ok(None);
     };
     let schema = &table.schema;
-    // Over-fetch to absorb MVCC-invisible / filtered hits, but never beyond the
-    // number of live vectors in the index.
-    let fetch = plan
+    // Over-fetch to absorb MVCC-invisible / filtered hits. Under delete churn the
+    // graph fills with head-deleted nodes the executor will skip, so widen the
+    // fetch by the dead/live ratio (VH-2) to still surface `k` *live* results —
+    // capped at the number of nodes actually present.
+    let live = index.live_len().max(1);
+    let total = index.len();
+    let base = plan
         .limit
         .saturating_mul(KNN_OVERFETCH)
-        .max(index.def.params.ef_search)
-        .min(index.len());
+        .max(ef_search.unwrap_or(index.def.params.ef_search));
+    let fetch = base.saturating_mul(total).div_ceil(live).min(total);
 
     let mut matched: Vec<&Vec<Value>> = Vec::new();
-    for (vid, _dist) in index.search(&query, fetch) {
+    for (vid, _dist) in index.search(&query, fetch, ef_search) {
         let Some(v) = table.version(vid) else {
             continue;
         };
