@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 6 — SQL Surface Completeness · Serverless OLTP Engine Spec</title>
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-id">P6</span>
+<span class="badge badge-status status-approved">Implemented</span>
+<span class="spec-date">Phase 6</span>
+</div>
+<h1>Phase 6 — SQL Surface Completeness</h1>
+<p class="lede">Phase 6 grows the hand-written SQL frontend (<code>sql.rs</code> → <code>exec.rs</code>) to cover the common, OLTP-shaped majority of the PostgreSQL and SQLite surface, so the SQL an application actually issues parses and runs the same on Twill. It is surface-completeness work, not a PostgreSQL re-implementation — every change is additive frontend growth, so <code>STORAGE_TRAIT_VERSION</code> and <code>ENGINE_ABI_VERSION</code> never moved and the C1–C8 conformance suite, branching, and scale-to-zero are untouched. All five stages (6A–6E) are implemented and gated by tests.</p>
+</header>
+
+<section>
+<h2>Overview</h2>
+<p>Phase 6 is the first phase that adds <strong>no</strong> new storage capability and <strong>no</strong> new C symbol: it is pure frontend growth. A statement still flows <code>sql.rs</code> (lexer + recursive-descent parser → <code>Stmt</code> AST) → <code>exec.rs</code> (evaluate against the MVCC store) → <code>conn.rs</code> (transaction state machine + commit durability); Phase 6 widens what the first two accept and evaluate, with <code>catalog.rs</code>/<code>conn.rs</code>/<code>wal.rs</code> carrying the stateful items (constraints, savepoints, schema evolution). The only WAL growth is backward-compatible additive catalog facts, so replay of an older log is unchanged.</p>
+<p>Because the seam never moves, the invariants below hold for every stage: <code>STORAGE_TRAIT_VERSION</code> stays <strong>2</strong>… well, <strong>3</strong> after the additive <code>stats()</code> surface (#53) — but unmoved <em>by Phase 6</em>; <code>ENGINE_ABI_VERSION</code> stays <strong>3</strong>; anything still unsupported returns a clean <code>ENGINE_ERR_SQL</code> — reject, never mis-parse.</p>
+</section>
+
+<section>
+<h2>The five stages</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Stage</th><th>Lands</th><th>Where</th><th>Tests</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>6A</strong> — expression &amp; single-table</td>
+<td><code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, string concat <code>||</code>, <code>NULLS FIRST/LAST</code>, <code>OFFSET</code>, <code>RETURNING</code>, upsert (<code>ON CONFLICT</code> / <code>OR REPLACE</code>/<code>OR IGNORE</code> with <code>excluded.*</code>), <code>INSERT … SELECT</code>, <code>COALESCE</code>/<code>NULLIF</code>/<code>GREATEST</code>/<code>LEAST</code>/<code>iif</code></td>
+<td><code>sql.rs</code> (<code>Expr::Case</code>/<code>Cast</code>, parser), <code>exec.rs</code></td>
+<td><code>tests/expr_6a.rs</code> — 12</td>
+</tr>
+<tr>
+<td><strong>6B</strong> — multi-table &amp; aggregation</td>
+<td>Joins (<code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code>, <code>ON</code>/<code>USING</code>), qualified names, <code>DISTINCT</code>, set ops (<code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code>), derived tables &amp; non-recursive CTEs, non-correlated and correlated subqueries, views, join-driven DML, <code>GROUP BY</code>/<code>HAVING</code> grouped aggregation. The largest stage.</td>
+<td><code>sql.rs</code>, <code>exec.rs</code> (nested-loop join over a materialized column namespace), <code>catalog.rs</code> (views)</td>
+<td><code>tests/relational_6b.rs</code> — 24</td>
+</tr>
+<tr>
+<td><strong>6C</strong> — function library</td>
+<td>A curated OLTP-common set of string / math / date-time / UUID / JSON scalar functions, evaluated once at execution so replay stays deterministic. Date-time on the SQLite <code>date()</code>/<code>strftime()</code> model (ISO-8601 <code>Text</code> / epoch <code>Integer</code>); minimal JSON accessor pack (<code>json_extract</code>, <code>-></code>/<code>-&gt;&gt;</code>, <code>json_array</code>).</td>
+<td><code>exec.rs</code> dispatch, <code>datetime.rs</code>, <code>json.rs</code></td>
+<td><code>tests/functions_6c.rs</code> — 7</td>
+</tr>
+<tr>
+<td><strong>6D</strong> — constraints, schema evolution &amp; savepoints</td>
+<td><code>DEFAULT</code>/<code>CHECK</code>/<code>UNIQUE</code> (single &amp; composite), composite <code>PRIMARY KEY</code>, <code>AUTOINCREMENT</code>/<code>SERIAL</code>, <code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code> / <code>RENAME TO</code>, <code>SAVEPOINT</code>/<code>RELEASE</code>/<code>ROLLBACK TO</code>. DDL stays autocommit-only.</td>
+<td><code>sql.rs</code> (<code>Stmt::AlterTable</code>/<code>Savepoint</code>), <code>catalog.rs</code>, <code>conn.rs</code>, <code>wal.rs</code> (additive ops)</td>
+<td><code>tests/constraints_6d.rs</code> — 8</td>
+</tr>
+<tr>
+<td><strong>6E</strong> — dialect shims</td>
+<td>Placeholder forms (<code>?</code> / <code>$1</code> / <code>:name</code> → 1-based binds), identifier quoting (backtick), the case-sensitive <code>LIKE</code> vs <code>ILIKE</code> split, <code>SET</code>/<code>SHOW</code>/<code>PRAGMA</code>/<code>EXPLAIN</code> and isolation-level/session no-ops — concentrated at the pgwire boundary so the core stays one dialect.</td>
+<td><code>lex.rs</code>, <code>sql.rs</code></td>
+<td><code>tests/dialect_6e.rs</code> — 5</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h3>Why it stays additive (the seam never moves)</h3>
+<p>Phase 6 is the proof that the architecture's central bet pays off: a whole class of capability — application-grade SQL — was added without touching the storage seam. Three properties fall out:</p>
+<ul>
+<li><strong>No storage-trait change.</strong> Every stage is parser/executor work; the engine still reaches durable state only through <code>trait Storage</code>. <code>STORAGE_TRAIT_VERSION</code> was unchanged by Phase 6 (it sits at <code>3</code> from the earlier additive <code>stats()</code> surface, #53), and the C1–C8 conformance suite + branching battery stayed green untouched.</li>
+<li><strong>No ABI change.</strong> No C symbol was added or removed; <code>ENGINE_ABI_VERSION</code> stays <code>3</code>, and the frozen <code>engine.h</code> contract and the Bun wrapper's pinned <code>EXPECTED_ABI_VERSION</code> are unaffected.</li>
+<li><strong>Backward-compatible WAL.</strong> The only durable growth is additive catalog facts (constraints, view definitions, <code>ALTER</code> reshape ops); an older log replays unchanged, and the new facts branch and scale-to-zero with the database like every other WAL record.</li>
+</ul>
+</section>
+
+<section>
+<h3>Relationship to the PostgREST-compat work</h3>
+<p>Some of the executor surface Phase 6 formalizes (<code>::</code> casts, <code>GROUP BY</code>/<code>HAVING</code>, <code>LIMIT … OFFSET</code>, scalar functions, <code>json_agg</code>/<code>json_build_object</code>) first grew under the PostgREST-compat track (#27). Phase 6 stages it deliberately and fills the gaps; the PostgREST-specific glue (version probe, catalog reflection, data-path rewriting) stays in <code>crates/server</code> (<code>introspect.rs</code>/<code>reflect.rs</code>/<code>datapath.rs</code>), never the engine. Foreign keys remain <strong>tracked metadata</strong> (parsed, persisted in <code>CreateTable</code>, reflected to clients), not engine-enforced referential integrity in this phase.</p>
+</section>
+
+<section>
+<h2>Deliberate scope boundaries (documented, not accidental)</h2>
+<ul>
+<li><strong>DDL stays autocommit-only.</strong> <code>CREATE</code>/<code>DROP</code>/<code>ALTER</code> inside an explicit transaction returns <code>ENGINE_ERR_TXN</code>; row DML is fully transactional. <code>SAVEPOINT</code> nests within a transaction (6D) but does not lift the DDL rule.</li>
+<li><strong>FK is metadata, not enforcement.</strong> Inline <code>REFERENCES</code> / table-level <code>FOREIGN KEY</code> parse and persist and reflect to clients; the engine does not enforce referential integrity this phase.</li>
+<li><strong>Correlation is one level.</strong> Correlated scalar/<code>EXISTS</code> subqueries evaluate per outer row; correlation under aggregation or nested deeper than one level stays out (<code>ENGINE_ERR_SQL</code>).</li>
+<li><strong>Recursive CTEs, <code>SIMILAR TO</code>/POSIX regex, <code>INTERVAL</code> arithmetic, full <code>JSONB</code> indexing, standalone <code>CREATE SEQUENCE</code>, scalar B-tree secondary indexes</strong> stay out by design — see the per-row status in <a href="16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a>.</li>
+<li><strong>Reject, never mis-parse.</strong> Anything still unsupported returns a clean <code>ENGINE_ERR_SQL</code>; the surface grows by widening the parser, never by silently accepting-and-ignoring.</li>
+</ul>
+</section>
+
+<section>
+<h2>Tests</h2>
+<ul>
+<li><code>crates/engine/tests/expr_6a.rs</code> (12), <code>relational_6b.rs</code> (24), <code>functions_6c.rs</code> (7), <code>constraints_6d.rs</code> (8), <code>dialect_6e.rs</code> (5) — one binary per stage, each asserting the new surface and that unsupported neighbours still reject cleanly.</li>
+<li>The existing <code>crates/engine/tests/engine.rs</code>, <code>ffi.rs</code>, and group-commit/MVCC suites stay green: Phase 6 widened the frontend without disturbing transaction, durability, or ABI behaviour.</li>
+</ul>
+</section>
+
+<section>
+<h2>Related</h2>
+<div class="xref-grid">
+<a class="xref" href="16-sql-compatibility.html"><span class="xref-title">SQL Compatibility &amp; Mapping</span><span class="xref-desc">The per-feature status map this phase implements — what's ✅ / ◑ / ✗ across types, DDL, queries, expressions, and functions.</span></a>
+<a class="xref" href="02-engine-core.html"><span class="xref-title">Engine Core</span><span class="xref-desc">The <code>sql.rs</code> → <code>exec.rs</code> → <code>conn.rs</code> pipeline Phase 6 widens, parser-first.</span></a>
+<a class="xref" href="03-storage-interface.html"><span class="xref-title">Storage Interface</span><span class="xref-desc">The seam Phase 6 never moves — pure frontend growth, no trait or ABI change.</span></a>
+<a class="xref" href="13-roadmap.html"><span class="xref-title">Roadmap &amp; Build Sequence</span><span class="xref-desc">The additive build order whose Phase 6 SQL-completeness milestone this map implements.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB — internal development specification. Implementation map. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/specs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -43,7 +43,7 @@
       <div class="stat"><div class="v">v0.4.0</div><div class="l">current workspace version</div></div>
       <div class="stat"><div class="v">ABI 3</div><div class="l">frozen C embedding contract</div></div>
       <div class="stat"><div class="v">Trait 3</div><div class="l">storage seam version</div></div>
-      <div class="stat"><div class="v">5 / 5</div><div class="l">capabilities shipped</div></div>
+      <div class="stat"><div class="v">6 / 6</div><div class="l">phases shipped</div></div>
     </div>
   </section>
 
@@ -86,6 +86,13 @@
         <p><strong>Gate:</strong> HNSW top-k matches brute force; WHERE-filtered + MVCC-correct KNN; the index branches and rebuilds from the WAL on restart. <a href="../specs/phase-5-capabilities.html">Implementation map →</a> · <a href="../specs/12-capabilities.html">Capabilities spec</a></p>
       </div>
 
+      <div class="tl-item done">
+        <h3>SQL surface completeness <span class="chip shipped">✓ Shipped</span></h3>
+        <p><span class="ver">richer SQL frontend (6A–6E) — parser + executor only; the storage seam never moved</span></p>
+        <p>The hand-written SQL frontend (<code>sql.rs</code> → <code>exec.rs</code>) grown to cover the common, OLTP-shaped majority of the PostgreSQL and SQLite surface, in five additive stages: <strong>6A</strong> expression &amp; single-table (<code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, <code>||</code>, <code>RETURNING</code>, upsert, <code>INSERT … SELECT</code>); <strong>6B</strong> multi-table (joins, <code>GROUP BY</code>/<code>HAVING</code>, subqueries, set ops, views &amp; CTEs); <strong>6C</strong> the scalar function library (string / math / date-time / uuid / JSON); <strong>6D</strong> constraints, schema evolution &amp; savepoints (<code>CHECK</code>/<code>DEFAULT</code>/<code>UNIQUE</code>, <code>ALTER TABLE</code>, <code>SAVEPOINT</code>); <strong>6E</strong> dialect shims (placeholders, quoting, <code>LIKE</code>/<code>ILIKE</code>, <code>SET</code>/<code>SHOW</code>/<code>PRAGMA</code>). Pure frontend growth — <code>STORAGE_TRAIT_VERSION</code> and <code>ENGINE_ABI_VERSION</code> never moved; anything still unsupported returns a clean <code>ENGINE_ERR_SQL</code>.</p>
+        <p><strong>Gate:</strong> per-stage test binaries (<code>expr_6a</code>, <code>relational_6b</code>, <code>functions_6c</code>, <code>constraints_6d</code>, <code>dialect_6e</code>) all green; the C1–C8 conformance suite, branching, and scale-to-zero untouched. <a href="../specs/phase-6-sql-completeness.html">Implementation map →</a> · <a href="../specs/16-sql-compatibility.html">SQL Compatibility spec</a></p>
+      </div>
+
     </div>
   </section>
 
@@ -94,30 +101,16 @@
     <div class="timeline">
 
       <div class="tl-item next">
-        <h3>SQL surface completeness <span class="chip planned">Phase 6 · Planned</span></h3>
-        <p><span class="ver">richer SQL frontend — parser + executor only; the storage seam never moves</span></p>
-        <p>Grow the hand-written SQL frontend (<code>sql.rs</code> → <code>exec.rs</code>) to cover the common, OLTP-shaped majority of the PostgreSQL and SQLite surface, so the SQL an application actually issues parses and runs the same on Twill. This is surface-completeness work, not a PostgreSQL re-implementation: every change is additive frontend work, so <code>STORAGE_TRAIT_VERSION</code> stays <code>2</code>, <code>ENGINE_ABI_VERSION</code> stays <code>3</code>, and the C1–C8 conformance suite, branching, and scale-to-zero are untouched. Anything still unsupported returns a clean <code>ENGINE_ERR_SQL</code> — reject, never mis-parse.</p>
-        <ul class="reqs">
-          <li><span class="req-tag stage">6A</span><span>Expression &amp; single-table completeness — <code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, <code>||</code>, <code>OFFSET</code>, <code>RETURNING</code>, upsert (<code>ON CONFLICT</code>), <code>INSERT … SELECT</code>.</span></li>
-          <li><span class="req-tag stage">6B</span><span>Multi-table &amp; aggregation — joins, <code>GROUP BY</code>/<code>HAVING</code>, subqueries, set operations, views &amp; non-recursive CTEs. The largest stage.</span></li>
-          <li><span class="req-tag stage">6C</span><span>Function library — a curated OLTP-common set of string, math, date/time, UUID and JSON functions, evaluated once at execution so replay stays deterministic.</span></li>
-          <li><span class="req-tag stage">6D</span><span>Constraints, schema evolution &amp; savepoints — <code>CHECK</code>/<code>DEFAULT</code>/<code>UNIQUE</code>, <code>AUTOINCREMENT</code>/<code>SERIAL</code>, <code>ALTER TABLE</code>, <code>SAVEPOINT</code> (DDL stays autocommit-only).</span></li>
-          <li><span class="req-tag stage">6E</span><span>Dialect shims — placeholder forms, identifier quoting, <code>LIKE</code>/<code>ILIKE</code>, isolation-level pinning and session no-ops, concentrated at the pgwire boundary so the core stays one dialect.</span></li>
-        </ul>
-        <p>Detail in <a href="../specs/16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/60" target="_blank" rel="noopener">issue #60</a>.</p>
-      </div>
-
-      <div class="tl-item next">
-        <h3>Twill Bench CLI <span class="chip progress">Building out</span></h3>
+        <h3>Twill Bench CLI <span class="chip shipped">✓ Scenarios shipped</span></h3>
         <p><span class="ver">benchmarking + correctness + serverless-efficiency CLI</span></p>
-        <p>Grow the existing <code>crates/bench</code> driver — today's spec-09 latency floor, group-commit curve and contention wall over both transports (embedded FFI + pgwire) and both backends (<code>file://</code> / <code>s3://</code>) — into the full Twill Bench tool: one driver that answers <em>is it fast</em>, <em>is the data still correct under stress</em>, and <em>how efficiently did the serverless architecture use compute</em>. Per the architecture guardrails, reporting/export stays CLI-only and feature-gated, and lifecycle metrics are sourced from <code>twill-controller</code> and the server, never the thread-free engine core.</p>
+        <p>The <code>crates/bench</code> driver — today's spec-09 latency floor, group-commit curve and contention wall over both transports (embedded FFI + pgwire) and both backends (<code>file://</code> / <code>s3://</code>) — grown into the full Twill Bench tool: one driver that answers <em>is it fast</em>, <em>is the data still correct under stress</em>, and <em>how efficiently did the serverless architecture use compute</em>. All committed scenarios have shipped. Per the architecture guardrails, reporting/export stays CLI-only and feature-gated, and lifecycle metrics are sourced from <code>twill-controller</code> and the server, never the thread-free engine core.</p>
         <ul class="reqs">
           <li><span class="req-tag stage">Mix ✓</span><span>Request-mix scenarios — <code>read-heavy</code> / <code>write-heavy</code> / <code>mixed-oltp</code> with ratio control over a seeded working set, deterministic per-writer PRNG. <em>Shipped.</em></span></li>
-          <li><span class="req-tag stage">Check ✓</span><span>Correctness profiles — <code>counter</code> and <code>bank-transfer</code> with ACID-invariant assertions (a violation fails with exit code 2). <em>Shipped;</em> <code>inventory</code> / <code>document-editing</code> still to come.</span></li>
+          <li><span class="req-tag stage">Check ✓</span><span>Correctness profiles — <code>counter</code>, <code>bank-transfer</code>, <code>inventory</code>, and <code>document-editing</code> with ACID-invariant assertions (a violation fails with exit code 2). <em>Shipped.</em></span></li>
           <li><span class="req-tag stage">Report ✓</span><span>Reporting — <code>--json</code>-only mode, the full 0–4 exit-code table, p90/p95 percentiles, and <code>compare --baseline --candidate</code> for release-over-release diffs. <em>Shipped.</em></span></li>
-          <li><span class="req-tag stage">Lifecycle</span><span>Lifecycle scenarios &amp; serverless-efficiency metrics — <code>burst</code>, <code>scale-to-zero</code> (Exp 5 cold read), <code>long-run</code>; compute active/idle, scale-to-zero count, compute-seconds/query. <em>Next: needs the controller in the loop.</em></span></li>
+          <li><span class="req-tag stage">Lifecycle ✓</span><span>Lifecycle scenarios &amp; serverless-efficiency metrics — <code>scale-to-zero</code> (Exp 5 cold read), <code>burst</code> (closed-loop rate driver), <code>long-run</code> (interval sampler + leak/drift detection), and a feature-gated <code>custom --profile workload.yaml</code> loader; compute active/idle, scale-to-zero count, compute-seconds/query. <em>Shipped (issues #78–#81).</em></span></li>
         </ul>
-        <p>Detail in <a href="../specs/15-twill-bench.html">Twill Bench CLI</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/49" target="_blank" rel="noopener">issue #49</a>.</p>
+        <p>Detail in <a href="../specs/15-twill-bench.html">Twill Bench CLI</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/49" target="_blank" rel="noopener">issue #49</a>. Remaining work is the ongoing spec-09 five-experiment validation, not the CLI surface.</p>
       </div>
 
       <div class="tl-item next">
@@ -159,6 +152,7 @@
           <tr><td><strong>M3 — Server</strong> <span class="chip shipped">✓</span></td><td>engine-server + pgwire subset + pooler guidance</td><td>Group-commit + contention in server mode</td><td>Multi-client; PostgREST + Bun.sql for free</td></tr>
           <tr><td><strong>M4 — Controller</strong> <span class="chip shipped">✓</span></td><td>Lifecycle state machine + branch-on-LSN + CAS fencing</td><td>Cold read + thundering-herd</td><td>True scale-to-zero + instant clones</td></tr>
           <tr><td><strong>M5 — Capabilities</strong> <span class="chip shipped">✓</span></td><td>Vector-in-core (HNSW); compose better-auth / PostgREST / DuckDB</td><td>HNSW top-k matches brute force; MVCC-correct KNN</td><td>Platform grows by composition</td></tr>
+          <tr><td><strong>M6 — SQL surface</strong> <span class="chip shipped">✓</span></td><td>Richer SQL frontend (6A–6E) — expressions, joins/aggregation, functions, constraints, dialect shims</td><td>Per-stage suites green; seam &amp; ABI unmoved; reject-never-mis-parse</td><td>App-grade SQL parses &amp; runs the same on Twill</td></tr>
         </tbody>
       </table>
     </div>
@@ -188,8 +182,8 @@
           <tr><td>12</td><td><a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a></td><td>Vectors/HNSW in-core; auth/REST/OLAP composed around</td><td><span class="chip shipped">● Live</span></td></tr>
           <tr><td>13</td><td><a href="../specs/13-roadmap.html">Roadmap &amp; Build Sequence</a></td><td>The additive build order and milestones</td><td><span class="chip shipped">● Live</span></td></tr>
           <tr><td>14</td><td><a href="../specs/14-tradeoffs-risks.html">Tradeoffs &amp; Risk Register</a></td><td>Write latency, single-writer ceiling, cold start</td><td><span class="chip shipped">● Live</span></td></tr>
-          <tr><td>15</td><td><a href="../specs/15-twill-bench.html">Twill Bench CLI</a></td><td>Benchmark + correctness + serverless-efficiency CLI</td><td><span class="chip progress">◐ In progress</span></td></tr>
-          <tr><td>16</td><td><a href="../specs/16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a></td><td>PostgreSQL/SQLite → Twill surface (Phase 6: 6A/6B live)</td><td><span class="chip progress">◐ In progress</span></td></tr>
+          <tr><td>15</td><td><a href="../specs/15-twill-bench.html">Twill Bench CLI</a></td><td>Benchmark + correctness + serverless-efficiency CLI (all scenarios shipped)</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>16</td><td><a href="../specs/16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a></td><td>PostgreSQL/SQLite → Twill surface (Phase 6: 6A–6E live)</td><td><span class="chip shipped">● Live</span></td></tr>
           <tr><td>17</td><td><a href="../specs/17-row-level-security.html">Row-Level Security</a></td><td>Proposal (Phase 7) — not yet implemented</td><td><span class="chip planned">○ Backlog</span></td></tr>
         </tbody>
       </table>
@@ -205,6 +199,7 @@
           <tr><td>3</td><td><a href="../specs/phase-3-server.html">Server + pgwire</a></td><td>engine-server</td></tr>
           <tr><td>4</td><td><a href="../specs/phase-4-branching-lifecycle.html">Branching &amp; Lifecycle</a></td><td>BranchStorage + lease + twill-controller</td></tr>
           <tr><td>5</td><td><a href="../specs/phase-5-capabilities.html">Capabilities: Vector Search</a></td><td>vector(N) + HNSW + KNN</td></tr>
+          <tr><td>6</td><td><a href="../specs/phase-6-sql-completeness.html">SQL Surface Completeness</a></td><td>SQL frontend 6A–6E (parser + executor only)</td></tr>
         </tbody>
       </table>
     </div>
