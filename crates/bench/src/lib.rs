@@ -41,6 +41,8 @@
 //!   * **release comparison** (`compare`) — diff two archived JSON records into a
 //!     PASS/regression verdict.
 
+pub mod analysis;
+pub mod boundary;
 pub mod burst;
 pub mod compare;
 pub mod correctness;
@@ -56,6 +58,12 @@ pub mod pgclient;
 /// minimal-dependency ethos.
 #[cfg(feature = "custom-profile")]
 pub mod profile;
+/// The spec-09 validation-campaign drivers (issue #91): the Exp-2
+/// group-commit-window sweep with plateau-knee detection (V-2) and the Exp-3
+/// N-database sharding orchestrator (V-3). These compose the steady-state
+/// experiment writers across a swept dimension and hand the resulting curve to
+/// [`analysis`] for the falsifiable verdict.
+pub mod sweep;
 pub mod workload;
 
 use engine::{Connection, EngineStatus, Value};
@@ -137,10 +145,13 @@ pub fn run_cli(args: &[String]) -> i32 {
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
     let rest = &args[2.min(args.len())..];
 
-    // `compare` is post-processing over archived records, not a run; it owns its
-    // own flag parsing and returns an exit code directly.
+    // `compare` and `boundary` are post-processing over archived records, not
+    // runs; each owns its own flag parsing and returns an exit code directly.
     if cmd == "compare" {
         return compare::run(rest);
+    }
+    if cmd == "boundary" {
+        return boundary::run(rest);
     }
     if matches!(cmd, "help" | "-h" | "--help") {
         print_help();
@@ -160,6 +171,9 @@ pub fn run_cli(args: &[String]) -> i32 {
         "exp1" => run_experiment(Experiment::LatencyFloor, &opts),
         "exp2" => run_experiment(Experiment::GroupCommit, &opts),
         "exp3" => run_experiment(Experiment::Contention, &opts),
+        "exp2-sweep" => sweep::run_group_commit_sweep(&opts),
+        "exp3-shard" => sweep::run_sharding(&opts),
+        "herd" => lifecycle::run_herd(&opts),
         "read-heavy" => workload::run_scenario(workload::Scenario::ReadHeavy, &opts),
         "write-heavy" => workload::run_scenario(workload::Scenario::WriteHeavy, &opts),
         "mixed-oltp" => workload::run_scenario(workload::Scenario::MixedOltp, &opts),
@@ -187,6 +201,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             // (issue #80 L5: drift → exit 2, #51-consistent).
             if report.failed_correctness() {
                 exit::CORRECTNESS
+            } else if report.failed_acceptance() {
+                exit::BENCH_FAILED
             } else {
                 exit::OK
             }
@@ -271,12 +287,18 @@ pub(crate) enum Fault {
     /// checker has an unambiguous leak/drift to catch (issue #80 L5 negative
     /// test). Like `LostUpdate`, a QA hook — undocumented in `--help`.
     Leak,
+    /// Inject a single pathological commit-latency sample into `exp1` so the V-1
+    /// `p999/p50` stall gate has an unambiguous tail to fire on (issue #91 V-1
+    /// acceptance: "the ratio gate fires on an injected stall and passes on a
+    /// clean run"). Like the others, a QA hook — undocumented in `--help`.
+    Stall,
 }
 
 fn parse_fault(s: &str) -> Result<Fault, String> {
     match s {
         "lost-update" => Ok(Fault::LostUpdate),
         "leak" => Ok(Fault::Leak),
+        "stall" => Ok(Fault::Stall),
         other => Err(format!("invalid --inject-fault '{other}'")),
     }
 }
@@ -332,6 +354,35 @@ pub(crate) struct Opts {
     /// without that feature the field is parsed-but-unread (the rebuild-hint path).
     #[cfg_attr(not(feature = "custom-profile"), allow(dead_code))]
     pub profile: Option<String>,
+    /// Deployment provenance recorded in the archived record (issue #91 V-5): the
+    /// object-store region the run targeted and the host instance type. They make
+    /// a baseline reproducible and let the same-region/cross-region Exp-1 variants
+    /// (V-1) be told apart in the archive. Free-form; `None` when unset.
+    pub region: Option<String>,
+    pub instance_type: Option<String>,
+    /// Exp-1 cold-connection variant (V-1): when set, each timed commit opens a
+    /// fresh connection so the one-time TLS/handshake cost is paid per sample
+    /// (the cold-connection distribution), rather than reusing a warm connection
+    /// (steady state). Tagged into the record so the two variants are comparable.
+    pub cold_connection: bool,
+    /// Exp-1 stall acceptance gate (V-1): when `Some(r)`, a `p999/p50` ratio
+    /// above `r` trips the gate (commit-path stall signal). `None` leaves the gate
+    /// off (it is reported but never gates the exit code).
+    pub max_stall_ratio: Option<f64>,
+    /// Number of independent databases in the Exp-3 sharding sweep (V-3) — the
+    /// lane count for the W2 lever; the sweep runs `1, 2, 4, … databases`.
+    pub databases: usize,
+    /// Upper bound of the Exp-2 concurrency/window sweep (V-2): the sweep walks
+    /// `1, 2, 4, … writers` up to this many.
+    pub sweep_max: usize,
+    /// Upper bound of the Exp-5 thundering-herd concurrency sweep (V-4): the sweep
+    /// fires `1, 2, 4, … concurrent cold starts` up to this many.
+    pub concurrency: usize,
+    /// When set, an acceptance gate on a validation sweep (the V-2 plateau guard,
+    /// the V-3 sharding-slope guard, the V-4 herd-knee guard) maps a failed gate
+    /// to a non-zero exit, the CI-gating form. Off by default so a smoke run
+    /// reports the verdict without failing on a single host's modest numbers.
+    pub gate: bool,
 }
 
 impl Opts {
@@ -340,12 +391,25 @@ impl Opts {
         let mut i = 0;
         while i < args.len() {
             let key = args[i].as_str();
-            // `--json` is a bare flag; everything else takes a value, fetched
-            // once here so the per-flag match stays a flat, low-branch dispatch.
-            if key == "--json" {
-                raw.json = true;
-                i += 1;
-                continue;
+            // Bare flags take no value; everything else takes one, fetched once
+            // here so the per-flag match stays a flat, low-branch dispatch.
+            match key {
+                "--json" => {
+                    raw.json = true;
+                    i += 1;
+                    continue;
+                }
+                "--cold-connection" => {
+                    raw.cold_connection = true;
+                    i += 1;
+                    continue;
+                }
+                "--gate" => {
+                    raw.gate = true;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
             }
             let value = args
                 .get(i + 1)
@@ -381,6 +445,14 @@ struct RawOpts {
     ramp_ms: u64,
     dwell_ms: u64,
     profile: Option<String>,
+    region: Option<String>,
+    instance_type: Option<String>,
+    cold_connection: bool,
+    max_stall_ratio: Option<f64>,
+    databases: usize,
+    sweep_max: usize,
+    concurrency: usize,
+    gate: bool,
 }
 
 impl Default for RawOpts {
@@ -405,6 +477,14 @@ impl Default for RawOpts {
             ramp_ms: 50,
             dwell_ms: 150,
             profile: None,
+            region: None,
+            instance_type: None,
+            cold_connection: false,
+            max_stall_ratio: None,
+            databases: 4,
+            sweep_max: 8,
+            concurrency: 8,
+            gate: false,
         }
     }
 }
@@ -431,6 +511,12 @@ impl RawOpts {
             "--server" => self.server = Some(value),
             "--inject-fault" => self.inject_fault = Some(parse_fault(&value)?),
             "--profile" => self.profile = Some(value),
+            "--region" => self.region = Some(value),
+            "--instance-type" => self.instance_type = Some(value),
+            "--max-stall-ratio" => self.max_stall_ratio = Some(parse_num(&value, key)?),
+            "--databases" => self.databases = parse_num(&value, key)?,
+            "--sweep-max" => self.sweep_max = parse_num(&value, key)?,
+            "--concurrency" => self.concurrency = parse_num(&value, key)?,
             other => return Err(format!("unknown flag {other}")),
         }
         Ok(())
@@ -477,6 +563,14 @@ impl RawOpts {
             ramp: Duration::from_millis(self.ramp_ms),
             dwell: Duration::from_millis(self.dwell_ms.max(1)),
             profile: self.profile,
+            region: self.region,
+            instance_type: self.instance_type,
+            cold_connection: self.cold_connection,
+            max_stall_ratio: self.max_stall_ratio.filter(|r| *r > 0.0),
+            databases: self.databases.max(1),
+            sweep_max: self.sweep_max.max(1),
+            concurrency: self.concurrency.max(1),
+            gate: self.gate,
         })
     }
 }
@@ -639,13 +733,27 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
 
     let tag = run_tag();
 
+    // The cold-connection variant is an Exp-1 (latency-floor) concern only; the
+    // throughput experiments always reuse warm connections.
+    let cold_connection = opts.cold_connection && matches!(exp, Experiment::LatencyFloor);
+
     let (tallies, elapsed) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..writers)
             .map(|w| {
                 let target = target.clone();
                 let warmup = opts.warmup;
                 let duration = opts.duration;
-                scope.spawn(move || writer_loop(&target, w, tag, same_row, warmup, duration))
+                scope.spawn(move || {
+                    writer_loop_variant(
+                        &target,
+                        w,
+                        tag,
+                        same_row,
+                        warmup,
+                        duration,
+                        cold_connection,
+                    )
+                })
             })
             .collect();
         let start = Instant::now();
@@ -661,7 +769,27 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
         merged.merge(&t.hist);
         conflicts += t.conflicts;
     }
+
+    // Negative-test hook (V-1): fold one pathological sample into the Exp-1
+    // distribution so the stall gate has an unambiguous tail to fire on. Off in
+    // every real run (no `--inject-fault stall`).
+    if matches!(exp, Experiment::LatencyFloor) && opts.inject_fault == Some(Fault::Stall) {
+        let p50 = merged.value_at_quantile(0.50).max(1);
+        merged.record(p50.saturating_mul(1000));
+    }
+
     let commits = merged.count();
+
+    // Exp-1 stall acceptance gate (V-1): the p999/p50 ratio, reported always and
+    // (when `--max-stall-ratio` is set) gating the exit code.
+    let stall = match exp {
+        Experiment::LatencyFloor => Some(StallGate::evaluate(
+            merged.value_at_quantile(0.50),
+            merged.value_at_quantile(0.999),
+            opts.max_stall_ratio,
+        )),
+        _ => None,
+    };
 
     Ok(Report {
         experiment: exp.name(),
@@ -682,10 +810,15 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
         soak: None,
         burst: None,
         mix_realized: None,
+        archival: Archival::from_opts(opts),
+        stall,
+        sweep: None,
+        shard: None,
+        herd: None,
     })
 }
 
-fn setup_schema(w: &mut Writer, same_row: bool) -> Result<(), BenchError> {
+pub(crate) fn setup_schema(w: &mut Writer, same_row: bool) -> Result<(), BenchError> {
     match w.exec(&format!(
         "CREATE TABLE IF NOT EXISTS {TABLE_LEDGER} (k TEXT PRIMARY KEY, v INTEGER)"
     )) {
@@ -708,7 +841,7 @@ fn setup_schema(w: &mut Writer, same_row: bool) -> Result<(), BenchError> {
 /// One writer: warm up (discarded), then commit in a timed window, recording the
 /// per-commit latency (including any first-committer-wins retry, which is what a
 /// real client experiences — identical across embedded and pgwire transports).
-fn writer_loop(
+pub(crate) fn writer_loop(
     target: &Target,
     writer: usize,
     tag: u128,
@@ -716,22 +849,47 @@ fn writer_loop(
     warmup: Duration,
     duration: Duration,
 ) -> Result<Tally, BenchError> {
+    writer_loop_variant(target, writer, tag, same_row, warmup, duration, false)
+}
+
+/// The writer loop with the Exp-1 cold-connection variant (V-1) exposed: when
+/// `cold_connection` is set each *timed* commit opens a fresh connection so the
+/// one-time connect/handshake cost is folded into every sample (the
+/// cold-connection distribution); when clear, one warm connection is reused for
+/// the whole window (steady state). The warm-up always runs on a reused
+/// connection — the variant is about the measured path, not setup.
+pub(crate) fn writer_loop_variant(
+    target: &Target,
+    writer: usize,
+    tag: u128,
+    same_row: bool,
+    warmup: Duration,
+    duration: Duration,
+    cold_connection: bool,
+) -> Result<Tally, BenchError> {
     let mut conn = target.open()?;
     let seq = AtomicU64::new(0);
 
-    let one = |conn: &mut Writer,
-               hist: Option<&mut Histogram>,
-               conflicts: &mut u64|
+    // The next statement this writer issues: an UPDATE of the one shared row
+    // (contention) or an INSERT of a fresh unique key (independent rows).
+    let next_sql = || {
+        if same_row {
+            format!("UPDATE {TABLE_COUNTER} SET n = n + 1 WHERE id = 1")
+        } else {
+            let i = seq.fetch_add(1, Ordering::Relaxed);
+            format!("INSERT INTO {TABLE_LEDGER} (k, v) VALUES ('{tag}-{writer}-{i}', 1)")
+        }
+    };
+
+    // Commit once with first-committer-wins retry, recording the elapsed since
+    // `t0` (which the caller starts — before the connect, for the cold variant).
+    let commit = |conn: &mut Writer,
+                  t0: Instant,
+                  hist: Option<&mut Histogram>,
+                  conflicts: &mut u64|
      -> Result<(), BenchError> {
-        let t0 = Instant::now();
         loop {
-            let sql = if same_row {
-                format!("UPDATE {TABLE_COUNTER} SET n = n + 1 WHERE id = 1")
-            } else {
-                let i = seq.fetch_add(1, Ordering::Relaxed);
-                format!("INSERT INTO {TABLE_LEDGER} (k, v) VALUES ('{tag}-{writer}-{i}', 1)")
-            };
-            match conn.exec(&sql) {
+            match conn.exec(&next_sql()) {
                 Outcome::Ok => break,
                 Outcome::Conflict => {
                     *conflicts += 1;
@@ -750,11 +908,12 @@ fn writer_loop(
         Ok(())
     };
 
-    // Warm-up window: drive load but discard measurements.
+    // Warm-up window: drive load but discard measurements (always warm-reused;
+    // the variant is about the measured path, not setup).
     let warm_until = Instant::now() + warmup;
     let mut scratch = 0u64;
     while Instant::now() < warm_until {
-        one(&mut conn, None, &mut scratch)?;
+        commit(&mut conn, Instant::now(), None, &mut scratch)?;
     }
 
     // Timed window (each recorded sample is one commit, so hist.count() == commits).
@@ -762,7 +921,14 @@ fn writer_loop(
     let mut conflicts = 0u64;
     let until = Instant::now() + duration;
     while Instant::now() < until {
-        one(&mut conn, Some(&mut hist), &mut conflicts)?;
+        // Cold-connection variant (V-1): start the timer, *then* open a fresh
+        // connection, so the handshake is inside the measured sample. Steady
+        // state reuses the one warm connection opened above.
+        let t0 = Instant::now();
+        if cold_connection {
+            conn = target.open()?;
+        }
+        commit(&mut conn, t0, Some(&mut hist), &mut conflicts)?;
     }
 
     Ok(Tally {
@@ -888,6 +1054,78 @@ impl MixRealized {
     }
 }
 
+/// Run provenance pinned into every archived record (issue #91 V-5): the bits
+/// that make a baseline reproducible and a regression attributable — the region
+/// and instance type the run targeted, the storage-backend SHA (from the
+/// environment so CI can stamp the exact `crates/storage` revision under test),
+/// and a wall-clock capture time. The git SHA already rides on the [`Report`]
+/// itself. All optional: a `file://` smoke run carries none of them.
+#[derive(Clone, Default)]
+pub(crate) struct Archival {
+    pub region: Option<String>,
+    pub instance_type: Option<String>,
+    /// `crates/storage` revision the run linked, from `TWILL_BENCH_BACKEND_SHA`.
+    pub backend_sha: Option<String>,
+    /// Unix seconds at which the run was captured (0 if the clock was unreadable).
+    pub captured_at: u64,
+}
+
+impl Archival {
+    fn from_opts(opts: &Opts) -> Archival {
+        Archival {
+            region: opts.region.clone(),
+            instance_type: opts.instance_type.clone(),
+            backend_sha: std::env::var("TWILL_BENCH_BACKEND_SHA")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            captured_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+
+    /// The archival fields as JSON object members (no braces), comma-prefixed so
+    /// they append cleanly onto the flat record. A `null` for any unset field.
+    fn json_members(&self) -> String {
+        let q = |o: &Option<String>| match o {
+            Some(s) => format!("\"{s}\""),
+            None => "null".to_string(),
+        };
+        format!(
+            ",\"region\":{},\"instance_type\":{},\"backend_sha\":{},\"captured_at\":{}",
+            q(&self.region),
+            q(&self.instance_type),
+            q(&self.backend_sha),
+            self.captured_at,
+        )
+    }
+}
+
+/// The Exp-1 stall acceptance gate (issue #91 V-1): the single-commit `p999/p50`
+/// ratio against an optional upper bound. A small ratio is network jitter; a
+/// large one is a commit-path stall (sync compaction, CAS-retry storm) to
+/// investigate before trusting any downstream curve. The gate is *reported*
+/// always; it gates the exit code only when a bound (`--max-stall-ratio`) is set.
+pub(crate) struct StallGate {
+    pub ratio: f64,
+    pub max: Option<f64>,
+}
+
+impl StallGate {
+    fn evaluate(p50: u64, p999: u64, max: Option<f64>) -> StallGate {
+        StallGate {
+            ratio: analysis::stall_ratio(p50, p999),
+            max,
+        }
+    }
+
+    /// True when a bound is set and the observed ratio exceeds it.
+    fn tripped(&self) -> bool {
+        self.max.is_some_and(|m| self.ratio > m)
+    }
+}
+
 pub(crate) struct Report {
     pub experiment: &'static str,
     pub label: String,
@@ -920,6 +1158,19 @@ pub(crate) struct Report {
     /// Present for the `custom` profile scenario (issue #81); the configured vs
     /// realized op mix, proving the driven shape tracked the requested ratios.
     pub mix_realized: Option<MixRealized>,
+    /// Run provenance for the archive (issue #91 V-5); always present.
+    pub archival: Archival,
+    /// Present for `exp1`; the W1 stall acceptance gate (issue #91 V-1).
+    pub stall: Option<StallGate>,
+    /// Present for `exp2-sweep`; the group-commit-window sweep + plateau knee
+    /// and the W1 plateau-engagement gate (issue #91 V-2).
+    pub sweep: Option<sweep::Sweep>,
+    /// Present for `exp3-shard`; the N-database sharding curve + the W2 near-
+    /// linear-scaling gate / cross-DB CAS finding (issue #91 V-3).
+    pub shard: Option<sweep::Shard>,
+    /// Present for `herd`; the thundering-herd concurrent-cold-start curve +
+    /// the spin-up saturation knee (issue #91 V-4).
+    pub herd: Option<lifecycle::Herd>,
 }
 
 impl Report {
@@ -929,6 +1180,19 @@ impl Report {
     fn failed_correctness(&self) -> bool {
         self.correctness.as_ref().is_some_and(|c| !c.passed)
             || self.soak.as_ref().is_some_and(|s| !s.passed())
+    }
+
+    /// Whether this run failed a validation-acceptance gate (exit code 1, the
+    /// CI-gating class): the Exp-1 stall ratio over its bound (V-1), or — when
+    /// `--gate` is set — the Exp-2 plateau guard (V-2), the Exp-3 sharding-slope
+    /// guard (V-3), or the Exp-5 herd-knee guard (V-4). Off-by-default for the
+    /// sweep guards so a smoke run reports the verdict without failing on one
+    /// host's modest numbers; the stall gate self-gates on `--max-stall-ratio`.
+    fn failed_acceptance(&self) -> bool {
+        self.stall.as_ref().is_some_and(|s| s.tripped())
+            || self.sweep.as_ref().is_some_and(|s| s.gate_failed())
+            || self.shard.as_ref().is_some_and(|s| s.gate_failed())
+            || self.herd.as_ref().is_some_and(|h| h.gate_failed())
     }
 
     fn print(&self) {
@@ -1048,6 +1312,36 @@ impl Report {
                 println!("mix want     {cfg}");
                 println!("mix got      {got}");
             }
+            if let Some(s) = &self.stall {
+                // The Exp-1 stall gate (V-1): the p999/p50 ratio + verdict.
+                let verdict = match s.max {
+                    Some(m) if s.tripped() => format!("STALL (> {m:.0}× bound)"),
+                    Some(m) => format!("clean (≤ {m:.0}× bound)"),
+                    None => "clean (no bound set)".to_string(),
+                };
+                println!("stall gate   p999/p50={:.1}×  {verdict}", s.ratio);
+            }
+            if let Some(s) = &self.sweep {
+                s.print_human();
+            }
+            if let Some(s) = &self.shard {
+                s.print_human();
+            }
+            if let Some(h) = &self.herd {
+                h.print_human();
+            }
+            // Run provenance (V-5): only when something is set (a real-host run).
+            if self.archival.region.is_some()
+                || self.archival.instance_type.is_some()
+                || self.archival.backend_sha.is_some()
+            {
+                println!(
+                    "provenance   region={}  instance={}  backend_sha={}",
+                    self.archival.region.as_deref().unwrap_or("-"),
+                    self.archival.instance_type.as_deref().unwrap_or("-"),
+                    self.archival.backend_sha.as_deref().unwrap_or("-"),
+                );
+            }
         }
         // Machine-readable record (one JSON line) for archiving / plotting.
         let correctness = match &self.correctness {
@@ -1132,12 +1426,40 @@ impl Report {
             ),
             None => "null".to_string(),
         };
+        // The validation-campaign sections (issue #91): the Exp-1 stall gate
+        // (V-1), the Exp-2 sweep (V-2), the Exp-3 sharding curve (V-3), and the
+        // Exp-5 herd curve (V-4). Each is `null` outside its own scenario.
+        let stall = match &self.stall {
+            Some(s) => format!(
+                "{{\"p999_over_p50\":{:.3},\"max\":{},\"tripped\":{}}}",
+                s.ratio,
+                match s.max {
+                    Some(m) => format!("{m:.3}"),
+                    None => "null".to_string(),
+                },
+                s.tripped(),
+            ),
+            None => "null".to_string(),
+        };
+        let sweep = self
+            .sweep
+            .as_ref()
+            .map_or("null".to_string(), |s| s.to_json());
+        let shard = self
+            .shard
+            .as_ref()
+            .map_or("null".to_string(), |s| s.to_json());
+        let herd = self
+            .herd
+            .as_ref()
+            .map_or("null".to_string(), |h| h.to_json());
         println!(
             "{{\"experiment\":\"{}\",\"label\":\"{}\",\"transport\":\"{}\",\"backend\":\"{}\",\
              \"git\":\"{}\",\"writers\":{},\"duration_s\":{:.3},\"commits\":{},\"conflicts\":{},\
              \"failures\":{},\"throughput_per_s\":{:.1},\"p50_us\":{},\"p90_us\":{},\"p95_us\":{},\
              \"p99_us\":{},\"p999_us\":{},\"min_us\":{},\"max_us\":{},\"mean_us\":{:.1},\
-             \"correctness\":{},\"lifecycle\":{},\"soak\":{},\"burst\":{},\"mix\":{}}}",
+             \"correctness\":{},\"lifecycle\":{},\"soak\":{},\"burst\":{},\"mix\":{},\
+             \"stall\":{},\"sweep\":{},\"shard\":{},\"herd\":{}{}}}",
             self.experiment,
             self.label,
             self.transport,
@@ -1162,6 +1484,11 @@ impl Report {
             soak,
             burst,
             mix_realized,
+            stall,
+            sweep,
+            shard,
+            herd,
+            self.archival.json_members(),
         );
     }
 }
@@ -1201,6 +1528,16 @@ fn print_help() {
          \x20 exp1            single-commit latency floor (one sequential writer)\n\
          \x20 exp2            group-commit throughput curve (N independent-row writers)\n\
          \x20 exp3            write-contention wall (N writers on the same row)\n\
+         \n\
+         VALIDATION CAMPAIGN (spec 09 sweeps & gates; issue #91):\n\
+         \x20 exp2-sweep      group-commit-window sweep + plateau-knee detection (V-2);\n\
+         \x20                 sweeps 1..--sweep-max writers, gates plateau vs the Exp-1 ceiling\n\
+         \x20 exp3-shard      N-database sharding sweep (V-3): 1..--databases independent DBs\n\
+         \x20                 under one pacer; reports aggregate scaling + cross-DB CAS finding\n\
+         \x20 herd            thundering-herd cold starts (V-4): 1..--concurrency simultaneous\n\
+         \x20                 cold boots; reports the spin-up saturation knee\n\
+         \x20 boundary        build the W1/W2 boundary tables from archived records (V-5):\n\
+         \x20                 boundary --dir <DIR> | --record <FILE>… [--out <FILE>] [--gate]\n\
          \n\
          REQUEST-MIX SCENARIOS (ratio-controlled SELECT/INSERT/UPDATE/DELETE):\n\
          \x20 read-heavy      90%% read / 10%% insert\n\
@@ -1248,6 +1585,14 @@ fn print_help() {
          \x20 --ramp-ms <MS>       burst ramp duration between plateaus (default 50)\n\
          \x20 --dwell-ms <MS>      burst hold at each active plateau (default 150)\n\
          \x20 --profile <FILE>     YAML workload profile for `custom` (feature-gated loader)\n\
+         \x20 --sweep-max <N>      max writers for exp2-sweep (default 8)\n\
+         \x20 --databases <N>      max independent databases for exp3-shard (default 4)\n\
+         \x20 --concurrency <N>    max simultaneous cold starts for herd (default 8)\n\
+         \x20 --cold-connection    exp1 variant: open a fresh connection per sample\n\
+         \x20 --max-stall-ratio <X>  exp1 gate: trip if p999/p50 exceeds X (e.g. 50)\n\
+         \x20 --region <TEXT>      object-store region recorded in the archive (V-5)\n\
+         \x20 --instance-type <TEXT>  host instance type recorded in the archive (V-5)\n\
+         \x20 --gate               map a failed validation-sweep gate to a non-zero exit\n\
          \x20 --label <TEXT>       free-form tag recorded in the output\n\
          \x20 --json               emit only the one-line JSON record (for scripting)\n\
          \n\

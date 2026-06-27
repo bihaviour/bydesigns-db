@@ -550,6 +550,11 @@ pub(crate) fn run_long_run(opts: &Opts) -> Result<Report, BenchError> {
         soak: Some(soak),
         burst: None,
         mix_realized: None,
+        archival: crate::Archival::from_opts(opts),
+        stall: None,
+        sweep: None,
+        shard: None,
+        herd: None,
     })
 }
 

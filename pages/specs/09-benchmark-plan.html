@@ -467,6 +467,21 @@ SELECT v FROM ledger WHERE k = :id;</code></pre>
 
 <section>
 <h2>Open questions &amp; risks</h2>
+<div class="callout note">
+<p class="callout-title">Validation-campaign status (issue #91)</p>
+<p>The drivers and analysis for both &ldquo;resolve&rdquo; questions below now ship in
+<code>twill-bench</code> &mdash; the group-commit-window sweep with plateau-knee
+detection (<code>exp2-sweep</code>, V-2) and the N-database sharding orchestrator
+with the near-linear-scaling / cross-DB-CAS verdict (<code>exp3-shard</code>, V-3),
+alongside the Exp-1 stall gate + same-region/cross-region/cold-connection variants
+(<code>exp1</code>, V-1), the thundering-herd cold-start knee (<code>herd</code>,
+V-4), and the provenance-pinned archival + regression gate + W1/W2
+boundary-table generator (<code>boundary</code> + the scheduled
+<code>bench-validation</code> CI job, V-5). The questions remain open until those
+sweeps run against a real network object store on a real host (the spec-09 MUST
+for Exp 1); the machinery to answer them &mdash; and to fail CI on a regression
+&mdash; is in place.</p>
+</div>
 <ul class="reqs">
 <li><span class="req-tag should">SHOULD</span> resolve: what group-commit window best trades Exp-2 plateau against Exp-1 tail for the platform's typical write frequency? Sweep it; it is the central tuning knob.</li>
 <li><span class="req-tag should">SHOULD</span> resolve: does the S3-CAS commit log itself become a cross-DB serialization point in the Exp-3 sharding variant? If lanes do not scale linearly, the bottleneck is architectural, not workload.</li>

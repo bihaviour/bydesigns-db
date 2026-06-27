@@ -58,7 +58,12 @@ twill-bench document-editing --url file://./b.db # correctness profile (shipped)
 twill-bench compare --baseline base.json --candidate cand.json   # shipped
 twill-bench burst --url file://./b.db           # shipped (issue #79 — closed-loop rate driver)
 twill-bench scale-to-zero --url file://./b.db   # shipped (spec 09 Exp 5 cold read)
-twill-bench custom --profile workload.yaml      # shipped (issue #81 — feature-gated YAML loader)</code></pre></div>
+twill-bench custom --profile workload.yaml      # shipped (issue #81 — feature-gated YAML loader)
+twill-bench exp1 --url s3://b/db --max-stall-ratio 50   # V-1 stall gate + region/cold-connection variants
+twill-bench exp2-sweep --url s3://b/db --sweep-max 64    # V-2 group-commit-window sweep + plateau knee
+twill-bench exp3-shard --url s3://b/db --databases 16    # V-3 N-database sharding + cross-DB CAS verdict
+twill-bench herd --url file://./b.db --concurrency 64    # V-4 thundering-herd cold-start knee
+twill-bench boundary --dir bench-archive --gate         # V-5 W1/W2 boundary tables from archived records</code></pre></div>
 </section>
 
 <section id="benchmark-scenarios">
@@ -252,6 +257,23 @@ mix:                      # per-op weights (arbitrary positive ints; ≥1 non-ze
 
 <h3>Release comparison <span class="req-tag must">IMPLEMENTED</span></h3>
 <p><code>twill-bench compare --baseline base.json --candidate cand.json [--threshold 0.10]</code> diffs two archived JSON records (throughput, p50/p99/p999) into a PASS/regression verdict — a regression (throughput down, or a tail latency up, beyond the threshold) exits 1. It is pure post-processing over the records the driver already emits (each carries the git SHA and the full percentile set), so it needs neither the engine nor a transport, and is naturally CI-friendly. Cold-start and memory deltas join the diff once those metrics are sourced from the controller.</p>
+
+<h3 id="validation-campaign">Validation campaign — sweeps, gates &amp; boundary tables (issue #91) <span class="req-tag must">SHIPPED</span></h3>
+<p>The single-lever experiments (<code>exp1</code>/<code>exp2</code>/<code>exp3</code>) became the falsifiable boundary the platform routes by. Each sweep drives the public commit path and hands the resulting spec-09 curve to a pure, unit-tested analysis layer (<code>crates/bench/src/analysis.rs</code>) for the verdict; the gates are report-only by default and map to a non-zero exit under <code>--gate</code> for CI.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Sub-issue</th><th>Command</th><th>What it lands</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>V-1</strong></td><td><code>exp1</code> (+flags)</td><td>The Exp-1 <code>p999/p50</code> <strong>stall acceptance gate</strong> (<code>--max-stall-ratio</code>; commit-path-stall signal → exit 1), plus the same-region/cross-region (<code>--region</code>) and cold-connection (<code>--cold-connection</code>, fresh connect per sample) variants. Real-S3 runs are the spec-09 MUST (W1 is the round-trip); a test fires the gate on an injected stall and passes a clean run.</td></tr>
+<tr><td><strong>V-2</strong></td><td><code>exp2-sweep</code></td><td>The <strong>group-commit-window sweep</strong>: sweeps <code>1..--sweep-max</code> offered-concurrency points (the coalescing window in the leader/follower group commit — no engine knob added), plots throughput vs the p99 tail, detects the plateau <strong>knee</strong> (Kneedle distance-from-chord), and gates the plateau against the Exp-1 ceiling (≤ 1.5× ⇒ batching not engaging).</td></tr>
+<tr><td><strong>V-3</strong></td><td><code>exp3-shard</code></td><td>The <strong>N-database sharding orchestrator</strong>: <code>1..--databases</code> independent databases, each with <code>--writers</code> contending on one hot row, driven under one synchronized pacer; reports aggregate throughput vs lane count and the near-linear-scaling verdict (efficiency ≥ 0.80) — answering whether the S3-CAS commit log is a cross-DB serialization point.</td></tr>
+<tr><td><strong>V-4</strong></td><td><code>herd</code></td><td>The <strong>thundering-herd</strong> variant: <code>1..--concurrency</code> simultaneous cold starts (barrier-synchronized), reporting the spin-up <strong>saturation knee</strong> plus the controller-pulled admission-wait and peak-worker gauges — never generated in the thread-free engine core.</td></tr>
+<tr><td><strong>V-5</strong></td><td><code>boundary</code> + CI</td><td>The archived record now pins <strong>provenance</strong> (<code>region</code>, <code>instance_type</code>, <code>backend_sha</code>, <code>captured_at</code>); <code>boundary --dir … --out … --gate</code> builds the <strong>W1/W2 boundary tables</strong> from the records (each tool's placement read off, not re-measured); and the scheduled <code>bench-validation</code> CI workflow runs Exp 1–3 against real S3 (when the <code>BENCH_S3_*</code> secrets are set, else a <code>file://</code> smoke), gates regressions via <code>compare</code>, and folds in the Experiment-4 crash-safety verdict so the durability proof travels with the numbers.</td></tr>
+</tbody>
+</table>
+</div>
 
 <h3>Output formats</h3>
 <ul class="reqs">

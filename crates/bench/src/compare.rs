@@ -79,16 +79,22 @@ struct Record {
     p999: f64,
 }
 
-fn load_record(path: &str) -> Result<Record, String> {
+/// The last line of a file that looks like a flat JSON object (a record file may
+/// also hold the human summary the driver prints above the record). Shared by
+/// `compare` and `boundary`, the two post-processors over archived records.
+pub(crate) fn last_json_object(path: &str) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    // Take the last line that looks like a JSON object (a file may also hold the
-    // human summary the driver prints above the record).
-    let line = text
-        .lines()
+    text.lines()
         .rev()
         .map(str::trim)
         .find(|l| l.starts_with('{') && l.ends_with('}'))
-        .ok_or("no JSON record found")?;
+        .map(str::to_string)
+        .ok_or_else(|| "no JSON record found".to_string())
+}
+
+fn load_record(path: &str) -> Result<Record, String> {
+    let line = last_json_object(path)?;
+    let line = line.as_str();
 
     Ok(Record {
         experiment: field_str(line, "experiment").unwrap_or_else(|| "?".into()),
@@ -160,7 +166,7 @@ fn row(label: &str, base: f64, cand: f64, delta: f64) {
 // ---- minimal flat-JSON field extraction --------------------------------
 
 /// Extract a string field `"key":"value"` from a flat JSON object line.
-fn field_str(json: &str, key: &str) -> Option<String> {
+pub(crate) fn field_str(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let start = json.find(&needle)? + needle.len();
     let end = json[start..].find('"')? + start;
@@ -168,7 +174,7 @@ fn field_str(json: &str, key: &str) -> Option<String> {
 }
 
 /// Extract a numeric field `"key":<number>` from a flat JSON object line.
-fn field_num(json: &str, key: &str) -> Option<f64> {
+pub(crate) fn field_num(json: &str, key: &str) -> Option<f64> {
     let needle = format!("\"{key}\":");
     let start = json.find(&needle)? + needle.len();
     let rest = &json[start..];

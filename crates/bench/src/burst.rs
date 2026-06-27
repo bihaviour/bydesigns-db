@@ -470,6 +470,11 @@ pub(crate) fn run_burst(opts: &Opts) -> Result<Report, BenchError> {
         soak: None,
         burst: Some(burst),
         mix_realized: None,
+        archival: crate::Archival::from_opts(opts),
+        stall: None,
+        sweep: None,
+        shard: None,
+        herd: None,
     })
 }
 
