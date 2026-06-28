@@ -114,15 +114,19 @@ fn to_result_set(r: QueryResult) -> ResultSet {
 fn assemble_catalog(cols: &QueryResult, rels: &QueryResult) -> Vec<CatalogTable> {
     let mut tables: Vec<CatalogTable> = Vec::new();
     for (i, row) in cols.rows.iter().enumerate() {
-        // (tbl, col, typ, notnull, pk)
+        // (tbl, col, typ, notnull, pk[, uniq, dflt]) — uniq/dflt are additive, so
+        // tolerate older servers that omit them (`cell` returns "" out of bounds).
         let tbl = cell(row, 0);
         let ty = parse_column_type(&cell(row, 2));
+        let dflt = cell(row, 6);
         let column = CatalogColumn {
             name: cell(row, 1),
             pg_type: pg_type_name(ty),
             ty,
             not_null: cell(row, 3) == "1",
             primary_key: cell(row, 4) == "1",
+            unique: cell(row, 5) == "1",
+            default_sql: if dflt.is_empty() { None } else { Some(dflt) },
             position: (i + 1) as i32,
         };
         match tables.iter_mut().find(|t| t.name == tbl) {

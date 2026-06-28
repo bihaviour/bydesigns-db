@@ -277,8 +277,10 @@ pub fn catalog_reflect(kind: CatalogKind, catalog: &[CatalogTable]) -> Canned {
     }
 }
 
-/// `twill.catalog`: one row per column, `(tbl, col, typ, notnull, pk)`, in table
-/// then ordinal order. `notnull` / `pk` are `0`/`1` integers.
+/// `twill.catalog`: one row per column, `(tbl, col, typ, notnull, pk, uniq,
+/// dflt)`, in table then ordinal order. `notnull` / `pk` / `uniq` are `0`/`1`
+/// integers; `dflt` is the column's `DEFAULT` SQL text (empty when none). The
+/// trailing `uniq` / `dflt` are additive — older readers ignore them.
 fn catalog_columns_rows(catalog: &[CatalogTable]) -> Canned {
     let mut rows = Vec::new();
     for t in catalog {
@@ -289,12 +291,14 @@ fn catalog_columns_rows(catalog: &[CatalogTable]) -> Canned {
                 Value::Text(sql_type_name(c.ty)),
                 Value::Int(c.not_null as i64),
                 Value::Int(c.primary_key as i64),
+                Value::Int(c.unique as i64),
+                Value::Text(c.default_sql.clone().unwrap_or_default()),
             ]);
         }
     }
     let n = rows.len();
     Canned::Rows {
-        columns: ["tbl", "col", "typ", "notnull", "pk"]
+        columns: ["tbl", "col", "typ", "notnull", "pk", "uniq", "dflt"]
             .iter()
             .map(|c| c.to_string())
             .collect(),

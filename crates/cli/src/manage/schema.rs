@@ -5,9 +5,10 @@
 //! with column types, nullability, primary key, and foreign keys.
 //!
 //! It is *reconstructed*, not a byte-exact replay: the catalog carries column
-//! type / nullability / key flags and FK relationships, so those round-trip;
-//! `DEFAULT` / `CHECK` / standalone `UNIQUE` are not part of the reflected
-//! catalog and so are not emitted (noted in the docs).
+//! type / nullability / key flags, single-column `UNIQUE` and `DEFAULT`, and FK
+//! relationships, so those round-trip (over both the embedded and `postgres://`
+//! transports). Table-level / composite `UNIQUE` and `CHECK` constraints are not
+//! part of the reflected catalog and so are not emitted (noted in the docs).
 
 use super::{open, positional, CmdError::Runtime, CmdError::Usage, CmdResult};
 use engine::{CatalogTable, ColumnType};
@@ -51,6 +52,13 @@ fn create_table_ddl(t: &CatalogTable) -> String {
         } else if c.not_null {
             // An inlined PRIMARY KEY already implies NOT NULL.
             col.push_str(" NOT NULL");
+        }
+        // `unique` is reflected only for non-PK columns (a PK is already unique).
+        if c.unique {
+            col.push_str(" UNIQUE");
+        }
+        if let Some(default) = &c.default_sql {
+            col.push_str(&format!(" DEFAULT {default}"));
         }
         lines.push(col);
     }
