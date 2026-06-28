@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add to a project · Twill DB docs</title>
+<meta name="description" content="Wire Twill DB into a new or existing Bun project — a reusable db module, env-driven connection string, and a paste-able prompt for an AI coding agent.">
+<link rel="stylesheet" href="../assets/app.css">
+<script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<button class="nav-toggle" aria-label="Toggle navigation">☰</button>
+<div class="layout">
+<aside class="sidebar" id="sidebar"></aside>
+<main class="content" id="main">
+<article>
+<header class="page-header">
+<div class="spec-meta">
+<span class="badge badge-status status-review">User guide</span>
+<span class="spec-date">~10 minutes</span>
+</div>
+<h1>Add to a project</h1>
+<p class="lede">The <a href="getting-started.html">Quickstart</a> gets you a running query. This page wires Twill DB into a real codebase — a fresh project from scratch, or an app you already have — with a reusable db module, an env-driven connection string, and the small habits (resource cleanup, <code>.gitignore</code>) that keep it tidy. The last section is a paste-able prompt that lets an AI coding agent do the wiring for you.</p>
+</header>
+
+<section>
+<h2>Pick a path</h2>
+<p>There are two ways to talk to the engine. They share the same SQL and the same connection-string model, so you can start embedded and add a server later without rewriting queries.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Path</th><th>How it runs</th><th>Reach for it when</th></tr></thead>
+<tbody>
+<tr><td><strong>Embedded</strong> (<code>@twilldb/bun</code>)</td><td>The engine links in-process via <code>bun:ffi</code>; queries are function calls, no network.</td><td>You run on Bun and want the lowest latency and zero infrastructure — a single app, a CLI, an edge/serverless function.</td></tr>
+<tr><td><strong>Server</strong> (Postgres wire)</td><td>The same engine behind a Postgres-wire listener; any Postgres driver/ORM connects.</td><td>You are not on Bun, want to use an existing Postgres ORM, or need many processes to share one database.</td></tr>
+</tbody>
+</table>
+</div>
+<p>This page covers the <strong>embedded</strong> path. For the server path, start at <a href="connect-postgres.html">Postgres client</a> and the per-language guides under <em>Connect as server</em>.</p>
+</section>
+
+<section>
+<h2>A · New project from scratch</h2>
+<p>Scaffold a Bun project and add the package. The prebuilt engine arrives with it — no Rust, no build step.</p>
+<pre data-lang="bash"><code>mkdir my-app &amp;&amp; cd my-app
+bun init -y
+bun add @twilldb/bun</code></pre>
+<p>Create a single module that owns the database handle so the rest of your code imports one ready-to-use instance:</p>
+<pre data-lang="ts"><code>// src/db.ts
+import { open } from "@twilldb/bun";
+
+// One connection string drives the backend. Default to a local file;
+// override with TWILLDB_URL (e.g. s3://my-bucket/app) in production.
+export const db = open(process.env.TWILLDB_URL ?? "file://./data/app.db");
+
+// Create tables once, on startup. DDL runs in autocommit only.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS notes (
+    id    INTEGER PRIMARY KEY,
+    body  TEXT NOT NULL,
+    done  INTEGER NOT NULL DEFAULT 0
+  )
+`);</code></pre>
+<pre data-lang="ts"><code>// src/index.ts
+import { db } from "./db";
+
+// Parameterized writes go through query() (exec takes no params); it returns
+// the (empty) result set for an INSERT.
+db.query("INSERT INTO notes (id, body) VALUES (?, ?)", [1, "first note"]);
+
+const rows = db.query("SELECT id, body, done FROM notes WHERE done = ?", [0]);
+console.log(rows);   // values come back as strings: [{ id: "1", body: "first note", done: "0" }]</code></pre>
+<pre data-lang="bash"><code>bun run src/index.ts</code></pre>
+<div class="callout note">
+<p class="callout-title">Keep the data file out of git</p>
+<p>The <code>file://</code> backend writes a database file (here <code>./data/app.db</code>) plus its WAL. Add the data directory to <code>.gitignore</code> — e.g. <code>echo "data/" &gt;&gt; .gitignore</code> — so local data never gets committed.</p>
+</div>
+</section>
+
+<section>
+<h2>B · Add to an existing app</h2>
+<p>If you already have a Bun project, you only need the package and a db module. Nothing else in your build changes.</p>
+<pre data-lang="bash"><code>bun add @twilldb/bun
+echo "data/" &gt;&gt; .gitignore</code></pre>
+<p>Drop in the same <code>src/db.ts</code> module shown above and import <code>db</code> wherever you query. A common shape — wiring it into an HTTP handler:</p>
+<pre data-lang="ts"><code>import { db } from "./db";
+
+Bun.serve({
+  port: 3000,
+  routes: {
+    "/notes": {
+      GET: () =&gt; Response.json(db.query("SELECT id, body, done FROM notes")),
+      POST: async (req) =&gt; {
+        const { id, body } = await req.json();
+        db.query("INSERT INTO notes (id, body) VALUES (?, ?)", [id, body]);
+        return new Response(null, { status: 201 });
+      },
+    },
+  },
+});</code></pre>
+<p>Framework-specific wiring (Hono, Elysia, Next.js, plain Bun HTTP) is covered under <em>Connect as embedded</em> — see the <a href="connect-embedded.html">overview</a>.</p>
+<div class="callout warning">
+<p class="callout-title">One writer per database</p>
+<p>The engine is single-writer per database. Within one Bun process, multiple imports of <code>src/db.ts</code> share the same handle — that is the intended pattern. Do <strong>not</strong> open the same <code>file://</code> path from several independent OS processes at once; if you need multi-process access, run the <a href="connect-postgres.html">server</a> instead. See <a href="connection-pooling.html">Connection pooling</a> for the details.</p>
+</div>
+</section>
+
+<section>
+<h2>Patterns that keep it clean</h2>
+<ul class="reqs">
+<li><span class="req-tag should">SHOULD</span> Own the handle in one module (the <code>db.ts</code> singleton above). Importing it elsewhere reuses the same in-process database — don't call <code>open()</code> per request.</li>
+<li><span class="req-tag should">SHOULD</span> Use <code>?</code> placeholders with a value array for anything user-supplied — values never touch the SQL text. Note <code>exec(sql)</code> takes no parameters, so parameterized statements (including writes) go through <code>query(sql, params)</code> or a <code>prepare</code>d statement. Every column comes back as a <strong>string</strong> (SQL <code>NULL</code> → <code>null</code>); cast to numbers/dates yourself.</li>
+<li><span class="req-tag should">SHOULD</span> Wrap multi-statement writes in <code>db.transaction(fn)</code> — it commits on return (blocking until the WAL is durable) and rolls back if <code>fn</code> throws.</li>
+<li><span class="req-tag may">MAY</span> Move the connection string to <code>TWILLDB_URL</code> so the same code runs on <code>file://</code> locally and <code>s3://</code>/<code>r2://</code>/<code>gs://</code> in production with no edit. Credentials come from the environment, never code.</li>
+<li><span class="req-tag may">MAY</span> Use <code>using</code> for short-lived handles (scripts, tests) so they dispose at scope exit; a long-lived server handle can live for the process lifetime.</li>
+</ul>
+<pre data-lang="ts"><code>// transaction: all-or-nothing, durable on return
+db.transaction((tx) =&gt; {
+  tx.query("UPDATE notes SET done = 1 WHERE id = ?", [1]);
+  tx.query("INSERT INTO notes (id, body) VALUES (?, ?)", [2, "follow-up"]);
+});   // ← COMMIT returns only after the WAL is fsync'd</code></pre>
+</section>
+
+<section>
+<h2>With an AI coding agent</h2>
+<p>Using Claude Code, Cursor, or a similar agent? Paste one of the blocks below into your agent. They carry the few facts an agent needs to get the integration right the first time — the npm package name, the Bun requirement, the connection-string model, and the engine's actual behaviour (strings out, autocommit DDL, single writer).</p>
+
+<h3>New project</h3>
+<pre data-lang="text"><code>Set up Twill DB as the database for a new Bun project.
+
+Requirements &amp; facts:
+- Runtime is Bun (>= 1.1). The package is `@twilldb/bun` on npm; install with
+  `bun add @twilldb/bun`. A prebuilt native engine ships as optional deps — no
+  Rust, no build step, no postinstall.
+- Open a database with `open(url)` from "@twilldb/bun". Use a connection string
+  from `process.env.TWILLDB_URL`, defaulting to "file://./data/app.db".
+- Create ONE module `src/db.ts` that calls `open(...)` once and exports the
+  handle; everything else imports it. Do not call open() per request.
+- API: `db.exec(sql)` for statements with NO parameters (DDL, simple writes;
+  returns rows affected). `db.query(sql, params?)` for reads AND for any
+  parameterized statement — exec() does not take params, so writes with `?`
+  placeholders go through query() (or a prepare()d statement). `db.transaction(fn)`
+  wraps multi-statement writes.
+- Behaviour to respect: every value comes back as a STRING (SQL NULL -> null),
+  so cast numbers/dates yourself. DDL (CREATE/DROP TABLE) runs in autocommit
+  ONLY — never inside transaction(). Always use `?` placeholders with a value
+  array (via query/prepare) for user input.
+- Add `data/` to .gitignore (the file:// backend writes a db file + WAL there).
+
+Deliver: package install, `src/db.ts` with schema bootstrap, and a small
+`src/index.ts` that inserts and queries a row to prove it works.</code></pre>
+
+<h3>Existing project</h3>
+<pre data-lang="text"><code>Integrate Twill DB into this existing Bun project as its database.
+
+Requirements &amp; facts:
+- Install `@twilldb/bun` with `bun add @twilldb/bun` (prebuilt engine ships with
+  it — no Rust/build step). Runtime must be Bun >= 1.1.
+- Add a single `db` module: call `open(process.env.TWILLDB_URL ?? "file://./data/app.db")`
+  once and export the handle. Reuse it everywhere; never open() per request.
+- Find where the app currently reads/writes data and route it through:
+  `db.exec(sql)` (no-parameter statements/DDL), `db.query(sql, params?)` (reads
+  AND any parameterized statement — exec() takes no params), and
+  `db.transaction(fn)` (multi-statement writes, durable on return).
+- Respect engine behaviour: values come back as STRINGS (NULL -> null); DDL is
+  autocommit-only (keep CREATE/DROP TABLE out of transaction()); always bind
+  user input with `?` placeholders + a value array.
+- The engine is single-writer per database within one process — the shared
+  module handle is correct; do not open the same file:// path from multiple
+  processes. Add `data/` to .gitignore.
+
+Deliver: the db module, the migrated data access, and a note on what changed.</code></pre>
+
+<div class="callout note">
+<p class="callout-title">Point your agent at the source of truth</p>
+<p>For deeper tasks, also give your agent these pages: <a href="connect-bun.html">Embedded (bun:ffi)</a> (full API), <a href="sql-reference.html">SQL reference</a> (the supported SQL surface — it is a focused subset), and <a href="connect.html">Connect to your database</a> (backends). That keeps the agent from assuming full Postgres SQL.</p>
+</div>
+</section>
+
+<section>
+<h2>Next steps</h2>
+<div class="xref-grid">
+<a class="xref" href="connect-bun.html"><span class="xref-title">Embedded (bun:ffi)</span><span class="xref-desc">The full embedded API: prepared statements, transactions, cleanup.</span></a>
+<a class="xref" href="connect-embedded.html"><span class="xref-title">Embedded frameworks</span><span class="xref-desc">Wire the engine into Hono, Elysia, Next.js, or plain Bun HTTP.</span></a>
+<a class="xref" href="sql-reference.html"><span class="xref-title">SQL reference</span><span class="xref-desc">The supported SQL surface and types.</span></a>
+<a class="xref" href="branching.html"><span class="xref-title">Branching</span><span class="xref-desc">Instant copy-on-write forks for previews and tests.</span></a>
+</div>
+</section>
+
+<nav class="page-nav" id="page-nav"></nav>
+</article>
+<footer class="doc-footer">Twill DB documentation · Licensed under AGPL-3.0. · <a href="../author/index.html">Author</a></footer>
+</main>
+<aside class="toc"><div class="toc-inner"><p class="toc-title">On this page</p><nav id="toc"></nav></div></aside>
+</div>
+<script src="../assets/docs-section.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quickstart · Twill DB docs</title>
-<meta name="description" content="Build the native library, open your first embedded Twill DB database from Bun, run SQL, and start a Postgres-wire server.">
+<meta name="description" content="Install @twilldb/bun from npm, open your first embedded Twill DB database, run SQL, branch it, and start a Postgres-wire server — no Rust required.">
 <link rel="stylesheet" href="../assets/app.css">
 <script>try{var t=localStorage.getItem('bd-theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
@@ -21,50 +21,43 @@
 <span class="spec-date">~5 minutes</span>
 </div>
 <h1>Quickstart</h1>
-<p class="lede">Build the engine once, open a database with a connection string, run SQL in-process from Bun, and then start the same engine as a Postgres-wire server. No infrastructure required for the embedded path.</p>
+<p class="lede">Install the package, open a database with a connection string, and run SQL in-process — no server, no Rust, no infrastructure. The prebuilt engine ships with the npm package, so you go from <code>bun add</code> to a durable query in two steps. The same connection string later moves you to object storage or a Postgres-wire server with no code change.</p>
 </header>
 
 <section>
 <h2>Prerequisites</h2>
 <ul class="reqs">
-<li><span class="req-tag must">MUST</span> A <strong>Rust</strong> toolchain (1.80+) to build the native library — <a href="https://rustup.rs" target="_blank" rel="noopener">rustup.rs</a>.</li>
-<li><span class="req-tag must">MUST</span> <strong>Bun</strong> for the embedded client and examples — <a href="https://bun.sh" target="_blank" rel="noopener">bun.sh</a>.</li>
-<li><span class="req-tag may">MAY</span> An S3-compatible bucket (AWS S3 / Cloudflare R2 / MinIO) only if you want the disaggregated (<code>s3://</code>) backend; the <code>file://</code> path needs nothing.</li>
+<li><span class="req-tag must">MUST</span> <strong>Bun</strong> ≥ 1.1 — the embedded client runs on <code>bun:ffi</code>. Install from <a href="https://bun.sh" target="_blank" rel="noopener">bun.sh</a>.</li>
+<li><span class="req-tag may">MAY</span> A <strong>Rust</strong> toolchain (1.80+) <em>only</em> if you build from source or are on a platform without a prebuilt binary — see <a href="#from-source">Build from source</a>. The npm path needs nothing.</li>
+<li><span class="req-tag may">MAY</span> An S3-compatible bucket (AWS S3 / Cloudflare R2 / MinIO) <em>only</em> for the disaggregated (<code>s3://</code>) backend; the <code>file://</code> path needs nothing.</li>
 </ul>
 </section>
 
 <section>
-<h2>1 · Build the engine</h2>
-<p>Clone the repository and build the release <code>libengine</code>. This produces the static and dynamic libraries plus the frozen C ABI header.</p>
-<pre data-lang="bash"><code>git clone https://github.com/bihaviour/twill-db
-cd twill-db
-
-cargo build -p twill-engine --release
-# → target/release/libengine.{a,so,dylib}  +  crates/engine/include/engine.h</code></pre>
+<h2>1 · Install</h2>
+<p>Add the wrapper to your project. The native engine ships as a set of <strong>per-platform binary packages</strong> (<code>@twilldb/engine-darwin-arm64</code>, <code>@twilldb/engine-linux-x64</code>, …) declared as optional dependencies; your package manager downloads only the one matching your OS and CPU. There is no build step, no postinstall, and no Rust toolchain.</p>
+<pre data-lang="bash"><code>bun add @twilldb/bun</code></pre>
 <div class="callout note">
-<p class="callout-title">When to rebuild</p>
-<p>The Bun client loads the native library through <code>bun:ffi</code>. After any change that touches the C ABI or engine behaviour, rebuild the release <code>libengine</code> before running the client — otherwise it runs against a stale binary.</p>
+<p class="callout-title">Adding to a real app?</p>
+<p>This page is the fast path to a running query. To wire Twill DB into a <strong>new or existing project</strong> — a reusable db module, env-driven connection string, <code>.gitignore</code> — or to hand the setup to an AI coding agent, see <a href="add-to-project.html">Add to a project</a>.</p>
 </div>
 </section>
 
 <section>
 <h2>2 · Your first embedded database</h2>
-<p>The <code>@twilldb/bun</code> wrapper auto-discovers the library from <code>target/{release,debug}</code> (or set <code>TWILLDB_ENGINE_PATH</code> to an explicit path). Open a <code>file://</code> database and run SQL at function-call latency.</p>
+<p>Open a <code>file://</code> database and run SQL at function-call latency. <code>open(url)</code> returns a handle; the <code>using</code> declaration disposes it at scope exit. Values come back as strings (a SQL <code>NULL</code> as <code>null</code>) — cast on the application side if you need numbers.</p>
 <pre data-lang="ts"><code>// notes.ts
 import { open } from "@twilldb/bun";
 
 using db = open("file://./local.db");          // pure-embedded, zero network
 
 db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`);
-db.query("INSERT INTO notes VALUES (?, ?)", [1, "hello"]);
+db.query("INSERT INTO notes VALUES (?, ?)", [1, "hello"]);  // parameterized writes go through query()
 
 const rows = db.query("SELECT id, body FROM notes");
 console.log(rows);                              // [{ id: "1", body: "hello" }]</code></pre>
-<pre data-lang="bash"><code>cd clients/bun
-bun install
-bun run ../../notes.ts          # or: bun run examples/notes.ts
-bun test                        # the end-to-end embedded test suite</code></pre>
-<p>The database persists to <code>./local.db</code> and is rebuilt by replaying the durable WAL on reopen, so your data survives a process restart.</p>
+<pre data-lang="bash"><code>bun run notes.ts</code></pre>
+<p>The database persists to <code>./local.db</code> and is rebuilt by replaying the durable WAL on reopen, so your data survives a process restart. Use <code>?</code> placeholders with a value array for any user input — values never touch the SQL text. See <a href="connect-bun.html">Embedded (bun:ffi)</a> for the full API: prepared statements, transactions, and resource management.</p>
 </section>
 
 <section>
@@ -75,8 +68,8 @@ bun test                        # the end-to-end embedded test suite</code></pre
 </section>
 
 <section>
-<h2>4 · Start a server</h2>
-<p>Run the same engine behind a Postgres-wire listener and connect with any Postgres client (cleartext / <code>sslmode=disable</code>).</p>
+<h2>4 · Start a server (optional)</h2>
+<p>Prefer a wire protocol over the in-process library? Run the same engine behind a Postgres-wire listener and connect with any Postgres client (cleartext / <code>sslmode=disable</code>). This path is built from the repo with Cargo.</p>
 <pre data-lang="bash"><code>cargo run -p twill-server -- --listen 127.0.0.1:5433 --db file://./srv.db   # or s3://bucket/db
 
 psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
@@ -84,6 +77,7 @@ psql "host=127.0.0.1 port=5433 user=postgres sslmode=disable"</code></pre>
 import { SQL } from "bun";
 const sql = new SQL("postgres://postgres@127.0.0.1:5433/srv?sslmode=disable");
 const rows = await sql`select 1 as n`;</code></pre>
+<p>See <a href="connect-postgres.html">Postgres client</a> and the per-language guides under <strong>Connect as server</strong> for Node, Python, Go, Drizzle, Prisma, and PostgREST.</p>
 </section>
 
 <section>
@@ -94,13 +88,29 @@ preview.exec("INSERT INTO notes VALUES (2, 'branch-only')");
 // the base never sees the branch's write, and vice versa</code></pre>
 </section>
 
+<section id="from-source">
+<h2>Build from source</h2>
+<p>You only need this if you are <strong>contributing to the engine</strong>, running on a platform without a prebuilt binary, or testing an unreleased change. Building produces the static/dynamic libraries plus the frozen C ABI header; the wrapper's loader then picks the library up from the cargo target dir automatically (or set <code>TWILLDB_ENGINE_PATH</code> to an explicit path).</p>
+<pre data-lang="bash"><code>git clone https://github.com/bihaviour/twill-db
+cd twill-db
+
+cargo build -p twill-engine --release
+# → target/release/libengine.{a,so,dylib}  +  crates/engine/include/engine.h
+
+cd clients/bun &amp;&amp; bun install &amp;&amp; bun test   # end-to-end embedded test suite</code></pre>
+<div class="callout note">
+<p class="callout-title">Rebuild after engine or ABI changes</p>
+<p>The wrapper loads the native library through <code>bun:ffi</code> and pins an expected ABI version. After any change that touches the C ABI or engine behaviour, rebuild the release <code>libengine</code> before running the client — otherwise it runs against a stale binary.</p>
+</div>
+</section>
+
 <section>
 <h2>Next steps</h2>
 <div class="xref-grid">
+<a class="xref" href="add-to-project.html"><span class="xref-title">Add to a project</span><span class="xref-desc">Wire Twill DB into a new or existing app — or hand it to an AI agent.</span></a>
 <a class="xref" href="connect.html"><span class="xref-title">Connect to your database</span><span class="xref-desc">The connection model and how to choose a backend.</span></a>
-<a class="xref" href="connect-bun.html"><span class="xref-title">Connect from Bun</span><span class="xref-desc">The full embedded API: transactions, prepared statements, branching.</span></a>
+<a class="xref" href="connect-bun.html"><span class="xref-title">Embedded (bun:ffi)</span><span class="xref-desc">The full embedded API: transactions, prepared statements, branching.</span></a>
 <a class="xref" href="sql-reference.html"><span class="xref-title">SQL reference</span><span class="xref-desc">The supported SQL surface and types.</span></a>
-<a class="xref" href="branching.html"><span class="xref-title">Branching</span><span class="xref-desc">Copy-on-write forks and their isolation rules.</span></a>
 </div>
 </section>
 
