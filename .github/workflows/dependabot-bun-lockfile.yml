@@ -1,0 +1,62 @@
+name: Dependabot bun.lock sync
+
+# Dependabot's npm support bumps clients/bun/package.json but does NOT update
+# clients/bun/bun.lock, so the CI `bun install --frozen-lockfile` step fails
+# ("lockfile had changes, but lockfile is frozen") before any test runs. This
+# workflow regenerates the lockfile to match and pushes it back onto the
+# Dependabot PR branch, so the bump merges with a consistent lockfile.
+#
+# Token behaviour:
+#   - With only GITHUB_TOKEN, the pushed lockfile commit keeps `main` correct
+#     after merge, BUT GitHub's loop-prevention means that push does NOT
+#     re-trigger the required CI checks — they must be re-run manually
+#     (`gh run rerun` or the "Re-run" button) before merging.
+#   - To make the push ALSO re-trigger CI (fully hands-off), add a PAT with
+#     `repo` scope as a *Dependabot* secret named DEPENDABOT_LOCKFILE_TOKEN
+#     (Settings → Secrets and variables → Dependabot — NOT Actions; Dependabot
+#     runs can't read Actions secrets). The workflow uses it automatically when
+#     present and falls back to GITHUB_TOKEN otherwise.
+
+on:
+  pull_request:
+    paths:
+      - "clients/bun/package.json"
+
+# Elevate GITHUB_TOKEN so the lockfile commit can be pushed. The permissions
+# key is honoured for Dependabot-triggered runs (default is read-only).
+permissions:
+  contents: write
+
+jobs:
+  sync-lockfile:
+    name: Sync bun.lock
+    # Only Dependabot PRs; human PRs are expected to update the lockfile themselves.
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Check out the PR branch so the push lands on it.
+          ref: ${{ github.head_ref }}
+          # Prefer a PAT (re-triggers CI) if provided; else GITHUB_TOKEN.
+          token: ${{ secrets.DEPENDABOT_LOCKFILE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Regenerate bun.lock to match package.json
+        working-directory: clients/bun
+        run: bun install
+
+      - name: Commit and push if the lockfile changed
+        run: |
+          if git diff --quiet -- clients/bun/bun.lock; then
+            echo "bun.lock already in sync — nothing to do."
+            exit 0
+          fi
+          git config user.name "dependabot[bot]"
+          git config user.email "49699333+dependabot[bot]@users.noreply.github.com"
+          git add clients/bun/bun.lock
+          git commit -m "build(deps): sync bun.lock with Dependabot package.json bump"
+          git push
