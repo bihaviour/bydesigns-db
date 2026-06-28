@@ -1,0 +1,41 @@
+# Self-hosted observability stack for twill-db engine-server: Prometheus scrapes
+# the engine-server `/metrics` endpoint, Grafana renders the bundled dashboard.
+#
+#   1. Run the server with metrics on:
+#        engine-server --listen 0.0.0.0:5433 --db file://./srv.db --metrics 0.0.0.0:9100
+#   2. docker compose up         (from this directory)
+#   3. Grafana:    http://localhost:3000   (anonymous, the "twill-db" dashboard is
+#                                            auto-provisioned)
+#      Prometheus: http://localhost:9090
+#
+# Nothing here phones home; it pulls from your own server.
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: twilldb-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    # Lets the `host.docker.internal` target in prometheus.yml reach the host on
+    # Linux (already resolvable on Docker Desktop).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: twilldb-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
