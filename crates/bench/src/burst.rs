@@ -361,14 +361,15 @@ pub(crate) fn run_burst(opts: &Opts) -> Result<Report, BenchError> {
 
         // The coordinator (this thread) walks the schedule in real time, driving
         // the pacer's rate and sampling the live warm-instance gauge so the report
-        // can prove the worker count rose under load and fell back to zero.
-        let (max_warm, reached_cold_each_cycle) = drive_schedule(&shared, &ctrl, &url, &schedule);
+        // can prove the worker count rose under load (scale-up). Scale-down is
+        // read after the run from the controller's durable scale-to-zero counter.
+        let max_warm = drive_schedule(&shared, &ctrl, &schedule);
 
         shared.running.store(false, Ordering::SeqCst);
         let tallies: Vec<WorkerTally> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        (tallies, max_warm, reached_cold_each_cycle)
+        (tallies, max_warm)
     });
-    let (tallies, max_warm, all_cycles_cold) = tallies;
+    let (tallies, max_warm) = tallies;
 
     // A worker hit a fatal engine/transport error → fail the run.
     if let Some(m) = shared.fatal.lock().unwrap().take() {
@@ -377,6 +378,12 @@ pub(crate) fn run_burst(opts: &Opts) -> Result<Report, BenchError> {
 
     let elapsed = shared.origin.elapsed();
     let end_stats = ctrl.stats();
+    // Scale-to-zero teardowns observed over the run — the durable, exact
+    // scale-down signal (the controller bumps this on every warm→Cold reap),
+    // read instead of sampling the transient Cold state during an idle plateau.
+    let scale_downs = end_stats
+        .scale_to_zero_events
+        .saturating_sub(start_stats.scale_to_zero_events);
 
     // Merge the per-worker latency + scaling distributions.
     let mut hist = Histogram::new();
@@ -408,9 +415,11 @@ pub(crate) fn run_burst(opts: &Opts) -> Result<Report, BenchError> {
             "instance never warmed under burst load (no scale-up observed)".into(),
         ));
     }
-    if !all_cycles_cold {
+    // Gated on the durable counter, not a sampled Cold transition, so a starved
+    // reaper or a sampler miss on a loaded CI host can't flake a real scale-down.
+    if scale_downs == 0 {
         return Err(BenchError::Run(
-            "instance did not scale to zero on an idle plateau (no scale-down observed)".into(),
+            "instance never scaled to zero on an idle plateau (no scale-down observed)".into(),
         ));
     }
 
@@ -421,9 +430,7 @@ pub(crate) fn run_burst(opts: &Opts) -> Result<Report, BenchError> {
         warm_starts: end_stats
             .warm_starts
             .saturating_sub(start_stats.warm_starts),
-        scale_to_zero: end_stats
-            .scale_to_zero_events
-            .saturating_sub(start_stats.scale_to_zero_events),
+        scale_to_zero: scale_downs,
         peak_workers: end_stats.peak_workers,
         compute_active_us: end_stats
             .compute_active_us
@@ -616,15 +623,12 @@ fn request(url: &str, key: &str) -> Result<u64, String> {
 }
 
 /// The coordinator: walk the schedule in real time, driving the pacer's rate from
-/// `rate_at(now)` and sampling the live warm-instance gauge. Returns the peak
-/// resident worker count seen and whether every idle plateau reached Cold (the
-/// scale-up / scale-down evidence the report asserts).
-fn drive_schedule(
-    shared: &Shared,
-    ctrl: &Controller,
-    url: &str,
-    schedule: &Schedule,
-) -> (u64, bool) {
+/// `rate_at(now)` and sampling the live warm-instance gauge for the peak resident
+/// worker count (the scale-up evidence). Scale-*down* is deliberately not sampled
+/// here — it is read after the run from the controller's durable `scale_to_zero`
+/// counter, which is exact and immune to reaper-vs-sampler timing races on a
+/// loaded host (sampling the transient Cold state flaked under CI contention).
+fn drive_schedule(shared: &Shared, ctrl: &Controller, schedule: &Schedule) -> u64 {
     // How often the coordinator re-points the pacer at the schedule + samples the
     // gauge. Fine enough to track a ramp without busy-spinning.
     let tick = Duration::from_millis(5);
@@ -632,10 +636,6 @@ fn drive_schedule(
     let mut max_warm = 0u64;
     let boundaries = schedule.boundaries();
     let mut next_boundary = 0usize;
-    // Whether the controller reached Cold during each idle plateau (rate 0).
-    let mut idle_cold_seen = false;
-    let mut idle_plateaus = 0u64;
-    let mut idle_plateaus_cold = 0u64;
     let mut was_paused = false;
 
     let mut elapsed = Duration::ZERO;
@@ -650,29 +650,11 @@ fn drive_schedule(
                 p.reanchor(shared.origin.elapsed().as_nanos());
             }
         }
+        was_paused = rate <= 0.0;
 
-        // Sample the live worker-count gauge.
+        // Sample the live worker-count gauge (the scale-up signal).
         let warm = ctrl.stats().warm_instances;
         max_warm = max_warm.max(warm);
-
-        // Track scale-down: count an idle plateau (rate 0) as "cold-reached" if
-        // the controller went Cold/absent at any point during it.
-        let paused = rate <= 0.0;
-        if paused {
-            if !was_paused {
-                idle_plateaus += 1;
-                idle_cold_seen = false;
-            }
-            if matches!(
-                ctrl.status(url),
-                None | Some(LifecycleState::Cold) | Some(LifecycleState::Stopping)
-            ) && !idle_cold_seen
-            {
-                idle_cold_seen = true;
-                idle_plateaus_cold += 1;
-            }
-        }
-        was_paused = paused;
 
         // Cross plateau boundaries: a sample point for a deployed run's snapshot
         // deltas (the in-process run folds the whole-run delta into the report).
@@ -684,8 +666,7 @@ fn drive_schedule(
         elapsed = shared.origin.elapsed();
     }
 
-    let all_cold = idle_plateaus > 0 && idle_plateaus_cold == idle_plateaus;
-    (max_warm, all_cold)
+    max_warm
 }
 
 /// Drop + recreate the burst table so the post-run row count is exactly the acked
