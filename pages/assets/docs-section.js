@@ -9,6 +9,7 @@ window.SECTION = {
       { file: "index.html",           title: "Introduction" },
       { file: "architecture.html",    title: "Architecture" },
       { file: "getting-started.html", title: "Quickstart" },
+      { file: "add-to-project.html",  title: "Add to a project" },
       { file: "scaffolding.html",     title: "Scaffold a project (CLI)" },
       { file: "manage.html",          title: "Manage a database (CLI)" },
     ]},
