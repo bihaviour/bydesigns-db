@@ -124,7 +124,7 @@ jobs:
           cat bench-archive/boundary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload archive + boundary tables
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-validation-${{ github.sha }}
           path: bench-archive/
