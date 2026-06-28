@@ -14,9 +14,12 @@ with a frozen C ABI, the pluggable `Storage` trait with `LocalFileStorage`
 (`file://`) and `ObjectStorage` (`s3://`/`r2://`/`gs://`) backends, MVCC snapshot
 isolation, crash-safe WAL durability + replay, an `engine-server` that speaks a
 Postgres-wire subset, **copy-on-write branching**, a durable single-writer lease,
-a **scale-to-zero lifecycle controller**, and **in-core vector search** (a
+a **scale-to-zero lifecycle controller**, **in-core vector search** (a
 `vector(N)` type + HNSW index whose graph branches and scales-to-zero with the
-database). See the [roadmap](#roadmap) and the [documentation](#documentation)
+database), an **app-grade SQL surface** (joins, aggregation, subqueries, CTEs,
+constraints, and a scalar-function library), and engine-native **row-level
+security** (Supabase-style policies enforced over MVCC, JWT identity composed
+around). See the [roadmap](#roadmap) and the [documentation](#documentation)
 entry points below.
 
 > [!WARNING]
@@ -148,7 +151,7 @@ Selected development specs (under [`pages/specs/`](pages/specs/)):
 | [Server Mode & Wire Protocol](pages/specs/07-server-mode.html) | The pgwire subset |
 | [Benchmark & Validation Plan](pages/specs/09-benchmark-plan.html) | Latency/throughput/crash-safety experiments |
 | [Roadmap & Build Sequence](pages/specs/13-roadmap.html) | Phased delivery plan |
-| Implementation maps | [Phase 1](pages/specs/phase-1-embedded.html) · [Phase 2](pages/specs/phase-2-object-storage.html) · [Phase 3](pages/specs/phase-3-server.html) · [Phase 4](pages/specs/phase-4-branching-lifecycle.html) |
+| Implementation maps | [Phase 1](pages/specs/phase-1-embedded.html) · [Phase 2](pages/specs/phase-2-object-storage.html) · [Phase 3](pages/specs/phase-3-server.html) · [Phase 4](pages/specs/phase-4-branching-lifecycle.html) · [Phase 5](pages/specs/phase-5-capabilities.html) · [Phase 6](pages/specs/phase-6-sql-completeness.html) |
 
 ## Repository layout
 
@@ -181,6 +184,8 @@ cargo build -p twill-engine --release && (cd clients/bun && bun test)
 3. **`engine-server` + Postgres wire protocol** — remote/server mode for multi-client and tools that expect Postgres. ✅ *implemented*
 4. **Controller** — idle stop (scale-to-zero) + branch-on-LSN (instant clones) + single-writer fencing. ✅ *implemented*
 5. **Capabilities** — built-in vector search (`vector(N)` + HNSW); compose auth / REST / OLAP over the shared storage floor. ✅ *implemented*
+6. **SQL surface completeness** — expressions, joins, aggregation, subqueries/CTEs, constraints, a scalar-function library, and dialect shims (parser + executor only; the seam never moved). ✅ *implemented*
+7. **Row-level security** — engine-native per-row enforcement (`USING` / `WITH CHECK`, default-deny, `auth.*` accessors); JWT identity composed around. ✅ *implemented*
 
 See [Releases & roadmap](pages/release/index.html) and the [full build sequence](pages/specs/13-roadmap.html) for milestones, dependencies, and exit criteria.
 

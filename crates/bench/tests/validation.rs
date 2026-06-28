@@ -35,7 +35,9 @@ fn argv(parts: &[&str]) -> Vec<String> {
 #[test]
 fn exp1_stall_gate_passes_clean_and_fires_on_injected_stall() {
     let url = unique_url();
-    // A clean run with a generous bound stays green.
+    // A clean run stays green: the bound (1000×) sits far above the worst p999/p50
+    // a loaded CI host produces from incidental tail jitter, and far below the
+    // injected stall (p50×5000), so the two cases never overlap.
     let ok = run_cli(&argv(&[
         "exp1",
         "--url",
@@ -45,7 +47,7 @@ fn exp1_stall_gate_passes_clean_and_fires_on_injected_stall() {
         "--warmup-ms",
         "80",
         "--max-stall-ratio",
-        "50",
+        "1000",
         "--json",
     ]));
     assert_eq!(ok, exit::OK, "clean exp1 should pass the stall gate");
@@ -62,7 +64,7 @@ fn exp1_stall_gate_passes_clean_and_fires_on_injected_stall() {
         "--warmup-ms",
         "80",
         "--max-stall-ratio",
-        "50",
+        "1000",
         "--inject-fault",
         "stall",
         "--json",

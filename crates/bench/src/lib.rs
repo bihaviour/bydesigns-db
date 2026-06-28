@@ -771,11 +771,13 @@ fn run_experiment(exp: Experiment, opts: &Opts) -> Result<Report, BenchError> {
     }
 
     // Negative-test hook (V-1): fold one pathological sample into the Exp-1
-    // distribution so the stall gate has an unambiguous tail to fire on. Off in
-    // every real run (no `--inject-fault stall`).
+    // distribution so the stall gate has an unambiguous tail to fire on — a
+    // multi-thousand-× spike, far above the worst real tail a loaded host
+    // produces, so the negative test stays well separated from clean-run jitter.
+    // Off in every real run (no `--inject-fault stall`).
     if matches!(exp, Experiment::LatencyFloor) && opts.inject_fault == Some(Fault::Stall) {
         let p50 = merged.value_at_quantile(0.50).max(1);
-        merged.record(p50.saturating_mul(1000));
+        merged.record(p50.saturating_mul(5000));
     }
 
     let commits = merged.count();
