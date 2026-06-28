@@ -12,11 +12,11 @@
         "typescript": "^6.0.3",
       },
       "optionalDependencies": {
-        "@twilldb/engine-darwin-arm64": "0.4.0",
-        "@twilldb/engine-darwin-x64": "0.4.0",
-        "@twilldb/engine-linux-arm64": "0.4.0",
-        "@twilldb/engine-linux-x64": "0.4.0",
-        "@twilldb/engine-win32-x64": "0.4.0",
+        "@twilldb/engine-darwin-arm64": "0.5.1",
+        "@twilldb/engine-darwin-x64": "0.5.1",
+        "@twilldb/engine-linux-arm64": "0.5.1",
+        "@twilldb/engine-linux-x64": "0.5.1",
+        "@twilldb/engine-win32-x64": "0.5.1",
       },
     },
   },
@@ -46,6 +46,16 @@
     "@opentelemetry/semantic-conventions": ["@opentelemetry/semantic-conventions@1.41.1", "", {}, "sha512-/UhIkaZgPutTFmQ7RnIJGgDXZmtEJ7Dvi86xNTFWcnRxVRNk/aotsqDJYeEvDP+FSMB2SdW+pQzNMcWP0rwuNA=="],
 
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
+
+    "@twilldb/engine-darwin-arm64": ["@twilldb/engine-darwin-arm64@0.5.1", "", { "os": "darwin", "cpu": "arm64" }, "sha512-HPGo6L96JxRuDZZrHUbayuRqU/DM8h5vX6+KdpelpF4tMDYHcjxxWRkP6RBnpW4Gl6f30AGwMECZUigjMIXG7g=="],
+
+    "@twilldb/engine-darwin-x64": ["@twilldb/engine-darwin-x64@0.5.1", "", { "os": "darwin", "cpu": "x64" }, "sha512-l1j8BMGU80HMgyUUAp7hoIcSn/rUeb5WtBuylULTL8C0td/Tu15wtb+g6xHWVB65U3ntFTYFo6W57ODSon9hkA=="],
+
+    "@twilldb/engine-linux-arm64": ["@twilldb/engine-linux-arm64@0.5.1", "", { "os": "linux", "cpu": "arm64" }, "sha512-v/IyD7INXfQI70z6os5vLdUJU5S2eC8LOaUuFoVjAVDlFe0vGuLXZVCLRft+4aIx+zqzrggcxThAd4oX6vSFyA=="],
+
+    "@twilldb/engine-linux-x64": ["@twilldb/engine-linux-x64@0.5.1", "", { "os": "linux", "cpu": "x64" }, "sha512-U5N6xHZlUiHA91fFlOOBovfhwRG/e5w3xgrwhfLn1AZRyg29cs3Migq4gwJne28SYH5YeUwF38RjEkkshZWNRg=="],
+
+    "@twilldb/engine-win32-x64": ["@twilldb/engine-win32-x64@0.5.1", "", { "os": "win32", "cpu": "x64" }, "sha512-eOFoo/foiybPH+Jg7GCc2y28bZgFKntdABHdXnE1TK8kZvLIumq7MHkgChyO3YNLs9w3mb0VTFs3OFdBvBtQHQ=="],
 
     "@types/node": ["@types/node@26.0.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-vf2YFi1iY9lHGwNJMs01biZFbKJkrZR1T6/MlzjhJLPdntOHLhTrDSnSVcdtvjihi4VQNlrFRIxLsDBlQpAipA=="],
 
