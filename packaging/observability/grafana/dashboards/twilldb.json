@@ -1,0 +1,120 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "title": "twill-db · engine-server",
+  "uid": "twilldb-engine-server",
+  "tags": ["twilldb"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Active connections",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" } } },
+      "targets": [
+        { "refId": "A", "expr": "twilldb_connections_active", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Committed LSN",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null } ] } } },
+      "targets": [
+        { "refId": "A", "expr": "twilldb_engine_committed_lsn", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Error ratio (5m)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 } ] } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(twilldb_query_errors_total[5m])) / clamp_min(sum(rate(twilldb_queries_total[5m])), 1)", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "targets": [
+        { "refId": "A", "expr": "twilldb_uptime_seconds", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Query throughput (qps)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(twilldb_queries_total[5m])", "legendFormat": "queries", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } },
+        { "refId": "B", "expr": "rate(twilldb_query_errors_total[5m])", "legendFormat": "errors", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Commits & write lane (per second)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(twilldb_engine_commits_total[5m])", "legendFormat": "commits", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } },
+        { "refId": "B", "expr": "rate(twilldb_engine_write_acquires_total[5m])", "legendFormat": "write acquires", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } },
+        { "refId": "C", "expr": "rate(twilldb_engine_durable_appends_total[5m])", "legendFormat": "durable appends", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Serialized-handoff ratio (hot-row contention)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(twilldb_engine_write_handoffs_total[5m]) / clamp_min(rate(twilldb_engine_write_acquires_total[5m]), 1)", "legendFormat": "handoff ratio", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Page cache hit ratio",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(twilldb_storage_cache_hits_total[5m]) / clamp_min(rate(twilldb_storage_cache_hits_total[5m]) + rate(twilldb_storage_cache_misses_total[5m]), 1)", "legendFormat": "hit ratio", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL throughput & rows returned",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(twilldb_storage_wal_bytes_total[5m])", "legendFormat": "WAL bytes/s", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } },
+        { "refId": "B", "expr": "rate(twilldb_rows_returned_total[5m])", "legendFormat": "rows/s", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection churn (per second)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(twilldb_connections_total[5m])", "legendFormat": "new connections", "datasource": { "type": "prometheus", "uid": "twilldb-prometheus" } }
+      ]
+    }
+  ]
+}

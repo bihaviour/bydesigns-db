@@ -1,0 +1,19 @@
+# Prometheus scrape config for twill-db engine-server.
+#
+# Start the server with the metrics exporter enabled, e.g.:
+#   engine-server --listen 0.0.0.0:5433 --db file://./srv.db --metrics 0.0.0.0:9100
+#
+# The target below assumes engine-server runs on the Docker host. On Docker
+# Desktop (macOS/Windows) `host.docker.internal` resolves to the host. On Linux,
+# the docker-compose file adds it via `extra_hosts: host-gateway`. If the server
+# runs elsewhere, replace the target with its host:port.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: twilldb
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          instance: "engine-server"

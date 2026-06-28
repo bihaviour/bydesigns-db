@@ -102,6 +102,13 @@ pub struct CatalogColumn {
     pub ty: ColumnType,
     pub not_null: bool,
     pub primary_key: bool,
+    /// A single-column `UNIQUE` constraint (stage 6D). Reflected so `schema dump`
+    /// can reconstruct it; the PK already implies uniqueness, so a PK column does
+    /// not also set this.
+    pub unique: bool,
+    /// The column's `DEFAULT <expr>` clause as original SQL text, if any (stage
+    /// 6D) — reflected so `schema dump` re-emits it.
+    pub default_sql: Option<String>,
     /// 1-based ordinal position in the table.
     pub position: i32,
 }
@@ -241,6 +248,9 @@ impl Connection {
                         ty: c.ty,
                         not_null: c.not_null,
                         primary_key: c.primary_key,
+                        // The PK already implies uniqueness; don't double-emit.
+                        unique: c.unique && !c.primary_key,
+                        default_sql: c.default_sql,
                         position: (i + 1) as i32,
                     })
                     .collect(),

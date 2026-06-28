@@ -456,7 +456,8 @@ fn schema_dump_reconstructs_reparseable_ddl() {
         "sql",
         &args(&[
             &url,
-            "CREATE TABLE authors (id integer primary key, name text NOT NULL)",
+            "CREATE TABLE authors (id integer primary key, name text NOT NULL, \
+             email text UNIQUE, country text DEFAULT 'US')",
         ]),
     )
     .unwrap();
@@ -474,6 +475,11 @@ fn schema_dump_reconstructs_reparseable_ddl() {
     assert!(dump.contains("CREATE TABLE authors ("), "got: {dump}");
     assert!(dump.contains("id integer PRIMARY KEY"), "pk inline: {dump}");
     assert!(dump.contains("name text NOT NULL"), "not null: {dump}");
+    assert!(dump.contains("email text UNIQUE"), "unique: {dump}");
+    assert!(
+        dump.contains("country text DEFAULT 'US'"),
+        "default: {dump}"
+    );
     assert!(dump.contains("embedding vector(3)"), "vector type: {dump}");
     assert!(
         dump.contains("FOREIGN KEY (author_id) REFERENCES authors (id)"),
@@ -558,7 +564,8 @@ fn postgres_transport_runs_sql_and_reflects_catalog() {
         "sql",
         &args(&[
             &pg,
-            "CREATE TABLE authors (id integer PRIMARY KEY, name text NOT NULL)",
+            "CREATE TABLE authors (id integer PRIMARY KEY, name text NOT NULL, \
+             email text UNIQUE, country text DEFAULT 'US')",
         ]),
     )
     .unwrap();
@@ -572,7 +579,7 @@ fn postgres_transport_runs_sql_and_reflects_catalog() {
     .unwrap();
     let ins = manage::run(
         "sql",
-        &args(&[&pg, "INSERT INTO authors VALUES (1, 'Ada')"]),
+        &args(&[&pg, "INSERT INTO authors (id, name) VALUES (1, 'Ada')"]),
     )
     .unwrap();
     assert!(ins.contains("1 row(s) affected"), "got: {ins}");
@@ -601,6 +608,12 @@ fn postgres_transport_runs_sql_and_reflects_catalog() {
     let dump = manage::run("schema", &args(&["dump", &pg])).unwrap();
     assert!(dump.contains("CREATE TABLE authors"), "got: {dump}");
     assert!(dump.contains("name text NOT NULL"), "got: {dump}");
+    // UNIQUE / DEFAULT round-trip over the wire reflection too (twill.catalog).
+    assert!(dump.contains("email text UNIQUE"), "wire unique: {dump}");
+    assert!(
+        dump.contains("country text DEFAULT 'US'"),
+        "wire default: {dump}"
+    );
     assert!(
         dump.contains("FOREIGN KEY (author_id) REFERENCES authors (id)"),
         "got: {dump}"

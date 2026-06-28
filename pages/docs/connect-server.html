@@ -36,6 +36,19 @@ cargo run -p twill-server -- --listen 0.0.0.0:5433 --db s3://my-bucket/mydb</cod
 </section>
 
 <section>
+<h2>Metrics &amp; health (self-hosted)</h2>
+<p>Pass <code>--metrics HOST:PORT</code> to expose an operator-facing <code>/metrics</code> endpoint in Prometheus text format, plus a <code>/healthz</code> liveness probe, on a <strong>separate</strong> address from the Postgres-wire listener. It is off by default and self-hosted — the server never sends anything outbound, so there is no telemetry to opt out of.</p>
+<pre data-lang="bash"><code># Wire on 5433, metrics on 9100 (scrape http://host:9100/metrics)
+cargo run -p twill-server -- --listen 0.0.0.0:5433 --db file://./srv.db --metrics 0.0.0.0:9100
+
+curl -s http://127.0.0.1:9100/metrics   # Prometheus exposition
+curl -s http://127.0.0.1:9100/healthz   # -> ok</code></pre>
+<p>Two families are exported. <em>Wire-level</em> counters come from the listener: <code>twilldb_connections_total</code> / <code>twilldb_connections_active</code>, <code>twilldb_queries_total</code>, <code>twilldb_query_errors_total</code>, <code>twilldb_rows_returned_total</code>, and <code>twilldb_uptime_seconds</code>. <em>Engine / storage</em> gauges are read live from the engine: <code>twilldb_engine_commits_total</code>, <code>twilldb_engine_committed_lsn</code>, <code>twilldb_engine_write_acquires_total</code> / <code>…_write_handoffs_total</code> (the serialized-handoff signal — see <a href="hot-row.html">hot-row contention</a>), and the storage seam's <code>twilldb_storage_wal_appends_total</code> / <code>…_wal_bytes_total</code> / <code>…_cache_hits_total</code> / <code>…_cache_misses_total</code> / <code>…_fsyncs_total</code>. Point Prometheus at the endpoint and graph error rate (<code>rate(twilldb_query_errors_total[5m])</code>), throughput, and cache hit ratio in Grafana.</p>
+<p>A scrape is the same cost as one client connecting; 15s is a sane interval. The same <code>SHOW twill.stats</code> surface is available in-band over the wire if you'd rather pull the engine gauges through a SQL client.</p>
+<p>A ready-to-run Prometheus + Grafana stack (with an auto-provisioned dashboard) lives in <code>packaging/observability/</code> — <code>docker compose up</code> and open Grafana at <code>localhost:3000</code>. See its <code>README.md</code> for the metric reference.</p>
+</section>
+
+<section>
 <h2>The connection string</h2>
 <p>Every client uses an ordinary Postgres DSN. The database name is accepted but nominal — the server serves the database given by <code>--db</code>.</p>
 <pre data-lang="bash"><code>postgresql://postgres@127.0.0.1:5433/main?sslmode=disable</code></pre>

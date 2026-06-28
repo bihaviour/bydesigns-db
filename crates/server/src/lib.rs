@@ -22,6 +22,7 @@
 pub mod capability;
 mod datapath;
 mod introspect;
+pub mod metrics;
 mod protocol;
 mod reflect;
 mod session;
@@ -60,6 +61,9 @@ pub fn serve_listener(listener: TcpListener, db_url: &str) -> io::Result<()> {
 
 fn handle(stream: TcpStream, db_url: &str) {
     let _ = stream.set_nodelay(true);
+    // Count this connection for the ops-metrics exporter; the active gauge is
+    // decremented when the guard drops, even on a panic in `serve`.
+    let _conn = metrics::ConnGuard::new();
     if let Err(e) = serve(stream, db_url) {
         // A dropped/aborted client connection is normal; log only unexpected I/O.
         if e.kind() != io::ErrorKind::UnexpectedEof && e.kind() != io::ErrorKind::BrokenPipe {

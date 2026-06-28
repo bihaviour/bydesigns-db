@@ -330,6 +330,10 @@ client_tls_sslmode    = require</code></pre>
 <section>
 <h2>Observability &amp; metrics</h2>
 <p>Server mode is the only mode with connections, so it owns connection-level observability. Metrics SHOULD be exported in a Prometheus-style scrape endpoint and SHOULD reuse the latency percentiles the benchmark plan demands (p50/p99/p999 — never mean-only; source §8).</p>
+<div class="callout note">
+<p class="callout-title">Implemented (opt-in) — the <code>/metrics</code> endpoint</p>
+<p><code>engine-server --metrics HOST:PORT</code> serves a hand-rolled Prometheus text-exposition <code>/metrics</code> endpoint plus a <code>/healthz</code> probe on a separate address from the wire listener, off by default and self-hosted (no phone-home). It exports the wire-level counters (<code>twilldb_connections_total</code>/<code>_active</code>, <code>twilldb_queries_total</code>, <code>twilldb_query_errors_total</code>, <code>twilldb_rows_returned_total</code>, <code>twilldb_uptime_seconds</code>) and the engine/storage gauges read live through one warm connection that shares the registry <code>Database</code> (<code>twilldb_engine_commits_total</code>, <code>twilldb_engine_committed_lsn</code>, <code>twilldb_engine_write_acquires_total</code>/<code>_write_handoffs_total</code>, and the seam's WAL/cache/fsync counters). No new dependency and no engine change — the exporter lives entirely in <code>crates/server</code> (<code>metrics.rs</code>). Latency-percentile histograms and tracing propagation below remain future work.</p>
+</div>
 <div class="metric-grid">
 <div class="metric"><div class="metric-value">p99</div><div class="metric-label">commit latency (target tracked)</div></div>
 <div class="metric"><div class="metric-value">conns</div><div class="metric-label">active / idle / fenced</div></div>
