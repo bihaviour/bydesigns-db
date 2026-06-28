@@ -259,11 +259,13 @@ impl Session {
                 tag,
             } => {
                 let oids = resolve_oids(oids, &columns, &rows);
+                crate::metrics::query_ok(rows.len());
                 self.send_rows(out, &columns, &oids, &rows, &[]);
                 out.command_complete(&tag);
                 Ok(())
             }
             Canned::Tag(tag) => {
+                crate::metrics::query_ok(0);
                 out.command_complete(&tag);
                 Ok(())
             }
@@ -275,6 +277,7 @@ impl Session {
                 // clear feature_not_supported error rather than letting it fall
                 // through to a baffling engine syntax error (EX-3 / spec 07 MUST).
                 if let Some(reason) = capability::unsupported_catalog_reason(sql) {
+                    crate::metrics::query_err();
                     out.error("ERROR", "0A000", &reason);
                     if self.conn.in_transaction() {
                         self.failed_txn = true;
@@ -285,15 +288,18 @@ impl Session {
                     Ok(rs) => {
                         if !rs.columns.is_empty() {
                             let oids = engine_oids(&rs);
+                            crate::metrics::query_ok(rs.rows.len());
                             self.send_rows(out, &rs.columns, &oids, &rs.rows, &[]);
                             out.command_complete(&format!("SELECT {}", rs.rows.len()));
                         } else {
+                            crate::metrics::query_ok(0);
                             let tag = command_tag(&classify(sql), 0, self.conn.last_changes);
                             out.command_complete(&tag);
                         }
                         Ok(())
                     }
                     Err(e) => {
+                        crate::metrics::query_err();
                         let (code, msg) = describe_error(&e.to_string());
                         out.error("ERROR", code, &msg);
                         if self.conn.in_transaction() {
@@ -523,6 +529,7 @@ impl Session {
             return;
         }
         if let Err((code, msg)) = self.materialize(&portal) {
+            crate::metrics::query_err();
             return self.fail(out, &code, &msg);
         }
         let p = self.portals.get(&portal).unwrap();
@@ -537,6 +544,7 @@ impl Session {
                 out.data_row(&cols);
             }
         }
+        crate::metrics::query_ok(if m.has_rows { m.rows.len() } else { 0 });
         out.command_complete(&m.tag);
         if !self.conn.in_transaction() {
             self.failed_txn = false;
