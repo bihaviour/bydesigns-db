@@ -13,7 +13,7 @@
 
 <div class="hero-wrap">
   <div class="hero">
-    <span class="eyebrow"><span class="dot"></span>Current: v0.4.0</span>
+    <span class="eyebrow"><span class="dot"></span>Current: v0.5.0</span>
     <h1>Changelog</h1>
     <p class="sub">What changed in each release of Twill DB, newest first — written to be read, not just diffed. Every version ships the whole workspace in lockstep, so the wrapper and the native binary it loads are always an ABI-matched pair. For the roadmap and spec status, see <a href="../release/index.html">Release</a>.</p>
     <div class="cta-row">
@@ -32,22 +32,32 @@
     </div>
   </section>
 
-  <!-- ===================== UNRELEASED ===================== -->
+  <!-- ===================== 0.5.0 ===================== -->
   <section>
     <div class="sec-head">
-      <span class="kicker">In progress</span>
-      <h2>Unreleased — since v0.4.0 <span class="chip progress">◐ building</span></h2>
-      <p>Work landed on <code>main</code> after the v0.4.0 tag. It will roll into the next version bump.</p>
+      <span class="kicker">Release</span>
+      <h2>v0.5.0 — SQL completeness, row-level security &amp; tooling <span class="chip shipped">✓ current</span></h2>
+      <p>The biggest feature release so far, and an entirely additive one. The query frontend grows to cover the SQL most applications actually write (Phase 6), row-level security lands <em>inside</em> the engine (Phase 7), Node and PHP join Bun as embedded clients, and Twill DB gains real command-line tooling — a project scaffolder and a full database-management CLI. Because the storage seam never moved — <code>ENGINE_ABI_VERSION</code> stays <strong>3</strong>, <code>STORAGE_TRAIT_VERSION</code> stays <strong>3</strong> — every one of these features branches, scales to zero, and restores point-in-time for free.</p>
     </div>
-    <ul class="reqs">
-      <li><span class="req-tag stage">SQL 6A</span><span><strong>Expression &amp; single-table completeness.</strong> <code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, string concat <code>||</code>, <code>RETURNING</code>, upsert (<code>ON CONFLICT</code>), and <code>INSERT … SELECT</code> — the everyday expression surface an app actually issues.</span></li>
-      <li><span class="req-tag stage">SQL 6B</span><span><strong>Multi-table &amp; aggregation.</strong> Joins, qualified names, <code>DISTINCT</code>, set operations, derived tables/CTEs, non-correlated <em>and</em> correlated subqueries, views, join-driven DML, and grouped aggregation. The largest stage.</span></li>
-      <li><span class="req-tag stage">SQL 6C</span><span><strong>Function library.</strong> A curated OLTP-common set of string, math, date/time, UUID and JSON scalar functions, evaluated once at execution so replay stays deterministic.</span></li>
-      <li><span class="req-tag stage">SQL 6D</span><span><strong>Constraints, schema evolution &amp; savepoints.</strong> <code>CHECK</code>/<code>DEFAULT</code>/<code>UNIQUE</code> (single &amp; composite), <code>AUTOINCREMENT</code>/<code>SERIAL</code>, <code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code> / <code>RENAME TO</code>, and <code>SAVEPOINT</code>/<code>RELEASE</code>/<code>ROLLBACK TO</code> (DDL stays autocommit-only).</span></li>
-      <li><span class="req-tag stage">SQL 6E</span><span><strong>Dialect shims.</strong> Placeholder forms (<code>?</code>/<code>$1</code>/<code>:name</code>), backtick quoting, the <code>LIKE</code>/<code>ILIKE</code> case split, and <code>SET</code>/<code>SHOW</code>/<code>PRAGMA</code>/<code>EXPLAIN</code> + session no-ops — concentrated at the pgwire boundary so the core stays one dialect. Completes Phase 6 (6A–6E); the seam and ABI never moved.</span></li>
-      <li><span class="req-tag should">Observability</span><span><strong>Storage <code>stats()</code> surface</strong> — a read-only, backend-neutral counters snapshot consumed by Twill Bench (and a future OTLP exporter). Additive: <code>STORAGE_TRAIT_VERSION</code> → <strong>3</strong>, with all C1–C8 conformance and branching tests still green.</span></li>
-      <li><span class="req-tag stage">Bench</span><span><strong>Twill Bench scenarios.</strong> Request-mix profiles, correctness profiles (counter, bank-transfer, inventory, document-editing), a <code>compare --baseline --candidate</code> diff, the serverless-efficiency report, scale-to-zero (Exp 5) cold-read, a <code>burst</code> autoscaling-stress scenario, a long-run soak, and a feature-gated custom workload loader.</span></li>
-      <li><span class="req-tag may">Proposal</span><span><strong>Row-Level Security (Phase 7)</strong> added to the roadmap as a proposed spec — design only, not yet implemented.</span></li>
+
+    <h3>A much larger SQL surface (Phase 6)</h3>
+    <p>The hand-written frontend grows in two stages without touching the seam. <strong>6A</strong> fills in expression-level and single-table SQL — <code>CASE</code>, <code>CAST</code>/<code>::</code>, <code>IN</code>/<code>BETWEEN</code>, string concatenation with <code>||</code>, <code>NULLS FIRST/LAST</code>, <code>RETURNING</code>, upserts via <code>ON CONFLICT</code>, and <code>INSERT … SELECT</code>. <strong>6B</strong> moves to multi-table work: views, joins, qualified names, <code>DISTINCT</code>, set operations, derived tables/CTEs, correlated and non-correlated subqueries, join-driven DML, and grouped aggregation. Together they take the engine from a deliberately narrow subset to something that runs the queries an everyday app issues; anything still unsupported returns a clean <code>ENGINE_ERR_SQL</code> rather than mis-parsing.</p>
+
+    <h3>Row-Level Security, built in (Phase 7)</h3>
+    <p>RLS is now enforced inside the engine, over the same MVCC snapshot every query already passes through. You declare policies with <code>CREATE</code>/<code>DROP POLICY</code> and switch enforcement on with <code>ALTER TABLE … ENABLE ROW LEVEL SECURITY</code>; both are persisted as additive WAL catalog facts, so policies travel with the database and its branches. Each connection carries a session context — a role plus JWT claims, set via <code>SET ROLE</code> and <code>SET twill.jwt.claims</code> — that policy expressions read through <code>auth.uid()</code>, <code>auth.role()</code>, and <code>auth.claim()</code>. Enforcement is <strong>default-deny</strong>: <code>USING</code> predicates filter reads, <code>WITH CHECK</code> governs writes, <code>RETURNING</code> is filtered to visible rows, and there is an explicit, off-by-default bypass that is never inferred from a role name. Policies reflect through <code>pg_policies</code>. JWT verification and identity stay composed <em>around</em> the engine, so PostgREST-style stacks keep working unchanged.</p>
+
+    <h3>Command-line tooling</h3>
+    <p>Two CLIs ship. The dependency-free <strong><code>twilldb</code> scaffolder</strong> generates a ready-to-run starter app (<code>new</code>/<code>init</code>, including a <code>--vector</code> HNSW template). The <strong>database-management CLI (spec 19)</strong> adds day-to-day operations — <code>sql</code>, <code>shell</code>, <code>tables</code>, <code>migrate</code>, <code>gen types</code>, <code>seed</code>, <code>stats</code>, <code>branch</code>, <code>db reset</code>, <code>schema dump</code>, and <code>serve</code> — and works both embedded (<code>file://</code>/<code>s3://</code>) and over the wire (<code>postgres://</code>), with the transport chosen by the connection-string scheme.</p>
+
+    <h3>Node &amp; PHP clients</h3>
+    <p><code>@twilldb/node</code> (koffi FFI) and <code>twilldb/twilldb</code> (PHP FFI) join the Bun client with the same surface, bringing Twill DB to Node, Next.js, Astro, and Vite on the JavaScript side and to Laravel and CodeIgniter on the PHP side.</p>
+
+    <h3>Also in this release</h3>
+    <ul>
+      <li><strong>Vector hardening:</strong> HNSW <code>ef_search</code> recall tuning, maintenance for delete-heavy churn, and page-layout improvements.</li>
+      <li><strong>Twill Bench validation campaign (spec 15 / #53):</strong> scenarios, correctness profiles (counter, bank-transfer, inventory, document-editing), a <code>compare</code> diff, the <code>stats()</code> observability surface, scale-to-zero cold-read, a serverless-efficiency report, <code>burst</code> autoscaling-stress, a long-run soak with leak/drift detection, a feature-gated custom YAML-profile loader, and the spec-09 sweeps, gates, and boundary tables.</li>
+      <li><strong>Relicensed to BUSL-1.1</strong> with a maintainer-led, no-PR policy; a full v0.4 documentation set (architecture, storage, connection guides) and the Phase 6 completeness map.</li>
+      <li><strong>Fix:</strong> the long-run soak gate no longer flakes on noisy p99 tail latency. p99 is a per-window tail statistic rather than a cumulative leak gauge, so a single slow commit on a shared CI host could fit a false upward trend; p99 is now informational while memory and fd growth remain the gated leak signals.</li>
     </ul>
   </section>
 
@@ -55,7 +65,7 @@
   <section>
     <div class="sec-head">
       <span class="kicker">Release</span>
-      <h2>v0.4.0 — Distribution &amp; benchmarking <span class="chip shipped">✓ current</span></h2>
+      <h2>v0.4.0 — Distribution &amp; benchmarking <span class="chip shipped">✓ shipped</span></h2>
       <p>The release that makes Twill DB installable and measurable: a real distribution story plus the validation tooling to back the performance and correctness claims.</p>
     </div>
     <h3>Highlights</h3>
