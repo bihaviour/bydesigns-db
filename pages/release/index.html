@@ -13,9 +13,9 @@
 
 <div class="hero-wrap">
   <div class="hero">
-    <span class="eyebrow"><span class="dot"></span>Current: v0.4.0</span>
+    <span class="eyebrow"><span class="dot"></span>Current: v0.5.0</span>
     <h1>Releases &amp; roadmap</h1>
-    <p class="sub">Twill DB is built additively: the smallest embeddable thing first, then disaggregation, then server mode, then the lifecycle controller, then vector search, now SQL-surface completeness — each one a working, demonstrable capability. This page records what has shipped, what is planned next, and the status of every design specification. For the human-readable version history, see the <a href="../changelog/index.html">Changelog</a>.</p>
+    <p class="sub">Twill DB is built additively: the smallest embeddable thing first, then disaggregation, then server mode, then the lifecycle controller, then vector search, then SQL-surface completeness, now row-level security — each one a working, demonstrable capability. This page records what has shipped, what is planned next, and the status of every design specification. For the human-readable version history, see the <a href="../changelog/index.html">Changelog</a>.</p>
     <div class="cta-row">
       <a class="btn btn-primary" href="../changelog/index.html">Changelog →</a>
       <a class="btn btn-ghost" href="https://github.com/bihaviour/twill-db/releases" target="_blank" rel="noopener">GitHub releases</a>
@@ -40,10 +40,10 @@
       <p>Every capability is implemented and gated by tests; the storage seam has never moved, so each one was purely additive. The project grows further by composition.</p>
     </div>
     <div class="stat-strip">
-      <div class="stat"><div class="v">v0.4.0</div><div class="l">current workspace version</div></div>
+      <div class="stat"><div class="v">v0.5.0</div><div class="l">current workspace version</div></div>
       <div class="stat"><div class="v">ABI 3</div><div class="l">frozen C embedding contract</div></div>
       <div class="stat"><div class="v">Trait 3</div><div class="l">storage seam version</div></div>
-      <div class="stat"><div class="v">6 / 6</div><div class="l">phases shipped</div></div>
+      <div class="stat"><div class="v">7 / 7</div><div class="l">phases shipped</div></div>
     </div>
   </section>
 
@@ -93,6 +93,20 @@
         <p><strong>Gate:</strong> per-stage test binaries (<code>expr_6a</code>, <code>relational_6b</code>, <code>functions_6c</code>, <code>constraints_6d</code>, <code>dialect_6e</code>) all green; the C1–C8 conformance suite, branching, and scale-to-zero untouched. <a href="../specs/phase-6-sql-completeness.html">Implementation map →</a> · <a href="../specs/16-sql-compatibility.html">SQL Compatibility spec</a></p>
       </div>
 
+      <div class="tl-item done">
+        <h3>Row-Level Security <span class="chip shipped">✓ Shipped</span></h3>
+        <p><span class="ver">in-core per-row enforcement (Phase 7) · JWT identity composed around</span></p>
+        <p>Supabase-style RLS built <em>into</em> the engine and enforced over the same MVCC snapshot every query already uses. <code>CREATE</code>/<code>DROP POLICY</code> and <code>ALTER TABLE … ENABLE ROW LEVEL SECURITY</code> persist as additive WAL catalog facts; a per-connection session context (role + JWT claims via <code>SET ROLE</code> / <code>SET twill.jwt.claims</code>) is read by <code>auth.uid()</code> / <code>auth.role()</code> / <code>auth.claim()</code>. Enforcement is <strong>default-deny</strong> — <code>USING</code> on reads, <code>WITH CHECK</code> on writes, RLS-filtered <code>RETURNING</code>, and an explicit off-by-default bypass — reflected through <code>pg_policies</code>. JWT verification stays composed around the engine, so PostgREST-style identity layers on without entering the core. Additive: <code>ENGINE_ABI_VERSION</code> and <code>STORAGE_TRAIT_VERSION</code> both unchanged, so policies branch / scale-to-zero / PITR-restore for free.</p>
+        <p><strong>Gate:</strong> default-deny read/write enforcement on the single-table and relational paths; bypass off unless explicitly set; policies survive branch + replay. <a href="../specs/17-row-level-security.html">Row-Level Security spec</a></p>
+      </div>
+
+      <div class="tl-item done">
+        <h3>CLI tooling &amp; multi-runtime clients <span class="chip shipped">✓ Shipped</span></h3>
+        <p><span class="ver">twilldb scaffolder + management CLI (spec 19) · @twilldb/node + PHP clients (spec 20)</span></p>
+        <p>A dependency-free <code>twilldb</code> scaffolder (<code>new</code>/<code>init</code>, with a <code>--vector</code> HNSW template) and a full database-management CLI — <code>sql</code>, <code>shell</code>, <code>tables</code>, <code>migrate</code>, <code>gen types</code>, <code>seed</code>, <code>stats</code>, <code>branch</code>, <code>db reset</code>, <code>schema dump</code>, <code>serve</code> — over both embedded (<code>file://</code>/<code>s3://</code>) and over-the-wire (<code>postgres://</code>) transports. Alongside them, <code>@twilldb/node</code> (koffi FFI) and <code>twilldb/twilldb</code> (PHP FFI) join the Bun client with the same surface.</p>
+        <p><strong>Gate:</strong> management tests behind the <code>manage</code> feature green while the default scaffolder build stays lean; Node + PHP embedded e2e suites pass. <a href="../specs/18-cli-tooling.html">CLI Tooling</a> · <a href="../specs/19-cli-management.html">Management CLI</a> · <a href="../specs/20-client-runtimes.html">Client Runtimes</a></p>
+      </div>
+
     </div>
   </section>
 
@@ -113,15 +127,15 @@
         <p>Detail in <a href="../specs/15-twill-bench.html">Twill Bench CLI</a>; tracked in <a href="https://github.com/bihaviour/twill-db/issues/49" target="_blank" rel="noopener">issue #49</a>. Remaining work is the ongoing spec-09 five-experiment validation (<a href="https://github.com/bihaviour/twill-db/issues/91" target="_blank" rel="noopener">epic #91</a>), not the CLI surface.</p>
       </div>
 
-      <div class="tl-item next">
-        <h3>Vector hardening <span class="chip planned">Planned</span></h3>
-        <p><span class="ver">deferred items from the vector-search scope boundaries</span></p>
+      <div class="tl-item done">
+        <h3>Vector hardening <span class="chip shipped">✓ Shipped</span></h3>
+        <p><span class="ver">deferred items from the vector-search scope boundaries — landed in v0.5.0</span></p>
         <ul class="reqs">
-          <li><span class="req-tag may">MAY</span> add a <strong>page-laid-out vector index</strong> as a cold-read optimization (the current index is WAL-derived in-memory state, rebuilt on open — correct and branch-safe, but warms on every cold start).</li>
-          <li><span class="req-tag may">MAY</span> support <strong>incremental index maintenance</strong> under heavy delete churn (deletes are tombstoned today; full-vs-incremental rebuild is an open question).</li>
-          <li><span class="req-tag should">SHOULD</span> expose richer <strong>recall tuning</strong> — HNSW is approximate by design, governed by <code>ef_search</code>; surface and document the recall/latency trade-off.</li>
+          <li><span class="req-tag stage">Done</span><span><strong>Page-laid-out vector index</strong> improvements for cold reads, on top of the WAL-derived index that branches and rebuilds on open.</span></li>
+          <li><span class="req-tag stage">Done</span><span><strong>Delete-churn maintenance</strong> so tombstoned deletes no longer degrade the graph over time.</span></li>
+          <li><span class="req-tag stage">Done</span><span><strong>Recall tuning</strong> via <code>ef_search</code> — the HNSW recall/latency trade-off is now surfaced and documented.</span></li>
         </ul>
-        <p>Detail in <a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a> and the <a href="../specs/phase-5-capabilities.html">vector-search implementation map</a>; scoped in <a href="https://github.com/bihaviour/twill-db/issues/89" target="_blank" rel="noopener">epic #89</a>.</p>
+        <p>Detail in <a href="../specs/12-capabilities.html">Capabilities: Build-in vs Compose</a> and the <a href="../specs/phase-5-capabilities.html">vector-search implementation map</a>; delivered under <a href="https://github.com/bihaviour/twill-db/issues/89" target="_blank" rel="noopener">epic #89</a>.</p>
       </div>
 
       <div class="tl-item next">
@@ -154,6 +168,7 @@
           <tr><td><strong>M4 — Controller</strong> <span class="chip shipped">✓</span></td><td>Lifecycle state machine + branch-on-LSN + CAS fencing</td><td>Cold read + thundering-herd</td><td>True scale-to-zero + instant clones</td></tr>
           <tr><td><strong>M5 — Capabilities</strong> <span class="chip shipped">✓</span></td><td>Vector-in-core (HNSW); compose better-auth / PostgREST / DuckDB</td><td>HNSW top-k matches brute force; MVCC-correct KNN</td><td>Platform grows by composition</td></tr>
           <tr><td><strong>M6 — SQL surface</strong> <span class="chip shipped">✓</span></td><td>Richer SQL frontend (6A–6E) — expressions, joins/aggregation, functions, constraints, dialect shims</td><td>Per-stage suites green; seam &amp; ABI unmoved; reject-never-mis-parse</td><td>App-grade SQL parses &amp; runs the same on Twill</td></tr>
+          <tr><td><strong>M7 — Row-Level Security</strong> <span class="chip shipped">✓</span></td><td>In-core per-row enforcement (Phase 7); JWT identity composed around</td><td>Default-deny read/write enforcement; bypass off unless set; policies survive branch + replay</td><td>Supabase-style RLS that branches &amp; scales-to-zero with the DB</td></tr>
         </tbody>
       </table>
     </div>
@@ -185,7 +200,10 @@
           <tr><td>14</td><td><a href="../specs/14-tradeoffs-risks.html">Tradeoffs &amp; Risk Register</a></td><td>Write latency, single-writer ceiling, cold start</td><td><span class="chip shipped">● Live</span></td></tr>
           <tr><td>15</td><td><a href="../specs/15-twill-bench.html">Twill Bench CLI</a></td><td>Benchmark + correctness + serverless-efficiency CLI (all scenarios shipped)</td><td><span class="chip shipped">● Live</span></td></tr>
           <tr><td>16</td><td><a href="../specs/16-sql-compatibility.html">SQL Compatibility &amp; Mapping</a></td><td>PostgreSQL/SQLite → Twill surface (Phase 6: 6A–6E live)</td><td><span class="chip shipped">● Live</span></td></tr>
-          <tr><td>17</td><td><a href="../specs/17-row-level-security.html">Row-Level Security</a></td><td>Proposal (Phase 7) — not yet implemented (<a href="https://github.com/bihaviour/twill-db/issues/88" target="_blank" rel="noopener">epic #88</a>)</td><td><span class="chip planned">○ Backlog</span></td></tr>
+          <tr><td>17</td><td><a href="../specs/17-row-level-security.html">Row-Level Security</a></td><td>In-core per-row enforcement (Phase 7); JWT identity composed around (<a href="https://github.com/bihaviour/twill-db/issues/88" target="_blank" rel="noopener">epic #88</a>)</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>18</td><td><a href="../specs/18-cli-tooling.html">CLI Tooling</a></td><td>The <code>twilldb</code> scaffolder (<code>new</code>/<code>init</code>) + distribution</td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>19</td><td><a href="../specs/19-cli-management.html">Management CLI</a></td><td>Inspect / migrate / branch / serve over <code>file://</code> &amp; <code>postgres://</code></td><td><span class="chip shipped">● Live</span></td></tr>
+          <tr><td>20</td><td><a href="../specs/20-client-runtimes.html">Client Runtimes</a></td><td><code>@twilldb/node</code> (koffi) + PHP FFI clients, Bun-parity</td><td><span class="chip shipped">● Live</span></td></tr>
         </tbody>
       </table>
     </div>
